@@ -73,10 +73,11 @@ impl<S: Store> AuthService<S> {
 
     /// Issue a fresh single-use challenge. A well-formed challenge is returned
     /// **even for unknown usernames** — no user-existence oracle (§9.3).
-    pub fn challenge(&self, username: &str, now_ms: u64) -> Challenge {
+    pub async fn challenge(&self, username: &str, now_ms: u64) -> Challenge {
         let nonce: [u8; 32] = random_array();
         self.store
-            .insert_nonce(nonce, username, now_ms + self.cfg.nonce_ttl_ms);
+            .insert_nonce(nonce, username, now_ms + self.cfg.nonce_ttl_ms)
+            .await;
         Challenge {
             nonce,
             server_id: self.cfg.server_id.clone(),
@@ -91,7 +92,7 @@ impl<S: Store> AuthService<S> {
     /// * The matched nonce is consumed on success — a valid proof cannot be
     ///   replayed (§9.2 / L4).
     /// * Every failure returns `Unauthorized` (no oracle, §9.3).
-    pub fn prove(
+    pub async fn prove(
         &self,
         username: &str,
         timestamp: u64,
@@ -99,8 +100,8 @@ impl<S: Store> AuthService<S> {
         exporter: &[u8; 32],
         now_ms: u64,
     ) -> Result<SessionToken, AuthError> {
-        let user = self.store.user_by_name(username);
-        for nonce in self.store.outstanding_nonces(username, now_ms) {
+        let user = self.store.user_by_name(username).await;
+        for nonce in self.store.outstanding_nonces(username, now_ms).await {
             let verified = match &user {
                 Some(u) => verify_proof(
                     &u.sig_pub,
@@ -126,18 +127,20 @@ impl<S: Store> AuthService<S> {
                 }
             };
             if verified {
-                self.store.consume_nonce(&nonce); // single-use ⇒ no replay
+                self.store.consume_nonce(&nonce).await; // single-use ⇒ no replay
                 let u = user.expect("verified implies a known user");
                 let token: [u8; 32] = random_array();
-                self.store.insert_session(
-                    sha256(&token),
-                    SessionRecord {
-                        user_id: u.user_id,
-                        tls_exporter: *exporter,
-                        expires_at_ms: now_ms + self.cfg.session_ttl_ms,
-                        revoked: false,
-                    },
-                );
+                self.store
+                    .insert_session(
+                        sha256(&token),
+                        SessionRecord {
+                            user_id: u.user_id,
+                            tls_exporter: *exporter,
+                            expires_at_ms: now_ms + self.cfg.session_ttl_ms,
+                            revoked: false,
+                        },
+                    )
+                    .await;
                 return Ok(SessionToken(token));
             }
         }
@@ -147,7 +150,7 @@ impl<S: Store> AuthService<S> {
     /// Validate a presented session token on the current connection. The token
     /// is accepted **only** on the channel it was minted on (exporter match);
     /// a lifted/replayed token on another connection is rejected (api.md §1.5).
-    pub fn validate_session(
+    pub async fn validate_session(
         &self,
         token: &[u8; 32],
         exporter: &[u8; 32],
@@ -156,6 +159,7 @@ impl<S: Store> AuthService<S> {
         let s = self
             .store
             .get_session(&sha256(token))
+            .await
             .ok_or(AuthError::Unauthorized)?;
         if s.revoked || s.expires_at_ms <= now_ms || &s.tls_exporter != exporter {
             return Err(AuthError::Unauthorized);
@@ -164,8 +168,8 @@ impl<S: Store> AuthService<S> {
     }
 
     /// Revoke a token server-side (`POST /v1/session/logout`).
-    pub fn logout(&self, token: &[u8; 32]) {
-        self.store.revoke_session(&sha256(token));
+    pub async fn logout(&self, token: &[u8; 32]) {
+        self.store.revoke_session(&sha256(token)).await;
     }
 }
 
@@ -241,113 +245,119 @@ mod tests {
         AuthService::new(MemoryStore::new(), AuthConfig::default())
     }
 
-    #[test]
-    fn login_succeeds_and_session_validates() {
+    #[tokio::test]
+    async fn login_succeeds_and_session_validates() {
         let svc = service();
         let user = enroll(svc.store(), "alice", 0x01);
-        let ch = svc.challenge("alice", TS);
+        let ch = svc.challenge("alice", TS).await;
         let proof = make_proof(&user.sk, svc.server_id(), &EXPORTER, &ch.nonce, TS);
-        let token = svc.prove("alice", TS, &proof, &EXPORTER, TS).unwrap();
+        let token = svc.prove("alice", TS, &proof, &EXPORTER, TS).await.unwrap();
         // Session validates on the same channel and resolves to the user.
         assert_eq!(
             svc.validate_session(token.as_bytes(), &EXPORTER, TS + 1)
+                .await
                 .unwrap(),
             user.rec.user_id
         );
     }
 
-    #[test]
-    fn replay_of_a_valid_proof_is_rejected() {
+    #[tokio::test]
+    async fn replay_of_a_valid_proof_is_rejected() {
         let svc = service();
         let user = enroll(svc.store(), "alice", 0x01);
-        let ch = svc.challenge("alice", TS);
+        let ch = svc.challenge("alice", TS).await;
         let proof = make_proof(&user.sk, svc.server_id(), &EXPORTER, &ch.nonce, TS);
-        assert!(svc.prove("alice", TS, &proof, &EXPORTER, TS).is_ok());
+        assert!(svc.prove("alice", TS, &proof, &EXPORTER, TS).await.is_ok());
         // Same proof again — the nonce was consumed (single-use).
         assert_eq!(
-            svc.prove("alice", TS, &proof, &EXPORTER, TS).err(),
+            svc.prove("alice", TS, &proof, &EXPORTER, TS).await.err(),
             Some(AuthError::Unauthorized)
         );
     }
 
-    #[test]
-    fn relay_to_a_different_channel_is_rejected() {
+    #[tokio::test]
+    async fn relay_to_a_different_channel_is_rejected() {
         let svc = service();
         let user = enroll(svc.store(), "alice", 0x01);
-        let ch = svc.challenge("alice", TS);
+        let ch = svc.challenge("alice", TS).await;
         // Proof built for EXPORTER, presented on a different connection's exporter.
         let proof = make_proof(&user.sk, svc.server_id(), &EXPORTER, &ch.nonce, TS);
         assert_eq!(
-            svc.prove("alice", TS, &proof, &[0x00; 32], TS).err(),
+            svc.prove("alice", TS, &proof, &[0x00; 32], TS).await.err(),
             Some(AuthError::Unauthorized)
         );
     }
 
-    #[test]
-    fn expired_nonce_is_rejected() {
+    #[tokio::test]
+    async fn expired_nonce_is_rejected() {
         let svc = service();
         let user = enroll(svc.store(), "alice", 0x01);
-        let ch = svc.challenge("alice", TS);
+        let ch = svc.challenge("alice", TS).await;
         let proof = make_proof(&user.sk, svc.server_id(), &EXPORTER, &ch.nonce, TS);
         // 61 s later the nonce has expired (TTL 60 s).
         assert_eq!(
-            svc.prove("alice", TS, &proof, &EXPORTER, TS + 61_000).err(),
+            svc.prove("alice", TS, &proof, &EXPORTER, TS + 61_000)
+                .await
+                .err(),
             Some(AuthError::Unauthorized)
         );
     }
 
-    #[test]
-    fn no_user_existence_oracle() {
+    #[tokio::test]
+    async fn no_user_existence_oracle() {
         let svc = service();
         // A well-formed challenge is issued for an unknown username (§9.3).
-        let ch = svc.challenge("nobody", TS);
+        let ch = svc.challenge("nobody", TS).await;
         assert_eq!(ch.nonce.len(), 32);
         assert_eq!(ch.server_id, svc.server_id());
         // And proving for an unknown user fails with the SAME shape as a bad proof.
         let bogus = [0u8; 64];
         assert_eq!(
-            svc.prove("nobody", TS, &bogus, &EXPORTER, TS).err(),
+            svc.prove("nobody", TS, &bogus, &EXPORTER, TS).await.err(),
             Some(AuthError::Unauthorized)
         );
     }
 
-    #[test]
-    fn wrong_key_proof_is_rejected() {
+    #[tokio::test]
+    async fn wrong_key_proof_is_rejected() {
         let svc = service();
         let _alice = enroll(svc.store(), "alice", 0x01);
         let attacker = SigningKey::generate();
-        let ch = svc.challenge("alice", TS);
+        let ch = svc.challenge("alice", TS).await;
         let proof = make_proof(&attacker, svc.server_id(), &EXPORTER, &ch.nonce, TS);
         assert_eq!(
-            svc.prove("alice", TS, &proof, &EXPORTER, TS).err(),
+            svc.prove("alice", TS, &proof, &EXPORTER, TS).await.err(),
             Some(AuthError::Unauthorized)
         );
     }
 
-    #[test]
-    fn session_rejected_on_wrong_channel_expiry_and_logout() {
+    #[tokio::test]
+    async fn session_rejected_on_wrong_channel_expiry_and_logout() {
         let svc = service();
         let user = enroll(svc.store(), "alice", 0x01);
-        let ch = svc.challenge("alice", TS);
+        let ch = svc.challenge("alice", TS).await;
         let proof = make_proof(&user.sk, svc.server_id(), &EXPORTER, &ch.nonce, TS);
-        let token = svc.prove("alice", TS, &proof, &EXPORTER, TS).unwrap();
+        let token = svc.prove("alice", TS, &proof, &EXPORTER, TS).await.unwrap();
 
         // Wrong channel (lifted token replayed on another connection).
         assert_eq!(
             svc.validate_session(token.as_bytes(), &[0x00; 32], TS + 1)
+                .await
                 .err(),
             Some(AuthError::Unauthorized)
         );
         // Expired.
         assert_eq!(
             svc.validate_session(token.as_bytes(), &EXPORTER, TS + 3_600_001)
+                .await
                 .err(),
             Some(AuthError::Unauthorized)
         );
         // Revoked by logout.
-        svc.logout(token.as_bytes());
+        svc.logout(token.as_bytes()).await;
         assert_eq!(
             svc.validate_session(token.as_bytes(), &EXPORTER, TS + 1)
+                .await
                 .err(),
             Some(AuthError::Unauthorized)
         );

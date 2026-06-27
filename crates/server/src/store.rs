@@ -8,6 +8,7 @@
 //! Methods take `&self` and the impl owns its synchronization, so the service
 //! is `Sync` for concurrent request handling.
 
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -36,16 +37,19 @@ pub struct SessionRecord {
     pub revoked: bool,
 }
 
-pub trait Store {
-    fn user_by_name(&self, username: &str) -> Option<UserRecord>;
-    fn insert_nonce(&self, nonce: [u8; 32], username: &str, expires_at_ms: u64);
+/// Async because the production backing is sqlx/Postgres. `Send + Sync` so the
+/// service can be shared across axum request tasks.
+#[async_trait]
+pub trait Store: Send + Sync {
+    async fn user_by_name(&self, username: &str) -> Option<UserRecord>;
+    async fn insert_nonce(&self, nonce: [u8; 32], username: &str, expires_at_ms: u64);
     /// Fresh (unexpired, unused) nonces outstanding for `username`.
-    fn outstanding_nonces(&self, username: &str, now_ms: u64) -> Vec<[u8; 32]>;
+    async fn outstanding_nonces(&self, username: &str, now_ms: u64) -> Vec<[u8; 32]>;
     /// Mark a nonce used (single-use; idempotent).
-    fn consume_nonce(&self, nonce: &[u8; 32]);
-    fn insert_session(&self, token_hash: [u8; 32], rec: SessionRecord);
-    fn get_session(&self, token_hash: &[u8; 32]) -> Option<SessionRecord>;
-    fn revoke_session(&self, token_hash: &[u8; 32]);
+    async fn consume_nonce(&self, nonce: &[u8; 32]);
+    async fn insert_session(&self, token_hash: [u8; 32], rec: SessionRecord);
+    async fn get_session(&self, token_hash: &[u8; 32]) -> Option<SessionRecord>;
+    async fn revoke_session(&self, token_hash: &[u8; 32]);
 }
 
 #[derive(Default)]
@@ -83,12 +87,13 @@ impl Default for MemoryStore {
     }
 }
 
+#[async_trait]
 impl Store for MemoryStore {
-    fn user_by_name(&self, username: &str) -> Option<UserRecord> {
+    async fn user_by_name(&self, username: &str) -> Option<UserRecord> {
         self.inner.lock().unwrap().users.get(username).cloned()
     }
 
-    fn insert_nonce(&self, nonce: [u8; 32], username: &str, expires_at_ms: u64) {
+    async fn insert_nonce(&self, nonce: [u8; 32], username: &str, expires_at_ms: u64) {
         self.inner.lock().unwrap().nonces.insert(
             nonce,
             NonceRecord {
@@ -99,7 +104,7 @@ impl Store for MemoryStore {
         );
     }
 
-    fn outstanding_nonces(&self, username: &str, now_ms: u64) -> Vec<[u8; 32]> {
+    async fn outstanding_nonces(&self, username: &str, now_ms: u64) -> Vec<[u8; 32]> {
         self.inner
             .lock()
             .unwrap()
@@ -110,21 +115,21 @@ impl Store for MemoryStore {
             .collect()
     }
 
-    fn consume_nonce(&self, nonce: &[u8; 32]) {
+    async fn consume_nonce(&self, nonce: &[u8; 32]) {
         if let Some(r) = self.inner.lock().unwrap().nonces.get_mut(nonce) {
             r.used = true;
         }
     }
 
-    fn insert_session(&self, token_hash: [u8; 32], rec: SessionRecord) {
+    async fn insert_session(&self, token_hash: [u8; 32], rec: SessionRecord) {
         self.inner.lock().unwrap().sessions.insert(token_hash, rec);
     }
 
-    fn get_session(&self, token_hash: &[u8; 32]) -> Option<SessionRecord> {
+    async fn get_session(&self, token_hash: &[u8; 32]) -> Option<SessionRecord> {
         self.inner.lock().unwrap().sessions.get(token_hash).cloned()
     }
 
-    fn revoke_session(&self, token_hash: &[u8; 32]) {
+    async fn revoke_session(&self, token_hash: &[u8; 32]) {
         if let Some(s) = self.inner.lock().unwrap().sessions.get_mut(token_hash) {
             s.revoked = true;
         }
