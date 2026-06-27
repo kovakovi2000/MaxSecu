@@ -57,6 +57,7 @@ All integers are **fixed-width, big-endian, unsigned**, exactly the stated byte 
 | `RecipientType` | `enum8`: `user = 0x01`, `recovery = 0x02` | when `recovery`, the paired `recipient_id` MUST be `RECOVERY_ID` (16 zero bytes); decoder enforces |
 | `StreamType` | `enum8`: `content = 0x01`, `metadata = 0x02`, `thumbnail = 0x03`, `preview = 0x04` | identifies a file's encrypted streams (§13 / D33) |
 | `Compression` | `enum8`: `none = 0x00`, `zstd = 0x01` | per-stream, carried in the signed manifest (D32) |
+| `FileType` | `enum8`: `video = 0x01`, `image = 0x02`, `blog = 0x03` | server-visible **and** authenticated listing key (§13 / D35) |
 
 Constants: `RECOVERY_ID = 0x00…00` (16 bytes). `GENESIS_HEAD = 0x00…00` (32 bytes) — the `prev_head` of the first record in the anchored control-log (§7).
 
@@ -70,8 +71,8 @@ Each begins with its `u16 type_id`, then fields in this exact order. These field
 `username:text` · `user_id:Id` · `enc_pub:X25519Pub` · `sig_pub:Ed25519Pub` · `key_version:u64` · `roles:set<Role>` · `not_before:Timestamp` · `not_after:Timestamp`
 
 ### `manifest` — `0x0002` (§12.3, multi-stream per D33)
-`file_id:Id` · `version:u64` · `alg:Suite` · `chunk_size:u32` · `dek_commit:Hash` · `streams:list<Stream>` · `recovery_present:bool` · `author_id:Id` · `created_at:Timestamp`
-*(decoder MAY require `recovery_present == true` and a `content` stream present. `streams` is ascending by `stream_type` with no duplicate type — §2 `set`-style ordering, count-prefixed; each element is a fixed-size `canonical(Stream)`.)*
+`file_id:Id` · `version:u64` · `file_type:FileType` · `alg:Suite` · `chunk_size:u32` · `dek_commit:Hash` · `streams:list<Stream>` · `recovery_present:bool` · `author_id:Id` · `created_at:Timestamp`
+*(`file_type` is server-visible & authenticated — the listing key of D35. Decoder MAY require `recovery_present == true` and a `content` stream present. `streams` is ascending by `stream_type` with no duplicate type — §2 `set`-style ordering, count-prefixed; each element is a fixed-size `canonical(Stream)`.)*
 
 ### `Stream` (manifest sub-struct) — `0x000D` (§13 / D33)
 `stream_type:StreamType` · `compression:Compression` · `chunk_count:u64` · `digest:Hash`

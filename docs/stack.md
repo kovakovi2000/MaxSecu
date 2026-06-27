@@ -18,6 +18,8 @@ This document is authoritative for language/runtime/library choices. Where a cho
 | Blob storage | **Dropbox (2 TB) backing + local LRU/LFU cache** | Bounds server disk; both tiers ciphertext-only (D31) |
 | Media pipeline | **client-side ffmpeg + image libs in an OS sandbox** | Transcode/thumbnail/preview before encryption; decode shared media safely (D30) |
 | Compression | **client-side, per-file, selective (zstd)** | Text yes, already-compressed media no; size side-channel accepted (D32) |
+| Listing | **server-visible `file_type` + stream structure; values encrypted** | Browse by decrypted title/thumbnail without the full file (D35) |
+| Tor (optional) | **`arti-client`; fail-closed; onion service** | Hide client IP from server/Dropbox; forces server-proxy (D34) |
 | Canonical encoder | **One Rust implementation** (`docs/encoding-spec.md`) | Single client platform ⇒ one encoder; server stores opaque bytes |
 | Air-gapped tooling | **Rust CLI binaries** sharing the client core crates | Ceremony tools are security-critical software (§12.1, §12.7) |
 | TLS | **rustls** | TLS 1.3 + keying-material exporter for channel binding (§9.2) |
@@ -109,6 +111,18 @@ All content understanding is **client-side** (the server has no key). Two activi
 
 > **"Quality-preserving" transcode** is usually impossible on re-encode. Prefer **remux / stream-copy** (container normalize, no re-encode, no loss) when the source codec is already acceptable; otherwise a visually-lossless high-bitrate encode. Less processing = smaller plaintext-handling window and less decoder surface.
 
+> **Single-format playback shrinks the surface.** Because the uploader converts to **one canonical format**, a *viewer* decodes only that format — so the playback path can ship a **single hardened/minimal decoder** instead of ffmpeg's whole demuxer set. The full transcoder is needed only at upload (author's own input). Both still run in the sandbox. The author also **previews the converted result in the same in-app player and confirms** before upload (D30).
+
+### 1.8 Optional Tor transport (D34)
+
+A client setting routes **all** connections over **Tor** for users who need network-location privacy.
+
+- **Implementation: `arti-client`** (pure-Rust Tor, embeddable — no external `tor` daemon). All client HTTP goes through Arti; pinned-TLS (rustls) runs *inside* the tunnel, so server-identity verification (§9.2) is unchanged.
+- **Strongest form: a server onion service (v3).** No exit node, the server's location is also hidden, and the client talks to the `.onion` directly (Arti onion-service support, or a C-tor hidden service fronting the app).
+- **Fail closed.** With Tor enabled the client makes **no clearnet connection, ever** — if Tor is unavailable it **blocks** rather than falling back (a silent fallback would leak the IP).
+- **Forces server-proxy (§2.4).** In Tor mode the client does **not** use direct Dropbox links (Dropbox blocks Tor exits, and it would expose access to a third party); all blobs come via the server/onion.
+- **Honest scope:** Tor hides the client's **IP / network location and coarse timing** from the server and Dropbox. It does **not** hide the **application-level sharing graph** or the server-visible `file_type`/sizes — you still authenticate as your account, so the server knows *who does what*, just not *from where* (`DESIGN.md` §13/§15.3). Large media over Tor is slow — pairs with the whole-file-download decode path (§8.1).
+
 ---
 
 ## 2. Server: Linux, secret-free
@@ -139,11 +153,12 @@ Large ciphertext blobs (the chunked `content`/`thumbnail`/`preview` streams) are
 
 - **Backing tier: Dropbox (2 TB).** Durable store of inert ciphertext. The server holds the Dropbox API token (a high-value **availability** secret — see risks); use a **scoped/app-folder token**, store it in a secret manager, never in code/env-in-image (§16.6).
 - **Cache tier: server local disk (50–100 GB), LRU/LFU.** On a cache miss the server pulls from Dropbox, **reports progress to the client**, and relays. Evict oldest-accessed / least-requested.
-- **Direct client↔Dropbox for large objects.** The server brokers a **short-lived, scoped, read-only link** (Dropbox temporary link) for the specific blob; the client downloads directly and still **verifies every byte** against the signed manifest + per-chunk AEAD tags (§12.3/§12.10). The master token is never given to the client.
+- **Server-proxy is the default; direct client↔Dropbox is *optional* (D31).** By default the client only ever talks to the server, which relays blob bytes — so the client never contacts a third party. As a bandwidth optimization the server *may* broker a **short-lived, scoped, read-only link** (Dropbox temporary link) for a large blob so the client downloads it directly; the client can **disable** this, and **Tor mode forces proxy** (§1.8). Either way the client **verifies every byte** against the signed manifest + per-chunk AEAD tags (§12.3/§12.10); the master token is never given to the client.
+- **Listing index (D35).** The server indexes each file's authenticated **`file_type`** (from the manifest) + small-stream **structure**/sizes to serve a browsable listing; **values stay encrypted** (the client decrypts the small `title`/`thumbnail` streams to render). The server can sort/filter only on `file_type`/size/time, never on content.
 - **No dedup.** Per-file random DEKs ⇒ identical plaintext yields different ciphertext, so cross-user dedup is impossible (good for privacy, costs storage — size the Dropbox tier accordingly).
 - **Small records stay in Postgres** (manifests, wraps, grants, tombstones, directory) — never in Dropbox.
 
-> **Security note carried into `DESIGN.md`:** Dropbox is in the **untrusted** zone (D31). It cannot read files (ciphertext only) and cannot feed bad bytes undetected (AEAD + manifest), but it is a **second metadata observer** (sizes/timing/access) and its token is an **availability/DR** risk (mass-delete; durability rests on Dropbox — consider an independent ciphertext backup). Crates: `dropbox-sdk` (or raw HTTP v2 API) on the server; the client uses plain `reqwest` + `rustls` for direct link fetches.
+> **Security note carried into `DESIGN.md`:** Dropbox is in the **untrusted** zone (D31). It cannot read files (ciphertext only) and cannot feed bad bytes undetected (AEAD + manifest). Residuals: a **second metadata observer** (sizes/timing/access) and a **second, independent availability dependency** (the Dropbox account). **Mass-delete is *not* a new risk** — a compromised operator could always destroy stored data, server or Dropbox alike; durability rests on the storage tier either way, so plan an independent ciphertext backup regardless. Secure the token (scoped/app-folder, secret manager, never in image env, §16.6). Crates: `dropbox-sdk` (or raw HTTP v2) on the server; client uses `reqwest` + `rustls` (over Tor when enabled) for any direct fetch.
 
 ### 2.5 Compression (D32)
 
