@@ -20,7 +20,7 @@ pub mod serve;
 pub mod store;
 
 pub use auth::{AuthConfig, AuthService, Challenge, SessionToken};
-pub use error::{AuthError, ProveError, RateLimited};
+pub use error::{AuthError, ChallengeError, ProveError, StoreError};
 pub use http::{router, AppState, AuthedSession, TlsExporter};
 pub use pg::PgStore;
 pub use ratelimit::{RateLimitConfig, RateLimiter};

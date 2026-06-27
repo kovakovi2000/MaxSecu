@@ -3,7 +3,7 @@
 //! supplies the live connection's TLS exporter; these methods are pure given
 //! `(store, now_ms, exporter)` and fully testable without TLS or a DB.
 
-use crate::error::{AuthError, ProveError, RateLimited};
+use crate::error::{AuthError, ChallengeError, ProveError, StoreError};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::store::{SessionRecord, Store};
 use maxsecu_crypto::{random_array, sha256, VerifyingKey};
@@ -85,14 +85,21 @@ impl<S: Store> AuthService<S> {
     /// **even for unknown usernames** — no user-existence oracle (§9.3) — unless
     /// the per-account issuance cap is hit, in which case the caller is throttled
     /// (`Err(RateLimited)` → HTTP 429, parameters §3).
-    pub async fn challenge(&self, username: &str, now_ms: u64) -> Result<Challenge, RateLimited> {
+    pub async fn challenge(
+        &self,
+        username: &str,
+        now_ms: u64,
+    ) -> Result<Challenge, ChallengeError> {
         if let Err(retry_after_s) = self.limiter.admit_challenge(username, now_ms) {
-            return Err(RateLimited { retry_after_s });
+            return Err(ChallengeError::RateLimited { retry_after_s });
         }
         let nonce: [u8; 32] = random_array();
+        // A backend fault here is surfaced (→ 500), not swallowed: a silently
+        // un-stored nonce would deny the *later* proof as a misleading 401.
         self.store
             .insert_nonce(nonce, username, now_ms + self.cfg.nonce_ttl_ms)
-            .await;
+            .await
+            .map_err(ChallengeError::Internal)?;
         Ok(Challenge {
             nonce,
             server_id: self.cfg.server_id.clone(),
@@ -122,8 +129,19 @@ impl<S: Store> AuthService<S> {
         if let Err(retry_after_s) = self.limiter.admit_proof(username, now_ms) {
             return Err(ProveError::RateLimited { retry_after_s });
         }
-        let user = self.store.user_by_name(username).await;
-        for nonce in self.store.outstanding_nonces(username, now_ms).await {
+        // A store fault is surfaced (→ 500), never masked as a 401: masking would
+        // make a transient DB outage indistinguishable from a bad credential.
+        let user = self
+            .store
+            .user_by_name(username)
+            .await
+            .map_err(ProveError::Internal)?;
+        for nonce in self
+            .store
+            .outstanding_nonces(username, now_ms)
+            .await
+            .map_err(ProveError::Internal)?
+        {
             let verified = match &user {
                 Some(u) => verify_proof(
                     &u.sig_pub,
@@ -149,7 +167,12 @@ impl<S: Store> AuthService<S> {
                 }
             };
             if verified {
-                self.store.consume_nonce(&nonce).await; // single-use ⇒ no replay
+                // single-use ⇒ no replay; a fault here must not hand back a token
+                // whose nonce wasn't consumed, so surface it rather than swallow.
+                self.store
+                    .consume_nonce(&nonce)
+                    .await
+                    .map_err(ProveError::Internal)?;
                 self.limiter.record_proof(username, now_ms, true); // clears backoff
                 let u = user.expect("verified implies a known user");
                 let token: [u8; 32] = random_array();
@@ -163,7 +186,8 @@ impl<S: Store> AuthService<S> {
                             revoked: false,
                         },
                     )
-                    .await;
+                    .await
+                    .map_err(ProveError::Internal)?; // don't return an unpersisted token
                 return Ok(SessionToken(token));
             }
         }
@@ -181,10 +205,13 @@ impl<S: Store> AuthService<S> {
         exporter: &[u8; 32],
         now_ms: u64,
     ) -> Result<[u8; 16], AuthError> {
+        // A backend fault is surfaced (→ 500); a genuinely absent session is the
+        // uniform 401. Distinguishing them is the whole point of the fallible Store.
         let s = self
             .store
             .get_session(&sha256(token))
             .await
+            .map_err(AuthError::Internal)?
             .ok_or(AuthError::Unauthorized)?;
         if s.revoked || s.expires_at_ms <= now_ms || &s.tls_exporter != exporter {
             return Err(AuthError::Unauthorized);
@@ -192,9 +219,10 @@ impl<S: Store> AuthService<S> {
         Ok(s.user_id)
     }
 
-    /// Revoke a token server-side (`POST /v1/session/logout`).
-    pub async fn logout(&self, token: &[u8; 32]) {
-        self.store.revoke_session(&sha256(token)).await;
+    /// Revoke a token server-side (`POST /v1/session/logout`). Propagates a
+    /// backend fault (→ 500) rather than reporting a false success.
+    pub async fn logout(&self, token: &[u8; 32]) -> Result<(), StoreError> {
+        self.store.revoke_session(&sha256(token)).await
     }
 }
 
@@ -226,7 +254,7 @@ fn verify_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{MemoryStore, UserRecord};
+    use crate::store::{FaultyStore, MemoryStore, UserRecord};
     use maxsecu_crypto::SigningKey;
 
     const EXPORTER: [u8; 32] = [0xE7; 32];
@@ -357,6 +385,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_fault_surfaces_as_internal_not_swallowed() {
+        // A backend fault must be a distinct, observable outcome (Internal → 500),
+        // NOT swallowed into the fail-closed business answer (a silent 401/no-op).
+        let svc = AuthService::new(FaultyStore, AuthConfig::default());
+
+        // challenge: insert_nonce faults → Internal, not a bogus Ok challenge.
+        assert!(
+            matches!(svc.challenge("alice", TS).await, Err(ChallengeError::Internal(_))),
+            "challenge must surface a store fault as Internal"
+        );
+
+        // prove: user_by_name/outstanding_nonces fault → Internal, not Unauthorized.
+        let proof = [0u8; 64];
+        assert!(
+            matches!(
+                svc.prove("alice", TS, &proof, &EXPORTER, TS).await,
+                Err(ProveError::Internal(_))
+            ),
+            "prove must surface a store fault as Internal, not mask it as 401"
+        );
+
+        // validate_session: get_session fault → Internal, not Unauthorized.
+        assert!(
+            matches!(
+                svc.validate_session(&[0u8; 32], &EXPORTER, TS).await,
+                Err(AuthError::Internal(_))
+            ),
+            "validate_session must surface a store fault as Internal, not mask it as 401"
+        );
+
+        // logout: revoke_session fault propagates as the StoreError.
+        assert!(
+            svc.logout(&[0u8; 32]).await.is_err(),
+            "logout must surface a store fault"
+        );
+    }
+
+    #[tokio::test]
     async fn session_rejected_on_wrong_channel_expiry_and_logout() {
         let svc = service();
         let user = enroll(svc.store(), "alice", 0x01);
@@ -379,7 +445,7 @@ mod tests {
             Some(AuthError::Unauthorized)
         );
         // Revoked by logout.
-        svc.logout(token.as_bytes()).await;
+        svc.logout(token.as_bytes()).await.unwrap();
         assert_eq!(
             svc.validate_session(token.as_bytes(), &EXPORTER, TS + 1)
                 .await

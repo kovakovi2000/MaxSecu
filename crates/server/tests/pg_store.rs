@@ -152,7 +152,7 @@ async fn register_then_full_login_persists_in_postgres() {
     let admin = db.seed_admin().await;
     db.seed_voucher(&admin, "voucher-1").await;
     assert!(
-        db.store.consume_voucher(&sha256(b"voucher-1")).await,
+        db.store.consume_voucher(&sha256(b"voucher-1")).await.unwrap(),
         "valid unused voucher consumes"
     );
 
@@ -161,6 +161,7 @@ async fn register_then_full_login_persists_in_postgres() {
         .store
         .create_user("bob", [0xE1; 32], sk.verifying_key().to_bytes())
         .await
+        .unwrap()
         .expect("create_user returns a fresh id");
     assert_eq!(user_id.len(), 16);
 
@@ -193,11 +194,13 @@ async fn duplicate_username_returns_none() {
         .store
         .create_user("carol", [0x01; 32], [0x02; 32])
         .await
+        .unwrap()
         .is_some());
     assert!(
         db.store
             .create_user("carol", [0x03; 32], [0x04; 32])
             .await
+            .unwrap()
             .is_none(),
         "second create with the same username is a 409 (None)"
     );
@@ -209,13 +212,16 @@ async fn voucher_is_single_use_and_unknown_is_false() {
     let db = db_or_skip!();
     let admin = db.seed_admin().await;
     db.seed_voucher(&admin, "one-shot").await;
-    assert!(db.store.consume_voucher(&sha256(b"one-shot")).await);
+    assert!(db.store.consume_voucher(&sha256(b"one-shot")).await.unwrap());
     assert!(
-        !db.store.consume_voucher(&sha256(b"one-shot")).await,
+        !db.store.consume_voucher(&sha256(b"one-shot")).await.unwrap(),
         "second consume of the same voucher fails"
     );
     assert!(
-        !db.store.consume_voucher(&sha256(b"never-issued")).await,
+        !db.store
+            .consume_voucher(&sha256(b"never-issued"))
+            .await
+            .unwrap(),
         "unknown voucher fails"
     );
     db.teardown().await;
@@ -226,10 +232,10 @@ async fn nonce_outstanding_respects_ttl_and_single_use() {
     let db = db_or_skip!();
     let nonce: [u8; 32] = random_array();
     // Expires at TS+1000 (the u64-ms ↔ TIMESTAMPTZ mapping under test).
-    db.store.insert_nonce(nonce, "dave", TS + 1000).await;
+    db.store.insert_nonce(nonce, "dave", TS + 1000).await.unwrap();
 
     assert_eq!(
-        db.store.outstanding_nonces("dave", TS).await,
+        db.store.outstanding_nonces("dave", TS).await.unwrap(),
         vec![nonce],
         "fresh nonce is outstanding before expiry"
     );
@@ -237,14 +243,15 @@ async fn nonce_outstanding_respects_ttl_and_single_use() {
         db.store
             .outstanding_nonces("dave", TS + 2000)
             .await
+            .unwrap()
             .is_empty(),
         "nonce past its expiry is not outstanding"
     );
 
     // Single-use: consuming removes it from the outstanding set.
-    db.store.consume_nonce(&nonce).await;
+    db.store.consume_nonce(&nonce).await.unwrap();
     assert!(
-        db.store.outstanding_nonces("dave", TS).await.is_empty(),
+        db.store.outstanding_nonces("dave", TS).await.unwrap().is_empty(),
         "consumed nonce is not outstanding"
     );
     db.teardown().await;
@@ -275,7 +282,8 @@ async fn session_channel_bind_expiry_and_revoke() {
                 revoked: false,
             },
         )
-        .await;
+        .await
+        .unwrap();
 
     let svc = AuthService::new(db.store.clone(), AuthConfig::default());
     // Right channel, not expired → ok.
@@ -291,7 +299,7 @@ async fn session_channel_bind_expiry_and_revoke() {
         .await
         .is_err());
     // Revoked (persisted) → 401, even on the right channel.
-    db.store.revoke_session(&token_hash).await;
+    db.store.revoke_session(&token_hash).await.unwrap();
     assert!(svc.validate_session(&token, &EXPORTER, TS + 1).await.is_err());
 
     db.teardown().await;
@@ -301,12 +309,22 @@ async fn session_channel_bind_expiry_and_revoke() {
 #[tokio::test]
 async fn user_by_name_round_trips() {
     let db = db_or_skip!();
-    assert!(db.store.user_by_name("ghost").await.is_none());
+    assert!(db.store.user_by_name("ghost").await.unwrap().is_none());
 
     let enc = [0x11; 32];
     let sig = [0x22; 32];
-    let id = db.store.create_user("frank", enc, sig).await.unwrap();
-    let rec = db.store.user_by_name("frank").await.expect("frank exists");
+    let id = db
+        .store
+        .create_user("frank", enc, sig)
+        .await
+        .unwrap()
+        .expect("frank created");
+    let rec = db
+        .store
+        .user_by_name("frank")
+        .await
+        .unwrap()
+        .expect("frank exists");
     assert_eq!(rec.user_id, id);
     assert_eq!(rec.enc_pub, enc);
     assert_eq!(rec.sig_pub, sig);

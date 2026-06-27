@@ -9,7 +9,7 @@
 //! was bound to (api.md §1.5).
 
 use crate::auth::AuthService;
-use crate::error::ProveError;
+use crate::error::{AuthError, ChallengeError, ProveError};
 use crate::store::Store;
 use axum::extract::{FromRequestParts, Json, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
@@ -60,6 +60,20 @@ fn rate_limited(retry_after_s: u64) -> Response {
         [(RETRY_AFTER, retry_after_s.to_string())],
     )
         .into_response()
+}
+
+/// Log a backend-fault cause **server-side only** (sanitized errors, §16.2): the
+/// detail never reaches a client — the wire response is always a bare `500`.
+fn log_internal(e: impl std::fmt::Display) {
+    eprintln!("maxsecu: internal error: {e}");
+}
+
+/// A backend fault → bare `500`. Distinct from the uniform `401`/`429` auth
+/// shapes; because a store fault is credential-independent it is not a
+/// user-existence or cause oracle (§9.3 / [`crate::error::StoreError`]).
+fn internal_error(e: impl std::fmt::Display) -> Response {
+    log_internal(e);
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
 fn now_ms() -> u64 {
@@ -121,8 +135,10 @@ async fn register<S: Store>(
     // Voucher is the anti-spam gate (the trust gate is the in-person ceremony).
     // Consumed first so one voucher buys exactly one creation attempt.
     let voucher_hash = maxsecu_crypto::sha256(req.enrollment_voucher.as_bytes());
-    if !st.auth.store().consume_voucher(&voucher_hash).await {
-        return Err(StatusCode::FORBIDDEN);
+    match st.auth.store().consume_voucher(&voucher_hash).await {
+        Ok(true) => {}                                                  // gate passed
+        Ok(false) => return Err(StatusCode::FORBIDDEN),                 // invalid/used voucher
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),       // backend fault, not "bad voucher"
     }
     match st
         .auth
@@ -130,13 +146,14 @@ async fn register<S: Store>(
         .create_user(&req.username, enc_pub, sig_pub)
         .await
     {
-        Some(user_id) => Ok((
+        Ok(Some(user_id)) => Ok((
             StatusCode::CREATED,
             Json(RegisterRes {
                 user_id: hex_encode(&user_id),
             }),
         )),
-        None => Err(StatusCode::CONFLICT), // username taken
+        Ok(None) => Err(StatusCode::CONFLICT), // username taken
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -167,7 +184,8 @@ async fn challenge<S: Store>(
             expires_in_s: ch.expires_in_s,
         })
         .into_response(),
-        Err(rl) => rate_limited(rl.retry_after_s),
+        Err(ChallengeError::RateLimited { retry_after_s }) => rate_limited(retry_after_s),
+        Err(ChallengeError::Internal(e)) => internal_error(e),
     }
 }
 
@@ -206,8 +224,10 @@ async fn prove<S: Store>(
         .into_response(),
         // Single 401 shape for every auth-failure cause — no oracle (§3) …
         Err(ProveError::Unauthorized) => StatusCode::UNAUTHORIZED.into_response(),
-        // … but a throttled attempt is the one deliberately-distinct 429 signal.
+        // … but a throttled attempt is the one deliberately-distinct 429 signal …
         Err(ProveError::RateLimited { retry_after_s }) => rate_limited(retry_after_s),
+        // … and a backend fault is a 500 (server health, not an auth decision).
+        Err(ProveError::Internal(e)) => internal_error(e),
     }
 }
 
@@ -217,8 +237,13 @@ async fn logout<S: Store + 'static>(
     State(st): State<AppState<S>>,
     session: AuthedSession,
 ) -> StatusCode {
-    st.auth.logout(&session.token).await;
-    StatusCode::NO_CONTENT
+    match st.auth.logout(&session.token).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            log_internal(e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 /// An authenticated, channel-bound session, resolved from the
@@ -252,7 +277,13 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AuthedSession {
             .auth
             .validate_session(&token, &exporter.0, now_ms())
             .await
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            .map_err(|e| match e {
+                AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
+                AuthError::Internal(e) => {
+                    log_internal(e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            })?;
         Ok(AuthedSession { user_id, token })
     }
 }
@@ -261,7 +292,7 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AuthedSession {
 mod tests {
     use super::*;
     use crate::auth::AuthConfig;
-    use crate::store::{MemoryStore, UserRecord};
+    use crate::store::{FaultyStore, MemoryStore, UserRecord};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use maxsecu_crypto::{generate_enc_keypair, sha256, SigningKey};
@@ -551,6 +582,41 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn store_fault_yields_500_not_401_or_403() {
+        // Over a backend that faults on every call, the HTTP layer must answer
+        // 500 (server health) — NOT a swallowed 200/401/403 that hides the fault.
+        let state = AppState {
+            auth: Arc::new(AuthService::new(FaultyStore, AuthConfig::default())),
+        };
+        let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
+
+        // challenge: insert_nonce faults → 500, not a bogus 200.
+        let (st, _) = post_json(
+            &router,
+            "/v1/session/challenge",
+            serde_json::json!({"username":"alice"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "challenge over a faulty store");
+
+        // register: a voucher-table fault → 500, not a misleading 403 "bad voucher".
+        let sk = SigningKey::generate();
+        let (_esk, epk) = generate_enc_keypair();
+        let (st, _) = post_json(
+            &router,
+            "/v1/users",
+            serde_json::json!({
+                "username": "bob",
+                "enc_pub_b64": b64encode(&epk.to_bytes()),
+                "sig_pub_b64": b64encode(&sk.verifying_key().to_bytes()),
+                "enrollment_voucher": "code",
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "register over a faulty store");
     }
 
     #[tokio::test]

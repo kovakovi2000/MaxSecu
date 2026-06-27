@@ -11,17 +11,21 @@
 //! (TIMESTAMPTZ is "advisory, never a freshness basis", schema.sql / §7.5). The
 //! advisory audit columns (`issued_at`/`used_at`/`revoked_at`) use the DB clock.
 //!
-//! **Fail-closed.** The [`Store`] contract is infallible (it was shaped for the
-//! in-memory backing). A real DB call can fail; an unexpected error here maps to
-//! the *safe* fallback (`None`/empty/`false`) so a transient fault denies rather
-//! than grants. (Follow-up: make `Store` return `Result` for observability.)
+//! **Fail-closed, but observable.** The [`Store`] contract is *fallible*
+//! (`Result<_, StoreError>`): a backend fault propagates as `Err` so the service
+//! and HTTP layers can log it and answer `500`, rather than the old infallible
+//! contract that forced this adapter to swallow every DB error into a
+//! fail-closed `None`/`false` — which silently denied and was indistinguishable
+//! from a legitimate "not found". Callers still fail *closed* (they map `Err` to
+//! denial); the difference is the fault is no longer invisible (see [`StoreError`]).
 
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgPool, PgRow};
 use sqlx::Row;
 use time::OffsetDateTime;
 
+use crate::error::StoreError;
 use crate::store::{SessionRecord, Store, UserRecord};
 
 /// Postgres [`Store`]. Cheap to clone (the pool is an `Arc` internally).
@@ -51,9 +55,23 @@ fn ts_to_ms(ts: OffsetDateTime) -> u64 {
     (ts.unix_timestamp_nanos() / 1_000_000) as u64
 }
 
-/// A `bytea` column → fixed-width array, or `None` on the wrong width.
-fn fixed<const N: usize>(v: Vec<u8>) -> Option<[u8; N]> {
-    v.try_into().ok()
+/// Map any sqlx failure to a `StoreError` tagged with the operation name. The
+/// message stays server-side (logged at the HTTP boundary), never sent to a client.
+fn store_err(op: &'static str) -> impl Fn(sqlx::Error) -> StoreError {
+    move |e| StoreError::new(op, e.to_string())
+}
+
+/// Read a fixed-width `bytea` column. A present-but-wrong-width value is a
+/// data-integrity fault (`Err`), not a "not found" — the server's own rows are
+/// CHECK-constrained to the right width, so this can only mean corruption.
+fn col_fixed<const N: usize>(
+    row: &PgRow,
+    op: &'static str,
+    col: &'static str,
+) -> Result<[u8; N], StoreError> {
+    let v: Vec<u8> = row.try_get(col).map_err(store_err(op))?;
+    v.try_into()
+        .map_err(|_| StoreError::new(op, format!("column `{col}` has unexpected width")))
 }
 
 #[async_trait]
@@ -63,7 +81,7 @@ impl Store for PgStore {
         username: &str,
         enc_pub: [u8; 32],
         sig_pub: [u8; 32],
-    ) -> Option<[u8; 16]> {
+    ) -> Result<Option<[u8; 16]>, StoreError> {
         // Server-assigned id (api.md §1.4). The PK + UNIQUE(username) make this
         // race-safe: a concurrent duplicate username loses with a unique violation.
         let user_id: [u8; 16] = random_array();
@@ -77,13 +95,14 @@ impl Store for PgStore {
         .execute(&self.pool)
         .await;
         match res {
-            Ok(_) => Some(user_id),
-            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => None, // username taken → 409
-            Err(_) => None,                                                   // fail-closed
+            Ok(_) => Ok(Some(user_id)),
+            // Username taken is a *business* outcome (→ 409), not a fault.
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(None),
+            Err(e) => Err(store_err("create_user")(e)),
         }
     }
 
-    async fn consume_voucher(&self, voucher_hash: &[u8; 32]) -> bool {
+    async fn consume_voucher(&self, voucher_hash: &[u8; 32]) -> Result<bool, StoreError> {
         // Atomic single-use: the `used_at IS NULL` predicate means exactly one of
         // any racing consumers updates the row. `expires_at` is the operational
         // voucher TTL (DB clock — no app `now` is passed here).
@@ -93,36 +112,46 @@ impl Store for PgStore {
         )
         .bind(&voucher_hash[..])
         .execute(&self.pool)
-        .await;
-        matches!(res, Ok(r) if r.rows_affected() == 1)
+        .await
+        .map_err(store_err("consume_voucher"))?;
+        Ok(res.rows_affected() == 1)
     }
 
-    async fn user_by_name(&self, username: &str) -> Option<UserRecord> {
+    async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, StoreError> {
         let row = sqlx::query("SELECT user_id, enc_pub, sig_pub FROM users WHERE username = $1")
             .bind(username)
             .fetch_optional(&self.pool)
             .await
-            .ok()
-            .flatten()?;
-        Some(UserRecord {
-            user_id: fixed(row.try_get("user_id").ok()?)?,
-            enc_pub: fixed(row.try_get("enc_pub").ok()?)?,
-            sig_pub: fixed(row.try_get("sig_pub").ok()?)?,
-        })
+            .map_err(store_err("user_by_name"))?;
+        let Some(row) = row else { return Ok(None) };
+        Ok(Some(UserRecord {
+            user_id: col_fixed(&row, "user_by_name", "user_id")?,
+            enc_pub: col_fixed(&row, "user_by_name", "enc_pub")?,
+            sig_pub: col_fixed(&row, "user_by_name", "sig_pub")?,
+        }))
     }
 
-    async fn insert_nonce(&self, nonce: [u8; 32], username: &str, expires_at_ms: u64) {
-        let _ = sqlx::query(
-            "INSERT INTO auth_nonces (nonce, username, expires_at) VALUES ($1, $2, $3)",
-        )
-        .bind(&nonce[..])
-        .bind(username)
-        .bind(ms_to_ts(expires_at_ms))
-        .execute(&self.pool)
-        .await; // fail-closed: a missing nonce simply can't be proven against
+    async fn insert_nonce(
+        &self,
+        nonce: [u8; 32],
+        username: &str,
+        expires_at_ms: u64,
+    ) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO auth_nonces (nonce, username, expires_at) VALUES ($1, $2, $3)")
+            .bind(&nonce[..])
+            .bind(username)
+            .bind(ms_to_ts(expires_at_ms))
+            .execute(&self.pool)
+            .await
+            .map_err(store_err("insert_nonce"))?;
+        Ok(())
     }
 
-    async fn outstanding_nonces(&self, username: &str, now_ms: u64) -> Vec<[u8; 32]> {
+    async fn outstanding_nonces(
+        &self,
+        username: &str,
+        now_ms: u64,
+    ) -> Result<Vec<[u8; 32]>, StoreError> {
         let rows = sqlx::query(
             "SELECT nonce FROM auth_nonces \
              WHERE username = $1 AND used_at IS NULL AND expires_at > $2",
@@ -130,25 +159,28 @@ impl Store for PgStore {
         .bind(username)
         .bind(ms_to_ts(now_ms))
         .fetch_all(&self.pool)
-        .await;
-        match rows {
-            Ok(rows) => rows
-                .into_iter()
-                .filter_map(|r| fixed(r.try_get("nonce").ok()?))
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        .await
+        .map_err(store_err("outstanding_nonces"))?;
+        rows.iter()
+            .map(|r| col_fixed(r, "outstanding_nonces", "nonce"))
+            .collect()
     }
 
-    async fn consume_nonce(&self, nonce: &[u8; 32]) {
-        let _ = sqlx::query("UPDATE auth_nonces SET used_at = now() WHERE nonce = $1 AND used_at IS NULL")
+    async fn consume_nonce(&self, nonce: &[u8; 32]) -> Result<(), StoreError> {
+        sqlx::query("UPDATE auth_nonces SET used_at = now() WHERE nonce = $1 AND used_at IS NULL")
             .bind(&nonce[..])
             .execute(&self.pool)
-            .await;
+            .await
+            .map_err(store_err("consume_nonce"))?;
+        Ok(())
     }
 
-    async fn insert_session(&self, token_hash: [u8; 32], rec: SessionRecord) {
-        let _ = sqlx::query(
+    async fn insert_session(
+        &self,
+        token_hash: [u8; 32],
+        rec: SessionRecord,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
             "INSERT INTO sessions (token_hash, user_id, tls_exporter, expires_at) \
              VALUES ($1, $2, $3, $4)",
         )
@@ -157,10 +189,15 @@ impl Store for PgStore {
         .bind(&rec.tls_exporter[..])
         .bind(ms_to_ts(rec.expires_at_ms))
         .execute(&self.pool)
-        .await;
+        .await
+        .map_err(store_err("insert_session"))?;
+        Ok(())
     }
 
-    async fn get_session(&self, token_hash: &[u8; 32]) -> Option<SessionRecord> {
+    async fn get_session(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<SessionRecord>, StoreError> {
         let row = sqlx::query(
             "SELECT user_id, tls_exporter, expires_at, revoked_at FROM sessions \
              WHERE token_hash = $1",
@@ -168,22 +205,29 @@ impl Store for PgStore {
         .bind(&token_hash[..])
         .fetch_optional(&self.pool)
         .await
-        .ok()
-        .flatten()?;
-        let expires_at: OffsetDateTime = row.try_get("expires_at").ok()?;
-        let revoked_at: Option<OffsetDateTime> = row.try_get("revoked_at").ok()?;
-        Some(SessionRecord {
-            user_id: fixed(row.try_get("user_id").ok()?)?,
-            tls_exporter: fixed(row.try_get("tls_exporter").ok()?)?,
+        .map_err(store_err("get_session"))?;
+        let Some(row) = row else { return Ok(None) };
+        let expires_at: OffsetDateTime =
+            row.try_get("expires_at").map_err(store_err("get_session"))?;
+        let revoked_at: Option<OffsetDateTime> =
+            row.try_get("revoked_at").map_err(store_err("get_session"))?;
+        Ok(Some(SessionRecord {
+            user_id: col_fixed(&row, "get_session", "user_id")?,
+            tls_exporter: col_fixed(&row, "get_session", "tls_exporter")?,
             expires_at_ms: ts_to_ms(expires_at),
             revoked: revoked_at.is_some(),
-        })
+        }))
     }
 
-    async fn revoke_session(&self, token_hash: &[u8; 32]) {
-        let _ = sqlx::query("UPDATE sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL")
-            .bind(&token_hash[..])
-            .execute(&self.pool)
-            .await;
+    async fn revoke_session(&self, token_hash: &[u8; 32]) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE sessions SET revoked_at = now() \
+             WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(&token_hash[..])
+        .execute(&self.pool)
+        .await
+        .map_err(store_err("revoke_session"))?;
+        Ok(())
     }
 }
