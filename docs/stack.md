@@ -23,6 +23,8 @@ This document is authoritative for language/runtime/library choices. Where a cho
 | Canonical encoder | **One Rust implementation** (`docs/encoding-spec.md`) | Single client platform ⇒ one encoder; server stores opaque bytes |
 | Air-gapped tooling | **Rust CLI binaries** sharing the client core crates | Ceremony tools are security-critical software (§12.1, §12.7) |
 | TLS | **rustls** | TLS 1.3 + keying-material exporter for channel binding (§9.2) |
+| Server packaging | **single signed static binary** or one `docker-compose.yml`; one-line bootstrap | Secret-free server (`DESIGN.md` §4.3) ⇒ low installer bar; secrets injected at runtime (§5.1) |
+| Client packaging | **portable, no-install** (pendrive-friendly); password-derived at-rest state | No machine-bound keystore; plaintext never on disk except explicit export (§5.2 / `DESIGN.md` §8.1) |
 
 ---
 
@@ -136,7 +138,7 @@ Per §4.3 the server stores **inert records** and enforces only **coarse** autho
 
 ### 2.2 Data + blobs
 
-- **PostgreSQL** for the small relational records of §11 (`users`, `files`, `file_key_wraps`, `auth_events` mirror, `revocations`, `reinstatements`, `file_genesis`). *No `write_grants`* — write is owner-only (D29). Use DB constraints to enforce the append-only/monotonic invariants (e.g. no-delete triggers on tombstones, one-genesis-per-file, unique `(file_id,version,recipient)`).
+- **PostgreSQL** for the small relational records of §11 — `users` (+ retained `directory_bindings`), `files`/`file_versions`/`file_streams`, `file_key_wraps`, `file_genesis`, the unified append-only **`control_log`** (revocation + reinstatement + key-compromise as **one** hash chain), the `auth_events` mirror, and the Phase-1 ephemeral `auth_nonces`/`sessions`/`enrollment_vouchers`. **Authoritative DDL: `docs/schema.sql`.** *No `write_grants`* — write is owner-only (D29). DB constraints/triggers enforce the append-only/monotonic invariants (no-update/delete on `control_log`/`file_genesis`, hash-chain `prev_head` linkage, one-genesis-per-file, unique `(file_id,version,recipient)`).
 - **Chunked ciphertext blobs** go to the **Dropbox backing tier + local cache** (§2.4), not a general object store, referenced by `files.blob_ref` (a logical id resolved to cache path or Dropbox path).
 - **TLS 1.3** terminated by the app (rustls) with the client pinning the server identity (§9.2); the keying-material exporter binds the auth challenge and session token to the channel.
 
@@ -145,7 +147,7 @@ Per §4.3 the server stores **inert records** and enforces only **coarse** autho
 `DESIGN.md` §16.5 + the simplification pass make the **external, append-only audit sink** load-bearing for **revocation completeness** (§7.6), not just audit. This is **not** the Postgres `auth_events` table (which is the untrusted server's own, forgeable mirror).
 
 - Provision a genuinely independent **WORM store or SIEM** outside the app server's control, with **digest anchoring** (hash-chain the event/tombstone stream and publish/cross-store the head).
-- The **anchored tombstone-chain head** that clients fetch to verify revocation completeness lives here. Its concrete client-facing interface is the subject of a separate spec (`docs/sink-interface.md`, to be written) and **must exist before coding revocation (Phase 5).**
+- The **anchored tombstone-chain head** that clients fetch to verify revocation completeness lives here. Its concrete client-facing interface is specified in `docs/sink-interface.md` (**must exist before coding revocation, Phase 5** — spec done; standing up the sink infra remains).
 
 ### 2.4 Blob storage tiering — Dropbox backing + local cache (D31)
 
@@ -178,10 +180,39 @@ Client-side, **before** encryption, **per file, no shared dictionary**: `zstd` f
 1. ✅ Canonical encoding chosen — explicit length-prefixed binary; spec in `docs/encoding-spec.md`.
 2. ✅ Write model — **owner-only write** (D29); `write_grants` not built.
 3. ✅ Large-file handling — **user RAM budget; warned disk-unlock past it** (D12/§8.1); no server-side size limit.
-4. ☐ Stand up the **external sink** + define `docs/sink-interface.md` (anchored-head fetch/verify) — blocks Phase 5.
-5. ☐ Define `docs/api.md` (RPC contract, chunk up/download, session tokens) + `docs/schema.sql` + `docs/parameters.md` (incl. the **sink-head refresh cadence** = revocation bound) — blocks Phase 1.
-6. ☐ **Prove out the media decode sandbox early** (§1.7) — AppContainer/restricted-token worker, fuzz it; this is the top RCE risk. Blocks Phase 4b.
+4. **Spec ✅ / infra ☐** — `docs/sink-interface.md` defines the anchored-head fetch/verify; **standing up the external sink** (independent WORM/SIEM) remains. Blocks Phase 5.
+5. ✅ **Defined** — `docs/api.md` (RPC contract, chunk up/download, session tokens) + `docs/schema.sql` + `docs/parameters.md` (sink-head refresh cadence pinned = revocation bound). **Phase 1 unblocked.**
+6. **Spec ✅ / build ☐** — `docs/media-sandbox.md` fixes the isolation model, pre-decode bounds, and canonical format; **building + fuzzing the AppContainer worker** (top RCE risk) remains. Blocks Phase 4b.
 7. ☐ Stand up the **Dropbox tier + cache + scoped-link brokering** (§2.4); secure the Dropbox token; plan independent ciphertext backup (availability/DR).
 8. ☐ Confirm operational prerequisites: air-gapped machine, reproducible-build + Authenticode pipeline, WORM/SIEM sink, Dropbox app account.
 9. ☐ Confirm single-device (D4).
 10. ☐ External cryptographer review of the protocol before/while building the core.
+
+---
+
+## 5. Deployment & packaging
+
+### 5.1 Server — one-file / one-line install (secret-free ⇒ low bar)
+
+Because the server holds no file-confidentiality secret (`DESIGN.md` §4.3), the installer bar is operational, not cryptographic. v1 ships **one** of:
+
+- a **single static Rust binary** (`x86_64-unknown-linux-musl`) that embeds the SQL migrations (`docs/schema.sql`) and self-applies them on first run, behind a one-line pinned bootstrap; **or**
+- a single **`docker-compose.yml`** bundling the server + PostgreSQL → `docker compose up -d`.
+
+Constraints either way:
+
+- **Secrets are injected at runtime, never baked in.** The Dropbox scoped token and the sink-write credentials are availability/integrity secrets (§2.4, `DESIGN.md` §16.6) — pass them by env / secret-manager reference, never in the binary, image, or compose file.
+- **Pin + verify the installer artifact** (publish a checksum/signature) — a `curl | sh`-style one-liner is itself MITM-able.
+- The one-liner still expects to reach: **PostgreSQL** (bundled in the compose form), the **external sink** (`docs/sink-interface.md`), and a **TLS certificate** for the pinned server identity (`DESIGN.md` §9.2).
+
+### 5.2 Client — portable, no-install (runs from a pendrive)
+
+The Windows client (§1) is a **portable, single Authenticode-signed `.exe`** — no installer, no registry writes; its state lives **beside the executable** (e.g. on the pendrive) and, per `DESIGN.md` §8.1, is **ciphertext-only** (`local_key_blob`, the trust-on-last-use store). Portability forces two refinements:
+
+- **At-rest state is password-derived, not machine-bound.** `DESIGN.md` §8.1 permits tying the local state key to the OS secure keystore (DPAPI/TPM), but those are machine-bound and don't travel. In **portable mode the at-rest key derives from the password (Argon2id)** so the encrypted state moves with the stick. Session tokens are ephemeral + channel-bound (`DESIGN.md` §9.2), so a new host simply re-authenticates — nothing token-shaped persists portably.
+- **The pendrive is "disk."** The §8.1 rule applies to it unchanged: only **ciphertext** is ever staged there; **plaintext never lands on it** except the explicit, warned **"Save unlocked"** export the user browses to. Large media is viewed via **decrypt-while-play** (`DESIGN.md` §8.1/§12.10) — a bounded RAM window — so even multi-GB files leave no plaintext on the drive.
+
+Two things portability does **not** change:
+
+- **Code-signing still applies** (§1.5): the `.exe` is Authenticode-signed and the OS verifies it on launch (D1); updates replace the signed exe (fits in-person delivery).
+- **Endpoint trust is still assumed (honest caveat).** Running portably on an **untrusted/borrowed host** widens exposure — that machine's keylogger / RAM scraper / pagefile is outside the client's control. `VirtualLock` + crash-dump-off protect the secret pages, but a compromised *running* host is the assumed-trusted endpoint limit (`DESIGN.md` §15.3). A pendrive client is **not** a safe-on-a-public-terminal guarantee.

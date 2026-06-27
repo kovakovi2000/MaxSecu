@@ -47,7 +47,7 @@ All integers are **fixed-width, big-endian, unsigned**, exactly the stated byte 
 
 | Logical type | Encoding | Notes |
 |---|---|---|
-| `Id` | `bytes_fixed(16)` | 128-bit server-assigned identifier (`user_id`, `file_id`, `recipient_id`, `granted_by`, …) |
+| `Id` | `bytes_fixed(16)` | 128-bit identifier — **server-assigned** (`user_id`/`recipient_id`/`granted_by`); **client-generated random** for `file_id`, which the owner signs into `genesis`/`manifest` before upload (`DESIGN.md` §12.2, server enforces uniqueness) |
 | `FileScope` | `enum8`: `0x01` ‖ `Id` (specific file) **or** `0x02` (account-wide `*`, no id follows) | the `*` sentinel of §11.5; decoder rejects an id after `0x02` or a missing id after `0x01` |
 | `X25519Pub` / `Ed25519Pub` | `bytes_fixed(32)` | raw public keys |
 | `Hash` | `bytes_fixed(32)` | SHA-256 output (`content_digest`, `enc_metadata_digest`, `dek_commit`, `prev_head`) |
@@ -190,7 +190,7 @@ Every vector below MUST be **rejected** (or, for the positive cases, produce the
 
 - [ ] Encoder + strict decoder implemented in the Rust core for all twelve structures (§4).
 - [ ] Property tests pass: `decode∘encode` identity; `encode∘decode` identity on all accepted inputs (the canonical guard, §7.5).
-- [ ] **All V-1 … V-12 adversarial vectors reject; both positive vectors match byte-for-byte.**
+- [ ] **All V-1 … V-13 adversarial vectors reject; both positive vectors match byte-for-byte.**
 - [ ] Domain-separated, length-framed `signing_input` (§6) wired into every Ed25519 sign/verify call; HPKE `info` and AEAD `AAD` wired to `canonical(wrap_context)` / `canonical(chunk_aad)`.
 - [ ] Fixtures committed so the air-gapped ceremony tools (and any server-side sanity check) link the **same** encoder and the **same** vectors.
 
