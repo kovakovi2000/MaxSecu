@@ -21,12 +21,15 @@
 
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
+use maxsecu_encoding::decode;
+use maxsecu_encoding::structs::DirBinding;
+use maxsecu_encoding::types::Role;
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::Row;
 use time::OffsetDateTime;
 
 use crate::error::StoreError;
-use crate::store::{SessionRecord, Store, UserRecord};
+use crate::store::{SessionRecord, StoredBinding, Store, UserRecord};
 
 /// Postgres [`Store`]. Cheap to clone (the pool is an `Arc` internally).
 #[derive(Clone)]
@@ -44,10 +47,19 @@ impl PgStore {
     }
 }
 
-/// App epoch-ms → `TIMESTAMPTZ`. Total over the representable range we use.
+/// App epoch-ms → `TIMESTAMPTZ`. Total over the representable range we use
+/// (app-clock values: `now + ttl`, always well within range).
 fn ms_to_ts(ms: u64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp_nanos((ms as i128) * 1_000_000)
         .expect("epoch-ms within OffsetDateTime range")
+}
+
+/// Checked epoch-ms → `TIMESTAMPTZ` for values decoded from a record (e.g. a
+/// binding's `not_after`): an out-of-range timestamp is a `StoreError`, never a
+/// handler panic.
+fn try_ms_to_ts(ms: u64, op: &'static str) -> Result<OffsetDateTime, StoreError> {
+    OffsetDateTime::from_unix_timestamp_nanos((ms as i128) * 1_000_000)
+        .map_err(|_| StoreError::new(op, "timestamp out of representable range"))
 }
 
 /// `TIMESTAMPTZ` → app epoch-ms (truncating sub-ms, which we never store).
@@ -230,4 +242,108 @@ impl Store for PgStore {
         .map_err(store_err("revoke_session"))?;
         Ok(())
     }
+
+    async fn put_binding(
+        &self,
+        user_id: [u8; 16],
+        key_version: u64,
+        binding_bytes: Vec<u8>,
+        signature: [u8; 64],
+    ) -> Result<(), StoreError> {
+        // Decode the signed bytes once to populate the advisory projection columns
+        // (directory_bindings is NOT NULL on them). The stored authority is the
+        // exact `binding_bytes`; clients verify those, never these projections.
+        let b: DirBinding = decode(&binding_bytes)
+            .map_err(|_| StoreError::new("put_binding", "binding bytes are not canonical"))?;
+        let roles: Vec<String> = b.roles.roles().iter().map(role_text).collect();
+
+        // Insert into the immutable history; re-publishing the same
+        // (user_id, key_version) is a no-op (the row is trigger-immutable).
+        sqlx::query(
+            "INSERT INTO directory_bindings \
+             (user_id, key_version, enc_pub, sig_pub, roles, not_before, not_after, \
+              binding_bytes, directory_signature) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+             ON CONFLICT (user_id, key_version) DO NOTHING",
+        )
+        .bind(&user_id[..])
+        .bind(key_version as i64)
+        .bind(&b.enc_pub.0[..])
+        .bind(&b.sig_pub.0[..])
+        .bind(&roles)
+        .bind(try_ms_to_ts(b.not_before.0, "put_binding")?)
+        .bind(try_ms_to_ts(b.not_after.0, "put_binding")?)
+        .bind(&binding_bytes)
+        .bind(&signature[..])
+        .execute(&self.pool)
+        .await
+        .map_err(store_err("put_binding"))?;
+
+        // Mark the account signed and sync the advisory current-material mirror.
+        sqlx::query(
+            "UPDATE users SET signed_at = now(), enc_pub = $2, sig_pub = $3, \
+             key_version = $4, roles = $5 WHERE user_id = $1",
+        )
+        .bind(&user_id[..])
+        .bind(&b.enc_pub.0[..])
+        .bind(&b.sig_pub.0[..])
+        .bind(key_version as i64)
+        .bind(&roles)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err("put_binding"))?;
+        Ok(())
+    }
+
+    async fn binding_by_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<StoredBinding>, StoreError> {
+        let row = sqlx::query(
+            "SELECT db.binding_bytes, db.directory_signature \
+             FROM directory_bindings db JOIN users u ON u.user_id = db.user_id \
+             WHERE u.username = $1 ORDER BY db.key_version DESC LIMIT 1",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err("binding_by_username"))?;
+        binding_from_row(row, "binding_by_username")
+    }
+
+    async fn binding_by_user_id(
+        &self,
+        user_id: &[u8; 16],
+    ) -> Result<Option<StoredBinding>, StoreError> {
+        let row = sqlx::query(
+            "SELECT binding_bytes, directory_signature FROM directory_bindings \
+             WHERE user_id = $1 ORDER BY key_version DESC LIMIT 1",
+        )
+        .bind(&user_id[..])
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err("binding_by_user_id"))?;
+        binding_from_row(row, "binding_by_user_id")
+    }
+}
+
+/// The lowercase role text stored in the advisory `roles TEXT[]` projection.
+fn role_text(r: &Role) -> String {
+    match r {
+        Role::User => "user".to_owned(),
+        Role::Admin => "admin".to_owned(),
+    }
+}
+
+/// Map an optional `(binding_bytes, directory_signature)` row to a [`StoredBinding`].
+fn binding_from_row(
+    row: Option<PgRow>,
+    op: &'static str,
+) -> Result<Option<StoredBinding>, StoreError> {
+    let Some(row) = row else { return Ok(None) };
+    let binding_bytes: Vec<u8> = row.try_get("binding_bytes").map_err(store_err(op))?;
+    Ok(Some(StoredBinding {
+        binding_bytes,
+        signature: col_fixed(&row, op, "directory_signature")?,
+    }))
 }

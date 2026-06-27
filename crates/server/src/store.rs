@@ -39,6 +39,15 @@ pub struct SessionRecord {
     pub revoked: bool,
 }
 
+/// A signed directory binding as served by `GET /v1/directory/...` (api.md §6.1):
+/// the exact `canonical(dirbinding)` bytes and the offline D5 signature. Inert —
+/// the client verifies it against the pinned root; the server forges neither.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredBinding {
+    pub binding_bytes: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
 /// Async because the production backing is sqlx/Postgres. `Send + Sync` so the
 /// service can be shared across axum request tasks.
 ///
@@ -85,6 +94,28 @@ pub trait Store: Send + Sync {
     async fn get_session(&self, token_hash: &[u8; 32])
         -> Result<Option<SessionRecord>, StoreError>;
     async fn revoke_session(&self, token_hash: &[u8; 32]) -> Result<(), StoreError>;
+
+    // ---- Phase 2: signed key directory (DESIGN §7, api.md §6) ----
+
+    /// Publish a ceremony-signed binding (`directory_bindings`, retained by
+    /// `key_version`); idempotent re-put of the same `(user_id, key_version)` is
+    /// allowed. Also marks the user's binding as signed.
+    async fn put_binding(
+        &self,
+        user_id: [u8; 16],
+        key_version: u64,
+        binding_bytes: Vec<u8>,
+        signature: [u8; 64],
+    ) -> Result<(), StoreError>;
+    /// The latest signed binding for a username (`GET /v1/directory/{username}`).
+    /// `Ok(None)` if the account has no signed binding (→ 404, not a recipient).
+    async fn binding_by_username(&self, username: &str)
+        -> Result<Option<StoredBinding>, StoreError>;
+    /// The latest signed binding for a `user_id` (`GET /v1/directory/by-id/...`).
+    async fn binding_by_user_id(
+        &self,
+        user_id: &[u8; 16],
+    ) -> Result<Option<StoredBinding>, StoreError>;
 }
 
 #[derive(Default)]
@@ -93,6 +124,8 @@ struct Inner {
     nonces: HashMap<[u8; 32], NonceRecord>,
     sessions: HashMap<[u8; 32], SessionRecord>,
     vouchers: HashSet<[u8; 32]>, // unused enrollment voucher hashes
+    // Latest signed binding per user_id, with its key_version (newer replaces older).
+    bindings: HashMap<[u8; 16], (u64, StoredBinding)>,
 }
 
 /// In-memory [`Store`] for tests and local dev.
@@ -223,6 +256,56 @@ impl Store for MemoryStore {
         }
         Ok(())
     }
+
+    async fn put_binding(
+        &self,
+        user_id: [u8; 16],
+        key_version: u64,
+        binding_bytes: Vec<u8>,
+        signature: [u8; 64],
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = inner.bindings.entry(user_id);
+        let rec = StoredBinding {
+            binding_bytes,
+            signature,
+        };
+        match entry {
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                if key_version >= o.get().0 {
+                    *o.get_mut() = (key_version, rec); // newer (or same) replaces
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((key_version, rec));
+            }
+        }
+        Ok(())
+    }
+
+    async fn binding_by_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<StoredBinding>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let Some(user) = inner.users.get(username) else {
+            return Ok(None);
+        };
+        Ok(inner.bindings.get(&user.user_id).map(|(_, b)| b.clone()))
+    }
+
+    async fn binding_by_user_id(
+        &self,
+        user_id: &[u8; 16],
+    ) -> Result<Option<StoredBinding>, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .bindings
+            .get(user_id)
+            .map(|(_, b)| b.clone()))
+    }
 }
 
 /// A [`Store`] whose every method returns `Err(StoreError)` — used to prove the
@@ -289,5 +372,26 @@ impl Store for FaultyStore {
     }
     async fn revoke_session(&self, _token_hash: &[u8; 32]) -> Result<(), StoreError> {
         Err(Self::fault("revoke_session"))
+    }
+    async fn put_binding(
+        &self,
+        _user_id: [u8; 16],
+        _key_version: u64,
+        _binding_bytes: Vec<u8>,
+        _signature: [u8; 64],
+    ) -> Result<(), StoreError> {
+        Err(Self::fault("put_binding"))
+    }
+    async fn binding_by_username(
+        &self,
+        _username: &str,
+    ) -> Result<Option<StoredBinding>, StoreError> {
+        Err(Self::fault("binding_by_username"))
+    }
+    async fn binding_by_user_id(
+        &self,
+        _user_id: &[u8; 16],
+    ) -> Result<Option<StoredBinding>, StoreError> {
+        Err(Self::fault("binding_by_user_id"))
     }
 }

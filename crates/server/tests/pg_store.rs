@@ -8,8 +8,9 @@
 
 use maxsecu_crypto::{random_array, sha256, SigningKey};
 use maxsecu_encoding::labels;
-use maxsecu_encoding::structs::AuthProofContext;
-use maxsecu_encoding::types::{Bytes32, Text, Timestamp};
+use maxsecu_encoding::structs::{AuthProofContext, DirBinding};
+use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
+use maxsecu_encoding::encode;
 use maxsecu_server::{AuthConfig, AuthService, PgStore, SessionRecord, Store};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -301,6 +302,68 @@ async fn session_channel_bind_expiry_and_revoke() {
     // Revoked (persisted) → 401, even on the right channel.
     db.store.revoke_session(&token_hash).await.unwrap();
     assert!(svc.validate_session(&token, &EXPORTER, TS + 1).await.is_err());
+
+    db.teardown().await;
+}
+
+fn dir_binding(user_id: [u8; 16], username: &str, enc: u8, sig: u8, key_version: u64) -> DirBinding {
+    DirBinding {
+        username: Text::new(username).unwrap(),
+        user_id: Id(user_id),
+        enc_pub: Bytes32([enc; 32]),
+        sig_pub: Bytes32([sig; 32]),
+        key_version,
+        roles: RoleSet::new([Role::User]),
+        not_before: Timestamp(0),
+        not_after: Timestamp(4_102_444_800_000), // 2100-01-01, a valid TIMESTAMPTZ
+    }
+}
+
+/// A signed binding persists, serves by name and id, and the latest key_version
+/// wins; re-publishing the same version is a no-op against the immutable history.
+#[tokio::test]
+async fn directory_binding_persists_and_latest_version_serves() {
+    let db = db_or_skip!();
+    let d5 = SigningKey::generate();
+    let user_id: [u8; 16] = random_array();
+    // A users row so by-username resolves (the binding is signed post-registration).
+    sqlx::query("INSERT INTO users (user_id, username, enc_pub, sig_pub) VALUES ($1,$2,$3,$4)")
+        .bind(&user_id[..])
+        .bind("grace")
+        .bind(&[0xE1u8; 32][..])
+        .bind(&[0x51u8; 32][..])
+        .execute(db.store.pool())
+        .await
+        .unwrap();
+
+    let b1 = dir_binding(user_id, "grace", 0xE1, 0x51, 1);
+    let bytes1 = encode(&b1);
+    let sig1 = d5.sign_canonical(labels::DIRBINDING, &b1);
+    db.store.put_binding(user_id, 1, bytes1.clone(), sig1).await.unwrap();
+
+    // Round-trips through a fresh pool (truly persisted), byte-exact.
+    let store2 = db.reopen().await;
+    let got = store2.binding_by_user_id(&user_id).await.unwrap().expect("binding");
+    assert_eq!(got.binding_bytes, bytes1);
+    assert_eq!(got.signature, sig1);
+    let by_name = store2
+        .binding_by_username("grace")
+        .await
+        .unwrap()
+        .expect("by name");
+    assert_eq!(by_name.binding_bytes, bytes1);
+
+    // An account with no signed binding → None.
+    assert!(store2.binding_by_username("ghost").await.unwrap().is_none());
+
+    // Re-publishing v1 is a no-op (immutable history); a rotation to v2 becomes latest.
+    db.store.put_binding(user_id, 1, bytes1.clone(), sig1).await.unwrap();
+    let b2 = dir_binding(user_id, "grace", 0xE2, 0x52, 2);
+    let bytes2 = encode(&b2);
+    let sig2 = d5.sign_canonical(labels::DIRBINDING, &b2);
+    db.store.put_binding(user_id, 2, bytes2.clone(), sig2).await.unwrap();
+    let latest = db.reopen().await.binding_by_user_id(&user_id).await.unwrap().unwrap();
+    assert_eq!(latest.binding_bytes, bytes2, "latest key_version serves");
 
     db.teardown().await;
 }

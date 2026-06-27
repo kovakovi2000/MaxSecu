@@ -11,11 +11,11 @@
 use crate::auth::AuthService;
 use crate::error::{AuthError, ChallengeError, ProveError};
 use crate::store::Store;
-use axum::extract::{FromRequestParts, Json, State};
+use axum::extract::{FromRequestParts, Json, Path, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Extension, Router};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -48,6 +48,8 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         .route("/v1/session/challenge", post(challenge::<S>))
         .route("/v1/session/proof", post(prove::<S>))
         .route("/v1/session/logout", post(logout::<S>))
+        .route("/v1/directory/by-id/{user_id}", get(directory_by_id::<S>))
+        .route("/v1/directory/{username}", get(directory_by_username::<S>))
         .with_state(state)
 }
 
@@ -246,6 +248,51 @@ async fn logout<S: Store + 'static>(
     }
 }
 
+// ---- GET /v1/directory/{username} · /v1/directory/by-id/{user_id} (api.md §6.1) ----
+
+#[derive(Serialize)]
+struct BindingRes {
+    binding_b64: String,            // canonical(dirbinding)
+    directory_signature_b64: String, // Ed25519 by the offline D5 key
+}
+
+/// Serve a [`StoredBinding`] as the §6.1 body, or `404` if absent. The bytes are
+/// opaque — the client verifies them against the pinned root (§7.2); the server
+/// is only the transport.
+fn binding_response(b: Option<crate::store::StoredBinding>) -> Response {
+    match b {
+        Some(b) => Json(BindingRes {
+            binding_b64: b64encode(&b.binding_bytes),
+            directory_signature_b64: b64encode(&b.signature),
+        })
+        .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(), // unsigned/pending ⇒ not a recipient
+    }
+}
+
+async fn directory_by_username<S: Store>(
+    State(st): State<AppState<S>>,
+    Path(username): Path<String>,
+) -> Response {
+    match st.auth.store().binding_by_username(&username).await {
+        Ok(b) => binding_response(b),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn directory_by_id<S: Store>(
+    State(st): State<AppState<S>>,
+    Path(user_id_hex): Path<String>,
+) -> Response {
+    let Some(user_id) = hex_fixed::<16>(&user_id_hex) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st.auth.store().binding_by_user_id(&user_id).await {
+        Ok(b) => binding_response(b),
+        Err(e) => internal_error(e),
+    }
+}
+
 /// An authenticated, channel-bound session, resolved from the
 /// `Authorization: MaxSecu-Session <hex>` header and validated against the live
 /// connection's exporter (api.md §1.5/§2.3). Rejects with `401` on any failure.
@@ -335,6 +382,30 @@ mod tests {
             timestamp: Timestamp(ts),
         };
         b64encode(&sk.sign_canonical(labels::AUTH, &ctx))
+    }
+
+    async fn get_json(router: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, json)
     }
 
     async fn post_json(
@@ -582,6 +653,68 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn directory_serves_signed_binding_byte_exactly() {
+        use maxsecu_crypto::VerifyingKey;
+        use maxsecu_encoding::structs::DirBinding;
+        use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
+        use maxsecu_encoding::{encode, labels};
+
+        let d5 = SigningKey::generate();
+        let store = MemoryStore::new();
+        let user_id = [0x01; 16];
+        store.add_user(
+            "alice",
+            UserRecord {
+                user_id,
+                enc_pub: [0xE1; 32],
+                sig_pub: [0x51; 32],
+            },
+        );
+        let binding = DirBinding {
+            username: Text::new("alice").unwrap(),
+            user_id: Id(user_id),
+            enc_pub: Bytes32([0xE1; 32]),
+            sig_pub: Bytes32([0x51; 32]),
+            key_version: 1,
+            roles: RoleSet::new([Role::User]),
+            not_before: Timestamp(0),
+            not_after: Timestamp(4_102_444_800_000), // 2100-01-01
+        };
+        let bytes = encode(&binding);
+        let sig = d5.sign_canonical(labels::DIRBINDING, &binding);
+        store.put_binding(user_id, 1, bytes.clone(), sig).await.unwrap();
+
+        let router = router(AppState {
+            auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        })
+        .layer(Extension(TlsExporter(EXPORTER)));
+
+        // By username: the served bytes are byte-exact and verify under D5.
+        let (st, body) = get_json(&router, "/v1/directory/alice").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            B64.decode(body["binding_b64"].as_str().unwrap()).unwrap(),
+            bytes
+        );
+        let got_sig = b64_fixed::<64>(body["directory_signature_b64"].as_str().unwrap()).unwrap();
+        let vk = VerifyingKey::from_bytes(&d5.verifying_key().to_bytes()).unwrap();
+        assert!(vk.verify_canonical(labels::DIRBINDING, &binding, &got_sig).is_ok());
+
+        // By id resolves the same binding.
+        let (st2, body2) = get_json(
+            &router,
+            &format!("/v1/directory/by-id/{}", hex_encode(&user_id)),
+        )
+        .await;
+        assert_eq!(st2, StatusCode::OK);
+        assert_eq!(body2["binding_b64"], body["binding_b64"]);
+
+        // An account with no signed binding is not a recipient → 404.
+        let (st3, _) = get_json(&router, "/v1/directory/nobody").await;
+        assert_eq!(st3, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

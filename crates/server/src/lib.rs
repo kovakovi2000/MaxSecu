@@ -25,4 +25,4 @@ pub use http::{router, AppState, AuthedSession, TlsExporter};
 pub use pg::PgStore;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use serve::{export_channel_binding, serve, CHANNEL_BINDING_LABEL, CHANNEL_BINDING_LEN};
-pub use store::{MemoryStore, NonceRecord, SessionRecord, Store, UserRecord};
+pub use store::{MemoryStore, NonceRecord, SessionRecord, StoredBinding, Store, UserRecord};
