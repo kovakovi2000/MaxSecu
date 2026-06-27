@@ -1,0 +1,8 @@
+# Normalize to LF in the repo for all text — reproducible builds (DESIGN §8) and
+# byte-stable golden fixtures must not depend on a checkout's line endings.
+* text=auto eol=lf
+
+# Fixtures and lockfiles are byte-significant: always LF, never munged.
+*.tsv text eol=lf
+Cargo.lock text eol=lf
+*.rs text eol=lf

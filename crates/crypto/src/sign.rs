@@ -30,6 +30,12 @@ impl SigningKey {
         VerifyingKey(self.0.verifying_key())
     }
 
+    /// Expose the 32-byte Ed25519 seed — only for sealing into the on-device
+    /// `local_key_blob` (DESIGN §9.1). Never send this anywhere.
+    pub fn to_seed(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+
     /// Sign a raw message (used for the auth challenge, which is assembled by
     /// the caller). Prefer [`SigningKey::sign_canonical`] for record signatures.
     pub fn sign_raw(&self, msg: &[u8]) -> [u8; 64] {
@@ -136,6 +142,16 @@ mod tests {
                 .verifying_key()
                 .verify_canonical(labels::GENESIS, &g, &sig),
             Err(CryptoError::Signature)
+        );
+    }
+
+    #[test]
+    fn seed_round_trip_reconstructs_key() {
+        let sk = SigningKey::generate();
+        let sk2 = SigningKey::from_seed(&sk.to_seed());
+        assert_eq!(
+            sk.verifying_key().to_bytes(),
+            sk2.verifying_key().to_bytes()
         );
     }
 

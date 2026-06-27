@@ -9,6 +9,7 @@ resolver = "2"
 members = [
     "crates/encoding",
     "crates/crypto",
+    "crates/client-core",
 ]
 
 [workspace.package]

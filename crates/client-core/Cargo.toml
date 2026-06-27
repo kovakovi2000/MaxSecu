@@ -1,0 +1,18 @@
+[package]
+name = "maxsecu-client-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "MaxSecu client core: identity, local_key_blob, login proof (DESIGN §9, Phase 1)."
+
+[dependencies]
+maxsecu-encoding = { path = "../encoding" }
+maxsecu-crypto = { path = "../crypto" }
+zeroize = "1" # wipe transient plaintext key material (DESIGN §8.1)
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -140,12 +140,76 @@ pub fn open_stream(
     Ok(out)
 }
 
+/// Single-shot AES-256-GCM (not chunk-framed): the on-device `local_key_blob`
+/// and any other one-shot sealed record (DESIGN §8.1). `nonce` must be unique
+/// per `key`; the blob uses a fresh random nonce stored beside the ciphertext.
+pub fn seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .encrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .expect("AES-256-GCM encryption is infallible for in-bounds inputs")
+}
+
+/// Open a [`seal`]ed ciphertext; any tamper / wrong key / wrong AAD fails closed.
+pub fn open(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| CryptoError::Aead)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const CK: [u8; 32] = [0x11; 32];
     const FID: Id = Id([0x22; 16]);
+
+    #[test]
+    fn single_shot_seal_open_round_trips() {
+        let key = [0x33; 32];
+        let nonce = [0x44; 12];
+        let aad = b"local-key-blob-header";
+        let pt = b"enc_sk||enc_pk||sig_seed";
+        let ct = seal(&key, &nonce, aad, pt);
+        assert_eq!(open(&key, &nonce, aad, &ct).unwrap(), pt);
+    }
+
+    #[test]
+    fn single_shot_rejects_wrong_key_aad_or_tamper() {
+        let key = [0x33; 32];
+        let nonce = [0x44; 12];
+        let ct = seal(&key, &nonce, b"aad", b"secret");
+        assert_eq!(
+            open(&[0x99; 32], &nonce, b"aad", &ct),
+            Err(CryptoError::Aead)
+        );
+        assert_eq!(
+            open(&key, &nonce, b"other-aad", &ct),
+            Err(CryptoError::Aead)
+        );
+        let mut bad = ct.clone();
+        let n = bad.len() - 1;
+        bad[n] ^= 0x01;
+        assert_eq!(open(&key, &nonce, b"aad", &bad), Err(CryptoError::Aead));
+    }
 
     fn body() -> Vec<u8> {
         (0..(1024 * 5 + 7)).map(|i| (i % 251) as u8).collect()

@@ -53,6 +53,11 @@ impl EncSecretKey {
     pub fn from_bytes(b: [u8; 32]) -> EncSecretKey {
         EncSecretKey(Zeroizing::new(b))
     }
+    /// Expose the raw secret scalar — only for sealing into the on-device
+    /// `local_key_blob` (DESIGN §9.1). Never send this anywhere.
+    pub fn expose_bytes(&self) -> [u8; 32] {
+        *self.0
+    }
 }
 
 fn ser32<T: Serializable>(x: &T) -> Result<[u8; 32], CryptoError> {
@@ -184,6 +189,17 @@ mod tests {
             unwrap_dek(&sk, &wrapped, &ctx(0x55)).map(|_| ()),
             Err(CryptoError::WrapOpen)
         );
+    }
+
+    #[test]
+    fn secret_key_bytes_round_trip() {
+        // expose_bytes → from_bytes reconstructs a working unwrap key (keyblob path).
+        let (sk, pk) = generate_enc_keypair();
+        let sk2 = EncSecretKey::from_bytes(sk.expose_bytes());
+        let dek = Dek::from_bytes([7; 32]);
+        let c = ctx(0x55);
+        let w = wrap_dek(&pk, &dek, &c).unwrap();
+        assert_eq!(unwrap_dek(&sk2, &w, &c).unwrap().expose(), dek.expose());
     }
 
     #[test]
