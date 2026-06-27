@@ -55,6 +55,8 @@ All integers are **fixed-width, big-endian, unsigned**, exactly the stated byte 
 | `Suite` | `enum16`: `0x0001` = {AEAD AES-256-GCM, KDF HKDF-SHA256, KEM X25519, SIG Ed25519, PWKDF Argon2id} | the algorithm-agility identifier (§5.1). New suites get new codepoints; clients reject unknown/below-floor suites |
 | `Role` | `enum8`: `user = 0x01`, `admin = 0x02` | |
 | `RecipientType` | `enum8`: `user = 0x01`, `recovery = 0x02` | when `recovery`, the paired `recipient_id` MUST be `RECOVERY_ID` (16 zero bytes); decoder enforces |
+| `StreamType` | `enum8`: `content = 0x01`, `metadata = 0x02`, `thumbnail = 0x03`, `preview = 0x04` | identifies a file's encrypted streams (§13 / D33) |
+| `Compression` | `enum8`: `none = 0x00`, `zstd = 0x01` | per-stream, carried in the signed manifest (D32) |
 
 Constants: `RECOVERY_ID = 0x00…00` (16 bytes). `GENESIS_HEAD = 0x00…00` (32 bytes) — the `prev_head` of the first record in the anchored control-log (§7).
 
@@ -67,15 +69,19 @@ Each begins with its `u16 type_id`, then fields in this exact order. These field
 ### `dirbinding` — `0x0001` (§7.1)
 `username:text` · `user_id:Id` · `enc_pub:X25519Pub` · `sig_pub:Ed25519Pub` · `key_version:u64` · `roles:set<Role>` · `not_before:Timestamp` · `not_after:Timestamp`
 
-### `manifest` — `0x0002` (§12.3)
-`file_id:Id` · `version:u64` · `alg:Suite` · `chunk_size:u32` · `chunk_count:u64` · `content_digest:Hash` · `enc_metadata_digest:Hash` · `dek_commit:Hash` · `recovery_present:bool` · `author_id:Id` · `created_at:Timestamp`
-*(decoder MAY require `recovery_present == true`.)*
+### `manifest` — `0x0002` (§12.3, multi-stream per D33)
+`file_id:Id` · `version:u64` · `alg:Suite` · `chunk_size:u32` · `dek_commit:Hash` · `streams:list<Stream>` · `recovery_present:bool` · `author_id:Id` · `created_at:Timestamp`
+*(decoder MAY require `recovery_present == true` and a `content` stream present. `streams` is ascending by `stream_type` with no duplicate type — §2 `set`-style ordering, count-prefixed; each element is a fixed-size `canonical(Stream)`.)*
+
+### `Stream` (manifest sub-struct) — `0x000D` (§13 / D33)
+`stream_type:StreamType` · `compression:Compression` · `chunk_count:u64` · `digest:Hash`
+`digest` = SHA-256 over that stream's ordered per-chunk AEAD tags (the per-stream analogue of the old `content_digest`). The stream's bytes are encrypted under `ck_<type> = HKDF(DEK, "MaxSecu-<stream_type>-v1")` with the stream's id bound into every chunk's AAD (so the four streams never share a (key,nonce) space). Fixed size (44 bytes), so `list<Stream>` is `u8 count` ‖ `count` × `canonical(Stream)`.
 
 ### `grant` (read-grant) — `0x0003` (§12.3a)
 `file_id:Id` · `file_version:u64` · `recipient_id:Id` · `recipient_type:RecipientType` · `dek_commit:Hash` · `granted_by:Id` · `created_at:Timestamp`
 
-### `write_grant` — `0x0004` (§11.6 / §12.3b)
-`file_id:Id` · `grantee_id:Id` · `granted_by:Id` · `granted_by_key_version:u64` · `created_at:Timestamp`
+### `write_grant` — `0x0004` — REMOVED (owner-only write, D29)
+Not used in v1: write is owner-only, so there are no write-grants. Type id `0x0004` is **reserved** and the decoder rejects it. Reintroduce only behind a new decision if multi-writer files are ever required.
 
 ### `genesis` — `0x0005` (§11.7)
 `file_id:Id` · `owner_id:Id` · `owner_key_version:u64` · `created_at:Timestamp`
@@ -98,8 +104,9 @@ Each begins with its `u16 type_id`, then fields in this exact order. These field
 ### `wrap_context` (HPKE `info`) — `0x000A` (§5)
 `file_id:Id` · `version:u64` · `recipient_id:Id`
 
-### `chunk_aad` — `0x000B` (§12.10)
-`file_id:Id` · `version:u64` · `chunk_index:u64` · `is_last:bool`
+### `chunk_aad` — `0x000B` (§12.10, per-stream per D33)
+`file_id:Id` · `version:u64` · `stream_type:StreamType` · `chunk_index:u64` · `is_last:bool`
+*(the `stream_type` binds each chunk to its stream, so a chunk cannot be replayed across the `content`/`thumbnail`/`preview`/`metadata` streams of the same file-version.)*
 
 ### `fingerprint_input` — `0x000C` (§7.1)
 `enc_pub:X25519Pub` · `sig_pub:Ed25519Pub`  → `fingerprint = SHA-256(canonical(fingerprint_input))`
@@ -112,12 +119,13 @@ Each begins with its `u16 type_id`, then fields in this exact order. These field
 
 | id | struct | id | struct |
 |---|---|---|---|
-| `0x0001` | dirbinding | `0x0007` | reinstatement |
-| `0x0002` | manifest | `0x0008` | key_compromise |
-| `0x0003` | grant | `0x0009` | auth_proof_context |
-| `0x0004` | write_grant | `0x000A` | wrap_context |
-| `0x0005` | genesis | `0x000B` | chunk_aad |
-| `0x0006` | revocation | `0x000C` | fingerprint_input |
+| `0x0001` | dirbinding | `0x0008` | key_compromise |
+| `0x0002` | manifest | `0x0009` | auth_proof_context |
+| `0x0003` | grant | `0x000A` | wrap_context |
+| `0x0004` | *reserved* (write_grant, removed D29) | `0x000B` | chunk_aad |
+| `0x0005` | genesis | `0x000C` | fingerprint_input |
+| `0x0006` | revocation | `0x000D` | Stream (manifest sub-struct) |
+| `0x0007` | reinstatement | | |
 
 Unknown id → reject. The id makes a value of one type structurally unusable as another (defeats cross-type signature transplant *before* the domain label is even considered).
 
@@ -135,7 +143,7 @@ where `label` is the ASCII domain string for that record from `DESIGN.md` §5 (e
 
 > **Strengthening over `DESIGN.md` notation:** the design writes `"label" ‖ canonical(x)` (raw concatenation, relying on labels being mutually non-prefix). This spec **length-prefixes the label** so the label/struct boundary is unambiguous regardless of label choice — strictly safer, and consistent with §5.2's "length-prefixed `‖`" rule. Verifiers MUST use this framed form.
 
-Non-signature contexts reuse `canonical(struct)` directly: HPKE `info = canonical(wrap_context)`; AEAD `AAD = canonical(chunk_aad)`; `fingerprint = SHA-256(canonical(fingerprint_input))`. The KDF labels (`"MaxSecu-dek-commit-v1"`, `"MaxSecu-content-v1"`, `"MaxSecu-metadata-v1"`) are HKDF `info` constants, not struct encodings.
+Non-signature contexts reuse `canonical(struct)` directly: HPKE `info = canonical(wrap_context)`; AEAD `AAD = canonical(chunk_aad)`; `fingerprint = SHA-256(canonical(fingerprint_input))`. The KDF labels (`"MaxSecu-dek-commit-v1"`, and the per-stream subkey infos `"MaxSecu-content-v1"`, `"MaxSecu-metadata-v1"`, `"MaxSecu-thumbnail-v1"`, `"MaxSecu-preview-v1"`) are HKDF `info` constants, not struct encodings.
 
 ---
 
@@ -173,6 +181,7 @@ Every vector below MUST be **rejected** (or, for the positive cases, produce the
 - **V-10 FileScope.** `0x02` (account-wide) followed by 16 id bytes → reject; `0x01` with no id → reject.
 - **V-11 recovery binding.** `recipient_type = recovery` with `recipient_id ≠ RECOVERY_ID` → reject.
 - **V-12 re-encode mismatch.** Any crafted input that decodes but re-encodes to different bytes → reject via §7.5 (e.g. a malformed `set`/`option` form that slips a naive parser).
+- **V-13 stream list order/dup.** `manifest.streams` with `thumbnail` before `content` (descending `stream_type`) → reject; two `content` streams → reject; the reserved `type_id 0x0004` (old write_grant) → reject. Canonical `streams` is ascending and unique by `stream_type`.
 
 ---
 

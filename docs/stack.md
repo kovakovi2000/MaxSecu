@@ -15,7 +15,9 @@ This document is authoritative for language/runtime/library choices. Where a cho
 | Client UI shell | **Tauri** (Rust backend + WebView2 UI) | Keeps security-critical code in Rust; UI is outside the TCB |
 | Server / API | **Rust or Go** on Linux (team's call) | Server holds no secrets (§4.3) — language is not a security decision |
 | Database | **PostgreSQL** | Relational schema (§11); strong constraints/transactions |
-| Blob store | **S3-compatible object store** | Chunked ciphertext (§12.10) |
+| Blob storage | **Dropbox (2 TB) backing + local LRU/LFU cache** | Bounds server disk; both tiers ciphertext-only (D31) |
+| Media pipeline | **client-side ffmpeg + image libs in an OS sandbox** | Transcode/thumbnail/preview before encryption; decode shared media safely (D30) |
+| Compression | **client-side, per-file, selective (zstd)** | Text yes, already-compressed media no; size side-channel accepted (D32) |
 | Canonical encoder | **One Rust implementation** (`docs/encoding-spec.md`) | Single client platform ⇒ one encoder; server stores opaque bytes |
 | Air-gapped tooling | **Rust CLI binaries** sharing the client core crates | Ceremony tools are security-critical software (§12.1, §12.7) |
 | TLS | **rustls** | TLS 1.3 + keying-material exporter for channel binding (§9.2) |
@@ -96,6 +98,17 @@ These are concrete Windows behaviours that will leak plaintext unless explicitly
 
 The directory-signing (D5) and recovery (D6) ceremonies (§12.1, §12.7) run on an **offline Windows (or Linux) machine** via **separate small Rust CLI binaries** that reuse the client core crates (same canonical encoder, same Ed25519/HPKE code). They never link networking. Built and signed under the same reproducible pipeline.
 
+### 1.7 Media pipeline & decode sandbox (D30 — the biggest new attack surface)
+
+All content understanding is **client-side** (the server has no key). Two activities, both touching plaintext:
+
+- **At upload (author's own content):** transcode video to the canonical format, render the `thumbnail`, cut the `preview`, and compress text — then encrypt each as a stream (§13/D33). Tools: **ffmpeg/libav** (via `ffmpeg-sidecar` or a vendored libav binding) for video; an image library (`image` crate, or libvips for speed) for thumbnails; **`zstd`** for selective compression.
+- **At view (someone *else's* shared media):** decode `content`/`thumbnail`/`preview` to render. **This decodes attacker-authored bytes in complex C codecs — the system's top RCE risk.**
+
+> **Mandatory sandbox.** Media decode/transcode runs in a **separate worker process** with **no network, no access to keys/the directory, a restricted token + Job Object, and ideally a Windows AppContainer**. The worker is handed only the decrypted media bytes and returns only decoded frames/clips over IPC; a decoder 0-day is then contained to a process that holds no secrets and cannot exfiltrate. Enforce **dimension/duration/size caps before allocation**, keep ffmpeg patched, and prefer memory-safe decoders where they exist. The main (key-holding) process never links ffmpeg directly. Treat this worker as **untrusted output** — validate decoded dimensions/format before use. This is `DESIGN.md` §8.1 / threat-model row "Malicious author's media → viewer's decoder".
+
+> **"Quality-preserving" transcode** is usually impossible on re-encode. Prefer **remux / stream-copy** (container normalize, no re-encode, no loss) when the source codec is already acceptable; otherwise a visually-lossless high-bitrate encode. Less processing = smaller plaintext-handling window and less decoder surface.
+
 ---
 
 ## 2. Server: Linux, secret-free
@@ -109,8 +122,8 @@ Per §4.3 the server stores **inert records** and enforces only **coarse** autho
 
 ### 2.2 Data + blobs
 
-- **PostgreSQL** for the relational tables in §11 (`users`, `files`, `file_key_wraps`, `auth_events` mirror, `revocations`, `reinstatements`, `write_grants`, `file_genesis`). Use DB constraints to enforce the append-only/monotonic invariants where possible (e.g. no-delete triggers on tombstones).
-- **S3-compatible object store** (MinIO on-prem, or cloud) for chunked ciphertext blobs (§12.10), referenced by `files.blob_ref`.
+- **PostgreSQL** for the small relational records of §11 (`users`, `files`, `file_key_wraps`, `auth_events` mirror, `revocations`, `reinstatements`, `file_genesis`). *No `write_grants`* — write is owner-only (D29). Use DB constraints to enforce the append-only/monotonic invariants (e.g. no-delete triggers on tombstones, one-genesis-per-file, unique `(file_id,version,recipient)`).
+- **Chunked ciphertext blobs** go to the **Dropbox backing tier + local cache** (§2.4), not a general object store, referenced by `files.blob_ref` (a logical id resolved to cache path or Dropbox path).
 - **TLS 1.3** terminated by the app (rustls) with the client pinning the server identity (§9.2); the keying-material exporter binds the auth challenge and session token to the channel.
 
 ### 2.3 The external append-only sink is a *separate, real* dependency
@@ -119,6 +132,22 @@ Per §4.3 the server stores **inert records** and enforces only **coarse** autho
 
 - Provision a genuinely independent **WORM store or SIEM** outside the app server's control, with **digest anchoring** (hash-chain the event/tombstone stream and publish/cross-store the head).
 - The **anchored tombstone-chain head** that clients fetch to verify revocation completeness lives here. Its concrete client-facing interface is the subject of a separate spec (`docs/sink-interface.md`, to be written) and **must exist before coding revocation (Phase 5).**
+
+### 2.4 Blob storage tiering — Dropbox backing + local cache (D31)
+
+Large ciphertext blobs (the chunked `content`/`thumbnail`/`preview` streams) are **not** kept on the server long-term:
+
+- **Backing tier: Dropbox (2 TB).** Durable store of inert ciphertext. The server holds the Dropbox API token (a high-value **availability** secret — see risks); use a **scoped/app-folder token**, store it in a secret manager, never in code/env-in-image (§16.6).
+- **Cache tier: server local disk (50–100 GB), LRU/LFU.** On a cache miss the server pulls from Dropbox, **reports progress to the client**, and relays. Evict oldest-accessed / least-requested.
+- **Direct client↔Dropbox for large objects.** The server brokers a **short-lived, scoped, read-only link** (Dropbox temporary link) for the specific blob; the client downloads directly and still **verifies every byte** against the signed manifest + per-chunk AEAD tags (§12.3/§12.10). The master token is never given to the client.
+- **No dedup.** Per-file random DEKs ⇒ identical plaintext yields different ciphertext, so cross-user dedup is impossible (good for privacy, costs storage — size the Dropbox tier accordingly).
+- **Small records stay in Postgres** (manifests, wraps, grants, tombstones, directory) — never in Dropbox.
+
+> **Security note carried into `DESIGN.md`:** Dropbox is in the **untrusted** zone (D31). It cannot read files (ciphertext only) and cannot feed bad bytes undetected (AEAD + manifest), but it is a **second metadata observer** (sizes/timing/access) and its token is an **availability/DR** risk (mass-delete; durability rests on Dropbox — consider an independent ciphertext backup). Crates: `dropbox-sdk` (or raw HTTP v2 API) on the server; the client uses plain `reqwest` + `rustls` for direct link fetches.
+
+### 2.5 Compression (D32)
+
+Client-side, **before** encryption, **per file, no shared dictionary**: `zstd` for text/blog bodies; **skip** already-compressed media (transcoded video, JPEG). The chosen algorithm id rides **inside the signed manifest** (per stream) so it is authenticated. Accept the static size side-channel (folded into the disclosed size residual, `DESIGN.md` §13/§15.2); optional padding/bucketing is the future mitigation.
 
 ---
 
@@ -132,8 +161,12 @@ Per §4.3 the server stores **inert records** and enforces only **coarse** autho
 ## 4. Pre-coding checklist (derived from the above)
 
 1. ✅ Canonical encoding chosen — explicit length-prefixed binary; spec in `docs/encoding-spec.md`.
-2. ☐ Stand up the **external sink** + define `docs/sink-interface.md` (anchored-head fetch/verify) — blocks Phase 5.
-3. ☐ Settle the **large-file streaming-decrypt** pipeline shape (§1.4) — blocks Phase 3 file I/O.
-4. ☐ Confirm operational prerequisites exist: air-gapped machine, reproducible-build + Authenticode pipeline, WORM/SIEM sink.
-5. ☐ Lock remaining product scope that changes the schema: write delegation (DESIGN review item #6); single-device confirmed (D4).
-6. ☐ External cryptographer review of the protocol before/while building the core.
+2. ✅ Write model — **owner-only write** (D29); `write_grants` not built.
+3. ✅ Large-file handling — **user RAM budget; warned disk-unlock past it** (D12/§8.1); no server-side size limit.
+4. ☐ Stand up the **external sink** + define `docs/sink-interface.md` (anchored-head fetch/verify) — blocks Phase 5.
+5. ☐ Define `docs/api.md` (RPC contract, chunk up/download, session tokens) + `docs/schema.sql` + `docs/parameters.md` (incl. the **sink-head refresh cadence** = revocation bound) — blocks Phase 1.
+6. ☐ **Prove out the media decode sandbox early** (§1.7) — AppContainer/restricted-token worker, fuzz it; this is the top RCE risk. Blocks Phase 4b.
+7. ☐ Stand up the **Dropbox tier + cache + scoped-link brokering** (§2.4); secure the Dropbox token; plan independent ciphertext backup (availability/DR).
+8. ☐ Confirm operational prerequisites: air-gapped machine, reproducible-build + Authenticode pipeline, WORM/SIEM sink, Dropbox app account.
+9. ☐ Confirm single-device (D4).
+10. ☐ External cryptographer review of the protocol before/while building the core.
