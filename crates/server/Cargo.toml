@@ -42,6 +42,11 @@ http-body-util = "0.1"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 hyper = { version = "1", features = ["client"] }
 tokio = { version = "1", features = ["io-util"] }
+# Phase-2 end-to-end test (tests/directory_e2e.rs): the offline ceremony side
+# (admin-core) produces signed bindings/tombstones; the client side (client-core)
+# verifies what the server serves over real TLS. Both test-only.
+maxsecu-admin-core = { path = "../admin-core" }
+maxsecu-client-core = { path = "../client-core" }
 
 [lints.rust]
 unsafe_code = "forbid"
