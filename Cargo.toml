@@ -1,0 +1,30 @@
+# MaxSecu cargo workspace.
+#
+# Phase 0 (DESIGN.md §17) ships two security-critical library crates that are
+# shared verbatim by the client core, the server, and the air-gapped ceremony
+# tools (docs/stack.md §1.6/§2.1): there is exactly ONE canonical-encoder and
+# ONE set of crypto primitive wrappers in the system.
+[workspace]
+resolver = "2"
+members = [
+    "crates/encoding",
+    "crates/crypto",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.96"
+publish = false
+
+# Pinned, audited dependencies live here so every member resolves the same
+# version (docs/stack.md §1.3 "pin and audit"). Add-on crates are introduced
+# per-crate as their phase arrives.
+[workspace.dependencies]
+# Unicode NFC normalization for the canonical `text` type (encoding-spec §2).
+unicode-normalization = "0.1"
+
+[profile.release]
+# Deterministic-ish release profile; reproducible-build flags are finalized in
+# Phase 6 (§8 control 2). Kept conservative here.
+opt-level = 3
+overflow-checks = true

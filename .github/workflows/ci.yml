@@ -1,0 +1,43 @@
+name: ci
+
+# Phase-0 guardrails (stack.md §1.3 / DESIGN §8): pinned toolchain, fmt, clippy
+# (warnings = errors), tests, and supply-chain audit (cargo-deny + cargo-audit).
+# The toolchain is pinned by rust-toolchain.toml, so `cargo`/`rustup` auto-select
+# 1.96.0 in every job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    # Windows MSVC is the production target for the client core (stack.md §1.5).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain (installs the pinned channel)
+        run: rustup show
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+      - name: Test
+        run: cargo test --workspace --locked
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny and cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+      - name: cargo-deny
+        run: cargo deny check
+      - name: cargo-audit
+        run: cargo audit --deny warnings

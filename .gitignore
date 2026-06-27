@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Never commit secrets. The Dropbox token / app secret and the offline D5/D6
+# key material are injected at runtime / kept air-gapped (DESIGN.md §16.6,
+# stack.md §5.1) — they must never land in the repo.
+*.secret
+*.token
+secrets/
+.env
+.env.*
+
+# OS / editor noise
+Thumbs.db
+.DS_Store

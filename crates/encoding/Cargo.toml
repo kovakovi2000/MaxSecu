@@ -1,0 +1,18 @@
+[package]
+name = "maxsecu-encoding"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "MaxSecu canonical injective binary encoding (docs/encoding-spec.md, Phase 0)."
+
+[dependencies]
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+# Property tests for decode∘encode / encode∘decode identity (encoding-spec §9).
+proptest = "1"
+
+[lints.rust]
+# The canonical encoder is security-critical: deny sloppiness.
+unsafe_code = "forbid"

@@ -1,0 +1,8 @@
+# Pinned toolchain (docs/stack.md §1.3 "pinned toolchain", D1/§8 supply chain).
+# Production target is the Windows MSVC ABI (Authenticode-signed native client,
+# stack.md §1.5). Bump deliberately, never float.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]
+profile = "minimal"

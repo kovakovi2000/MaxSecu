@@ -1,0 +1,30 @@
+[package]
+name = "maxsecu-crypto"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "MaxSecu cryptographic primitive wrappers (DESIGN.md §5, Phase 0)."
+
+# Crypto primitives map 1:1 to DESIGN.md §5 / stack.md §1.3 (RustCrypto + dalek).
+[dependencies]
+maxsecu-encoding = { path = "../encoding" }
+aes-gcm = "0.10" # AES-256-GCM, chunked/framed (§12.10)
+hkdf = "0.12" # HKDF-SHA256 (ck/mk/dek_commit derivations)
+sha2 = "0.10" # SHA-256 (digests, fingerprints, tombstone chain)
+argon2 = "0.5" # Argon2id password KDF (parameters §1.1)
+ed25519-dalek = "2" # Ed25519, strict verification
+# X25519 (the user "unwrap" key) is the HPKE KEM below — no separate dep needed.
+# HPKE base mode, X25519 + HKDF-SHA256 + AES-256-GCM only — no p256/chacha KEMs.
+hpke = { version = "0.12", default-features = false, features = ["x25519", "std", "alloc"] }
+zeroize = "1" # secret hygiene (Zeroizing wrappers)
+subtle = "2" # constant-time equality where needed
+getrandom = "0.2" # OS CSPRNG (BCryptGenRandom on Windows)
+rand_core = { version = "0.6", features = ["getrandom"] } # OsRng for HPKE seal
+
+[dev-dependencies]
+# Randomized round-trip property tests (Phase-0 exit gate, DESIGN §17).
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
