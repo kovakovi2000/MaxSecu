@@ -10,6 +10,7 @@ members = [
     "crates/encoding",
     "crates/crypto",
     "crates/client-core",
+    "crates/server",
 ]
 
 [workspace.package]

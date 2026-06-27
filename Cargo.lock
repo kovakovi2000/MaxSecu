@@ -426,6 +426,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxsecu-server"
+version = "0.0.0"
+dependencies = [
+ "maxsecu-crypto",
+ "maxsecu-encoding",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"

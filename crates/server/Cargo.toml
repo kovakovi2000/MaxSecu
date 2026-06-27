@@ -1,0 +1,17 @@
+[package]
+name = "maxsecu-server"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "MaxSecu secret-free app server (DESIGN §4.1, Phase 1: auth core)."
+
+[dependencies]
+maxsecu-encoding = { path = "../encoding" }
+maxsecu-crypto = { path = "../crypto" }
+# HTTP (axum), DB (sqlx), and TLS (tokio-rustls) adapters are added in the next
+# increment; the auth state machine below is transport/persistence-agnostic and
+# testable without them (mirrors the client-core split).
+
+[lints.rust]
+unsafe_code = "forbid"
