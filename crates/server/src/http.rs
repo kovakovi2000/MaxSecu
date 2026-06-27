@@ -9,10 +9,12 @@
 //! was bound to (api.md §1.5).
 
 use crate::auth::AuthService;
+use crate::error::ProveError;
 use crate::store::Store;
 use axum::extract::{FromRequestParts, Json, State};
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{request::Parts, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Extension, Router};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -47,6 +49,17 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         .route("/v1/session/proof", post(prove::<S>))
         .route("/v1/session/logout", post(logout::<S>))
         .with_state(state)
+}
+
+/// Uniform `429 Too Many Requests` + `Retry-After: <seconds>` for a throttled
+/// request (parameters §3). The only response shape distinct from the single
+/// `401` auth-failure shape (no oracle, §9.3).
+fn rate_limited(retry_after_s: u64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(RETRY_AFTER, retry_after_s.to_string())],
+    )
+        .into_response()
 }
 
 fn now_ms() -> u64 {
@@ -144,14 +157,18 @@ struct ChallengeRes {
 async fn challenge<S: Store>(
     State(st): State<AppState<S>>,
     Json(req): Json<ChallengeReq>,
-) -> Json<ChallengeRes> {
-    // A well-formed challenge is returned for unknown usernames too (§9.3).
-    let ch = st.auth.challenge(&req.username, now_ms()).await;
-    Json(ChallengeRes {
-        nonce_b64: b64encode(&ch.nonce),
-        server_id: ch.server_id,
-        expires_in_s: ch.expires_in_s,
-    })
+) -> Response {
+    // A well-formed challenge is returned for unknown usernames too (§9.3),
+    // unless the per-account issuance cap throttles it (429, parameters §3).
+    match st.auth.challenge(&req.username, now_ms()).await {
+        Ok(ch) => Json(ChallengeRes {
+            nonce_b64: b64encode(&ch.nonce),
+            server_id: ch.server_id,
+            expires_in_s: ch.expires_in_s,
+        })
+        .into_response(),
+        Err(rl) => rate_limited(rl.retry_after_s),
+    }
 }
 
 // ---- POST /v1/session/proof (api.md §2.2) ----
@@ -173,19 +190,24 @@ async fn prove<S: Store>(
     State(st): State<AppState<S>>,
     Extension(exporter): Extension<TlsExporter>,
     Json(req): Json<ProveReq>,
-) -> Result<Json<ProveRes>, StatusCode> {
-    let proof = b64_fixed::<64>(&req.proof_b64).ok_or(StatusCode::BAD_REQUEST)?;
+) -> Response {
+    let Some(proof) = b64_fixed::<64>(&req.proof_b64) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
     match st
         .auth
         .prove(&req.username, req.timestamp, &proof, &exporter.0, now_ms())
         .await
     {
-        Ok(token) => Ok(Json(ProveRes {
+        Ok(token) => Json(ProveRes {
             session_token: token.to_hex(),
             expires_in_s: 3600,
-        })),
-        // Single 401 shape for every cause — no oracle (§3).
-        Err(_) => Err(StatusCode::UNAUTHORIZED),
+        })
+        .into_response(),
+        // Single 401 shape for every auth-failure cause — no oracle (§3) …
+        Err(ProveError::Unauthorized) => StatusCode::UNAUTHORIZED.into_response(),
+        // … but a throttled attempt is the one deliberately-distinct 429 signal.
+        Err(ProveError::RateLimited { retry_after_s }) => rate_limited(retry_after_s),
     }
 }
 
@@ -484,6 +506,51 @@ mod tests {
         assert_eq!(st1, StatusCode::CREATED);
         let (st2, _) = post_json(&router, "/v1/users", register_body(&sk, "bob", "v2")).await;
         assert_eq!(st2, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn challenge_issuance_cap_returns_429() {
+        let (router, _sk) = app(EXPORTER);
+        // 30 challenges/account/minute are allowed (parameters §3)…
+        for i in 0..30 {
+            let (st, _) = post_json(
+                &router,
+                "/v1/session/challenge",
+                serde_json::json!({"username":"alice"}),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "challenge #{i}");
+        }
+        // …the 31st within the window is throttled.
+        let (st, _) = post_json(
+            &router,
+            "/v1/session/challenge",
+            serde_json::json!({"username":"alice"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn failed_proof_arms_backoff_then_429() {
+        let (router, _sk) = app(EXPORTER);
+        let bogus = b64encode(&[0u8; 64]);
+        // First attempt fails 401 (no oracle) and arms the per-account backoff.
+        let (st, _) = post_json(
+            &router,
+            "/v1/session/proof",
+            serde_json::json!({"username":"alice","timestamp":1u64,"proof_b64":bogus}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        // An immediate retry (well inside the 1s backoff) is throttled 429, not 401.
+        let (st, _) = post_json(
+            &router,
+            "/v1/session/proof",
+            serde_json::json!({"username":"alice","timestamp":1u64,"proof_b64":bogus}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

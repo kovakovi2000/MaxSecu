@@ -1,0 +1,18 @@
+# cargo-audit configuration (companion to deny.toml; stack.md §1.3 supply chain).
+# Run: cargo audit   (CI may also pass --ignore explicitly; keep the two in sync).
+#
+# Keep this list identical to deny.toml's [advisories] ignore, with the same
+# written justification. An entry here means: a known advisory whose vulnerable
+# code is NOT compiled into any MaxSecu binary (or has no upstream fix and is
+# unreachable on our code path) — never a blanket silence.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" RSA timing sidechannel (medium, NO fix
+    # available). `rsa` is a Cargo.lock-only transitive of `sqlx-postgres`; it is
+    # NOT in the build graph (`cargo tree -i rsa -e normal,build` is empty), so
+    # the vulnerable code is never compiled or linked. The server↔Postgres link
+    # is loopback (SCRAM/trust) and never exercises RSA password auth.
+    # Remove when sqlx drops `rsa` or a fixed `rsa` is released.
+    "RUSTSEC-2023-0071",
+]

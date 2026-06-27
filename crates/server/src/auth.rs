@@ -3,7 +3,8 @@
 //! supplies the live connection's TLS exporter; these methods are pure given
 //! `(store, now_ms, exporter)` and fully testable without TLS or a DB.
 
-use crate::error::AuthError;
+use crate::error::{AuthError, ProveError, RateLimited};
+use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::store::{SessionRecord, Store};
 use maxsecu_crypto::{random_array, sha256, VerifyingKey};
 use maxsecu_encoding::labels;
@@ -35,12 +36,14 @@ impl SessionToken {
     }
 }
 
-/// Auth configuration (values from parameters §2).
+/// Auth configuration (values from parameters §2/§3).
 #[derive(Clone, Debug)]
 pub struct AuthConfig {
     pub server_id: String,
     pub nonce_ttl_ms: u64,
     pub session_ttl_ms: u64,
+    /// Anti-automation tunables (parameters §3).
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Default for AuthConfig {
@@ -49,6 +52,7 @@ impl Default for AuthConfig {
             server_id: "maxsecu-dev-1".to_owned(),
             nonce_ttl_ms: 60_000,      // 60 s (parameters §2)
             session_ttl_ms: 3_600_000, // 60 min (parameters §2)
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -56,11 +60,17 @@ impl Default for AuthConfig {
 pub struct AuthService<S: Store> {
     store: S,
     cfg: AuthConfig,
+    limiter: RateLimiter,
 }
 
 impl<S: Store> AuthService<S> {
     pub fn new(store: S, cfg: AuthConfig) -> Self {
-        AuthService { store, cfg }
+        let limiter = RateLimiter::new(cfg.rate_limit.clone());
+        AuthService {
+            store,
+            cfg,
+            limiter,
+        }
     }
 
     pub fn store(&self) -> &S {
@@ -72,17 +82,22 @@ impl<S: Store> AuthService<S> {
     }
 
     /// Issue a fresh single-use challenge. A well-formed challenge is returned
-    /// **even for unknown usernames** — no user-existence oracle (§9.3).
-    pub async fn challenge(&self, username: &str, now_ms: u64) -> Challenge {
+    /// **even for unknown usernames** — no user-existence oracle (§9.3) — unless
+    /// the per-account issuance cap is hit, in which case the caller is throttled
+    /// (`Err(RateLimited)` → HTTP 429, parameters §3).
+    pub async fn challenge(&self, username: &str, now_ms: u64) -> Result<Challenge, RateLimited> {
+        if let Err(retry_after_s) = self.limiter.admit_challenge(username, now_ms) {
+            return Err(RateLimited { retry_after_s });
+        }
         let nonce: [u8; 32] = random_array();
         self.store
             .insert_nonce(nonce, username, now_ms + self.cfg.nonce_ttl_ms)
             .await;
-        Challenge {
+        Ok(Challenge {
             nonce,
             server_id: self.cfg.server_id.clone(),
             expires_in_s: self.cfg.nonce_ttl_ms / 1000,
-        }
+        })
     }
 
     /// Verify a login proof and, on success, mint a channel-bound session.
@@ -99,7 +114,14 @@ impl<S: Store> AuthService<S> {
         proof: &[u8; 64],
         exporter: &[u8; 32],
         now_ms: u64,
-    ) -> Result<SessionToken, AuthError> {
+    ) -> Result<SessionToken, ProveError> {
+        // Per-account failed-proof backoff (parameters §3): reject while in the
+        // backoff window *before* doing verification work, and without consuming
+        // a nonce. Never a hard lock — the wait is bounded (cap) and a success
+        // resets it.
+        if let Err(retry_after_s) = self.limiter.admit_proof(username, now_ms) {
+            return Err(ProveError::RateLimited { retry_after_s });
+        }
         let user = self.store.user_by_name(username).await;
         for nonce in self.store.outstanding_nonces(username, now_ms).await {
             let verified = match &user {
@@ -128,6 +150,7 @@ impl<S: Store> AuthService<S> {
             };
             if verified {
                 self.store.consume_nonce(&nonce).await; // single-use ⇒ no replay
+                self.limiter.record_proof(username, now_ms, true); // clears backoff
                 let u = user.expect("verified implies a known user");
                 let token: [u8; 32] = random_array();
                 self.store
@@ -144,7 +167,9 @@ impl<S: Store> AuthService<S> {
                 return Ok(SessionToken(token));
             }
         }
-        Err(AuthError::Unauthorized)
+        // No nonce verified — one failed attempt; extend the per-account backoff.
+        self.limiter.record_proof(username, now_ms, false);
+        Err(ProveError::Unauthorized)
     }
 
     /// Validate a presented session token on the current connection. The token
@@ -249,7 +274,7 @@ mod tests {
     async fn login_succeeds_and_session_validates() {
         let svc = service();
         let user = enroll(svc.store(), "alice", 0x01);
-        let ch = svc.challenge("alice", TS).await;
+        let ch = svc.challenge("alice", TS).await.unwrap();
         let proof = make_proof(&user.sk, svc.server_id(), &EXPORTER, &ch.nonce, TS);
         let token = svc.prove("alice", TS, &proof, &EXPORTER, TS).await.unwrap();
         // Session validates on the same channel and resolves to the user.
@@ -265,13 +290,13 @@ mod tests {
     async fn replay_of_a_valid_proof_is_rejected() {
         let svc = service();
         let user = enroll(svc.store(), "alice", 0x01);
-        let ch = svc.challenge("alice", TS).await;
+        let ch = svc.challenge("alice", TS).await.unwrap();
         let proof = make_proof(&user.sk, svc.server_id(), &EXPORTER, &ch.nonce, TS);
         assert!(svc.prove("alice", TS, &proof, &EXPORTER, TS).await.is_ok());
         // Same proof again — the nonce was consumed (single-use).
         assert_eq!(
             svc.prove("alice", TS, &proof, &EXPORTER, TS).await.err(),
-            Some(AuthError::Unauthorized)
+            Some(ProveError::Unauthorized)
         );
     }
 
@@ -279,12 +304,12 @@ mod tests {
     async fn relay_to_a_different_channel_is_rejected() {
         let svc = service();
         let user = enroll(svc.store(), "alice", 0x01);
-        let ch = svc.challenge("alice", TS).await;
+        let ch = svc.challenge("alice", TS).await.unwrap();
         // Proof built for EXPORTER, presented on a different connection's exporter.
         let proof = make_proof(&user.sk, svc.server_id(), &EXPORTER, &ch.nonce, TS);
         assert_eq!(
             svc.prove("alice", TS, &proof, &[0x00; 32], TS).await.err(),
-            Some(AuthError::Unauthorized)
+            Some(ProveError::Unauthorized)
         );
     }
 
@@ -292,14 +317,14 @@ mod tests {
     async fn expired_nonce_is_rejected() {
         let svc = service();
         let user = enroll(svc.store(), "alice", 0x01);
-        let ch = svc.challenge("alice", TS).await;
+        let ch = svc.challenge("alice", TS).await.unwrap();
         let proof = make_proof(&user.sk, svc.server_id(), &EXPORTER, &ch.nonce, TS);
         // 61 s later the nonce has expired (TTL 60 s).
         assert_eq!(
             svc.prove("alice", TS, &proof, &EXPORTER, TS + 61_000)
                 .await
                 .err(),
-            Some(AuthError::Unauthorized)
+            Some(ProveError::Unauthorized)
         );
     }
 
@@ -307,14 +332,14 @@ mod tests {
     async fn no_user_existence_oracle() {
         let svc = service();
         // A well-formed challenge is issued for an unknown username (§9.3).
-        let ch = svc.challenge("nobody", TS).await;
+        let ch = svc.challenge("nobody", TS).await.unwrap();
         assert_eq!(ch.nonce.len(), 32);
         assert_eq!(ch.server_id, svc.server_id());
         // And proving for an unknown user fails with the SAME shape as a bad proof.
         let bogus = [0u8; 64];
         assert_eq!(
             svc.prove("nobody", TS, &bogus, &EXPORTER, TS).await.err(),
-            Some(AuthError::Unauthorized)
+            Some(ProveError::Unauthorized)
         );
     }
 
@@ -323,11 +348,11 @@ mod tests {
         let svc = service();
         let _alice = enroll(svc.store(), "alice", 0x01);
         let attacker = SigningKey::generate();
-        let ch = svc.challenge("alice", TS).await;
+        let ch = svc.challenge("alice", TS).await.unwrap();
         let proof = make_proof(&attacker, svc.server_id(), &EXPORTER, &ch.nonce, TS);
         assert_eq!(
             svc.prove("alice", TS, &proof, &EXPORTER, TS).await.err(),
-            Some(AuthError::Unauthorized)
+            Some(ProveError::Unauthorized)
         );
     }
 
@@ -335,7 +360,7 @@ mod tests {
     async fn session_rejected_on_wrong_channel_expiry_and_logout() {
         let svc = service();
         let user = enroll(svc.store(), "alice", 0x01);
-        let ch = svc.challenge("alice", TS).await;
+        let ch = svc.challenge("alice", TS).await.unwrap();
         let proof = make_proof(&user.sk, svc.server_id(), &EXPORTER, &ch.nonce, TS);
         let token = svc.prove("alice", TS, &proof, &EXPORTER, TS).await.unwrap();
 

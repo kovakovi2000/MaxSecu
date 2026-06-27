@@ -77,10 +77,12 @@ Maps every primitive in `DESIGN.md` §5 to a concrete, audited crate. One ecosys
 | Secret hygiene | `zeroize` | `Zeroizing<…>` wrappers on all key/plaintext buffers |
 | Page locking | `region` **or** `windows` (`VirtualLock`) | §8.1 lock secret pages |
 | CSPRNG | `getrandom` / `rand` | OS RNG (`BCryptGenRandom` on Windows) — never `rand`'s userspace PRNG for keys |
-| TLS 1.3 + channel binding | `rustls` | `export_keying_material` (RFC 5705) feeds the §9.2 auth challenge |
+| TLS 1.3 + channel binding | `rustls` + `tokio-rustls` (provider: **`aws-lc-rs`**) | `export_keying_material` (RFC 5705) feeds the §9.2 auth challenge; TLS 1.3 only (no `tls12` feature). Provider note below |
 | Post-quantum (Phase 7) | `ml-kem` (RustCrypto) | Behind the `alg` registry; not in v1 (§5/D20) |
 
 > **Pin and audit (D1/§8 supply chain).** Lockfile with hashes, `cargo audit`/`cargo deny` in CI, pinned toolchain. No `build.rs` network access. Vendoring dependencies is acceptable for the air-gapped tooling.
+
+> **TLS crypto provider — the one sanctioned exception to "pure-Rust, single ecosystem."** rustls requires a `CryptoProvider`; the only pure-Rust one (`rustls-rustcrypto`) is pre-1.0 alpha, so the v1 server uses **`aws-lc-rs`** (chosen on **runtime speed** — the fastest rustls backend on the bulk-AEAD path that the §2.4/D31 blob proxy exercises). This is a **deliberate, narrow carve-out**, not a loosening of the app-layer TCB: (1) the application's confidentiality/integrity TCB — every key, wrap, signature, manifest and AEAD over *file data* — stays 100% RustCrypto + dalek (table above); TLS is the **transport**, not the zero-knowledge boundary (the server holds no decryption key regardless, §4.3). (2) The security-relevant output of the provider here is the **RFC 5705 exporter** (channel binding, §9.2) plus server-identity pinning — not data confidentiality. (3) `deny.toml` still **bans `ring`/`openssl`** (the accidental-second-stack guard); `aws-lc-rs` is the *only* non-RustCrypto crypto crate, admitted on purpose for TLS alone, and its license clears the allow-list. (4) It builds with **no extra toolchain** (no cmake/NASM on PATH) on both Linux (prod) and Windows MSVC, so the loopback channel-binding test runs on both. Revisit if `rustls-rustcrypto` reaches a stable release (would restore a fully pure-Rust graph) or if a FIPS posture is ever required (aws-lc-rs already supports it).
 
 ### 1.4 Windows-specific §8.1 mechanics (easy to miss)
 

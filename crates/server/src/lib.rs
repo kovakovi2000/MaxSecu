@@ -14,9 +14,15 @@ mod error;
 
 pub mod auth;
 pub mod http;
+pub mod pg;
+pub mod ratelimit;
+pub mod serve;
 pub mod store;
 
 pub use auth::{AuthConfig, AuthService, Challenge, SessionToken};
-pub use error::AuthError;
+pub use error::{AuthError, ProveError, RateLimited};
 pub use http::{router, AppState, AuthedSession, TlsExporter};
+pub use pg::PgStore;
+pub use ratelimit::{RateLimitConfig, RateLimiter};
+pub use serve::{export_channel_binding, serve, CHANNEL_BINDING_LABEL, CHANNEL_BINDING_LEN};
 pub use store::{MemoryStore, NonceRecord, SessionRecord, Store, UserRecord};
