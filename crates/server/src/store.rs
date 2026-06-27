@@ -8,9 +8,11 @@
 //! Methods take `&self` and the impl owns its synchronization, so the service
 //! is `Sync` for concurrent request handling.
 
-use crate::error::StoreError;
+use crate::control::decode_control;
+use crate::error::{ControlAppendError, StoreError};
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
+use maxsecu_encoding::types::Role;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -46,6 +48,18 @@ pub struct SessionRecord {
 pub struct StoredBinding {
     pub binding_bytes: Vec<u8>,
     pub signature: [u8; 64],
+}
+
+/// One control-log record as served by `GET /v1/revocations` (api.md §7.1): the
+/// opaque signed bytes, the issuer (and optional co-) signature, and the chain
+/// `head` (advisory — the client recomputes it and checks the anchored head).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredControlRecord {
+    pub kind: i16, // 6=revocation 7=reinstatement 8=key_compromise
+    pub record_bytes: Vec<u8>,
+    pub sig: [u8; 64],
+    pub co_sig: Option<[u8; 64]>,
+    pub head: [u8; 32],
 }
 
 /// Async because the production backing is sqlx/Postgres. `Send + Sync` so the
@@ -116,6 +130,29 @@ pub trait Store: Send + Sync {
         &self,
         user_id: &[u8; 16],
     ) -> Result<Option<StoredBinding>, StoreError>;
+
+    // ---- Phase 2: revocation control-log (DESIGN §7.6/§11.5, api.md §7) ----
+
+    /// Append a record to the single hash chain (`POST /v1/revocations|...`).
+    /// The server derives `prev_head`/`head` from the record bytes and enforces
+    /// `prev_head == current head` — `Conflict` on a mismatch, `Malformed` on
+    /// non-canonical bytes. Returns the new chain head. The authoritative event
+    /// is the *sink* anchoring (Phase 6); here the chain is built and linked.
+    async fn append_control(
+        &self,
+        record_bytes: Vec<u8>,
+        sig: [u8; 64],
+        co_sig: Option<[u8; 64]>,
+    ) -> Result<[u8; 32], ControlAppendError>;
+    /// The full chain in append order (`GET /v1/revocations`); the client checks
+    /// contiguity to the anchored head and fails closed on a gap.
+    async fn control_records(&self) -> Result<Vec<StoredControlRecord>, StoreError>;
+    /// The current chain head (`GENESIS_HEAD` if empty).
+    async fn control_head(&self) -> Result<[u8; 32], StoreError>;
+    /// The caller's advisory roles, for the **coarse** admin gate on control-log
+    /// writes (§10.1). Not the security boundary — the client re-verifies every
+    /// tombstone's authenticity independently.
+    async fn user_roles(&self, user_id: &[u8; 16]) -> Result<Vec<Role>, StoreError>;
 }
 
 #[derive(Default)]
@@ -126,6 +163,12 @@ struct Inner {
     vouchers: HashSet<[u8; 32]>, // unused enrollment voucher hashes
     // Latest signed binding per user_id, with its key_version (newer replaces older).
     bindings: HashMap<[u8; 16], (u64, StoredBinding)>,
+    // The single append-only control-log chain (in order) + its running head.
+    // The default `[0; 32]` is exactly `GENESIS_HEAD` (encoding-spec §3).
+    control_log: Vec<StoredControlRecord>,
+    control_head: [u8; 32],
+    // Advisory roles per user_id for the coarse admin gate (default {user}).
+    roles: HashMap<[u8; 16], Vec<Role>>,
 }
 
 /// In-memory [`Store`] for tests and local dev.
@@ -152,6 +195,11 @@ impl MemoryStore {
     /// Seed a usable enrollment voucher by its `SHA-256` hash (issued in person).
     pub fn add_voucher(&self, voucher_hash: [u8; 32]) {
         self.inner.lock().unwrap().vouchers.insert(voucher_hash);
+    }
+
+    /// Seed a user's advisory roles (test/dev) — drives the coarse admin gate.
+    pub fn set_roles(&self, user_id: [u8; 16], roles: Vec<Role>) {
+        self.inner.lock().unwrap().roles.insert(user_id, roles);
     }
 }
 
@@ -306,6 +354,47 @@ impl Store for MemoryStore {
             .get(user_id)
             .map(|(_, b)| b.clone()))
     }
+
+    async fn append_control(
+        &self,
+        record_bytes: Vec<u8>,
+        sig: [u8; 64],
+        co_sig: Option<[u8; 64]>,
+    ) -> Result<[u8; 32], ControlAppendError> {
+        let d = decode_control(&record_bytes).ok_or(ControlAppendError::Malformed)?;
+        let mut inner = self.inner.lock().unwrap();
+        if d.prev_head != inner.control_head {
+            return Err(ControlAppendError::Conflict); // gap/stale/concurrent
+        }
+        inner.control_head = d.head;
+        inner.control_log.push(StoredControlRecord {
+            kind: d.kind,
+            record_bytes,
+            sig,
+            co_sig,
+            head: d.head,
+        });
+        Ok(d.head)
+    }
+
+    async fn control_records(&self) -> Result<Vec<StoredControlRecord>, StoreError> {
+        Ok(self.inner.lock().unwrap().control_log.clone())
+    }
+
+    async fn control_head(&self) -> Result<[u8; 32], StoreError> {
+        Ok(self.inner.lock().unwrap().control_head)
+    }
+
+    async fn user_roles(&self, user_id: &[u8; 16]) -> Result<Vec<Role>, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .roles
+            .get(user_id)
+            .cloned()
+            .unwrap_or_else(|| vec![Role::User]))
+    }
 }
 
 /// A [`Store`] whose every method returns `Err(StoreError)` — used to prove the
@@ -393,5 +482,22 @@ impl Store for FaultyStore {
         _user_id: &[u8; 16],
     ) -> Result<Option<StoredBinding>, StoreError> {
         Err(Self::fault("binding_by_user_id"))
+    }
+    async fn append_control(
+        &self,
+        _record_bytes: Vec<u8>,
+        _sig: [u8; 64],
+        _co_sig: Option<[u8; 64]>,
+    ) -> Result<[u8; 32], ControlAppendError> {
+        Err(ControlAppendError::Store(Self::fault("append_control")))
+    }
+    async fn control_records(&self) -> Result<Vec<StoredControlRecord>, StoreError> {
+        Err(Self::fault("control_records"))
+    }
+    async fn control_head(&self) -> Result<[u8; 32], StoreError> {
+        Err(Self::fault("control_head"))
+    }
+    async fn user_roles(&self, _user_id: &[u8; 16]) -> Result<Vec<Role>, StoreError> {
+        Err(Self::fault("user_roles"))
     }
 }

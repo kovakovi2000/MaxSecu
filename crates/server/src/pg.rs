@@ -24,12 +24,14 @@ use maxsecu_crypto::random_array;
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::DirBinding;
 use maxsecu_encoding::types::Role;
+use maxsecu_encoding::GENESIS_HEAD;
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::Row;
 use time::OffsetDateTime;
 
-use crate::error::StoreError;
-use crate::store::{SessionRecord, StoredBinding, Store, UserRecord};
+use crate::control::{decode_control, role_from_text, role_text};
+use crate::error::{ControlAppendError, StoreError};
+use crate::store::{SessionRecord, StoredBinding, StoredControlRecord, Store, UserRecord};
 
 /// Postgres [`Store`]. Cheap to clone (the pool is an `Arc` internally).
 #[derive(Clone)]
@@ -325,13 +327,94 @@ impl Store for PgStore {
         .map_err(store_err("binding_by_user_id"))?;
         binding_from_row(row, "binding_by_user_id")
     }
-}
 
-/// The lowercase role text stored in the advisory `roles TEXT[]` projection.
-fn role_text(r: &Role) -> String {
-    match r {
-        Role::User => "user".to_owned(),
-        Role::Admin => "admin".to_owned(),
+    async fn append_control(
+        &self,
+        record_bytes: Vec<u8>,
+        sig: [u8; 64],
+        co_sig: Option<[u8; 64]>,
+    ) -> Result<[u8; 32], ControlAppendError> {
+        let d = decode_control(&record_bytes).ok_or(ControlAppendError::Malformed)?;
+        // Pre-check the head for a clean Conflict; the append-guard trigger is the
+        // authoritative defense-in-depth (and the race winner under concurrency).
+        let current = self
+            .control_head()
+            .await
+            .map_err(ControlAppendError::Store)?;
+        if d.prev_head != current {
+            return Err(ControlAppendError::Conflict);
+        }
+        let effective_from = match d.effective_from_ms {
+            Some(ms) => Some(try_ms_to_ts(ms, "append_control").map_err(ControlAppendError::Store)?),
+            None => None,
+        };
+        let res = sqlx::query(
+            "INSERT INTO control_log \
+             (kind, prev_head, head, record_bytes, sig, co_sig, issued_by, co_signed_by, \
+              is_account_wide, scope_file_id, subject_user_id, revoked_capability, from_version, \
+              scope_epoch, supersedes_epoch, compromised_key_version, effective_from) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
+        )
+        .bind(d.kind)
+        .bind(&d.prev_head[..])
+        .bind(&d.head[..])
+        .bind(&record_bytes)
+        .bind(&sig[..])
+        .bind(co_sig.as_ref().map(|s| &s[..]))
+        .bind(&d.issued_by[..])
+        .bind(d.co_signed_by.as_ref().map(|i| &i[..]))
+        .bind(d.is_account_wide)
+        .bind(d.scope_file_id.as_ref().map(|i| &i[..]))
+        .bind(&d.subject_user_id[..])
+        .bind(d.revoked_capability)
+        .bind(d.from_version)
+        .bind(d.scope_epoch)
+        .bind(d.supersedes_epoch)
+        .bind(d.compromised_key_version)
+        .bind(effective_from)
+        .execute(&self.pool)
+        .await;
+        match res {
+            Ok(_) => Ok(d.head),
+            // The append-guard trigger raises P0001 on a prev_head mismatch (a
+            // concurrent append won the race) → Conflict, not a server fault.
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("P0001") => {
+                Err(ControlAppendError::Conflict)
+            }
+            Err(e) => Err(ControlAppendError::Store(store_err("append_control")(e))),
+        }
+    }
+
+    async fn control_records(&self) -> Result<Vec<StoredControlRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT kind, record_bytes, sig, co_sig, head FROM control_log ORDER BY chain_seq",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err("control_records"))?;
+        rows.iter().map(control_record_from_row).collect()
+    }
+
+    async fn control_head(&self) -> Result<[u8; 32], StoreError> {
+        let row = sqlx::query("SELECT head FROM control_log ORDER BY chain_seq DESC LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_err("control_head"))?;
+        match row {
+            Some(row) => col_fixed(&row, "control_head", "head"),
+            None => Ok(GENESIS_HEAD.0),
+        }
+    }
+
+    async fn user_roles(&self, user_id: &[u8; 16]) -> Result<Vec<Role>, StoreError> {
+        let row = sqlx::query("SELECT roles FROM users WHERE user_id = $1")
+            .bind(&user_id[..])
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_err("user_roles"))?;
+        let Some(row) = row else { return Ok(Vec::new()) };
+        let roles: Vec<String> = row.try_get("roles").map_err(store_err("user_roles"))?;
+        Ok(roles.iter().filter_map(|s| role_from_text(s)).collect())
     }
 }
 
@@ -346,4 +429,27 @@ fn binding_from_row(
         binding_bytes,
         signature: col_fixed(&row, op, "directory_signature")?,
     }))
+}
+
+/// Map a `control_log` row to a [`StoredControlRecord`] (a present-but-wrong-width
+/// `co_sig` is a data-integrity fault, not a missing co-signature).
+fn control_record_from_row(row: &PgRow) -> Result<StoredControlRecord, StoreError> {
+    let op = "control_records";
+    let kind: i16 = row.try_get("kind").map_err(store_err(op))?;
+    let record_bytes: Vec<u8> = row.try_get("record_bytes").map_err(store_err(op))?;
+    let co_sig: Option<Vec<u8>> = row.try_get("co_sig").map_err(store_err(op))?;
+    let co_sig = match co_sig {
+        Some(v) => Some(
+            v.try_into()
+                .map_err(|_| StoreError::new(op, "co_sig has unexpected width"))?,
+        ),
+        None => None,
+    };
+    Ok(StoredControlRecord {
+        kind,
+        record_bytes,
+        sig: col_fixed(row, op, "sig")?,
+        co_sig,
+        head: col_fixed(row, op, "head")?,
+    })
 }

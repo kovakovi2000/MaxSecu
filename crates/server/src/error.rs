@@ -92,3 +92,16 @@ pub enum ProveError {
     RateLimited { retry_after_s: u64 },
     Internal(StoreError),
 }
+
+/// Outcome of appending a control-log record (api.md §7.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlAppendError {
+    /// The record's `prev_head` did not match the current chain head — a stale
+    /// or concurrent append (→ 409). The issuer must re-fetch the head and rebuild.
+    Conflict,
+    /// The bytes were not a canonical revocation/reinstatement/key-compromise
+    /// record (→ 400).
+    Malformed,
+    /// A backend fault (→ 500).
+    Store(StoreError),
+}

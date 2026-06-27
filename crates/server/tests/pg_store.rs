@@ -368,6 +368,72 @@ async fn directory_binding_persists_and_latest_version_serves() {
     db.teardown().await;
 }
 
+fn revocation_bytes(prev_head: [u8; 32], epoch: u64, victim: u8, issuer: [u8; 16]) -> Vec<u8> {
+    use maxsecu_encoding::structs::Revocation;
+    use maxsecu_encoding::types::FileScope;
+    encode(&Revocation {
+        scope: FileScope::Specific(Id([0x0A; 16])),
+        revoked_user_id: Id([victim; 16]),
+        revoked_capability: None,
+        from_version: 1,
+        revocation_epoch: epoch,
+        prev_head: Bytes32(prev_head),
+        issued_by: Id(issuer),
+        co_signed_by: None,
+        created_at: Timestamp(1_719_500_000_000),
+    })
+}
+
+/// The control-log chain appends, serves in order, persists, and the append-guard
+/// trigger rejects a fork (a stale `prev_head`) as a Conflict.
+#[tokio::test]
+async fn control_log_chain_appends_serves_and_rejects_forks() {
+    use maxsecu_server::ControlAppendError;
+    let db = db_or_skip!();
+    let genesis = [0u8; 32];
+    // issued_by has a FK to users — seed the admin issuer.
+    let issuer: [u8; 16] = random_array();
+    sqlx::query("INSERT INTO users (user_id, username, enc_pub, sig_pub) VALUES ($1,$2,$3,$4)")
+        .bind(&issuer[..])
+        .bind("ctl-admin")
+        .bind(&[0xAAu8; 32][..])
+        .bind(&[0xBBu8; 32][..])
+        .execute(db.store.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.store.control_head().await.unwrap(),
+        genesis,
+        "empty chain head is GENESIS_HEAD"
+    );
+
+    let r1 = revocation_bytes(genesis, 1, 0x99, issuer);
+    let head1 = db.store.append_control(r1.clone(), [0xCC; 64], None).await.unwrap();
+    assert_eq!(db.store.control_head().await.unwrap(), head1);
+
+    let r2 = revocation_bytes(head1, 2, 0x98, issuer);
+    let head2 = db.store.append_control(r2.clone(), [0xDD; 64], None).await.unwrap();
+
+    // Serve in append order through a fresh pool (truly persisted).
+    let store2 = db.reopen().await;
+    let recs = store2.control_records().await.unwrap();
+    assert_eq!(recs.len(), 2);
+    assert_eq!(recs[0].record_bytes, r1);
+    assert_eq!(recs[1].record_bytes, r2);
+    assert_eq!(recs[1].head, head2);
+    assert_eq!(recs[0].kind, 6);
+
+    // A fork (prev_head = GENESIS again) is rejected by the append guard.
+    let fork = revocation_bytes(genesis, 3, 0x97, issuer);
+    assert!(matches!(
+        db.store.append_control(fork, [0xEE; 64], None).await,
+        Err(ControlAppendError::Conflict)
+    ));
+
+    db.teardown().await;
+}
+
 /// Unknown user → `user_by_name` is `None`; a seeded user round-trips exactly.
 #[tokio::test]
 async fn user_by_name_round_trips() {

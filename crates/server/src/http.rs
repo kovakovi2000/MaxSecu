@@ -9,8 +9,9 @@
 //! was bound to (api.md §1.5).
 
 use crate::auth::AuthService;
-use crate::error::{AuthError, ChallengeError, ProveError};
+use crate::error::{AuthError, ChallengeError, ControlAppendError, ProveError};
 use crate::store::Store;
+use maxsecu_encoding::types::Role;
 use axum::extract::{FromRequestParts, Json, Path, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{request::Parts, StatusCode};
@@ -50,6 +51,12 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         .route("/v1/session/logout", post(logout::<S>))
         .route("/v1/directory/by-id/{user_id}", get(directory_by_id::<S>))
         .route("/v1/directory/{username}", get(directory_by_username::<S>))
+        .route(
+            "/v1/revocations",
+            get(get_revocations::<S>).post(post_control::<S>),
+        )
+        .route("/v1/reinstatements", post(post_control::<S>))
+        .route("/v1/key-compromise", post(post_control::<S>))
         .with_state(state)
 }
 
@@ -290,6 +297,114 @@ async fn directory_by_id<S: Store>(
     match st.auth.store().binding_by_user_id(&user_id).await {
         Ok(b) => binding_response(b),
         Err(e) => internal_error(e),
+    }
+}
+
+// ---- Revocation control-log (api.md §7) ----
+
+fn b64_vec(s: &str) -> Option<Vec<u8>> {
+    B64.decode(s).ok()
+}
+
+fn kind_str(kind: i16) -> &'static str {
+    match kind {
+        6 => "revocation",
+        7 => "reinstatement",
+        8 => "key_compromise",
+        _ => "unknown",
+    }
+}
+
+#[derive(Serialize)]
+struct ControlRecordJson {
+    kind: String,
+    record_b64: String,
+    sig_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    co_sig_b64: Option<String>,
+    chain_head_b64: String,
+}
+
+#[derive(Serialize)]
+struct RevocationsRes {
+    records: Vec<ControlRecordJson>,
+    next_cursor: Option<String>,
+}
+
+/// `GET /v1/revocations` — serve the whole chain in append order (api.md §7.1).
+/// The client links each `prev_head` and checks the final head against the
+/// sink-anchored head; the server's heads are advisory.
+async fn get_revocations<S: Store>(State(st): State<AppState<S>>) -> Response {
+    match st.auth.store().control_records().await {
+        Ok(records) => Json(RevocationsRes {
+            records: records
+                .iter()
+                .map(|r| ControlRecordJson {
+                    kind: kind_str(r.kind).to_owned(),
+                    record_b64: b64encode(&r.record_bytes),
+                    sig_b64: b64encode(&r.sig),
+                    co_sig_b64: r.co_sig.map(|c| b64encode(&c)),
+                    chain_head_b64: b64encode(&r.head),
+                })
+                .collect(),
+            next_cursor: None,
+        })
+        .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ControlReq {
+    record_b64: String,
+    sig_b64: String,
+    co_sig_b64: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ChainHeadRes {
+    chain_head_b64: String,
+}
+
+/// `POST /v1/revocations | /v1/reinstatements | /v1/key-compromise` — append a
+/// control-log record (api.md §7.2). **Coarse** admin gate only (§10.1): the
+/// authenticated caller must hold the advisory `admin` role; the record's own
+/// authenticity (issuer admin-signature, dual control) is re-verified client-side.
+/// The record's authenticated `kind` governs — the path is cosmetic.
+async fn post_control<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Json(req): Json<ControlReq>,
+) -> Response {
+    match st.auth.store().user_roles(&session.user_id).await {
+        Ok(roles) if roles.contains(&Role::Admin) => {}
+        Ok(_) => return StatusCode::FORBIDDEN.into_response(), // not an admin
+        Err(e) => return internal_error(e),
+    }
+    let Some(record) = b64_vec(&req.record_b64) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(sig) = b64_fixed::<64>(&req.sig_b64) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let co_sig = match req.co_sig_b64.as_deref() {
+        None => None,
+        Some(s) => match b64_fixed::<64>(s) {
+            Some(c) => Some(c),
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+    };
+    match st.auth.store().append_control(record, sig, co_sig).await {
+        Ok(head) => (
+            StatusCode::CREATED,
+            Json(ChainHeadRes {
+                chain_head_b64: b64encode(&head),
+            }),
+        )
+            .into_response(),
+        Err(ControlAppendError::Conflict) => StatusCode::CONFLICT.into_response(),
+        Err(ControlAppendError::Malformed) => StatusCode::BAD_REQUEST.into_response(),
+        Err(ControlAppendError::Store(e)) => internal_error(e),
     }
 }
 
@@ -715,6 +830,177 @@ mod tests {
         // An account with no signed binding is not a recipient → 404.
         let (st3, _) = get_json(&router, "/v1/directory/nobody").await;
         assert_eq!(st3, StatusCode::NOT_FOUND);
+    }
+
+    async fn post_json_auth(
+        router: &Router,
+        uri: &str,
+        body: serde_json::Value,
+        token: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header(AUTHORIZATION, format!("MaxSecu-Session {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, json)
+    }
+
+    async fn login(router: &Router, username: &str, sk: &SigningKey) -> String {
+        let (_st, ch) = post_json(
+            router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": username }),
+        )
+        .await;
+        let nonce = b64_fixed::<32>(ch["nonce_b64"].as_str().unwrap()).unwrap();
+        let server_id = ch["server_id"].as_str().unwrap();
+        let ts = 1_719_500_000_000u64;
+        let proof_b64 = make_proof(sk, server_id, &EXPORTER, &nonce, ts);
+        let (_st, res) = post_json(
+            router,
+            "/v1/session/proof",
+            serde_json::json!({"username": username, "timestamp": ts, "proof_b64": proof_b64}),
+        )
+        .await;
+        res["session_token"].as_str().unwrap().to_owned()
+    }
+
+    fn admin_app() -> (Router, SigningKey, SigningKey) {
+        let store = MemoryStore::new();
+        let admin_sk = SigningKey::generate();
+        store.add_user(
+            "admin",
+            UserRecord {
+                user_id: [0xAD; 16],
+                enc_pub: [0xE1; 32],
+                sig_pub: admin_sk.verifying_key().to_bytes(),
+            },
+        );
+        store.set_roles([0xAD; 16], vec![Role::User, Role::Admin]);
+        let bob_sk = SigningKey::generate();
+        store.add_user(
+            "bob",
+            UserRecord {
+                user_id: [0xB0; 16],
+                enc_pub: [0xE2; 32],
+                sig_pub: bob_sk.verifying_key().to_bytes(),
+            },
+        );
+        let router = router(AppState {
+            auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        })
+        .layer(Extension(TlsExporter(EXPORTER)));
+        (router, admin_sk, bob_sk)
+    }
+
+    // Build a single-file revocation chaining to `prev_head` (server doesn't
+    // verify the issuer sig — that's client-side — so a placeholder sig suffices).
+    fn revocation_b64(prev_head: [u8; 32], epoch: u64, victim: u8) -> (String, String) {
+        use maxsecu_encoding::structs::Revocation;
+        use maxsecu_encoding::types::{Bytes32, FileScope, Id, Timestamp};
+        let rec = Revocation {
+            scope: FileScope::Specific(Id([0x0A; 16])),
+            revoked_user_id: Id([victim; 16]),
+            revoked_capability: None,
+            from_version: 1,
+            revocation_epoch: epoch,
+            prev_head: Bytes32(prev_head),
+            issued_by: Id([0xAD; 16]),
+            co_signed_by: None,
+            created_at: Timestamp(1_719_500_000_000),
+        };
+        (
+            b64encode(&maxsecu_encoding::encode(&rec)),
+            b64encode(&[0xCC; 64]),
+        )
+    }
+
+    #[tokio::test]
+    async fn control_log_append_serve_and_admin_gate() {
+        let (router, admin_sk, bob_sk) = admin_app();
+        let admin = login(&router, "admin", &admin_sk).await;
+        let genesis = [0u8; 32];
+
+        // Admin appends a revocation chaining to GENESIS_HEAD → 201 + new head.
+        let (rec1, sig1) = revocation_b64(genesis, 1, 0x99);
+        let (st, res) = post_json_auth(
+            &router,
+            "/v1/revocations",
+            serde_json::json!({"record_b64": rec1, "sig_b64": sig1}),
+            &admin,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let head1 = res["chain_head_b64"].as_str().unwrap().to_owned();
+
+        // GET serves the record byte-exactly with its kind.
+        let (st, body) = get_json(&router, "/v1/revocations").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["records"].as_array().unwrap().len(), 1);
+        assert_eq!(body["records"][0]["record_b64"].as_str().unwrap(), rec1);
+        assert_eq!(body["records"][0]["kind"], "revocation");
+
+        // A second record chaining to head1 → 201.
+        let (rec2, sig2) = revocation_b64(b64_fixed::<32>(&head1).unwrap(), 2, 0x98);
+        let (st, _) = post_json_auth(
+            &router,
+            "/v1/revocations",
+            serde_json::json!({"record_b64": rec2, "sig_b64": sig2}),
+            &admin,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+
+        // A stale append (prev_head = GENESIS again) → 409 Conflict.
+        let (rec3, sig3) = revocation_b64(genesis, 3, 0x97);
+        let (st, _) = post_json_auth(
+            &router,
+            "/v1/revocations",
+            serde_json::json!({"record_b64": rec3, "sig_b64": sig3}),
+            &admin,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
+
+        // A non-admin caller is rejected by the coarse gate → 403.
+        let bob = login(&router, "bob", &bob_sk).await;
+        let (rec4, sig4) = revocation_b64(genesis, 1, 0x96);
+        let (st, _) = post_json_auth(
+            &router,
+            "/v1/revocations",
+            serde_json::json!({"record_b64": rec4, "sig_b64": sig4}),
+            &bob,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+
+        // Malformed record bytes → 400.
+        let (st, _) = post_json_auth(
+            &router,
+            "/v1/revocations",
+            serde_json::json!({"record_b64": b64encode(&[1u8, 2, 3]), "sig_b64": b64encode(&[0xCC; 64])}),
+            &admin,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
