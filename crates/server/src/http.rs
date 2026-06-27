@@ -42,6 +42,7 @@ impl<S: Store> Clone for AppState<S> {
 /// per-connection `Extension<TlsExporter>` layer (TLS transport / test).
 pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
     Router::new()
+        .route("/v1/users", post(register::<S>))
         .route("/v1/session/challenge", post(challenge::<S>))
         .route("/v1/session/proof", post(prove::<S>))
         .route("/v1/session/logout", post(logout::<S>))
@@ -64,6 +65,14 @@ fn b64_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
     v.try_into().ok()
 }
 
+fn hex_encode(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
+}
+
 fn hex_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
     if s.len() != 2 * N {
         return None;
@@ -73,6 +82,49 @@ fn hex_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
         *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
     }
     Some(out)
+}
+
+// ---- POST /v1/users — voucher-gated enrollment (api.md §5.1) ----
+
+#[derive(Deserialize)]
+struct RegisterReq {
+    username: String,
+    enc_pub_b64: String,
+    sig_pub_b64: String,
+    enrollment_voucher: String,
+}
+
+#[derive(Serialize)]
+struct RegisterRes {
+    user_id: String, // lowercase hex (api.md §1.4)
+}
+
+async fn register<S: Store>(
+    State(st): State<AppState<S>>,
+    Json(req): Json<RegisterReq>,
+) -> Result<(StatusCode, Json<RegisterRes>), StatusCode> {
+    let enc_pub = b64_fixed::<32>(&req.enc_pub_b64).ok_or(StatusCode::BAD_REQUEST)?;
+    let sig_pub = b64_fixed::<32>(&req.sig_pub_b64).ok_or(StatusCode::BAD_REQUEST)?;
+    // Voucher is the anti-spam gate (the trust gate is the in-person ceremony).
+    // Consumed first so one voucher buys exactly one creation attempt.
+    let voucher_hash = maxsecu_crypto::sha256(req.enrollment_voucher.as_bytes());
+    if !st.auth.store().consume_voucher(&voucher_hash).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    match st
+        .auth
+        .store()
+        .create_user(&req.username, enc_pub, sig_pub)
+        .await
+    {
+        Some(user_id) => Ok((
+            StatusCode::CREATED,
+            Json(RegisterRes {
+                user_id: hex_encode(&user_id),
+            }),
+        )),
+        None => Err(StatusCode::CONFLICT), // username taken
+    }
 }
 
 // ---- POST /v1/session/challenge (api.md §2.1) ----
@@ -190,7 +242,7 @@ mod tests {
     use crate::store::{MemoryStore, UserRecord};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use maxsecu_crypto::SigningKey;
+    use maxsecu_crypto::{generate_enc_keypair, sha256, SigningKey};
     use maxsecu_encoding::labels;
     use maxsecu_encoding::structs::AuthProofContext;
     use maxsecu_encoding::types::{Bytes32, Text, Timestamp};
@@ -347,6 +399,91 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    fn app_with_vouchers(vouchers: &[&str]) -> Router {
+        let store = MemoryStore::new();
+        for v in vouchers {
+            store.add_voucher(sha256(v.as_bytes()));
+        }
+        let state = AppState {
+            auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        };
+        router(state).layer(Extension(TlsExporter(EXPORTER)))
+    }
+
+    fn register_body(sk: &SigningKey, username: &str, voucher: &str) -> serde_json::Value {
+        let (_esk, epk) = generate_enc_keypair();
+        serde_json::json!({
+            "username": username,
+            "enc_pub_b64": b64encode(&epk.to_bytes()),
+            "sig_pub_b64": b64encode(&sk.verifying_key().to_bytes()),
+            "enrollment_voucher": voucher,
+        })
+    }
+
+    #[tokio::test]
+    async fn register_with_voucher_then_login() {
+        let voucher = "in-person-code-001";
+        let router = app_with_vouchers(&[voucher]);
+        let sk = SigningKey::generate();
+        let (st, res) = post_json(&router, "/v1/users", register_body(&sk, "bob", voucher)).await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(res["user_id"].as_str().unwrap().len(), 32); // 16 bytes hex
+
+        // The freshly-registered user can complete a login end-to-end.
+        let (_st, ch) = post_json(
+            &router,
+            "/v1/session/challenge",
+            serde_json::json!({"username":"bob"}),
+        )
+        .await;
+        let nonce = b64_fixed::<32>(ch["nonce_b64"].as_str().unwrap()).unwrap();
+        let server_id = ch["server_id"].as_str().unwrap();
+        let ts = 1_719_500_000_000u64;
+        let proof_b64 = make_proof(&sk, server_id, &EXPORTER, &nonce, ts);
+        let (st, res) = post_json(
+            &router,
+            "/v1/session/proof",
+            serde_json::json!({"username":"bob","timestamp":ts,"proof_b64":proof_b64}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(res["session_token"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn reused_voucher_is_forbidden() {
+        let voucher = "one-time-code";
+        let router = app_with_vouchers(&[voucher]);
+        let sk = SigningKey::generate();
+        let (st1, _) = post_json(&router, "/v1/users", register_body(&sk, "bob", voucher)).await;
+        assert_eq!(st1, StatusCode::CREATED);
+        let (st2, _) = post_json(&router, "/v1/users", register_body(&sk, "carol", voucher)).await;
+        assert_eq!(st2, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn bad_voucher_is_forbidden() {
+        let router = app_with_vouchers(&["real-code"]);
+        let sk = SigningKey::generate();
+        let (st, _) = post_json(
+            &router,
+            "/v1/users",
+            register_body(&sk, "bob", "wrong-code"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn duplicate_username_conflicts() {
+        let router = app_with_vouchers(&["v1", "v2"]);
+        let sk = SigningKey::generate();
+        let (st1, _) = post_json(&router, "/v1/users", register_body(&sk, "bob", "v1")).await;
+        assert_eq!(st1, StatusCode::CREATED);
+        let (st2, _) = post_json(&router, "/v1/users", register_body(&sk, "bob", "v2")).await;
+        assert_eq!(st2, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
