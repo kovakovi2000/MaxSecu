@@ -11,11 +11,18 @@
 mod error;
 
 pub mod auth;
+pub mod directory;
 pub mod identity;
 pub mod keyblob;
 pub mod password;
+pub mod revocation;
 
+pub use directory::{
+    AuthorizedRecipient, DirectoryVerifier, MemoryTrustStore, TrustRecord, TrustStore,
+    VerifiedBinding, VerifyError,
+};
 pub use error::{ClientError, PasswordError};
+pub use revocation::{TombstoneError, TombstoneSet};
 pub use identity::Identity;
 
 // Re-export the Argon2 profiles so callers select a calibrated profile without

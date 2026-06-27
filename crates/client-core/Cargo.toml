@@ -13,6 +13,9 @@ zeroize = "1" # wipe transient plaintext key material (DESIGN §8.1)
 
 [dev-dependencies]
 proptest = "1"
+# Test-only: build real, validly-linked control-log chains to feed the
+# client-side verifier (the offline issuer side; not a runtime dependency).
+maxsecu-admin-core = { path = "../admin-core" }
 
 [lints.rust]
 unsafe_code = "forbid"

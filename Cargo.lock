@@ -1106,6 +1106,7 @@ dependencies = [
 name = "maxsecu-client-core"
 version = "0.0.0"
 dependencies = [
+ "maxsecu-admin-core",
  "maxsecu-crypto",
  "maxsecu-encoding",
  "proptest",
