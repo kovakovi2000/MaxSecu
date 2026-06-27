@@ -1,0 +1,18 @@
+[package]
+name = "maxsecu-admin-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "MaxSecu offline ceremony / signing core (DESIGN.md §7.1/§11.5/§12.1, Phase 2 P2.1)."
+
+# Pure, transport-agnostic core for the AIR-GAPPED trust root (DESIGN §4.1): the
+# D5 directory-signing key and admin tombstone issuance. Links the one canonical
+# encoder + crypto wrappers; no I/O, no networking — a thin bin wraps it for the
+# actual ceremony.
+[dependencies]
+maxsecu-encoding = { path = "../encoding" }
+maxsecu-crypto = { path = "../crypto" }
+
+[lints.rust]
+unsafe_code = "forbid"
