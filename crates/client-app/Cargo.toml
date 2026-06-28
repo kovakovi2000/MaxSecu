@@ -1,0 +1,24 @@
+[package]
+name = "maxsecu-client-app"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "MaxSecu media client (Tauri shell over client-core TCB)."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+maxsecu-client-core = { path = "../client-core", features = ["net"] }
+maxsecu-crypto = { path = "../crypto" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+zeroize = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
