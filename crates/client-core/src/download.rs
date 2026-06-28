@@ -8,9 +8,11 @@
 //! re-encode guard), every signature checked, every framing field bound-checked
 //! before allocation, and the DEK self-validated against the manifest commitment.
 //!
-//! Phase 3 is single-recipient (self or recovery) with owner-only write (D29),
-//! so a grant chains directly to the author; the re-share ancestor chain
-//! (§12.4b) and full tombstone-completeness evaluation are Phase 4/5.
+//! A leaf wrap-grant either chains directly to the version author (owner-only
+//! write, D29) or via re-share ancestor grants (§12.4b/§12.5), each intermediate
+//! granter's key directory-resolved (§7.2) — see [`verify_grant_chain`], bounded
+//! by [`MAX_GRANT_CHAIN_DEPTH`] and cycle-guarded. Full tombstone-completeness
+//! evaluation against the sink-anchored head is Phase 5.
 
 use maxsecu_crypto::{
     open_stream, open_stream_streaming, stream_digest, unwrap_dek, Dek, EncSecretKey, VerifyingKey,
@@ -20,9 +22,12 @@ use maxsecu_encoding::structs::{Genesis, Grant, Manifest, WrapContext};
 use maxsecu_encoding::types::{Compression, FileType, Id, RecipientType, StreamType};
 use maxsecu_encoding::{decode, labels, Canonical, RECOVERY_ID};
 
+use std::collections::{HashMap, HashSet};
+
 use crate::error::DownloadError;
 use crate::limits::{
     CHUNK_SIZE_MAX, CHUNK_SIZE_MIN, FIRST_CONTACT_VERSION_CEILING, MAX_ADDRESSABLE_BYTES,
+    MAX_GRANT_CHAIN_DEPTH,
 };
 
 /// One stream's ordered ciphertext chunks as served (api.md §9.2).
@@ -42,6 +47,10 @@ pub struct DownloadBundle {
     pub wrapped_dek: WrappedDek,
     pub grant_bytes: Vec<u8>,
     pub grant_sig: [u8; 64],
+    /// The re-share ancestor grants (each `canonical(grant)` + sig) needed to
+    /// chain the caller's leaf grant up to the version author (api.md §8.5
+    /// `ancestor_grants`). Empty for an author-rooted (non-re-shared) wrap.
+    pub ancestor_grants: Vec<(Vec<u8>, [u8; 64])>,
     /// The recovery recipient's grant (grant only, for the presence check).
     pub recovery_grant_bytes: Vec<u8>,
     pub recovery_grant_sig: [u8; 64],
@@ -66,6 +75,21 @@ pub struct VerifyContext<'a> {
     /// Highest `version` accepted for this file (trust-on-last-use), or `None`
     /// at first contact (§7.5). Supplied/persisted by the version-memory store.
     pub seen_max_version: Option<u64>,
+    /// Resolves an intermediate re-share granter's **directory-verified** Ed25519
+    /// `sig_pub` (§7.2), or `None` if it cannot be authenticated. Consulted only
+    /// when a leaf/ancestor grant's `granted_by` is *not* the version author; an
+    /// author-rooted wrap never calls it. Pass [`NO_GRANTERS`] when no re-share
+    /// chain is expected.
+    pub granter_sig_pub: &'a dyn Fn(Id) -> Option<[u8; 32]>,
+}
+
+/// A granter resolver that authenticates no one — for callers with no re-share
+/// ancestor chain (every grant is author-rooted). `'static`, so it can back a
+/// [`VerifyContext`] returned from a helper.
+pub static NO_GRANTERS: fn(Id) -> Option<[u8; 32]> = no_granters;
+
+fn no_granters(_: Id) -> Option<[u8; 32]> {
+    None
 }
 
 /// One decrypted (and, later, decompressed) stream.
@@ -136,6 +160,7 @@ fn verify_header(
     genesis_sig: &[u8; 64],
     grant_bytes: &[u8],
     grant_sig: &[u8; 64],
+    ancestor_grants: &[(Vec<u8>, [u8; 64])],
     recovery_grant_bytes: &[u8],
     recovery_grant_sig: &[u8; 64],
     wrapped_dek: &WrappedDek,
@@ -171,12 +196,12 @@ fn verify_header(
     // (4) Freshness / rollback (clock-independent, §7.5/D23).
     version_acceptable(manifest.version, ctx.seen_max_version)?;
 
-    // (5) The caller's own read-grant: decode, verify, chain to the author.
+    // (5) The caller's own read-grant: decode, field-bind to this exact
+    // file/version/recipient/DEK, then verify it chains to the version author —
+    // directly (author edge) or via re-share edges (§12.3a/§12.5).
     let grant: Grant = decode(grant_bytes).map_err(|_| BadGrant)?;
-    if !verify(&ctx.author_sig_pub, labels::GRANT, &grant, grant_sig) {
-        return Err(GrantSignature);
-    }
-    check_grant(&grant, &manifest, ctx, genesis.owner_id)?;
+    check_grant_fields(&grant, &manifest, ctx)?;
+    verify_grant_chain(&grant, grant_sig, ancestor_grants, &manifest, ctx)?;
 
     // (6) Recovery-grant presence — an anomaly flag, never a hard rejection.
     let recovery_grant_ok = recovery_grant_valid(
@@ -217,6 +242,7 @@ pub fn verify_and_open(
         &bundle.genesis_sig,
         &bundle.grant_bytes,
         &bundle.grant_sig,
+        &bundle.ancestor_grants,
         &bundle.recovery_grant_bytes,
         &bundle.recovery_grant_sig,
         &bundle.wrapped_dek,
@@ -273,14 +299,10 @@ fn verify<T: Canonical>(pubkey: &[u8; 32], label: &str, v: &T, sig: &[u8; 64]) -
         .is_ok()
 }
 
-/// Check the caller's grant binds this exact file/version/recipient/DEK and
-/// chains to the author (owner, in Phase 3). A mismatch ⇒ the wrap is absent.
-fn check_grant(
-    g: &Grant,
-    m: &Manifest,
-    ctx: &VerifyContext,
-    owner_id: Id,
-) -> Result<(), DownloadError> {
+/// Check the caller's leaf grant binds this exact file/version/recipient/DEK
+/// (its `granted_by` chain is verified separately by [`verify_grant_chain`]). A
+/// mismatch ⇒ the wrap is treated as absent (§12.3a).
+fn check_grant_fields(g: &Grant, m: &Manifest, ctx: &VerifyContext) -> Result<(), DownloadError> {
     use DownloadError::GrantMismatch;
     if g.file_id != ctx.file_id {
         return Err(GrantMismatch("file_id"));
@@ -297,12 +319,85 @@ fn check_grant(
     if g.dek_commit != m.dek_commit {
         return Err(GrantMismatch("dek_commit"));
     }
-    // Owner-only write (D29): the version author is the owner, and a Phase-3
-    // grant is author-rooted, so `granted_by` must be the owner.
-    if g.granted_by != owner_id {
-        return Err(GrantMismatch("granted_by"));
+    Ok(())
+}
+
+/// An ancestor (re-share) grant must bind this exact file/version/DEK and grant
+/// to a `user` recipient (a re-sharer held a real wrap, §12.3a).
+fn check_ancestor_fields(g: &Grant, m: &Manifest) -> Result<(), DownloadError> {
+    use DownloadError::GrantMismatch;
+    if g.file_id != m.file_id {
+        return Err(GrantMismatch("ancestor file_id"));
+    }
+    if g.file_version != m.version {
+        return Err(GrantMismatch("ancestor file_version"));
+    }
+    if g.dek_commit != m.dek_commit {
+        return Err(GrantMismatch("ancestor dek_commit"));
+    }
+    if g.recipient_type != RecipientType::User {
+        return Err(GrantMismatch("ancestor recipient_type"));
     }
     Ok(())
+}
+
+/// Verify the caller's leaf grant chains to the version author (§12.5 step 5):
+/// directly when `granted_by == author_id` (author edge, verified under the
+/// author's directory key), or via a re-share chain where each intermediate
+/// granter's grant is verified under that granter's **directory-verified**
+/// `sig_pub` (§7.2, resolved by `ctx.granter_sig_pub`) and the granter must
+/// itself hold a grant for this version. Both author and re-share edges entail
+/// the granter actually held the DEK, so any verified chain is
+/// possession-entailing (carry-forward-eligible, §12.9). Fail closed on a broken
+/// chain, an unknown granter key, a cycle, or a chain past the depth cap.
+fn verify_grant_chain(
+    leaf: &Grant,
+    leaf_sig: &[u8; 64],
+    ancestors: &[(Vec<u8>, [u8; 64])],
+    m: &Manifest,
+    ctx: &VerifyContext,
+) -> Result<(), DownloadError> {
+    use DownloadError::*;
+
+    // Decode each ancestor once, field-bind it, and index by the recipient it
+    // grants to (so a granter's own grant is found by id during the walk).
+    let mut by_recipient: HashMap<Id, (Grant, [u8; 64])> = HashMap::new();
+    for (bytes, sig) in ancestors {
+        let g: Grant = decode(bytes).map_err(|_| BadGrant)?;
+        check_ancestor_fields(&g, m)?;
+        by_recipient.insert(g.recipient_id, (g, *sig));
+    }
+
+    let author = m.author_id;
+    let mut visited: HashSet<Id> = HashSet::new();
+    let mut current: &Grant = leaf;
+    let mut current_sig: &[u8; 64] = leaf_sig;
+    let mut depth = 0usize;
+    loop {
+        let granter = current.granted_by;
+        if granter == author {
+            // Author edge: the root, verified under the author's directory key.
+            if !verify(&ctx.author_sig_pub, labels::GRANT, current, current_sig) {
+                return Err(GrantSignature);
+            }
+            return Ok(());
+        }
+        // Re-share edge: bounded depth, directory-resolved granter key.
+        if depth >= MAX_GRANT_CHAIN_DEPTH {
+            return Err(GrantChainTooDeep);
+        }
+        let granter_pub = (ctx.granter_sig_pub)(granter).ok_or(GranterKeyUnknown)?;
+        if !verify(&granter_pub, labels::GRANT, current, current_sig) {
+            return Err(GrantSignature);
+        }
+        if !visited.insert(granter) {
+            return Err(GrantChainCycle);
+        }
+        let (next, next_sig) = by_recipient.get(&granter).ok_or(GrantChainBroken)?;
+        current = next;
+        current_sig = next_sig;
+        depth += 1;
+    }
 }
 
 /// Is a valid author recovery grant present for this version? (Presence check
@@ -339,6 +434,9 @@ pub struct StreamHeader {
     pub wrapped_dek: WrappedDek,
     pub grant_bytes: Vec<u8>,
     pub grant_sig: [u8; 64],
+    /// The re-share ancestor grants chaining the leaf grant to the author
+    /// (api.md §8.5); empty for an author-rooted wrap.
+    pub ancestor_grants: Vec<(Vec<u8>, [u8; 64])>,
     pub recovery_grant_bytes: Vec<u8>,
     pub recovery_grant_sig: [u8; 64],
     /// Every manifest stream except `content`, served whole (these are small —
@@ -393,6 +491,7 @@ where
         &header.genesis_sig,
         &header.grant_bytes,
         &header.grant_sig,
+        &header.ancestor_grants,
         &header.recovery_grant_bytes,
         &header.recovery_grant_sig,
         &header.wrapped_dek,
@@ -541,6 +640,7 @@ mod tests {
             wrapped_dek: sw.wrapped_dek.clone(),
             grant_bytes: encode(&sw.grant),
             grant_sig: sw.grant_sig,
+            ancestor_grants: vec![],
             recovery_grant_bytes: encode(&rw.grant),
             recovery_grant_sig: rw.grant_sig,
             streams: b
@@ -564,6 +664,7 @@ mod tests {
             recipient_type: RecipientType::User,
             recipient_secret: built.owner.enc_secret(),
             seen_max_version: None,
+            granter_sig_pub: &NO_GRANTERS,
         }
     }
 
@@ -612,6 +713,7 @@ mod tests {
             wrapped_dek: sw.wrapped_dek.clone(),
             grant_bytes: encode(&sw.grant),
             grant_sig: sw.grant_sig,
+            ancestor_grants: vec![],
             recovery_grant_bytes: encode(&rw.grant),
             recovery_grant_sig: rw.grant_sig,
             small_streams: small,
@@ -729,6 +831,7 @@ mod tests {
             recipient_type: RecipientType::Recovery,
             recipient_secret: &built.recovery_sk,
             seen_max_version: None,
+            granter_sig_pub: &NO_GRANTERS,
         };
         let opened = verify_and_open(&c, &db).expect("recovery opens");
         assert_eq!(opened.version, 1);
@@ -803,6 +906,7 @@ mod tests {
             recipient_type: RecipientType::User,
             recipient_secret: owner.enc_secret(),
             seen_max_version: None,
+            granter_sig_pub: &NO_GRANTERS,
         };
         assert!(matches!(
             verify_and_open(&c, &db),
@@ -885,6 +989,305 @@ mod tests {
         assert!(!opened.recovery_grant_ok, "recovery anomaly flagged");
     }
 
+    /// Build R (author-rooted recipient) and V (re-shared by R), recovering the
+    /// DEK from the owner self-wrap so the test can forge real wraps to both.
+    /// Returns V's download bundle, V's identity, and R's signing pubkey.
+    const R_ID: Id = Id([0x22; 16]);
+    const V_ID: Id = Id([0x33; 16]);
+
+    fn reshare_chain(built: &Built) -> (DownloadBundle, Identity, Identity) {
+        let b = &built.bundle;
+        let sw = b
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == RecipientType::User)
+            .unwrap();
+        let owner_ctx = WrapContext {
+            file_id: FILE_ID,
+            version: 1,
+            recipient_id: OWNER_ID,
+        };
+        let dek = unwrap_dek(built.owner.enc_secret(), &sw.wrapped_dek, &owner_ctx).unwrap();
+        let dek_commit = Bytes32(dek.commit());
+
+        // R: author granted R directly (granted_by = owner).
+        let r = Identity::generate();
+        let r_ctx = WrapContext {
+            file_id: FILE_ID,
+            version: 1,
+            recipient_id: R_ID,
+        };
+        let _r_wrap = wrap_dek(&EncPublicKey::from_bytes(r.enc_pub_bytes()), &dek, &r_ctx).unwrap();
+        let r_grant = Grant {
+            file_id: FILE_ID,
+            file_version: 1,
+            recipient_id: R_ID,
+            recipient_type: RecipientType::User,
+            dek_commit,
+            granted_by: OWNER_ID,
+            created_at: NOW,
+        };
+        let r_grant_sig = built.owner.signing_key().sign_canonical(labels::GRANT, &r_grant);
+
+        // V: re-shared by R (granted_by = R), signed with R's own key.
+        let v = Identity::generate();
+        let v_ctx = WrapContext {
+            file_id: FILE_ID,
+            version: 1,
+            recipient_id: V_ID,
+        };
+        let v_wrap = wrap_dek(&EncPublicKey::from_bytes(v.enc_pub_bytes()), &dek, &v_ctx).unwrap();
+        let v_grant = Grant {
+            file_id: FILE_ID,
+            file_version: 1,
+            recipient_id: V_ID,
+            recipient_type: RecipientType::User,
+            dek_commit,
+            granted_by: R_ID,
+            created_at: NOW,
+        };
+        let v_grant_sig = r.signing_key().sign_canonical(labels::GRANT, &v_grant);
+
+        let rw = b
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == RecipientType::Recovery)
+            .unwrap();
+        let bundle = DownloadBundle {
+            manifest_bytes: encode(&b.manifest),
+            manifest_sig: b.manifest_sig,
+            genesis_bytes: encode(&b.genesis),
+            genesis_sig: b.genesis_sig,
+            wrapped_dek: v_wrap,
+            grant_bytes: encode(&v_grant),
+            grant_sig: v_grant_sig,
+            ancestor_grants: vec![(encode(&r_grant), r_grant_sig)],
+            recovery_grant_bytes: encode(&rw.grant),
+            recovery_grant_sig: rw.grant_sig,
+            streams: b
+                .streams
+                .iter()
+                .map(|s| StreamChunks {
+                    stream_type: s.stream_type,
+                    chunks: s.chunks.clone(),
+                })
+                .collect(),
+        };
+        (bundle, v, r)
+    }
+
+    #[test]
+    fn reshared_recipient_chains_to_author_and_opens() {
+        let built = build();
+        let (bundle, v, r) = reshare_chain(&built);
+        let r_pub = r.sig_pub_bytes();
+        let resolver = move |id: Id| (id == R_ID).then_some(r_pub);
+        let owner_pub = built.owner.sig_pub_bytes();
+        let vctx = VerifyContext {
+            file_id: FILE_ID,
+            author_sig_pub: owner_pub,
+            owner_sig_pub: owner_pub,
+            recipient_id: V_ID,
+            recipient_type: RecipientType::User,
+            recipient_secret: v.enc_secret(),
+            seen_max_version: None,
+            granter_sig_pub: &resolver,
+        };
+        let opened = verify_and_open(&vctx, &bundle).expect("re-shared read chains to author");
+        let content = opened
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .unwrap();
+        assert_eq!(
+            content.plaintext,
+            b"the quick brown fox jumps over the lazy dog"
+        );
+    }
+
+    /// Build a V-recipient context whose resolver maps `R_ID` to `r`'s key.
+    fn reshare_ctx<'a>(
+        built: &'a Built,
+        v: &'a Identity,
+        resolver: &'a dyn Fn(Id) -> Option<[u8; 32]>,
+    ) -> VerifyContext<'a> {
+        let owner_pub = built.owner.sig_pub_bytes();
+        VerifyContext {
+            file_id: FILE_ID,
+            author_sig_pub: owner_pub,
+            owner_sig_pub: owner_pub,
+            recipient_id: V_ID,
+            recipient_type: RecipientType::User,
+            recipient_secret: v.enc_secret(),
+            seen_max_version: None,
+            granter_sig_pub: resolver,
+        }
+    }
+
+    #[test]
+    fn forged_ancestor_grant_signature_is_rejected() {
+        let built = build();
+        let (mut bundle, v, r) = reshare_chain(&built);
+        bundle.ancestor_grants[0].1[0] ^= 0x01; // corrupt R's grant signature
+        let r_pub = r.sig_pub_bytes();
+        let resolver = move |id: Id| (id == R_ID).then_some(r_pub);
+        assert_eq!(
+            verify_and_open(&reshare_ctx(&built, &v, &resolver), &bundle),
+            Err(DownloadError::GrantSignature)
+        );
+    }
+
+    #[test]
+    fn broken_chain_with_missing_ancestor_is_rejected() {
+        let built = build();
+        let (mut bundle, v, r) = reshare_chain(&built);
+        bundle.ancestor_grants.clear(); // R's grant withheld — chain cannot reach author
+        let r_pub = r.sig_pub_bytes();
+        let resolver = move |id: Id| (id == R_ID).then_some(r_pub);
+        assert_eq!(
+            verify_and_open(&reshare_ctx(&built, &v, &resolver), &bundle),
+            Err(DownloadError::GrantChainBroken)
+        );
+    }
+
+    #[test]
+    fn unresolvable_granter_key_is_rejected() {
+        let built = build();
+        let (bundle, v, _r) = reshare_chain(&built);
+        let resolver = |_: Id| None; // R cannot be directory-verified
+        assert_eq!(
+            verify_and_open(&reshare_ctx(&built, &v, &resolver), &bundle),
+            Err(DownloadError::GranterKeyUnknown)
+        );
+    }
+
+    #[test]
+    fn ancestor_grant_for_a_different_dek_is_rejected() {
+        let built = build();
+        let (mut bundle, v, r) = reshare_chain(&built);
+        // Re-issue R's ancestor grant committing to the wrong DEK (a server
+        // splicing a foreign grant into the chain) — caught before any sig use.
+        let bad = Grant {
+            file_id: FILE_ID,
+            file_version: 1,
+            recipient_id: R_ID,
+            recipient_type: RecipientType::User,
+            dek_commit: Bytes32([0xAB; 32]),
+            granted_by: OWNER_ID,
+            created_at: NOW,
+        };
+        bundle.ancestor_grants[0].0 = encode(&bad);
+        let r_pub = r.sig_pub_bytes();
+        let resolver = move |id: Id| (id == R_ID).then_some(r_pub);
+        assert_eq!(
+            verify_and_open(&reshare_ctx(&built, &v, &resolver), &bundle),
+            Err(DownloadError::GrantMismatch("ancestor dek_commit"))
+        );
+    }
+
+    #[test]
+    fn cyclic_grant_chain_is_rejected() {
+        let built = build();
+        let dek_commit = built.bundle.manifest.dek_commit;
+        let r = Identity::generate();
+        let v = Identity::generate();
+        let mk = |recipient: Id, granted_by: Id, signer: &Identity| {
+            let g = Grant {
+                file_id: FILE_ID,
+                file_version: 1,
+                recipient_id: recipient,
+                recipient_type: RecipientType::User,
+                dek_commit,
+                granted_by,
+                created_at: NOW,
+            };
+            let sig = signer.signing_key().sign_canonical(labels::GRANT, &g);
+            (encode(&g), sig)
+        };
+        // leaf V←R, and ancestors R←V and V←R: granters cycle R→V→R.
+        let (leaf_bytes, leaf_sig) = mk(V_ID, R_ID, &r);
+        let a = mk(R_ID, V_ID, &v); // R's grant, signed by V
+        let b = mk(V_ID, R_ID, &r); // V's grant, signed by R
+        let bundle = DownloadBundle {
+            manifest_bytes: encode(&built.bundle.manifest),
+            manifest_sig: built.bundle.manifest_sig,
+            genesis_bytes: encode(&built.bundle.genesis),
+            genesis_sig: built.bundle.genesis_sig,
+            wrapped_dek: WrappedDek { enc: [0; 32], ct: vec![0; 48] },
+            grant_bytes: leaf_bytes,
+            grant_sig: leaf_sig,
+            ancestor_grants: vec![a, b],
+            recovery_grant_bytes: vec![],
+            recovery_grant_sig: [0; 64],
+            streams: vec![],
+        };
+        let (r_pub, v_pub) = (r.sig_pub_bytes(), v.sig_pub_bytes());
+        let resolver = move |id: Id| match id {
+            x if x == R_ID => Some(r_pub),
+            x if x == V_ID => Some(v_pub),
+            _ => None,
+        };
+        assert_eq!(
+            verify_and_open(&reshare_ctx(&built, &v, &resolver), &bundle),
+            Err(DownloadError::GrantChainCycle)
+        );
+    }
+
+    #[test]
+    fn over_deep_grant_chain_is_rejected() {
+        use std::collections::HashMap;
+        let built = build();
+        let dek_commit = built.bundle.manifest.dek_commit;
+        // A chain of more re-share edges than the depth cap, none reaching the
+        // author within the bound — must fail closed before exhausting it.
+        let n = MAX_GRANT_CHAIN_DEPTH + 2;
+        let nodes: Vec<Identity> = (0..=n).map(|_| Identity::generate()).collect();
+        // Offset to avoid the all-zero RECOVERY_ID and the OWNER/R/V ids.
+        let node_id = |i: usize| Id([(0x40 + i) as u8; 16]);
+        let mk = |recipient: Id, granted_by: Id, signer: &Identity| {
+            let g = Grant {
+                file_id: FILE_ID,
+                file_version: 1,
+                recipient_id: recipient,
+                recipient_type: RecipientType::User,
+                dek_commit,
+                granted_by,
+                created_at: NOW,
+            };
+            let sig = signer.signing_key().sign_canonical(labels::GRANT, &g);
+            (g, sig)
+        };
+        // leaf V←nodes[0]; ancestor i: nodes[i]←nodes[i+1].
+        let (leaf_g, leaf_sig) = mk(V_ID, node_id(0), &nodes[0]);
+        let mut ancestors = Vec::new();
+        let mut keys: HashMap<Id, [u8; 32]> = HashMap::new();
+        keys.insert(node_id(0), nodes[0].sig_pub_bytes());
+        for i in 0..n {
+            let (g, sig) = mk(node_id(i), node_id(i + 1), &nodes[i + 1]);
+            ancestors.push((encode(&g), sig));
+            keys.insert(node_id(i + 1), nodes[i + 1].sig_pub_bytes());
+        }
+        let bundle = DownloadBundle {
+            manifest_bytes: encode(&built.bundle.manifest),
+            manifest_sig: built.bundle.manifest_sig,
+            genesis_bytes: encode(&built.bundle.genesis),
+            genesis_sig: built.bundle.genesis_sig,
+            wrapped_dek: WrappedDek { enc: [0; 32], ct: vec![0; 48] },
+            grant_bytes: encode(&leaf_g),
+            grant_sig: leaf_sig,
+            ancestor_grants: ancestors,
+            recovery_grant_bytes: vec![],
+            recovery_grant_sig: [0; 64],
+            streams: vec![],
+        };
+        let v = Identity::generate();
+        let resolver = move |id: Id| keys.get(&id).copied();
+        assert_eq!(
+            verify_and_open(&reshare_ctx(&built, &v, &resolver), &bundle),
+            Err(DownloadError::GrantChainTooDeep)
+        );
+    }
+
     #[test]
     fn version_rollback_is_rejected() {
         let built = build();
@@ -937,6 +1340,7 @@ mod tests {
             },
             grant_bytes: vec![],
             grant_sig: [0; 64],
+            ancestor_grants: vec![],
             recovery_grant_bytes: vec![],
             recovery_grant_sig: [0; 64],
             streams: vec![],
@@ -950,6 +1354,7 @@ mod tests {
             recipient_type: RecipientType::User,
             recipient_secret: owner.enc_secret(),
             seen_max_version: None,
+            granter_sig_pub: &NO_GRANTERS,
         };
         assert!(matches!(
             verify_and_open(&c, &db),

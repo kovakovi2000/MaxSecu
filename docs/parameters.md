@@ -72,6 +72,7 @@
 | `GENESIS_HEAD` (control-log `prev_head` seed) | 32 zero bytes |
 | Current suite codepoint | `0x0001` |
 | Integer widths | fixed, big-endian, unsigned, as declared (no varints) |
+| `MAX_GRANT_CHAIN_DEPTH` (re-share ancestor chain, `DESIGN.md` §12.3a/§12.5) | **32** — a client-enforced, fail-closed cap on a server-supplied re-share grant chain. Each rotation re-roots every carried recipient under the new author, so a real chain is only the re-shares since the last rotation (typically 1–3); the cap is an anti-DoS bound, with a cycle guard rejecting repeated granters independently |
 
 ### 1.6 RNG & memory budget (stack §1.3/§1.4, `DESIGN.md` §8.1/D12)
 

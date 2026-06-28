@@ -94,6 +94,18 @@ pub enum DownloadError {
     /// A grant field did not match the manifest/context (file/version/recipient/
     /// dek_commit/granted_by) — the wrap is treated as absent (§12.3a).
     GrantMismatch(&'static str),
+    /// A re-share grant names a `granted_by` for whom no ancestor grant was
+    /// supplied — the chain to the version author is broken (§12.5 step 5).
+    GrantChainBroken,
+    /// The re-share ancestor chain exceeds the depth cap (limits §
+    /// `MAX_GRANT_CHAIN_DEPTH`) — a fail-closed anti-DoS bound on server-supplied
+    /// chains.
+    GrantChainTooDeep,
+    /// A granter appears twice in the ancestor chain — a cycle (fail closed).
+    GrantChainCycle,
+    /// No directory-verified `sig_pub` was resolved for an intermediate granter,
+    /// so its re-share grant cannot be authenticated (§7.2/§12.3a).
+    GranterKeyUnknown,
     /// The HPKE unwrap of the recipient's wrap failed (wrong key/context).
     DekUnwrap,
     /// The unwrapped DEK did not match the manifest `dek_commit` — the
@@ -139,6 +151,10 @@ impl fmt::Display for DownloadError {
                 write!(f, "version {version} reused with different content (fork)")
             }
             GrantMismatch(what) => write!(f, "grant mismatch: {what}"),
+            GrantChainBroken => write!(f, "re-share grant chain to author is broken"),
+            GrantChainTooDeep => write!(f, "re-share grant chain exceeds depth cap"),
+            GrantChainCycle => write!(f, "re-share grant chain contains a cycle"),
+            GranterKeyUnknown => write!(f, "no directory-verified key for grant granter"),
             DekUnwrap => write!(f, "DEK unwrap failed"),
             DekCommitMismatch => write!(f, "DEK does not match manifest commitment"),
             StreamMissing(_) => write!(f, "a manifest stream was not provided"),

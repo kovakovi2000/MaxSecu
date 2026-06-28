@@ -18,3 +18,10 @@ pub const MAX_ADDRESSABLE_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 /// Absolute first-contact `version` ceiling (parameters §4 / D23) — a sanity cap
 /// applied when the client has no trust-on-last-use record for the file yet.
 pub const FIRST_CONTACT_VERSION_CEILING: u64 = 1_000_000;
+
+/// Maximum accepted re-share ancestor-grant chain depth (§12.3a/§12.5). Each
+/// rotation re-roots every carried recipient under the new author, so a real
+/// chain is only the re-shares since the last rotation — typically 1–3. This is
+/// a hard fail-closed anti-DoS bound on a server-supplied chain; a cycle guard
+/// rejects repeated granters independently. Pinned in parameters.md §1.2.
+pub const MAX_GRANT_CHAIN_DEPTH: usize = 32;

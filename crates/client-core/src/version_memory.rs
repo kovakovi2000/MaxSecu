@@ -94,7 +94,7 @@ pub fn open_and_remember(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::download::StreamChunks;
+    use crate::download::{StreamChunks, NO_GRANTERS};
     use crate::identity::Identity;
     use crate::upload::{build_upload, PlaintextStreams, UploadBundle, UploadParams};
     use maxsecu_crypto::generate_enc_keypair;
@@ -151,6 +151,7 @@ mod tests {
             wrapped_dek: sw.wrapped_dek.clone(),
             grant_bytes: encode(&sw.grant),
             grant_sig: sw.grant_sig,
+            ancestor_grants: vec![],
             recovery_grant_bytes: encode(&rw.grant),
             recovery_grant_sig: rw.grant_sig,
             streams: b
@@ -174,6 +175,7 @@ mod tests {
             recipient_type: RecipientType::User,
             recipient_secret: built.owner.enc_secret(),
             seen_max_version: Some(999), // deliberately wrong — the store overrides
+            granter_sig_pub: &NO_GRANTERS,
         }
     }
 

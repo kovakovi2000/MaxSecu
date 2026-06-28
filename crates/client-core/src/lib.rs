@@ -29,7 +29,7 @@ pub use directory::{
 };
 pub use download::{
     verify_and_open, verify_and_stream_content, version_acceptable, DownloadBundle, OpenedFile,
-    OpenedHeader, OpenedStream, StreamChunks, StreamHeader, VerifyContext,
+    OpenedHeader, OpenedStream, StreamChunks, StreamHeader, VerifyContext, NO_GRANTERS,
 };
 pub use budget::{plan_unlock, AuditEvent, UnlockPlan};
 pub use error::{ClientError, DownloadError, PasswordError, UploadError};

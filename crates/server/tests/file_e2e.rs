@@ -32,7 +32,7 @@ use base64::Engine;
 
 use maxsecu_client_core::{
     build_upload, safe_export_path, verify_and_open, DownloadBundle, DownloadError, Identity,
-    PlaintextStreams, StreamChunks, UploadParams, VerifyContext,
+    PlaintextStreams, StreamChunks, UploadParams, VerifyContext, NO_GRANTERS,
 };
 use maxsecu_crypto::{generate_enc_keypair, sha256, WrappedDek};
 use maxsecu_encoding::structs::Manifest;
@@ -402,6 +402,7 @@ async fn phase3_exit_gates_over_real_tls() {
         wrapped_dek: wrap_from_bytes(&dec(&mw["wrapped_dek_b64"])),
         grant_bytes: dec(&mw["grant_b64"]),
         grant_sig: dec64(&mw["grant_sig_b64"]),
+        ancestor_grants: vec![],
         recovery_grant_bytes: dec(&rg["grant_b64"]),
         recovery_grant_sig: dec64(&rg["grant_sig_b64"]),
         streams: dl_streams,
@@ -414,6 +415,7 @@ async fn phase3_exit_gates_over_real_tls() {
         recipient_type: RecipientType::User,
         recipient_secret: owner.enc_secret(),
         seen_max_version: None,
+        granter_sig_pub: &NO_GRANTERS,
     };
 
     // GATE — round-trip: the exact plaintext is recovered.
@@ -487,6 +489,7 @@ fn clone_bundle(b: &DownloadBundle) -> DownloadBundle {
         wrapped_dek: b.wrapped_dek.clone(),
         grant_bytes: b.grant_bytes.clone(),
         grant_sig: b.grant_sig,
+        ancestor_grants: b.ancestor_grants.clone(),
         recovery_grant_bytes: b.recovery_grant_bytes.clone(),
         recovery_grant_sig: b.recovery_grant_sig,
         streams: b
