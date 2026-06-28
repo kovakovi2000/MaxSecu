@@ -1,6 +1,6 @@
 # MaxSecu — External Sink Interface (anchored control-log head)
 
-**Status:** Spec (stand up before Phase 5; the sink itself is an operational prerequisite, stack.md §2.3/§4).
+**Status:** Spec + **real in-repo implementation (Phase 6)**. The client read interface (§3), the anchor-proof forms (§4, incl. the transparency-log form), the fail-closed verification (§5), and issuer-side anchoring (§6) are implemented: `crates/sink-server` is a concrete append-only sink service over this REST contract, `client-core::sink::HttpSinkClient`/`confirm_anchored` are the real client side, and `server::audit::HttpSinkPublisher` publishes control records to it (proven e2e over real TLS). A genuinely third-party WORM/SIEM + cross-publication of the head (§1 leg 2) remains the operational swap-in behind this adapter (stack.md §2.3/§4).
 **Scope:** how a client fetches and verifies the **anchored head** of the control-log hash chain from the **external, append-only sink**, independent of the app server — the control that turns tombstone *withholding* from "detected" into "prevented within one refresh" (`DESIGN.md` §7.6/§16.5, D18/D22). Also defines the issuer-side anchoring step that closes write-time withholding.
 **Companion to:** `DESIGN.md` §7.6/§11.4/§16.5, `docs/api.md` §7 (the server-served chain), `docs/parameters.md` §5 (refresh cadence), `docs/encoding-spec.md` §4 (the chained records).
 

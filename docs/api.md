@@ -75,9 +75,9 @@ The server checks the user against the `sig_pub` it stored; if it swapped that k
 
 ## 3. Error model (`DESIGN.md` §16.2 — fail closed, sanitized)
 
-All errors: `{ "error": { "code": "<code>", "retry_after_s"?: N } }`. **No** stack traces, DB text, paths, or existence signals. Any exception on an auth/authz path ⇒ deny.
+Errors are conveyed by the **HTTP status code with an empty body** — the most-sanitized shape (impossible to leak), verified by `crates/server/tests/sanitized_errors.rs` (Phase 6, P6.7). The only structured signals are the sanctioned `429` `Retry-After` header and the constant `403 {"code":"direct_disabled"}` for the direct-link opt-out. The `code` column below names the **semantics** of each status, not a JSON field. **No** stack traces, DB text, paths, internal detail, or existence signals ever reach a client. Any exception on an auth/authz path ⇒ deny.
 
-| HTTP | `code` | Used for |
+| HTTP | semantics | Used for |
 |---|---|---|
 | 400 | `invalid_request` | malformed envelope, bad base64, bound-check failure (e.g. `chunk_size` out of range) |
 | 401 | `unauthorized` | no/expired/channel-mismatched token; failed login (single shape, no oracle) |
