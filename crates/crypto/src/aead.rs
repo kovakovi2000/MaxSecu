@@ -92,7 +92,6 @@ pub fn seal_stream(
     }
     let n = frames.len();
     let mut chunks = Vec::with_capacity(n);
-    let mut tags = Vec::with_capacity(n * TAG_LEN);
     for (i, frame) in frames.iter().enumerate() {
         let aad = ChunkAad {
             file_id,
@@ -101,14 +100,13 @@ pub fn seal_stream(
             chunk_index: i as u64,
             is_last: i == n - 1,
         };
-        let ct = seal_chunk(ck, &aad, frame);
-        tags.extend_from_slice(&ct[ct.len() - TAG_LEN..]);
-        chunks.push(ct);
+        chunks.push(seal_chunk(ck, &aad, frame));
     }
+    let digest = stream_digest(&chunks);
     SealedStream {
         chunks,
         chunk_count: n as u64,
-        digest: sha256(&tags),
+        digest,
     }
 }
 
@@ -175,6 +173,19 @@ pub fn open(
         .map_err(|_| CryptoError::Aead)
 }
 
+/// The per-stream manifest digest: `SHA-256` over the ordered per-chunk AEAD
+/// tags (DESIGN §12.3 / D33). Equals [`SealedStream::digest`]; a downloader
+/// recomputes it over the served chunks and rejects a manifest-mismatch. Robust
+/// against an undersized (untrusted-server) chunk — it never indexes out of
+/// bounds, so a short chunk simply yields a non-matching digest.
+pub fn stream_digest(chunks: &[Vec<u8>]) -> [u8; 32] {
+    let mut tags = Vec::with_capacity(chunks.len() * TAG_LEN);
+    for ct in chunks {
+        tags.extend_from_slice(&ct[ct.len().saturating_sub(TAG_LEN)..]);
+    }
+    sha256(&tags)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +224,23 @@ mod tests {
 
     fn body() -> Vec<u8> {
         (0..(1024 * 5 + 7)).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn stream_digest_matches_seal_and_detects_tamper() {
+        let pt = body();
+        let sealed = seal_stream(&CK, FID, 1, StreamType::Content, 1024, &pt);
+        // Recomputing over the served chunks equals the manifest-committed digest.
+        assert_eq!(stream_digest(&sealed.chunks), sealed.digest);
+        // Flipping a tag byte changes the digest (manifest mismatch on download).
+        let mut tampered = sealed.chunks.clone();
+        let last = tampered.last_mut().unwrap();
+        let i = last.len() - 1;
+        last[i] ^= 0x01;
+        assert_ne!(stream_digest(&tampered), sealed.digest);
+        // A truncated/undersized chunk does not panic (untrusted input).
+        let short = vec![vec![0u8; 3]];
+        let _ = stream_digest(&short);
     }
 
     #[test]

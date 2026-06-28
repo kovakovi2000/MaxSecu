@@ -23,12 +23,10 @@ use maxsecu_encoding::RECOVERY_ID;
 use crate::error::UploadError;
 use crate::identity::Identity;
 
+use crate::limits::{CHUNK_SIZE_MAX, CHUNK_SIZE_MIN};
+
 /// First-version number (DESIGN §12.2 step 2 — `version = 1`, monotonic-by-1).
 const FIRST_VERSION: u64 = 1;
-
-/// Accepted chunk-framing size range (parameters §1.2 / DESIGN §12.10).
-const CHUNK_SIZE_MIN: u32 = 4 * 1024;
-const CHUNK_SIZE_MAX: u32 = 8 * 1024 * 1024;
 
 /// Plaintext per-stream inputs. `content` is mandatory (the manifest requires a
 /// `content` stream, DESIGN §12.3); `metadata`/`thumbnail`/`preview` are present

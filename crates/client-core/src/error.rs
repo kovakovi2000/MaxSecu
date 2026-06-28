@@ -56,6 +56,95 @@ impl fmt::Display for UploadError {
 
 impl std::error::Error for UploadError {}
 
+/// Errors verifying & opening a downloaded file (DESIGN §12.5, Phase 3). Every
+/// variant means "reject and surface a sanitized error" (§12.5 step 7) — fail
+/// closed. A *missing/invalid recovery grant* is not here: per §12.5 step 5 it
+/// is an anomaly flagged in [`crate::download::OpenedFile::recovery_grant_ok`],
+/// not a hard rejection of the downloader's own read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadError {
+    /// A signed record failed strict canonical decode (the re-encode guard) —
+    /// the server supplied bytes that don't decode to one canonical value.
+    BadManifest,
+    BadGenesis,
+    BadGrant,
+    /// The author's `manifest_sig` did not verify against their directory key.
+    ManifestSignature,
+    /// The owner's `genesis_sig` did not verify against the owner binding.
+    GenesisSignature,
+    /// The recipient's read-grant signature did not verify against the granter.
+    GrantSignature,
+    /// `author_id != genesis.owner_id` — a non-owner authored this version
+    /// (owner-only write, D29 / §12.5 author-entitlement).
+    AuthorNotOwner,
+    /// A record's `file_id` did not match the requested file (substitution).
+    FileIdMismatch,
+    /// Served `version` is older than the highest trust-on-last-use record (§7.5).
+    VersionRollback { seen_max: u64, served: u64 },
+    /// Served `version` exceeds the highest seen by more than 1 — rollback-memory
+    /// poisoning guard (§7.5 / D23).
+    VersionTooHigh { seen_max: u64, served: u64 },
+    /// First contact (no prior record) and `version` exceeds the absolute sanity
+    /// ceiling (parameters §4 / D23).
+    FirstContactCeiling { served: u64 },
+    /// A grant field did not match the manifest/context (file/version/recipient/
+    /// dek_commit/granted_by) — the wrap is treated as absent (§12.3a).
+    GrantMismatch(&'static str),
+    /// The HPKE unwrap of the recipient's wrap failed (wrong key/context).
+    DekUnwrap,
+    /// The unwrapped DEK did not match the manifest `dek_commit` — the
+    /// self-validating access proof (§12.5 step 6): a garbage wrap yields denial.
+    DekCommitMismatch,
+    /// A manifest-declared stream was not provided by the server.
+    StreamMissing(maxsecu_encoding::types::StreamType),
+    /// A stream's chunked-AEAD framing failed (tamper, truncation, reorder).
+    StreamFraming(maxsecu_encoding::types::StreamType),
+    /// A stream's recomputed chunk-tag digest did not match the signed manifest.
+    StreamDigestMismatch(maxsecu_encoding::types::StreamType),
+    /// A framing field (chunk_size / chunk_count) is out of bounds, or the served
+    /// chunk count disagrees with the signed manifest — bound-checked before any
+    /// allocation (§12.10).
+    FramingBoundsExceeded(&'static str),
+    /// A stream declared a compression the v1 client cannot yet apply (Phase 3
+    /// leaves everything uncompressed; zstd is a later increment).
+    CompressionUnsupported,
+}
+
+impl fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use DownloadError::*;
+        match self {
+            BadManifest => write!(f, "malformed manifest"),
+            BadGenesis => write!(f, "malformed genesis"),
+            BadGrant => write!(f, "malformed grant"),
+            ManifestSignature => write!(f, "manifest signature verification failed"),
+            GenesisSignature => write!(f, "genesis signature verification failed"),
+            GrantSignature => write!(f, "grant signature verification failed"),
+            AuthorNotOwner => write!(f, "author is not the file owner"),
+            FileIdMismatch => write!(f, "record file_id does not match the request"),
+            VersionRollback { seen_max, served } => {
+                write!(f, "version rollback: served {served} < seen {seen_max}")
+            }
+            VersionTooHigh { seen_max, served } => {
+                write!(f, "version {served} exceeds seen {seen_max} by more than 1")
+            }
+            FirstContactCeiling { served } => {
+                write!(f, "first-contact version {served} above sanity ceiling")
+            }
+            GrantMismatch(what) => write!(f, "grant mismatch: {what}"),
+            DekUnwrap => write!(f, "DEK unwrap failed"),
+            DekCommitMismatch => write!(f, "DEK does not match manifest commitment"),
+            StreamMissing(_) => write!(f, "a manifest stream was not provided"),
+            StreamFraming(_) => write!(f, "stream framing verification failed"),
+            StreamDigestMismatch(_) => write!(f, "stream digest does not match manifest"),
+            FramingBoundsExceeded(what) => write!(f, "framing bounds exceeded: {what}"),
+            CompressionUnsupported => write!(f, "unsupported stream compression"),
+        }
+    }
+}
+
+impl std::error::Error for DownloadError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PasswordError {
     /// Below the minimum length (parameters §2: 15).

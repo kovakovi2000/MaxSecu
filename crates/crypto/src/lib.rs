@@ -19,7 +19,9 @@ mod rng;
 mod sign;
 mod wrap;
 
-pub use aead::{open, open_chunk, open_stream, seal, seal_chunk, seal_stream, SealedStream};
+pub use aead::{
+    open, open_chunk, open_stream, seal, seal_chunk, seal_stream, stream_digest, SealedStream,
+};
 pub use dek::{fingerprint, Dek};
 pub use hash::sha256;
 pub use kdf::hkdf_sha256_32;

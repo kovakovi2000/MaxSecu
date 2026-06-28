@@ -12,8 +12,10 @@ mod error;
 
 pub mod auth;
 pub mod directory;
+pub mod download;
 pub mod identity;
 pub mod keyblob;
+pub mod limits;
 pub mod password;
 pub mod revocation;
 pub mod upload;
@@ -22,7 +24,11 @@ pub use directory::{
     AuthorizedRecipient, DirectoryVerifier, MemoryTrustStore, TrustRecord, TrustStore,
     VerifiedBinding, VerifyError,
 };
-pub use error::{ClientError, PasswordError, UploadError};
+pub use download::{
+    verify_and_open, version_acceptable, DownloadBundle, OpenedFile, OpenedStream, StreamChunks,
+    VerifyContext,
+};
+pub use error::{ClientError, DownloadError, PasswordError, UploadError};
 pub use revocation::{TombstoneError, TombstoneSet};
 pub use identity::Identity;
 pub use upload::{
