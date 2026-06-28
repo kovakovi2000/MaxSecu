@@ -196,11 +196,12 @@ impl HttpSinkPublisher {
         }
     }
 
-    /// `POST /v1/control-log/records {record_b64}` with the admin bearer, over the
-    /// sink's pinned TLS channel. Returns `Err(())` on any transport/HTTP failure
-    /// — the caller swallows it (best-effort), so no internal detail escapes.
-    async fn post_record(&self, record_bytes: &[u8]) -> Result<(), ()> {
-        use base64::Engine;
+    /// The shared best-effort POST dance over the sink's pinned TLS channel: TCP
+    /// connect → TLS 1.3 with the pinned config → http1 handshake → POST `path`
+    /// with the admin Bearer + JSON `body` → drain. Returns `Err(())` on ANY
+    /// transport/HTTP failure — the caller swallows it (best-effort), so no
+    /// internal detail escapes. The per-route wrappers below only build the body.
+    async fn post_json(&self, path: &str, body: String) -> Result<(), ()> {
         use http_body_util::{BodyExt, Full};
         use hyper::body::Bytes;
         use hyper_util::rt::TokioIo;
@@ -221,11 +222,9 @@ impl HttpSinkPublisher {
             let _ = conn.await;
         });
 
-        let record_b64 = base64::engine::general_purpose::STANDARD.encode(record_bytes);
-        let body = serde_json::json!({ "record_b64": record_b64 }).to_string();
         let req = hyper::Request::builder()
             .method("POST")
-            .uri("/v1/control-log/records")
+            .uri(path)
             .header("host", self.server_name.as_str())
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {}", self.admin_token))
@@ -242,53 +241,25 @@ impl HttpSinkPublisher {
         }
     }
 
-    /// `POST /v1/genesis-anchor {file_id_b64}` with the admin bearer, over the
-    /// sink's pinned TLS channel — anchoring `file_id`'s genesis at a global sink
-    /// position (the R27/D28 cutoff basis, `sink-interface.md` §4). The sink is
-    /// idempotent: re-anchoring is a no-op that returns the existing position.
-    /// Returns `Err(())` on any transport/HTTP failure — the caller swallows it
-    /// (best-effort), so no internal detail escapes. Mirrors [`Self::post_record`].
+    /// `POST /v1/control-log/records {record_b64}` (admin bearer). Best-effort,
+    /// infallible from the caller (see [`Self::post_json`]).
+    async fn post_record(&self, record_bytes: &[u8]) -> Result<(), ()> {
+        use base64::Engine;
+        let record_b64 = base64::engine::general_purpose::STANDARD.encode(record_bytes);
+        let body = serde_json::json!({ "record_b64": record_b64 }).to_string();
+        self.post_json("/v1/control-log/records", body).await
+    }
+
+    /// `POST /v1/genesis-anchor {file_id_b64}` (admin bearer) — anchoring
+    /// `file_id`'s genesis at a global sink position (the R27/D28 cutoff basis,
+    /// `sink-interface.md` §4). The sink is idempotent: re-anchoring returns the
+    /// existing position. Best-effort, infallible from the caller (see
+    /// [`Self::post_json`]).
     async fn post_genesis(&self, file_id: &[u8; 16]) -> Result<(), ()> {
         use base64::Engine;
-        use http_body_util::{BodyExt, Full};
-        use hyper::body::Bytes;
-        use hyper_util::rt::TokioIo;
-        use tokio_rustls::rustls::pki_types::ServerName;
-        use tokio_rustls::TlsConnector;
-
-        let tcp = tokio::net::TcpStream::connect(self.addr)
-            .await
-            .map_err(|_| ())?;
-        let connector = TlsConnector::from(self.tls.clone());
-        let server_name = ServerName::try_from(self.server_name.clone()).map_err(|_| ())?;
-        let tls = connector.connect(server_name, tcp).await.map_err(|_| ())?;
-
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
-            .await
-            .map_err(|_| ())?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-
         let file_id_b64 = base64::engine::general_purpose::STANDARD.encode(file_id);
         let body = serde_json::json!({ "file_id_b64": file_id_b64 }).to_string();
-        let req = hyper::Request::builder()
-            .method("POST")
-            .uri("/v1/genesis-anchor")
-            .header("host", self.server_name.as_str())
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {}", self.admin_token))
-            .body(Full::<Bytes>::from(body))
-            .map_err(|_| ())?;
-        let resp = sender.send_request(req).await.map_err(|_| ())?;
-        let ok = resp.status().is_success();
-        // Drain so the connection task can finish cleanly.
-        let _ = resp.into_body().collect().await;
-        if ok {
-            Ok(())
-        } else {
-            Err(())
-        }
+        self.post_json("/v1/genesis-anchor", body).await
     }
 }
 

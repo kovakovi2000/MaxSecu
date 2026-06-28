@@ -57,6 +57,9 @@ impl PositionLog {
     }
 
     /// The global position of the `chain_seq`-th control append (1-based), if any.
+    /// Recorded now but not yet routed over HTTP: the client-side R27 cutoff
+    /// comparison (a genesis position vs. its `key_compromise` control record's
+    /// position) consumes this in the P7.14 capstone, which adds the read route.
     pub fn control_pos(&self, chain_seq: u64) -> Option<u64> {
         chain_seq
             .checked_sub(1)

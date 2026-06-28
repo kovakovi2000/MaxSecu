@@ -113,6 +113,17 @@ fn b64(b: &[u8]) -> String {
     B64.encode(b)
 }
 
+/// The coarse admin gate (§6.1): the request must carry `Authorization: Bearer
+/// <admin_token>`. Used by every mutating route (control-log append + genesis
+/// anchor) so the strip-prefix + compare lives in one place.
+fn admin_ok(headers: &axum::http::HeaderMap, token: &str) -> bool {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        == Some(token)
+}
+
 /// Render an anchored head + its bundle into the §3.1 head JSON. The bundle MUST
 /// be the one produced for exactly this head (its transparency leaf is `head`).
 fn head_json(head: AnchoredHead, bundle: &AnchorBundle) -> HeadJson {
@@ -211,11 +222,7 @@ async fn post_record(
     Json(req): Json<AppendReq>,
 ) -> Response {
     // Coarse admin gate (§6.1): a constant-shape `403` for missing/bad cred.
-    let presented = headers
-        .get(AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
-    if presented != Some(st.admin_token.as_str()) {
+    if !admin_ok(&headers, &st.admin_token) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Ok(bytes) = B64.decode(req.record_b64.as_bytes()) else {
@@ -299,11 +306,7 @@ async fn post_genesis_anchor(
     Json(req): Json<GenesisAnchorReq>,
 ) -> Response {
     // Coarse admin gate (§6.1) — same constant-shape `403` as `post_record`.
-    let presented = headers
-        .get(AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
-    if presented != Some(st.admin_token.as_str()) {
+    if !admin_ok(&headers, &st.admin_token) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Ok(raw) = B64.decode(req.file_id_b64.as_bytes()) else {
