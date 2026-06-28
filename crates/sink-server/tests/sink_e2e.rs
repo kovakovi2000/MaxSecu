@@ -158,6 +158,90 @@ async fn fetch_records(
         .collect()
 }
 
+/// POST a genesis anchor for `file_id` over TLS and return its global position.
+async fn post_genesis(
+    addr: std::net::SocketAddr,
+    client_config: Arc<ClientConfig>,
+    token: &str,
+    file_id: &[u8; 16],
+) -> u64 {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let connector = TlsConnector::from(client_config);
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let tls = connector.connect(server_name, tcp).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let body = serde_json::json!({ "file_id_b64": B64.encode(file_id) }).to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/genesis-anchor")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Full::new(Bytes::from(body)))
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    v["position"].as_u64().unwrap()
+}
+
+/// The production `HttpSinkClient` reads BOTH sides of the R27/D28 cutoff — a
+/// file's genesis anchor position AND a control record's unified global position —
+/// from the real sink over its pinned channel (P7.17). This is what lets the
+/// client-side cutoff comparison source from the real sink, not `MemoryAuditSink`.
+#[tokio::test]
+async fn http_client_reads_control_and_genesis_positions() {
+    let pki = test_pki();
+
+    // ---- Stand up the sink over loopback TLS. ----
+    let anchorer = Anchorer::new(SigningKey::generate(), SigningKey::generate());
+    let app = router(SinkState::new(anchorer, TOKEN));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve(listener, pki.server_config.clone(), app));
+
+    // ---- Anchor a genesis (global position g), then append one real record. ----
+    let file = [0xF1u8; 16];
+    let g = post_genesis(addr, pki.client_config.clone(), TOKEN, &file).await;
+    let admin = SigningKey::generate();
+    let mut chain = ControlChain::new();
+    let r1 = chain.revoke(&admin, rp(0x99), None).unwrap();
+    assert_eq!(
+        post_record(addr, pki.client_config.clone(), TOKEN, &r1.bytes).await,
+        StatusCode::OK
+    );
+
+    // The HttpSinkClient fetch runs on its own per-call runtime, so drive it from a
+    // blocking thread (it must not be nested inside this test's runtime).
+    let cc = pki.client_config.clone();
+    let (gp, none, cp, missing) = tokio::task::spawn_blocking(move || {
+        let sink = HttpSinkClient::new(addr, "localhost", cc);
+        (
+            sink.fetch_genesis_pos(&file),       // anchored → Some(g)
+            sink.fetch_genesis_pos(&[0xABu8; 16]), // un-anchored → Ok(None)
+            sink.fetch_control_pos(1),           // 1st control append → g+1
+            sink.fetch_control_pos(99),          // no such record → Err (fail closed)
+        )
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(gp.unwrap(), Some(g));
+    assert_eq!(none.unwrap(), None, "an un-anchored file is a clean Ok(None)");
+    assert_eq!(
+        cp.unwrap(),
+        g + 1,
+        "the control append drew the next global position after the genesis"
+    );
+    assert!(missing.is_err(), "a missing chain_seq fails closed, never a silent 0");
+}
+
 #[tokio::test]
 async fn client_fetches_verifies_and_detects_withholding_over_tls() {
     let pki = test_pki();

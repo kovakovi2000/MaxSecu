@@ -218,8 +218,21 @@ impl HttpSinkClient {
     }
 
     /// Run the blocking GET on a tiny current-thread runtime and return the raw
-    /// response body. Any failure collapses to [`SinkError::Unreachable`].
+    /// response body on a 2xx. A non-2xx (incl. 404) or any transport/TLS/parse
+    /// failure collapses to [`SinkError::Unreachable`] (fail closed).
     fn get(&self, path: &str) -> Result<Vec<u8>, SinkError> {
+        let (status, body) = self.get_with_status(path)?;
+        if (200..300).contains(&status) {
+            Ok(body)
+        } else {
+            Err(SinkError::Unreachable)
+        }
+    }
+
+    /// Like [`HttpSinkClient::get`] but returns the HTTP status alongside the body
+    /// (no 2xx gate), so a caller can treat a `404` distinctly — e.g. an
+    /// un-anchored genesis is a legitimate `Ok(None)`, not an error.
+    fn get_with_status(&self, path: &str) -> Result<(u16, Vec<u8>), SinkError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -227,7 +240,7 @@ impl HttpSinkClient {
         rt.block_on(self.get_async(path))
     }
 
-    async fn get_async(&self, path: &str) -> Result<Vec<u8>, SinkError> {
+    async fn get_async(&self, path: &str) -> Result<(u16, Vec<u8>), SinkError> {
         use http_body_util::{BodyExt, Empty};
         use hyper::body::Bytes;
         use hyper_util::rt::TokioIo;
@@ -262,16 +275,52 @@ impl HttpSinkClient {
             .send_request(req)
             .await
             .map_err(|_| SinkError::Unreachable)?;
-        if !resp.status().is_success() {
-            return Err(SinkError::Unreachable);
-        }
+        let status = resp.status().as_u16();
         let bytes = resp
             .into_body()
             .collect()
             .await
             .map_err(|_| SinkError::Unreachable)?
             .to_bytes();
-        Ok(bytes.to_vec())
+        Ok((status, bytes.to_vec()))
+    }
+
+    /// `GET /v1/genesis-anchor/{file_id}` — the global sink position at which the
+    /// file's `genesis` was anchored, or `Ok(None)` if it was never anchored (a
+    /// legitimate state; the R27 cutoff treats an unknown position under an active
+    /// compromise as fail-closed at the comparison site, not here). Feeds
+    /// `download::CompromiseCheck.genesis_sink_pos`.
+    pub fn fetch_genesis_pos(&self, file_id: &[u8; 16]) -> Result<Option<u64>, SinkError> {
+        let hex: String = file_id.iter().map(|b| format!("{b:02x}")).collect();
+        let (status, body) = self.get_with_status(&format!("/v1/genesis-anchor/{hex}"))?;
+        if status == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&status) {
+            return Err(SinkError::Unreachable);
+        }
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| SinkError::Unreachable)?;
+        v.get("position")
+            .and_then(|p| p.as_u64())
+            .map(Some)
+            .ok_or(SinkError::Unreachable)
+    }
+
+    /// `GET /v1/control-log/position?chain_seq=<n>` — the global sink position of
+    /// the `chain_seq`-th control append (1-based). A `404` (no such record at the
+    /// sink) is **fail-closed** [`SinkError::Unreachable`], never a silent zero:
+    /// the caller maps a verified `key_compromise` record's chain position here to
+    /// obtain `download::CompromiseCheck.cutoff`, and must refuse to proceed if it
+    /// cannot be established. This is the cutoff side of the R27/D28 comparison
+    /// (`sink-interface.md` §3.5).
+    pub fn fetch_control_pos(&self, chain_seq: u64) -> Result<u64, SinkError> {
+        let body = self.get(&format!("/v1/control-log/position?chain_seq={chain_seq}"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| SinkError::Unreachable)?;
+        v.get("position")
+            .and_then(|p| p.as_u64())
+            .ok_or(SinkError::Unreachable)
     }
 }
 
