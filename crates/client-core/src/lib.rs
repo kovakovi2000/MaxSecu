@@ -45,7 +45,7 @@ pub use sandbox::{
     decode_rgba_bounded, validate_decoded, DecodeError, DecodedImage, InProcessFakeDecoder,
     OutputReject, SandboxedDecoder,
 };
-pub use revocation::{TombstoneError, TombstoneSet};
+pub use revocation::{ControlRecordIn, IssuerInfo, TombstoneError, TombstoneSet};
 pub use sanitize::{safe_export_path, sanitize_filename, SanitizeError};
 pub use identity::Identity;
 pub use version_memory::{open_and_remember, FileVersionRecord, MemoryVersionStore, VersionStore};
