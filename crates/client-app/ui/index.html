@@ -38,7 +38,9 @@
         top: 0;
         transform: translateY(-120%);
         padding: 0.5rem 1rem;
-        background: var(--accent);
+        /* Fixed high-contrast pair, independent of --accent, so contrast holds
+           in both light and dark schemes (#fff on #0b57d0 ~= 6.4:1). */
+        background: #0b57d0;
         color: #fff;
         text-decoration: none;
         z-index: 100;
