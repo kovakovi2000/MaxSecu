@@ -49,7 +49,9 @@ use maxsecu_admin_core::{
 };
 use maxsecu_crypto::{generate_enc_keypair, sha256, unwrap_dek, Dek, EncPublicKey, WrappedDek};
 use maxsecu_encoding::structs::WrapContext;
-use maxsecu_encoding::types::{FileScope, FileType, Id, RecipientType, Role, StreamType, Timestamp};
+use maxsecu_encoding::types::{
+    FileScope, FileType, Id, RecipientType, Role, StreamType, Suite, Timestamp,
+};
 use maxsecu_encoding::{encode, GENESIS_HEAD};
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuthConfig, AuthService, FsBlobStore, MemoryAuditSink,
@@ -467,6 +469,7 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
         file_type: FileType::Blog,
         chunk_size: 4096,
         recovery_pub,
+        recovery_mlkem_pub: None,
         created_at: Timestamp(TS),
     };
     let bundle: UploadBundle = build_upload(&params, &small_streams()).unwrap();
@@ -498,6 +501,8 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
             dek_commit,
             recipient_id: Id(v_id),
             recipient_enc_pub: EncPublicKey::from_bytes(v.enc_pub_bytes()),
+            suite: Suite::V1,
+            recipient_mlkem_pub: None,
             created_at: Timestamp(TS),
         },
         &dek,
@@ -521,6 +526,7 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
         recipient_id: Id(v_id),
         recipient_type: RecipientType::User,
         recipient_secret: v.enc_secret(),
+        recipient_mlkem_seed: None,
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS, // V's grant is author-rooted
         admin_sig_pub: &NO_ADMINS,
@@ -544,6 +550,8 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
             dek_commit,
             recipient_id: Id(w_id),
             recipient_enc_pub: EncPublicKey::from_bytes(w.enc_pub_bytes()),
+            suite: Suite::V1,
+            recipient_mlkem_pub: None,
             created_at: Timestamp(TS),
         },
         &dek_v,
@@ -570,6 +578,7 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
         recipient_id: Id(w_id),
         recipient_type: RecipientType::User,
         recipient_secret: w.enc_secret(),
+        recipient_mlkem_seed: None,
         seen_max_version: None,
         granter_sig_pub: &resolver,
         admin_sig_pub: &NO_ADMINS,
@@ -625,6 +634,7 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
             CarryForwardCandidate {
                 recipient_id: Id(rid),
                 recipient_enc_pub: enc_for(rid),
+                recipient_mlkem_pub: None,
                 leaf_grant_bytes: dec(r["grant_b64"].as_str().unwrap()),
                 leaf_grant_sig: dec64(r["grant_sig_b64"].as_str().unwrap()),
                 ancestor_grants: ancestors,
@@ -644,6 +654,8 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
             new_version: 2,
             chunk_size: 4096,
             recovery_pub: recovery_pub2,
+            suite: Suite::V1,
+            recovery_mlkem_pub: None,
             created_at: Timestamp(TS + 1),
             prior_version: 1,
             prior_dek_commit: dek_commit,
@@ -687,6 +699,7 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
         recipient_id: Id(w_id),
         recipient_type: RecipientType::User,
         recipient_secret: w.enc_secret(),
+        recipient_mlkem_seed: None,
         seen_max_version: Some(1),
         granter_sig_pub: &NO_GRANTERS,
         admin_sig_pub: &NO_ADMINS,
@@ -757,6 +770,7 @@ async fn upload_v1(
         file_type: FileType::Blog,
         chunk_size: 4096,
         recovery_pub,
+        recovery_mlkem_pub: None,
         created_at: Timestamp(TS),
     };
     let bundle: UploadBundle = build_upload(&params, &small_streams()).unwrap();
@@ -845,6 +859,8 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
             dek_commit: bundle.manifest.dek_commit.0,
             recipient_id: Id(v_id),
             recipient_enc_pub: EncPublicKey::from_bytes(v.enc_pub_bytes()),
+            suite: Suite::V1,
+            recipient_mlkem_pub: None,
             created_at: Timestamp(TS),
         },
         &dek,
@@ -929,6 +945,7 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
         recipient_id: Id(owner_id),
         recipient_type: RecipientType::User,
         recipient_secret: owner.enc_secret(),
+        recipient_mlkem_seed: None,
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS,
         admin_sig_pub: &NO_ADMINS,

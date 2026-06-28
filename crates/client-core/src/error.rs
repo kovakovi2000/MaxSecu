@@ -146,6 +146,10 @@ pub enum DownloadError {
     GranterKeyUnknown,
     /// The HPKE unwrap of the recipient's wrap failed (wrong key/context).
     DekUnwrap,
+    /// The manifest selects the Suite::V2 hybrid wrap, but the recipient supplied
+    /// no ML-KEM-768 decapsulation seed — a PQ-enrolled key is required to open a
+    /// V2 wrap (Phase 7). Fail closed rather than panic (P7.5).
+    PqKeyMissing,
     /// The unwrapped DEK did not match the manifest `dek_commit` — the
     /// self-validating access proof (§12.5 step 6): a garbage wrap yields denial.
     DekCommitMismatch,
@@ -206,6 +210,7 @@ impl fmt::Display for DownloadError {
             GrantChainCycle => write!(f, "re-share grant chain contains a cycle"),
             GranterKeyUnknown => write!(f, "no directory-verified key for grant granter"),
             DekUnwrap => write!(f, "DEK unwrap failed"),
+            PqKeyMissing => write!(f, "no ML-KEM key for a Suite::V2 hybrid wrap"),
             DekCommitMismatch => write!(f, "DEK does not match manifest commitment"),
             StreamMissing(_) => write!(f, "a manifest stream was not provided"),
             StreamFraming(_) => write!(f, "stream framing verification failed"),

@@ -24,15 +24,15 @@
 //!     the anchored head never builds a `TombstoneSet`, so the re-share cannot
 //!     proceed on an unverified set (fail closed, parameters §5).
 
-use maxsecu_crypto::{wrap_dek, Dek, EncPublicKey};
+use maxsecu_crypto::{wrap_dek, wrap_dek_hybrid, Dek, EncPublicKey, HybridEncPublicKey};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::{Grant, WrapContext};
-use maxsecu_encoding::types::{Bytes32, Id, RecipientType, Timestamp};
+use maxsecu_encoding::types::{Bytes32, Id, RecipientType, Suite, Timestamp};
 use maxsecu_encoding::RECOVERY_ID;
 
 use crate::identity::Identity;
 use crate::revocation::TombstoneSet;
-use crate::upload::WrapOut;
+use crate::upload::{pack_hybrid_wrap, WrapOut};
 
 /// Inputs for a single online read re-share (§12.4b). The granter's `enc_priv`
 /// is not needed — the DEK has already been unwrapped on download and is passed
@@ -50,6 +50,15 @@ pub struct ReshareParams<'a> {
     /// The recipient being granted read (directory-verified by the caller, §7.2).
     pub recipient_id: Id,
     pub recipient_enc_pub: EncPublicKey,
+    /// The file's wrap suite (from the verified `manifest.alg`). A V2 file
+    /// re-shares with a hybrid wrap; a V1 file re-shares classically — the wrap
+    /// layout always matches the FILE's suite (P7.5).
+    pub suite: Suite,
+    /// The recipient's directory-verified ML-KEM-768 encapsulation key (from
+    /// `AuthorizedRecipient.mlkem_pub`), required for a V2 re-share. `None` for a
+    /// classical recipient; a V2 re-share to a non-PQ recipient fails closed
+    /// ([`ReshareError::ResharePqKeyMissing`]) so the UI can prompt re-enrollment.
+    pub recipient_mlkem_pub: Option<[u8; 1184]>,
     pub created_at: Timestamp,
 }
 
@@ -68,6 +77,10 @@ pub enum ReshareError {
     RecipientIsRecovery,
     /// The DEK could not be wrapped to the recipient's `enc_pub`.
     WrapFailed,
+    /// The file is Suite::V2 (PQ-hybrid) but the target recipient carries no
+    /// ML-KEM key — re-sharing a V2 file requires a PQ-enrolled recipient.
+    /// Surfaced so the UI can prompt the recipient to re-enroll (P7.5).
+    ResharePqKeyMissing,
 }
 
 impl std::fmt::Display for ReshareError {
@@ -83,6 +96,9 @@ impl std::fmt::Display for ReshareError {
                 write!(f, "cannot re-share to the recovery recipient")
             }
             ReshareError::WrapFailed => write!(f, "failed to wrap the DEK to the recipient"),
+            ReshareError::ResharePqKeyMissing => {
+                write!(f, "recipient has no ML-KEM key for a Suite::V2 re-share")
+            }
         }
     }
 }
@@ -119,13 +135,28 @@ pub fn build_reshare(
         return Err(RecipientRevoked);
     }
 
-    // (4) Re-wrap the DEK to the recipient's directory-verified `enc_pub`.
+    // (4) Re-wrap the DEK to the recipient's directory-verified key, under the
+    // FILE's suite (the wrap layout must match `manifest.alg`, P7.5): a V1 file
+    // re-shares classically; a V2 file re-shares with a hybrid wrap to the
+    // recipient's {enc_pub, mlkem_pub}. A V2 re-share to a non-PQ recipient fails
+    // closed so the UI can prompt re-enrollment.
     let ctx = WrapContext {
         file_id: params.file_id,
         version: params.version,
         recipient_id: params.recipient_id,
     };
-    let wrapped_dek = wrap_dek(&params.recipient_enc_pub, dek, &ctx).map_err(|_| WrapFailed)?;
+    let wrapped_dek = match params.suite {
+        Suite::V1 => wrap_dek(&params.recipient_enc_pub, dek, &ctx).map_err(|_| WrapFailed)?,
+        Suite::V2 => {
+            let mlkem = params.recipient_mlkem_pub.ok_or(ResharePqKeyMissing)?;
+            let hybrid_pub = HybridEncPublicKey {
+                x25519: params.recipient_enc_pub.to_bytes(),
+                mlkem,
+            };
+            let hybrid = wrap_dek_hybrid(&hybrid_pub, dek, &ctx).map_err(|_| WrapFailed)?;
+            pack_hybrid_wrap(&hybrid)
+        }
+    };
 
     // (5) Issue a possession-entailing read-grant rooted at the granter.
     let grant = Grant {
@@ -178,6 +209,8 @@ mod tests {
             dek_commit: dek.commit(),
             recipient_id: RECIPIENT_ID,
             recipient_enc_pub,
+            suite: Suite::V1,
+            recipient_mlkem_pub: None,
             created_at: NOW,
         }
     }
@@ -302,6 +335,51 @@ mod tests {
         assert!(matches!(
             build_reshare(&params(&granter, recipient_pk, &dek), &dek, &tombstones),
             Err(ReshareError::RecipientRevoked)
+        ));
+    }
+
+    #[test]
+    fn reshare_v2_roundtrips() {
+        use maxsecu_crypto::{
+            deserialize_hybrid_wrap, generate_mlkem_keypair, unwrap_dek_hybrid, HybridEncSecretKey,
+        };
+        // A V2 file re-shares with a hybrid wrap to a PQ recipient; the recipient
+        // reconstructs its hybrid secret and opens it to the committed DEK.
+        let granter = Identity::generate();
+        let (recipient_sk, recipient_pk) = generate_enc_keypair();
+        let (recipient_seed, recipient_mlkem) = generate_mlkem_keypair();
+        let dek = Dek::generate();
+        let mut p = params(&granter, recipient_pk, &dek);
+        p.suite = Suite::V2;
+        p.recipient_mlkem_pub = Some(recipient_mlkem);
+
+        let out = build_reshare(&p, &dek, &empty_tombstones()).expect("v2 re-share succeeds");
+
+        let ctx = WrapContext {
+            file_id: FILE_ID,
+            version: 1,
+            recipient_id: RECIPIENT_ID,
+        };
+        let mut wire = out.wrapped_dek.enc.to_vec();
+        wire.extend_from_slice(&out.wrapped_dek.ct);
+        let hybrid = deserialize_hybrid_wrap(&wire).expect("re-share wrap is hybrid wire");
+        let sec = HybridEncSecretKey::from_components(recipient_sk.expose_bytes(), recipient_seed);
+        let opened = unwrap_dek_hybrid(&sec, &hybrid, &ctx).unwrap();
+        assert_eq!(opened.commit(), dek.commit());
+    }
+
+    #[test]
+    fn reshare_v2_to_classical_recipient_fails() {
+        // A V2 file re-shared to a recipient with no ML-KEM key fails closed.
+        let granter = Identity::generate();
+        let (_sk, recipient_pk) = generate_enc_keypair();
+        let dek = Dek::generate();
+        let mut p = params(&granter, recipient_pk, &dek);
+        p.suite = Suite::V2;
+        p.recipient_mlkem_pub = None;
+        assert!(matches!(
+            build_reshare(&p, &dek, &empty_tombstones()),
+            Err(ReshareError::ResharePqKeyMissing)
         ));
     }
 }

@@ -20,7 +20,7 @@
 //! sink-anchored head, fail-closed on a gap, §7.6/D22), so a rotator that cannot
 //! fetch the head never rotates on an unverified set (parameters §5).
 
-use maxsecu_crypto::{Dek, EncPublicKey};
+use maxsecu_crypto::{Dek, EncPublicKey, HybridEncPublicKey, HybridEncSecretKey, SigningKey};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::{Grant, Manifest};
 use maxsecu_encoding::types::{Bytes32, FileType, Hash, Id, RecipientType, Suite, Timestamp};
@@ -31,7 +31,9 @@ use crate::error::UploadError;
 use crate::identity::Identity;
 use crate::limits::{CHUNK_SIZE_MAX, CHUNK_SIZE_MIN};
 use crate::revocation::TombstoneSet;
-use crate::upload::{seal_streams, wrap_and_grant, PlaintextStreams, SealedStreamOut, WrapOut};
+use crate::upload::{
+    seal_streams, wrap_and_grant, wrap_and_grant_hybrid, PlaintextStreams, SealedStreamOut, WrapOut,
+};
 
 /// A prior-version recipient the rotator may carry forward, with the grant chain
 /// the server served for it (api.md §8.5). The `recipient_enc_pub` is the
@@ -40,6 +42,11 @@ use crate::upload::{seal_streams, wrap_and_grant, PlaintextStreams, SealedStream
 pub struct CarryForwardCandidate {
     pub recipient_id: Id,
     pub recipient_enc_pub: EncPublicKey,
+    /// The recipient's directory-verified ML-KEM-768 encapsulation key, required
+    /// to carry it forward on a Suite::V2 rotation. `None` for a classical
+    /// recipient; a survivor lacking a PQ key on a V2 rotation fails closed
+    /// ([`RotateError::PqKeyMissing`], P7.5).
+    pub recipient_mlkem_pub: Option<[u8; 1184]>,
     pub leaf_grant_bytes: Vec<u8>,
     pub leaf_grant_sig: [u8; 64],
     pub ancestor_grants: Vec<(Vec<u8>, [u8; 64])>,
@@ -58,6 +65,14 @@ pub struct RotateParams<'a> {
     pub chunk_size: u32,
     /// The recovery recipient's directory-verified `enc_pub` (always re-added).
     pub recovery_pub: EncPublicKey,
+    /// The file's wrap suite, carried forward from the prior manifest's `alg`. A
+    /// V2 file rotates under hybrid wraps to every survivor + recovery; a V1 file
+    /// rotates classically (P7.5).
+    pub suite: Suite,
+    /// The recovery recipient's ML-KEM-768 encapsulation key, required for a V2
+    /// rotation. `None` for a classical recovery key; a V2 rotation without it
+    /// fails closed ([`RotateError::PqKeyMissing`]).
+    pub recovery_mlkem_pub: Option<[u8; 1184]>,
     pub created_at: Timestamp,
     /// The version being rotated away from (carry-forward grants are verified
     /// against it).
@@ -95,6 +110,10 @@ pub enum RotateError {
     PriorDekMismatch,
     /// A wrap/self-check failure while building the new wraps.
     Upload(UploadError),
+    /// The file is Suite::V2 (PQ-hybrid) but a recipient to re-wrap (the owner,
+    /// the recovery recipient, or a carried-forward survivor) has no ML-KEM key —
+    /// fail closed rather than silently down-grade the suite (P7.5).
+    PqKeyMissing,
 }
 
 impl From<UploadError> for RotateError {
@@ -113,6 +132,9 @@ impl std::fmt::Display for RotateError {
                 write!(f, "recovered DEK does not match the prior commitment")
             }
             RotateError::Upload(e) => write!(f, "wrap build failed: {e}"),
+            RotateError::PqKeyMissing => {
+                write!(f, "a recipient has no ML-KEM key for a Suite::V2 rotation")
+            }
         }
     }
 }
@@ -147,38 +169,69 @@ pub fn build_next_version(
         seal_streams(&dek, params.file_id, params.new_version, params.chunk_size, streams);
 
     let signer = params.owner.signing_key();
-    let owner_enc_pub = EncPublicKey::from_bytes(params.owner.enc_pub_bytes());
+    let suite = params.suite;
 
     // Always re-add the owner (self) and the recovery recipient, then carry
     // forward each surviving prior recipient — re-rooted under the new author.
-    let mut wraps = vec![
-        wrap_and_grant(
+    // Every wrap matches the FILE's suite (V1 classical / V2 hybrid, P7.5).
+    let owner_wrap = match suite {
+        Suite::V1 => wrap_and_grant(
             signer,
             params.file_id,
             params.new_version,
             params.owner_id,
             RecipientType::User,
-            &owner_enc_pub,
+            &EncPublicKey::from_bytes(params.owner.enc_pub_bytes()),
             &dek,
             dek_commit,
             params.owner_id,
             params.created_at,
             Some(params.owner.enc_secret()),
         )?,
-        wrap_and_grant(
-            signer,
-            params.file_id,
-            params.new_version,
-            RECOVERY_ID,
-            RecipientType::Recovery,
-            &params.recovery_pub,
-            &dek,
-            dek_commit,
-            params.owner_id,
-            params.created_at,
-            None,
-        )?,
-    ];
+        Suite::V2 => {
+            let owner_mlkem = params
+                .owner
+                .mlkem_pub_bytes()
+                .ok_or(RotateError::PqKeyMissing)?;
+            let owner_seed = params.owner.mlkem_seed().ok_or(RotateError::PqKeyMissing)?;
+            let hpub = HybridEncPublicKey {
+                x25519: params.owner.enc_pub_bytes(),
+                mlkem: owner_mlkem,
+            };
+            let hsec = HybridEncSecretKey::from_components(
+                params.owner.enc_secret().expose_bytes(),
+                owner_seed,
+            );
+            wrap_and_grant_hybrid(
+                signer,
+                params.file_id,
+                params.new_version,
+                params.owner_id,
+                RecipientType::User,
+                &hpub,
+                &dek,
+                dek_commit,
+                params.owner_id,
+                params.created_at,
+                Some(&hsec),
+            )?
+        }
+    };
+    let recovery_wrap = wrap_under_suite(
+        suite,
+        signer,
+        params.file_id,
+        params.new_version,
+        RECOVERY_ID,
+        RecipientType::Recovery,
+        &params.recovery_pub,
+        params.recovery_mlkem_pub,
+        &dek,
+        dek_commit,
+        params.owner_id,
+        params.created_at,
+    )?;
+    let mut wraps = vec![owner_wrap, recovery_wrap];
 
     for c in candidates {
         // Owner/recovery are already present; skip duplicates.
@@ -188,18 +241,19 @@ pub fn build_next_version(
         if !candidate_survives(c, params, tombstones, granter_sig_pub) {
             continue;
         }
-        wraps.push(wrap_and_grant(
+        wraps.push(wrap_under_suite(
+            suite,
             signer,
             params.file_id,
             params.new_version,
             c.recipient_id,
             RecipientType::User,
             &c.recipient_enc_pub,
+            c.recipient_mlkem_pub,
             &dek,
             dek_commit,
             params.owner_id,
             params.created_at,
-            None,
         )?);
     }
 
@@ -207,7 +261,7 @@ pub fn build_next_version(
         file_id: params.file_id,
         version: params.new_version,
         file_type: params.file_type,
-        alg: Suite::V1,
+        alg: suite,
         chunk_size: params.chunk_size,
         dek_commit: Bytes32(dek_commit),
         streams: manifest_streams,
@@ -225,6 +279,63 @@ pub fn build_next_version(
         streams: sealed_out,
         wraps,
     })
+}
+
+/// Re-wrap the DEK to one carried-forward / standing recipient (no self-check)
+/// under the file's suite (P7.5): V1 classical HPKE, V2 hybrid to {enc_pub,
+/// mlkem_pub}. A V2 wrap to a recipient with no ML-KEM key fails closed. Used for
+/// the recovery recipient and every surviving prior recipient; the owner self
+/// wrap is built inline (it carries a self-check).
+#[allow(clippy::too_many_arguments)]
+fn wrap_under_suite(
+    suite: Suite,
+    signer: &SigningKey,
+    file_id: Id,
+    version: u64,
+    recipient_id: Id,
+    recipient_type: RecipientType,
+    enc_pub: &EncPublicKey,
+    mlkem_pub: Option<[u8; 1184]>,
+    dek: &Dek,
+    dek_commit: [u8; 32],
+    granted_by: Id,
+    created_at: Timestamp,
+) -> Result<WrapOut, RotateError> {
+    match suite {
+        Suite::V1 => Ok(wrap_and_grant(
+            signer,
+            file_id,
+            version,
+            recipient_id,
+            recipient_type,
+            enc_pub,
+            dek,
+            dek_commit,
+            granted_by,
+            created_at,
+            None,
+        )?),
+        Suite::V2 => {
+            let mlkem = mlkem_pub.ok_or(RotateError::PqKeyMissing)?;
+            let hpub = HybridEncPublicKey {
+                x25519: enc_pub.to_bytes(),
+                mlkem,
+            };
+            Ok(wrap_and_grant_hybrid(
+                signer,
+                file_id,
+                version,
+                recipient_id,
+                recipient_type,
+                &hpub,
+                dek,
+                dek_commit,
+                granted_by,
+                created_at,
+                None,
+            )?)
+        }
+    }
 }
 
 /// Decide whether a prior recipient is carried into the next version (§12.9 step
@@ -310,6 +421,8 @@ mod tests {
             new_version: 2,
             chunk_size: 4096,
             recovery_pub: EncPublicKey::from_bytes([0xE9; 32]),
+            suite: Suite::V1,
+            recovery_mlkem_pub: None,
             created_at: NOW,
             prior_version: 1,
             prior_dek_commit: prior_dek.commit(),
@@ -333,6 +446,7 @@ mod tests {
         CarryForwardCandidate {
             recipient_id: V_ID,
             recipient_enc_pub: EncPublicKey::from_bytes(v.enc_pub_bytes()),
+            recipient_mlkem_pub: None,
             leaf_grant_bytes: encode(&grant),
             leaf_grant_sig: sig,
             ancestor_grants: vec![],
@@ -417,6 +531,7 @@ mod tests {
         let cand = CarryForwardCandidate {
             recipient_id: W_ID,
             recipient_enc_pub: EncPublicKey::from_bytes(w.enc_pub_bytes()),
+            recipient_mlkem_pub: None,
             leaf_grant_bytes: encode(&w_grant),
             leaf_grant_sig: w_grant_sig,
             ancestor_grants: vec![(encode(&r_grant), r_grant_sig)],
@@ -462,6 +577,7 @@ mod tests {
         let cand = CarryForwardCandidate {
             recipient_id: V_ID,
             recipient_enc_pub: EncPublicKey::from_bytes(v.enc_pub_bytes()),
+            recipient_mlkem_pub: None,
             leaf_grant_bytes: encode(&grant),
             leaf_grant_sig: sig,
             ancestor_grants: vec![],
@@ -553,6 +669,80 @@ mod tests {
         assert!(matches!(
             build_next_version(&params, &plaintext(), &prior_dek, &[], &empty_tombstones(), &NO_GRANTERS),
             Err(RotateError::PriorDekMismatch)
+        ));
+    }
+
+    #[test]
+    fn rotate_v2_carries_forward() {
+        use maxsecu_crypto::{
+            deserialize_hybrid_wrap, generate_mlkem_keypair, unwrap_dek_hybrid, HybridEncSecretKey,
+        };
+        // A V2 file rotates under DEK': owner + recovery + a carried PQ recipient,
+        // each re-wrapped as a hybrid wrap. The carried recipient reads version 2.
+        let owner = Identity::generate();
+        let v = Identity::generate();
+        let prior_dek = Dek::generate();
+        let v_seed = v.mlkem_seed().unwrap();
+        let v_mlkem = v.mlkem_pub_bytes().unwrap();
+        let mut cand = author_rooted_candidate(&owner, &prior_dek, &v);
+        cand.recipient_mlkem_pub = Some(v_mlkem);
+
+        let (_rec_seed, rec_mlkem) = generate_mlkem_keypair();
+        let mut params = rotate_params(&owner, &prior_dek);
+        params.suite = Suite::V2;
+        params.recovery_mlkem_pub = Some(rec_mlkem);
+
+        let bundle = build_next_version(
+            &params,
+            &plaintext(),
+            &prior_dek,
+            std::slice::from_ref(&cand),
+            &empty_tombstones(),
+            &NO_GRANTERS,
+        )
+        .expect("v2 rotation builds");
+
+        assert!(matches!(bundle.manifest.alg, Suite::V2));
+        assert_eq!(bundle.wraps.len(), 3, "owner + recovery + V");
+
+        let vw = bundle.wraps.iter().find(|w| w.recipient_id == V_ID).unwrap();
+        assert_eq!(vw.grant.granted_by, OWNER_ID, "re-rooted under the new author");
+        let ctx = WrapContext {
+            file_id: FILE_ID,
+            version: 2,
+            recipient_id: V_ID,
+        };
+        let mut wire = vw.wrapped_dek.enc.to_vec();
+        wire.extend_from_slice(&vw.wrapped_dek.ct);
+        let hybrid = deserialize_hybrid_wrap(&wire).expect("carried wrap is hybrid wire");
+        let sec = HybridEncSecretKey::from_components(v.enc_secret().expose_bytes(), v_seed);
+        let dek2 = unwrap_dek_hybrid(&sec, &hybrid, &ctx).unwrap();
+        assert_eq!(Bytes32(dek2.commit()), bundle.manifest.dek_commit);
+        assert_ne!(dek2.commit(), prior_dek.commit(), "DEK rotated");
+    }
+
+    #[test]
+    fn rotate_v2_survivor_without_pq_fails_closed() {
+        // A V2 rotation where a surviving recipient has no ML-KEM key fails closed
+        // rather than silently down-grading the suite (P7.5).
+        let owner = Identity::generate();
+        let v = Identity::generate();
+        let prior_dek = Dek::generate();
+        let cand = author_rooted_candidate(&owner, &prior_dek, &v); // recipient_mlkem_pub: None
+        let (_rec_seed, rec_mlkem) = maxsecu_crypto::generate_mlkem_keypair();
+        let mut params = rotate_params(&owner, &prior_dek);
+        params.suite = Suite::V2;
+        params.recovery_mlkem_pub = Some(rec_mlkem);
+        assert!(matches!(
+            build_next_version(
+                &params,
+                &plaintext(),
+                &prior_dek,
+                std::slice::from_ref(&cand),
+                &empty_tombstones(),
+                &NO_GRANTERS,
+            ),
+            Err(RotateError::PqKeyMissing)
         ));
     }
 }

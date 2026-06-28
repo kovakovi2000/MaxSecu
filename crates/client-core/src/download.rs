@@ -15,11 +15,11 @@
 //! evaluation against the sink-anchored head is Phase 5.
 
 use maxsecu_crypto::{
-    open_stream, open_stream_streaming, stream_digest, unwrap_dek, Dek, EncSecretKey, VerifyingKey,
-    WrappedDek,
+    open_stream, open_stream_streaming, stream_digest, unwrap_dek, unwrap_dek_hybrid, Dek,
+    EncSecretKey, HybridEncSecretKey, VerifyingKey, WrappedDek,
 };
 use maxsecu_encoding::structs::{Genesis, Grant, Manifest, WrapContext};
-use maxsecu_encoding::types::{Compression, FileType, Id, RecipientType, StreamType};
+use maxsecu_encoding::types::{Compression, FileType, Id, RecipientType, StreamType, Suite};
 use maxsecu_encoding::{decode, labels, Canonical, RECOVERY_ID};
 
 use std::collections::{HashMap, HashSet};
@@ -72,6 +72,11 @@ pub struct VerifyContext<'a> {
     pub recipient_id: Id,
     pub recipient_type: RecipientType,
     pub recipient_secret: &'a EncSecretKey,
+    /// The recipient's 64-byte ML-KEM-768 decapsulation seed, required to open a
+    /// `Suite::V2` hybrid wrap (paired with `recipient_secret` as the classical
+    /// leg). `None` for a classical (V1) recipient; a V2 manifest with no seed
+    /// fails closed ([`DownloadError::PqKeyMissing`]), never panics (P7.5).
+    pub recipient_mlkem_seed: Option<[u8; 64]>,
     /// Highest `version` accepted for this file (trust-on-last-use), or `None`
     /// at first contact (§7.5). Supplied/persisted by the version-memory store.
     pub seen_max_version: Option<u64>,
@@ -286,13 +291,28 @@ fn verify_header(
         genesis.owner_id,
     );
 
-    // (7) Unwrap the DEK and self-validate against the manifest commitment.
+    // (7) Unwrap the DEK and self-validate against the manifest commitment. The
+    // stored wrap's wire layout is selected by `manifest.alg` (P7.5): V1 opens the
+    // classical HPKE wrap; V2 reconstructs the hybrid wrap from its byte-carrier
+    // and opens it with the recipient's {x25519, ML-KEM} secret. Everything
+    // downstream (dek_commit self-validation) is unchanged.
     let wrap_ctx = WrapContext {
         file_id: ctx.file_id,
         version: manifest.version,
         recipient_id: ctx.recipient_id,
     };
-    let dek = unwrap_dek(ctx.recipient_secret, wrapped_dek, &wrap_ctx).map_err(|_| DekUnwrap)?;
+    let dek = match manifest.alg {
+        Suite::V1 => unwrap_dek(ctx.recipient_secret, wrapped_dek, &wrap_ctx).map_err(|_| DekUnwrap)?,
+        Suite::V2 => {
+            let seed = ctx.recipient_mlkem_seed.ok_or(PqKeyMissing)?;
+            let hybrid = crate::upload::unpack_hybrid_wrap(wrapped_dek).map_err(|_| DekUnwrap)?;
+            let hsk = HybridEncSecretKey::from_components(
+                ctx.recipient_secret.expose_bytes(),
+                seed,
+            );
+            unwrap_dek_hybrid(&hsk, &hybrid, &wrap_ctx).map_err(|_| DekUnwrap)?
+        }
+    };
     if dek.commit() != manifest.dek_commit.0 {
         return Err(DekCommitMismatch);
     }
@@ -715,6 +735,7 @@ mod tests {
             file_type: FileType::Blog,
             chunk_size: 4096,
             recovery_pub: recovery_pk,
+            recovery_mlkem_pub: None,
             created_at: NOW,
         };
         let streams = PlaintextStreams {
@@ -773,6 +794,7 @@ mod tests {
             recipient_id: OWNER_ID,
             recipient_type: RecipientType::User,
             recipient_secret: built.owner.enc_secret(),
+            recipient_mlkem_seed: None,
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
             admin_sig_pub: &NO_ADMINS,
@@ -793,6 +815,7 @@ mod tests {
             file_type: FileType::Blog,
             chunk_size: 4096,
             recovery_pub: recovery_pk,
+            recovery_mlkem_pub: None,
             created_at: NOW,
         };
         let content: Vec<u8> = (0..(4096 * 3 + 123)).map(|i| (i % 251) as u8).collect();
@@ -943,6 +966,7 @@ mod tests {
             recipient_id: RECOVERY_ID,
             recipient_type: RecipientType::Recovery,
             recipient_secret: &built.recovery_sk,
+            recipient_mlkem_seed: None,
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
             admin_sig_pub: &NO_ADMINS,
@@ -1084,6 +1108,7 @@ mod tests {
             recipient_id: RECOVERED_ID,
             recipient_type: RecipientType::User,
             recipient_secret: recip.enc_secret(),
+            recipient_mlkem_seed: None,
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
             admin_sig_pub: admin_res,
@@ -1219,6 +1244,7 @@ mod tests {
             file_type: FileType::Blog,
             chunk_size: 4096,
             recovery_pub: rpk,
+            recovery_mlkem_pub: None,
             created_at: NOW,
         };
         let big = vec![7u8; 4096 * 3 + 11];
@@ -1246,6 +1272,7 @@ mod tests {
             recipient_id: OWNER_ID,
             recipient_type: RecipientType::User,
             recipient_secret: owner.enc_secret(),
+            recipient_mlkem_seed: None,
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
             admin_sig_pub: &NO_ADMINS,
@@ -1434,6 +1461,7 @@ mod tests {
             recipient_id: V_ID,
             recipient_type: RecipientType::User,
             recipient_secret: v.enc_secret(),
+            recipient_mlkem_seed: None,
             seen_max_version: None,
             granter_sig_pub: &resolver,
             admin_sig_pub: &NO_ADMINS,
@@ -1466,6 +1494,7 @@ mod tests {
             recipient_id: V_ID,
             recipient_type: RecipientType::User,
             recipient_secret: v.enc_secret(),
+            recipient_mlkem_seed: None,
             seen_max_version: None,
             granter_sig_pub: resolver,
             admin_sig_pub: &NO_ADMINS,
@@ -1703,6 +1732,7 @@ mod tests {
             recipient_id: OWNER_ID,
             recipient_type: RecipientType::User,
             recipient_secret: owner.enc_secret(),
+            recipient_mlkem_seed: None,
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
             admin_sig_pub: &NO_ADMINS,
@@ -1720,6 +1750,106 @@ mod tests {
         assert!(version_acceptable(1, None).is_ok());
         assert!(version_acceptable(7, Some(7)).is_ok()); // re-download current
         assert!(version_acceptable(8, Some(7)).is_ok()); // next version
+    }
+
+    /// Build a V2 (PQ-hybrid) upload bundle: owner + recovery both PQ-enrolled.
+    fn build_v2() -> (Identity, UploadBundle) {
+        use maxsecu_crypto::generate_mlkem_keypair;
+        let owner = Identity::generate();
+        let (_recovery_sk, recovery_pk) = generate_enc_keypair();
+        let (_recovery_seed, recovery_mlkem) = generate_mlkem_keypair();
+        let params = UploadParams {
+            owner: &owner,
+            owner_id: OWNER_ID,
+            owner_key_version: 1,
+            file_id: FILE_ID,
+            file_type: FileType::Blog,
+            chunk_size: 4096,
+            recovery_pub: recovery_pk,
+            recovery_mlkem_pub: Some(recovery_mlkem),
+            created_at: NOW,
+        };
+        let streams = PlaintextStreams {
+            content: b"post-quantum content stream".to_vec(),
+            metadata: Some(b"title=pq".to_vec()),
+            thumbnail: None,
+            preview: None,
+        };
+        let bundle = build_upload(&params, &streams).unwrap();
+        (owner, bundle)
+    }
+
+    #[test]
+    fn v2_hybrid_wrap_opens_on_download() {
+        let (owner, bundle) = build_v2();
+        assert!(matches!(bundle.manifest.alg, Suite::V2));
+        let sw = bundle
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == RecipientType::User)
+            .unwrap();
+        let rw = bundle
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == RecipientType::Recovery)
+            .unwrap();
+        let db = DownloadBundle {
+            manifest_bytes: encode(&bundle.manifest),
+            manifest_sig: bundle.manifest_sig,
+            genesis_bytes: encode(&bundle.genesis),
+            genesis_sig: bundle.genesis_sig,
+            wrapped_dek: sw.wrapped_dek.clone(),
+            grant_bytes: encode(&sw.grant),
+            grant_sig: sw.grant_sig,
+            ancestor_grants: vec![],
+            recovery_grant_bytes: encode(&rw.grant),
+            recovery_grant_sig: rw.grant_sig,
+            streams: bundle
+                .streams
+                .iter()
+                .map(|s| StreamChunks {
+                    stream_type: s.stream_type,
+                    chunks: s.chunks.clone(),
+                })
+                .collect(),
+        };
+        let pk = owner.sig_pub_bytes();
+        let c = VerifyContext {
+            file_id: FILE_ID,
+            author_sig_pub: pk,
+            owner_sig_pub: pk,
+            recipient_id: OWNER_ID,
+            recipient_type: RecipientType::User,
+            recipient_secret: owner.enc_secret(),
+            recipient_mlkem_seed: owner.mlkem_seed(),
+            seen_max_version: None,
+            granter_sig_pub: &NO_GRANTERS,
+            admin_sig_pub: &NO_ADMINS,
+            tombstones: None,
+            compromise: None,
+        };
+        let opened = verify_and_open(&c, &db).expect("v2 hybrid wrap opens");
+        let content = opened
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .unwrap();
+        assert_eq!(content.plaintext, b"post-quantum content stream");
+
+        // Fail closed (no panic) when a V2 file is opened without an ML-KEM seed.
+        let mut c2 = c.clone();
+        c2.recipient_mlkem_seed = None;
+        assert_eq!(verify_and_open(&c2, &db), Err(DownloadError::PqKeyMissing));
+    }
+
+    #[test]
+    fn v1_wrap_still_opens() {
+        // Regression: a classical (Suite::V1) wrap still opens with no ML-KEM seed.
+        let built = build();
+        assert!(matches!(built.bundle.manifest.alg, Suite::V1));
+        let db = self_bundle(&built.bundle);
+        let opened = verify_and_open(&ctx(&built), &db).expect("v1 opens");
+        assert_eq!(opened.version, 1);
     }
 
     #[test]

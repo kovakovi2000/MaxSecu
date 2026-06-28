@@ -323,6 +323,7 @@ mod tests {
             file_type, // the authenticated D35 listing key, from the transcoder
             chunk_size: 4096,
             recovery_pub: rpk,
+            recovery_mlkem_pub: None,
             created_at: Timestamp(1_719_500_000_000),
         };
         let bundle = build_upload(&params, &ps).expect("media upload builds");

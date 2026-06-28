@@ -10,7 +10,9 @@
 //! and self-checks the wraps it holds the key for before returning.
 
 use maxsecu_crypto::{
-    seal_stream, unwrap_dek, wrap_dek, Dek, EncPublicKey, EncSecretKey, SigningKey, WrappedDek,
+    deserialize_hybrid_wrap, seal_stream, serialize_hybrid_wrap, unwrap_dek, unwrap_dek_hybrid,
+    wrap_dek, wrap_dek_hybrid, CryptoError, Dek, EncPublicKey, EncSecretKey, HybridEncPublicKey,
+    HybridEncSecretKey, HybridWrappedDek, SigningKey, WrappedDek,
 };
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::WrapContext;
@@ -57,6 +59,12 @@ pub struct UploadParams<'a> {
     pub chunk_size: u32,
     /// The recovery recipient's directory-verified `enc_pub` (standing recipient).
     pub recovery_pub: EncPublicKey,
+    /// The recovery recipient's directory-verified ML-KEM-768 encapsulation key
+    /// (the PQ leg of its hybrid wrap), or `None` for a classical recovery key.
+    /// Suite::V2 requires BOTH the uploader and the recovery recipient to be
+    /// PQ-enrolled (recovery is mandatory, DESIGN §6.3); otherwise the upload
+    /// falls back to Suite::V1 so a partially-enrolled fleet still uploads (P7.5).
+    pub recovery_mlkem_pub: Option<[u8; 1184]>,
     /// Caller-supplied creation time (the core takes no clock dependency).
     pub created_at: Timestamp,
 }
@@ -120,11 +128,21 @@ pub fn build_upload(
 
     let signer = params.owner.signing_key();
 
+    // Suite-selection policy (P7.5): emit Suite::V2 iff BOTH the uploader's own
+    // identity AND the recovery recipient carry an ML-KEM key. Recovery is a
+    // mandatory recipient (DESIGN §6.3), so V2 requires the recovery binding to be
+    // PQ too; otherwise a partially-enrolled fleet still uploads under Suite::V1.
+    let pq = params
+        .owner
+        .mlkem_pub_bytes()
+        .zip(params.recovery_mlkem_pub);
+    let suite = if pq.is_some() { Suite::V2 } else { Suite::V1 };
+
     let manifest = Manifest {
         file_id: params.file_id,
         version: FIRST_VERSION,
         file_type: params.file_type,
-        alg: Suite::V1,
+        alg: suite,
         chunk_size: params.chunk_size,
         dek_commit: Bytes32(dek_commit),
         streams: manifest_streams,
@@ -144,35 +162,88 @@ pub fn build_upload(
 
     // Wrap to self (we hold the secret, so self-check the wrap) and to the
     // standing recovery recipient. Owner-only write ⇒ no other recipients (D29).
-    let owner_enc_pub = EncPublicKey::from_bytes(params.owner.enc_pub_bytes());
-    let wraps = vec![
-        wrap_and_grant(
-            signer,
-            params.file_id,
-            FIRST_VERSION,
-            params.owner_id,
-            RecipientType::User,
-            &owner_enc_pub,
-            &dek,
-            dek_commit,
-            params.owner_id,
-            params.created_at,
-            Some(params.owner.enc_secret()),
-        )?,
-        wrap_and_grant(
-            signer,
-            params.file_id,
-            FIRST_VERSION,
-            RECOVERY_ID,
-            RecipientType::Recovery,
-            &params.recovery_pub,
-            &dek,
-            dek_commit,
-            params.owner_id,
-            params.created_at,
-            None,
-        )?,
-    ];
+    // The wrap wire layout matches `manifest.alg`: V1 classical HPKE, V2 hybrid.
+    let wraps = match pq {
+        Some((owner_mlkem, recovery_mlkem)) => {
+            // Suite::V2 — hybrid wraps to {x25519, ML-KEM} recipients. The same
+            // WrapContext binding as V1 is used (file_id/version/recipient_id).
+            let owner_hybrid_pub = HybridEncPublicKey {
+                x25519: params.owner.enc_pub_bytes(),
+                mlkem: owner_mlkem,
+            };
+            let owner_hybrid_sec = HybridEncSecretKey::from_components(
+                params.owner.enc_secret().expose_bytes(),
+                params
+                    .owner
+                    .mlkem_seed()
+                    .expect("owner ML-KEM pub implies its seed"),
+            );
+            let recovery_hybrid_pub = HybridEncPublicKey {
+                x25519: params.recovery_pub.to_bytes(),
+                mlkem: recovery_mlkem,
+            };
+            vec![
+                wrap_and_grant_hybrid(
+                    signer,
+                    params.file_id,
+                    FIRST_VERSION,
+                    params.owner_id,
+                    RecipientType::User,
+                    &owner_hybrid_pub,
+                    &dek,
+                    dek_commit,
+                    params.owner_id,
+                    params.created_at,
+                    Some(&owner_hybrid_sec),
+                )?,
+                wrap_and_grant_hybrid(
+                    signer,
+                    params.file_id,
+                    FIRST_VERSION,
+                    RECOVERY_ID,
+                    RecipientType::Recovery,
+                    &recovery_hybrid_pub,
+                    &dek,
+                    dek_commit,
+                    params.owner_id,
+                    params.created_at,
+                    None,
+                )?,
+            ]
+        }
+        None => {
+            // Suite::V1 — classical HPKE wraps (behavior unchanged from Phase 3).
+            let owner_enc_pub = EncPublicKey::from_bytes(params.owner.enc_pub_bytes());
+            vec![
+                wrap_and_grant(
+                    signer,
+                    params.file_id,
+                    FIRST_VERSION,
+                    params.owner_id,
+                    RecipientType::User,
+                    &owner_enc_pub,
+                    &dek,
+                    dek_commit,
+                    params.owner_id,
+                    params.created_at,
+                    Some(params.owner.enc_secret()),
+                )?,
+                wrap_and_grant(
+                    signer,
+                    params.file_id,
+                    FIRST_VERSION,
+                    RECOVERY_ID,
+                    RecipientType::Recovery,
+                    &params.recovery_pub,
+                    &dek,
+                    dek_commit,
+                    params.owner_id,
+                    params.created_at,
+                    None,
+                )?,
+            ]
+        }
+    };
 
     Ok(UploadBundle {
         file_id: params.file_id,
@@ -265,6 +336,95 @@ pub(crate) fn wrap_and_grant(
             return Err(UploadError::WrapSelfCheckFailed);
         }
     }
+    let (grant, grant_sig) = build_grant(
+        signer,
+        file_id,
+        version,
+        recipient_id,
+        recipient_type,
+        dek_commit,
+        granted_by,
+        created_at,
+    );
+    Ok(WrapOut {
+        recipient_id,
+        recipient_type,
+        wrapped_dek,
+        granted_by,
+        grant,
+        grant_sig,
+    })
+}
+
+/// Wrap the DEK to one recipient under the **Suite::V2 hybrid** KEM (X25519 +
+/// ML-KEM-768) and sign its read-grant, mirroring [`wrap_and_grant`] but for the
+/// PQ wire layout (P7.5). The grant is identical to the V1 path — it binds
+/// `dek_commit`, not the wrap layout. The hybrid wrap is stored in the
+/// [`WrappedDek`] byte-carrier (`enc ‖ ct` == `serialize_hybrid_wrap`, see
+/// [`pack_hybrid_wrap`]). When the caller holds the recipient's hybrid secret
+/// (the self wrap), the wrap is re-opened and checked against `dek_commit`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrap_and_grant_hybrid(
+    signer: &SigningKey,
+    file_id: Id,
+    version: u64,
+    recipient_id: Id,
+    recipient_type: RecipientType,
+    recipient_pub: &HybridEncPublicKey,
+    dek: &Dek,
+    dek_commit: [u8; 32],
+    granted_by: Id,
+    created_at: Timestamp,
+    self_secret: Option<&HybridEncSecretKey>,
+) -> Result<WrapOut, UploadError> {
+    let ctx = WrapContext {
+        file_id,
+        version,
+        recipient_id,
+    };
+    let hybrid = wrap_dek_hybrid(recipient_pub, dek, &ctx)?;
+    if let Some(sk) = self_secret {
+        let reopened = unwrap_dek_hybrid(sk, &hybrid, &ctx)?;
+        if reopened.commit() != dek_commit {
+            return Err(UploadError::WrapSelfCheckFailed);
+        }
+    }
+    let wrapped_dek = pack_hybrid_wrap(&hybrid);
+    let (grant, grant_sig) = build_grant(
+        signer,
+        file_id,
+        version,
+        recipient_id,
+        recipient_type,
+        dek_commit,
+        granted_by,
+        created_at,
+    );
+    Ok(WrapOut {
+        recipient_id,
+        recipient_type,
+        wrapped_dek,
+        granted_by,
+        grant,
+        grant_sig,
+    })
+}
+
+/// Build and sign a possession-entailing read-grant for `(file_id, version,
+/// recipient)` rooted at `granted_by`. Shared by the V1 and V2 wrap paths — the
+/// grant binds `dek_commit`, never the wrap wire layout (P7.5), so it is suite-
+/// independent.
+#[allow(clippy::too_many_arguments)]
+fn build_grant(
+    signer: &SigningKey,
+    file_id: Id,
+    version: u64,
+    recipient_id: Id,
+    recipient_type: RecipientType,
+    dek_commit: [u8; 32],
+    granted_by: Id,
+    created_at: Timestamp,
+) -> (Grant, [u8; 64]) {
     let grant = Grant {
         file_id,
         file_version: version,
@@ -275,14 +435,32 @@ pub(crate) fn wrap_and_grant(
         created_at,
     };
     let grant_sig = signer.sign_canonical(labels::GRANT, &grant);
-    Ok(WrapOut {
-        recipient_id,
-        recipient_type,
-        wrapped_dek,
-        granted_by,
-        grant,
-        grant_sig,
-    })
+    (grant, grant_sig)
+}
+
+/// Pack a Suite::V2 hybrid wrap into the [`WrappedDek`] byte-carrier. The stored
+/// wire form is exactly `serialize_hybrid_wrap` = `eph_x_pub(32) ‖ ct_pq(1088) ‖
+/// aead_ct(48)` (1168 bytes), split so `enc` = the 32-byte X25519 ephemeral and
+/// `ct` = `ct_pq ‖ aead_ct`. The server stores these opaque bytes (`enc ‖ ct`)
+/// identically to a V1 wrap; the layout is selected on read by `manifest.alg`.
+pub(crate) fn pack_hybrid_wrap(h: &HybridWrappedDek) -> WrappedDek {
+    let bytes = serialize_hybrid_wrap(h);
+    let mut enc = [0u8; 32];
+    enc.copy_from_slice(&bytes[..32]);
+    WrappedDek {
+        enc,
+        ct: bytes[32..].to_vec(),
+    }
+}
+
+/// Reconstruct a Suite::V2 hybrid wrap from the [`WrappedDek`] byte-carrier (the
+/// inverse of [`pack_hybrid_wrap`]). Fail-closed on a malformed length — the
+/// stored `enc ‖ ct` must be the exact 1168-byte hybrid wire form.
+pub(crate) fn unpack_hybrid_wrap(w: &WrappedDek) -> Result<HybridWrappedDek, CryptoError> {
+    let mut bytes = Vec::with_capacity(32 + w.ct.len());
+    bytes.extend_from_slice(&w.enc);
+    bytes.extend_from_slice(&w.ct);
+    deserialize_hybrid_wrap(&bytes)
 }
 
 #[cfg(test)]
@@ -300,6 +478,7 @@ mod tests {
             file_type: FileType::Blog,
             chunk_size: 4096,
             recovery_pub,
+            recovery_mlkem_pub: None,
             created_at: Timestamp(1_719_500_000_000),
         }
     }
@@ -468,5 +647,104 @@ mod tests {
         p.chunk_size = 1024; // below 4 KiB
         let err = build_upload(&p, &streams()).err().expect("rejected");
         assert_eq!(err, UploadError::ChunkSizeOutOfRange { chunk_size: 1024 });
+    }
+
+    /// Concatenate a wrap's byte-carrier back to its stored wire form
+    /// (`enc ‖ ct`) — for a V2 wrap this is exactly `serialize_hybrid_wrap`.
+    fn wrap_wire(w: &WrappedDek) -> Vec<u8> {
+        let mut v = w.enc.to_vec();
+        v.extend_from_slice(&w.ct);
+        v
+    }
+
+    #[test]
+    fn pq_upload_emits_v2_hybrid_wraps() {
+        use maxsecu_crypto::generate_mlkem_keypair;
+        // Both the uploader's identity and the recovery recipient are PQ-enrolled
+        // ⇒ Suite::V2 hybrid wraps to self + recovery.
+        let owner = Identity::generate();
+        let (recovery_sk, recovery_pk) = generate_enc_keypair();
+        let (recovery_seed, recovery_mlkem) = generate_mlkem_keypair();
+        let mut p = params(&owner, recovery_pk);
+        p.recovery_mlkem_pub = Some(recovery_mlkem);
+        let b = build_upload(&p, &streams()).expect("v2 upload builds");
+
+        assert!(matches!(b.manifest.alg, Suite::V2), "manifest.alg is V2");
+        assert_eq!(b.wraps.len(), 2, "self + recovery");
+
+        // The self wrap deserializes as the 1168-byte hybrid wire form and the
+        // identity's reconstructed hybrid secret unwraps it to the committed DEK.
+        let sw = b
+            .wraps
+            .iter()
+            .find(|w| w.recipient_id == p.owner_id && w.recipient_type == RecipientType::User)
+            .expect("a self wrap");
+        let self_wire = wrap_wire(&sw.wrapped_dek);
+        assert_eq!(self_wire.len(), 1168, "hybrid wrap is eph(32)+ct_pq(1088)+aead(48)");
+        let self_hybrid = deserialize_hybrid_wrap(&self_wire).expect("self wrap is hybrid wire");
+        let owner_sec = HybridEncSecretKey::from_components(
+            owner.enc_secret().expose_bytes(),
+            owner.mlkem_seed().unwrap(),
+        );
+        let sctx = WrapContext {
+            file_id: p.file_id,
+            version: 1,
+            recipient_id: p.owner_id,
+        };
+        let dek = unwrap_dek_hybrid(&owner_sec, &self_hybrid, &sctx).expect("self hybrid opens");
+        assert_eq!(dek.commit(), b.manifest.dek_commit.0, "self → committed DEK");
+
+        // The recovery wrap opens with a test recovery hybrid secret.
+        let rw = b
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == RecipientType::Recovery)
+            .expect("a recovery wrap");
+        let rec_hybrid = deserialize_hybrid_wrap(&wrap_wire(&rw.wrapped_dek))
+            .expect("recovery wrap is hybrid wire");
+        let rec_sec =
+            HybridEncSecretKey::from_components(recovery_sk.expose_bytes(), recovery_seed);
+        let rctx = WrapContext {
+            file_id: p.file_id,
+            version: 1,
+            recipient_id: RECOVERY_ID,
+        };
+        let rdek = unwrap_dek_hybrid(&rec_sec, &rec_hybrid, &rctx).expect("recovery hybrid opens");
+        assert_eq!(rdek.commit(), b.manifest.dek_commit.0, "recovery → committed DEK");
+    }
+
+    #[test]
+    fn non_pq_upload_stays_v1() {
+        // Recovery lacks an ML-KEM key (owner is PQ-capable) ⇒ V1 fallback so a
+        // partially-enrolled fleet still uploads. The classical path is unchanged.
+        let owner = Identity::generate();
+        let (_recovery_sk, recovery_pk) = generate_enc_keypair();
+        let p = params(&owner, recovery_pk); // recovery_mlkem_pub == None
+        let b = build_upload(&p, &streams()).expect("v1 upload builds");
+        assert!(matches!(b.manifest.alg, Suite::V1), "recovery-missing ⇒ V1");
+        let sw = b
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == RecipientType::User)
+            .unwrap();
+        let ctx = WrapContext {
+            file_id: p.file_id,
+            version: 1,
+            recipient_id: p.owner_id,
+        };
+        let dek = unwrap_dek(owner.enc_secret(), &sw.wrapped_dek, &ctx).expect("v1 self opens");
+        assert_eq!(dek.commit(), b.manifest.dek_commit.0);
+
+        // Symmetric case: the uploader's identity lacks ML-KEM (a v1 blob) but the
+        // recovery key is PQ ⇒ still V1 (V2 needs BOTH legs PQ).
+        let (esk, epk, seed, _) = owner.secret_bytes();
+        let v1_owner = Identity::from_secret_bytes(esk, epk, seed, None);
+        assert!(v1_owner.mlkem_pub_bytes().is_none());
+        let (_rsk, rpk) = generate_enc_keypair();
+        let (_rseed, rmlkem) = maxsecu_crypto::generate_mlkem_keypair();
+        let mut p2 = params(&v1_owner, rpk);
+        p2.recovery_mlkem_pub = Some(rmlkem);
+        let b2 = build_upload(&p2, &streams()).expect("v1 upload builds");
+        assert!(matches!(b2.manifest.alg, Suite::V1), "identity-missing ⇒ V1");
     }
 }

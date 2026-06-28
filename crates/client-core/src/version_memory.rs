@@ -120,6 +120,7 @@ mod tests {
             file_type: FileType::Blog,
             chunk_size: 4096,
             recovery_pub: recovery_pk,
+            recovery_mlkem_pub: None,
             created_at: Timestamp(1_719_500_000_000),
         };
         let streams = PlaintextStreams {
@@ -174,6 +175,7 @@ mod tests {
             recipient_id: OWNER_ID,
             recipient_type: RecipientType::User,
             recipient_secret: built.owner.enc_secret(),
+            recipient_mlkem_seed: None,
             seen_max_version: Some(999), // deliberately wrong — the store overrides
             granter_sig_pub: &NO_GRANTERS,
             admin_sig_pub: &NO_ADMINS,

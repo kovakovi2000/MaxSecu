@@ -294,6 +294,7 @@ async fn phase3_exit_gates_over_real_tls() {
         file_type: FileType::Blog,
         chunk_size: 4096,
         recovery_pub,
+        recovery_mlkem_pub: None,
         created_at: Timestamp(TS),
     };
     // Content large enough to span multiple chunks (exercises framing/streaming).
@@ -418,6 +419,7 @@ async fn phase3_exit_gates_over_real_tls() {
         recipient_id: Id(user_id),
         recipient_type: RecipientType::User,
         recipient_secret: owner.enc_secret(),
+        recipient_mlkem_seed: None,
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS,
         admin_sig_pub: &NO_ADMINS,
@@ -589,6 +591,7 @@ async fn phase4b_media_exit_gates_over_real_tls() {
         file_type: FileType::Image,
         chunk_size: 4096,
         recovery_pub,
+        recovery_mlkem_pub: None,
         created_at: Timestamp(TS),
     };
     let bundle = build_upload(&params, &streams).unwrap();
@@ -681,6 +684,7 @@ async fn phase4b_media_exit_gates_over_real_tls() {
         recipient_id: Id(user_id),
         recipient_type: RecipientType::User,
         recipient_secret: owner.enc_secret(),
+        recipient_mlkem_seed: None,
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS,
         admin_sig_pub: &NO_ADMINS,
