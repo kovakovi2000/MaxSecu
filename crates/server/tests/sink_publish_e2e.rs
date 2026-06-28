@@ -28,13 +28,15 @@ use tokio_rustls::TlsConnector;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
-use maxsecu_admin_core::{ControlChain, RevokeParams, SignedControlRecord};
+use maxsecu_admin_core::{ControlChain, DirectorySigner, RevokeParams, SignedControlRecord};
 use maxsecu_client_core::{confirm_anchored, AnchoredHead, HttpSinkClient, Identity, SinkError};
 use maxsecu_crypto::{sha256, SigningKey};
-use maxsecu_encoding::types::{FileScope, Id, Role, Timestamp};
+use maxsecu_encoding::encode;
+use maxsecu_encoding::structs::DirBinding;
+use maxsecu_encoding::types::{Bytes32, FileScope, Id, Role, RoleSet, Text, Timestamp};
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuditSink, AuthConfig, AuthService, FsBlobStore,
-    HttpSinkPublisher, MemoryStore, UserRecord,
+    HttpSinkPublisher, MemoryStore, Store, UserRecord,
 };
 use maxsecu_sink_server::{router as sink_router, serve as sink_serve, Anchorer, SinkState};
 
@@ -209,7 +211,25 @@ async fn boot() -> Booted {
             sig_pub: admin.sig_pub_bytes(),
         },
     );
-    store.set_roles(ADMIN_ID, vec![Role::User, Role::Admin]);
+    // Admin authority flows from a D5-signed {User, Admin} binding (D-K), verified
+    // server-side by the AdminSession gate — not an advisory roles table.
+    let d5 = DirectorySigner::generate();
+    let admin_binding = DirBinding {
+        username: Text::new("admin").unwrap(),
+        user_id: Id(ADMIN_ID),
+        enc_pub: Bytes32(admin.enc_pub_bytes()),
+        sig_pub: Bytes32(admin.sig_pub_bytes()),
+        key_version: 1,
+        roles: RoleSet::new([Role::User, Role::Admin]),
+        not_before: Timestamp(0),
+        not_after: Timestamp(4_102_444_800_000),
+        mlkem_pub: None,
+    };
+    let signed = d5.sign_binding(&admin_binding, None);
+    store
+        .put_binding(ADMIN_ID, 1, encode(&signed.binding), signed.signature)
+        .await
+        .unwrap();
 
     let publisher = HttpSinkPublisher::new(
         sink_addr,
@@ -220,7 +240,10 @@ async fn boot() -> Booted {
     let blob_dir =
         std::env::temp_dir().join(format!("mxs65_{}", hex(&maxsecu_crypto::random_array::<8>())));
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(AuthService::new(
+            store,
+            AuthConfig::default().with_directory_pub(d5.public_key()),
+        )),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(publisher),
         direct_links_enabled: false,

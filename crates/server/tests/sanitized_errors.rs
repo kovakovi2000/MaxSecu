@@ -34,11 +34,15 @@ use base64::Engine;
 use serde_json::json;
 use tower::ServiceExt; // oneshot
 
+use maxsecu_admin_core::DirectorySigner;
 use maxsecu_crypto::SigningKey;
+use maxsecu_encoding::encode;
 use maxsecu_encoding::labels;
-use maxsecu_encoding::structs::{AuthProofContext, Genesis, Manifest, Revocation, Stream};
+use maxsecu_encoding::structs::{
+    AuthProofContext, DirBinding, Genesis, Manifest, Revocation, Stream,
+};
 use maxsecu_encoding::types::{
-    Bytes32, Compression, FileScope, FileType, Id, Role, StreamType, Suite, Text, Timestamp,
+    Bytes32, Compression, FileScope, FileType, Id, Role, RoleSet, StreamType, Suite, Text, Timestamp,
 };
 use maxsecu_server::{
     router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteWrapError,
@@ -393,7 +397,7 @@ fn state_router<S: Store + 'static>(store: S) -> Router {
 
 /// A `MemoryStore`-backed app with admin (role Admin) + bob (plain), both with a
 /// `sig_pub` whose private half is returned for login.
-fn app() -> (Router, SigningKey, SigningKey) {
+async fn app() -> (Router, SigningKey, SigningKey) {
     let store = MemoryStore::new();
     let admin = SigningKey::generate();
     store.add_user(
@@ -404,7 +408,25 @@ fn app() -> (Router, SigningKey, SigningKey) {
             sig_pub: admin.verifying_key().to_bytes(),
         },
     );
-    store.set_roles(ADMIN_ID, vec![Role::User, Role::Admin]);
+    // Admin authority via a D5-signed {User, Admin} binding (D-K), verified by the
+    // server's AdminSession gate — not the advisory roles table.
+    let d5 = DirectorySigner::generate();
+    let admin_binding = DirBinding {
+        username: Text::new("admin").unwrap(),
+        user_id: Id(ADMIN_ID),
+        enc_pub: Bytes32([0xE1; 32]),
+        sig_pub: Bytes32(admin.verifying_key().to_bytes()),
+        key_version: 1,
+        roles: RoleSet::new([Role::User, Role::Admin]),
+        not_before: Timestamp(0),
+        not_after: Timestamp(4_102_444_800_000),
+        mlkem_pub: None,
+    };
+    let signed = d5.sign_binding(&admin_binding, None);
+    store
+        .put_binding(ADMIN_ID, 1, encode(&signed.binding), signed.signature)
+        .await
+        .unwrap();
     let bob = SigningKey::generate();
     store.add_user(
         "bob",
@@ -414,7 +436,17 @@ fn app() -> (Router, SigningKey, SigningKey) {
             sig_pub: bob.verifying_key().to_bytes(),
         },
     );
-    (state_router(store), admin, bob)
+    let state = AppState {
+        auth: Arc::new(AuthService::new(
+            store,
+            AuthConfig::default().with_directory_pub(d5.public_key()),
+        )),
+        blobs: Arc::new(MemoryBlobStore::new()),
+        audit: Arc::new(NullAuditSink),
+        direct_links_enabled: false,
+    };
+    let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
+    (router, admin, bob)
 }
 
 fn req_json(method: &str, uri: &str, body: &serde_json::Value, token: Option<&str>) -> Request<Body> {
@@ -703,7 +735,7 @@ async fn error_responses_never_leak_internals() {
     assert_generic("500 list_files handler", &body);
 
     // ===== the MemoryStore-backed app for the 4xx paths =====
-    let (router, admin, bob) = app();
+    let (router, admin, bob) = app().await;
     let admin_tok = login(&router, "admin", &admin).await;
     let bob_tok = login(&router, "bob", &bob).await;
 
@@ -794,7 +826,7 @@ async fn error_responses_never_leak_internals() {
     assert_generic("413 chunk index past framing", &body);
 
     // ----- 429 rate-limited (the one distinct shape: 429 + Retry-After) -----
-    let (rl, admin2, _bob) = app();
+    let (rl, admin2, _bob) = app().await;
     for i in 0..30 {
         let (st, _, _) = send(
             &rl,
@@ -841,7 +873,7 @@ async fn error_responses_never_leak_internals() {
 
 #[tokio::test]
 async fn no_existence_oracle() {
-    let (router, admin, bob) = app();
+    let (router, admin, bob) = app().await;
     let admin_tok = login(&router, "admin", &admin).await;
     let bob_tok = login(&router, "bob", &bob).await;
 
@@ -851,10 +883,11 @@ async fn no_existence_oracle() {
     let unknown = [0xEE; 16];
 
     // --- directory: unknown username vs a known user with no signed binding ---
-    // (admin/bob are enrolled but never ceremony-signed → binding is None → 404,
-    // exactly as for a wholly unknown username.)
+    // (bob is enrolled but never ceremony-signed → binding is None → 404, exactly
+    // as for a wholly unknown username. admin DOES carry a D5 binding now, since
+    // that is how admin authority is conferred — so bob is the unsigned probe.)
     let (us, _, ub) = send(&router, req_get("/v1/directory/ghost", None)).await;
-    let (ks, _, kb) = send(&router, req_get("/v1/directory/admin", None)).await;
+    let (ks, _, kb) = send(&router, req_get("/v1/directory/bob", None)).await;
     assert_eq!(us, StatusCode::NOT_FOUND);
     assert_eq!((us, &ub), (ks, &kb), "directory: unknown vs unsigned must match");
     assert_generic("directory no-oracle", &ub);

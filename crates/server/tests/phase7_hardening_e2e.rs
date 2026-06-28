@@ -63,7 +63,7 @@ use maxsecu_encoding::types::{
 use maxsecu_encoding::{encode, labels, RECOVERY_ID};
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuditSink, AuthConfig, AuthService, FsBlobStore,
-    HttpSinkPublisher, MemoryStore, UserRecord,
+    HttpSinkPublisher, MemoryStore, Store, UserRecord,
 };
 use maxsecu_sink_server::{router as sink_router, serve as sink_serve, Anchorer, SinkState};
 
@@ -1046,14 +1046,35 @@ async fn r27_cutoff_over_real_sink() {
             sig_pub: admin1.sig_pub_bytes(),
         },
     );
-    store.set_roles(a1_id, vec![Role::User, Role::Admin]);
+    // Admin authority flows from a D5-signed {User, Admin} binding (D-K), verified
+    // server-side by the AdminSession gate — not an advisory roles table.
+    let d5 = DirectorySigner::generate();
+    let admin1_binding = DirBinding {
+        username: Text::new("admin1").unwrap(),
+        user_id: Id(a1_id),
+        enc_pub: Bytes32(admin1.enc_pub_bytes()),
+        sig_pub: Bytes32(admin1.sig_pub_bytes()),
+        key_version: 1,
+        roles: RoleSet::new([Role::User, Role::Admin]),
+        not_before: Timestamp(0),
+        not_after: Timestamp(4_102_444_800_000),
+        mlkem_pub: None,
+    };
+    let signed_a1 = d5.sign_binding(&admin1_binding, None);
+    store
+        .put_binding(a1_id, 1, encode(&signed_a1.binding), signed_a1.signature)
+        .await
+        .unwrap();
 
     let publisher =
         HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
     let blob_dir =
         std::env::temp_dir().join(format!("mxr27_{}", hex(&maxsecu_crypto::random_array::<8>())));
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(AuthService::new(
+            store,
+            AuthConfig::default().with_directory_pub(d5.public_key()),
+        )),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(publisher),
         direct_links_enabled: false,

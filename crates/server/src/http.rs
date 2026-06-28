@@ -85,6 +85,8 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         )
         .route("/v1/reinstatements", post(post_control::<S>))
         .route("/v1/key-compromise", post(post_control::<S>))
+        .route("/v1/pending", get(list_pending::<S>))
+        .route("/v1/vouchers", post(issue_voucher::<S>))
         .route("/v1/files", get(list_files::<S>).post(create_file::<S>))
         .route("/v1/files/{file_id}", get(get_file::<S>))
         .route(
@@ -530,19 +532,14 @@ struct ChainHeadRes {
 
 /// `POST /v1/revocations | /v1/reinstatements | /v1/key-compromise` — append a
 /// control-log record (api.md §7.2). **Coarse** admin gate only (§10.1): the
-/// authenticated caller must hold the advisory `admin` role; the record's own
-/// authenticity (issuer admin-signature, dual control) is re-verified client-side.
-/// The record's authenticated `kind` governs — the path is cosmetic.
+/// [`AdminSession`] extractor requires a D5-verified admin binding; the record's
+/// own authenticity (issuer admin-signature, dual control) is re-verified
+/// client-side. The record's authenticated `kind` governs — the path is cosmetic.
 async fn post_control<S: Store + 'static>(
     State(st): State<AppState<S>>,
-    session: AuthedSession,
+    _admin: AdminSession,
     Json(req): Json<ControlReq>,
 ) -> Response {
-    match st.auth.store().user_roles(&session.user_id).await {
-        Ok(roles) if roles.contains(&Role::Admin) => {}
-        Ok(_) => return StatusCode::FORBIDDEN.into_response(), // not an admin
-        Err(e) => return internal_error(e),
-    }
     let Some(record) = b64_vec(&req.record_b64) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -574,6 +571,72 @@ async fn post_control<S: Store + 'static>(
         Err(ControlAppendError::Conflict) => StatusCode::CONFLICT.into_response(),
         Err(ControlAppendError::Malformed) => StatusCode::BAD_REQUEST.into_response(),
         Err(ControlAppendError::Store(e)) => internal_error(e),
+    }
+}
+
+// ---- Admin approval queue + voucher issuance (api.md §4.2/§5, D-G/D-K) ----
+
+#[derive(Serialize)]
+struct PendingOut {
+    user_id: String,
+    username: String,
+    created_at: u64,
+}
+
+#[derive(Serialize)]
+struct PendingRes {
+    pending: Vec<PendingOut>,
+}
+
+/// `GET /v1/pending` — the admin approval queue (D-G). Admin-gated; lists users
+/// with no published binding. Status only — no key material.
+async fn list_pending<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    _admin: AdminSession,
+) -> Response {
+    match st.auth.store().list_pending_users().await {
+        Ok(list) => Json(PendingRes {
+            pending: list
+                .iter()
+                .map(|p| PendingOut {
+                    user_id: hex_encode(&p.user_id),
+                    username: p.username.clone(),
+                    created_at: p.created_at_ms,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Admin-issued voucher TTL (operational anti-spam window).
+const VOUCHER_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+#[derive(Deserialize)]
+struct IssueVoucherReq {
+    voucher_hash_b64: String,
+}
+
+/// `POST /v1/vouchers` — admin issues a one-time enrollment voucher (§4.2). The
+/// admin client generates the code and posts only its `SHA-256` (the server never
+/// sees the code). Admin-gated.
+async fn issue_voucher<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    admin: AdminSession,
+    Json(req): Json<IssueVoucherReq>,
+) -> Response {
+    let Some(hash) = b64_fixed::<32>(&req.voucher_hash_b64) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st
+        .auth
+        .store()
+        .issue_voucher(hash, admin.user_id, now_ms() + VOUCHER_TTL_MS)
+        .await
+    {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(e) => internal_error(e),
     }
 }
 
@@ -1495,6 +1558,62 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AuthedSession {
     }
 }
 
+/// A channel-bound session whose caller is a **D5-verified admin** (DESIGN
+/// §4.2/§10.1, D-K): the session resolves to a `user_id` whose stored binding
+/// verifies under the pinned D5 key, is within its validity window, and carries
+/// `Role::Admin`. The server can never confer admin — authority flows only from
+/// the offline directory ceremony. This is the coarse server gate; the client
+/// re-verifies every control-log record's authenticity independently. Rejects
+/// `401` (not a session) or `403` (authenticated but not a verified admin).
+pub struct AdminSession {
+    pub user_id: [u8; 16],
+    #[allow(dead_code)] // mirrors AuthedSession; kept for symmetry / future use
+    pub token: [u8; 32],
+}
+
+impl<S: Store + 'static> FromRequestParts<AppState<S>> for AdminSession {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState<S>,
+    ) -> Result<Self, StatusCode> {
+        let session = AuthedSession::from_request_parts(parts, state).await?;
+        let Some(dir_pub) = state.auth.directory_pub() else {
+            return Err(StatusCode::FORBIDDEN); // admin authz disabled (no pinned D5)
+        };
+        let stored = state
+            .auth
+            .store()
+            .binding_by_user_id(&session.user_id)
+            .await
+            .map_err(|e| {
+                log_internal(e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .ok_or(StatusCode::FORBIDDEN)?; // no published binding ⇒ not an admin
+        let binding =
+            decode::<DirBinding>(&stored.binding_bytes).map_err(|_| StatusCode::FORBIDDEN)?;
+        let ok = VerifyingKey::from_bytes(&dir_pub)
+            .and_then(|vk| vk.verify_canonical(DIRBINDING, &binding, &stored.signature))
+            .is_ok();
+        if !ok {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let now = now_ms();
+        if now < binding.not_before.0 || now > binding.not_after.0 {
+            return Err(StatusCode::FORBIDDEN); // outside the binding's validity window
+        }
+        if !binding.roles.roles().contains(&Role::Admin) {
+            return Err(StatusCode::FORBIDDEN); // a valid binding, but not an admin
+        }
+        Ok(AdminSession {
+            user_id: session.user_id,
+            token: session.token,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2118,20 +2237,31 @@ mod tests {
         res["session_token"].as_str().unwrap().to_owned()
     }
 
-    fn admin_app() -> (Router, SigningKey, SigningKey) {
-        let (router, admin_sk, bob_sk, _audit) = admin_app_audited();
+    async fn admin_app() -> (Router, SigningKey, SigningKey) {
+        let (router, admin_sk, bob_sk, _audit) = admin_app_audited().await;
         (router, admin_sk, bob_sk)
     }
 
     /// Like [`admin_app`] but returns a handle to the `MemoryAuditSink` so a
     /// test can assert the grant edges the handlers emit (§16.5).
-    fn admin_app_audited() -> (
+    ///
+    /// Admin authority is conferred the production way (D-K): the pinned D5 key
+    /// signs a `{User, Admin}` binding for the admin, which the server verifies on
+    /// every admin-gated request — NOT the advisory `set_roles` table. `bob` has a
+    /// record but no binding, so he is a valid session yet not an admin (→ 403).
+    async fn admin_app_audited() -> (
         Router,
         SigningKey,
         SigningKey,
         Arc<crate::audit::MemoryAuditSink>,
     ) {
         use crate::audit::MemoryAuditSink;
+        use maxsecu_admin_core::DirectorySigner;
+        use maxsecu_encoding::encode;
+        use maxsecu_encoding::structs::DirBinding;
+        use maxsecu_encoding::types::{Id, RoleSet};
+
+        let d5 = DirectorySigner::generate();
         let store = MemoryStore::new();
         let admin_sk = SigningKey::generate();
         store.add_user(
@@ -2142,7 +2272,22 @@ mod tests {
                 sig_pub: admin_sk.verifying_key().to_bytes(),
             },
         );
-        store.set_roles([0xAD; 16], vec![Role::User, Role::Admin]);
+        let admin_binding = DirBinding {
+            username: Text::new("admin").unwrap(),
+            user_id: Id([0xAD; 16]),
+            enc_pub: Bytes32([0xE1; 32]),
+            sig_pub: Bytes32(admin_sk.verifying_key().to_bytes()),
+            key_version: 1,
+            roles: RoleSet::new([Role::User, Role::Admin]),
+            not_before: Timestamp(0),
+            not_after: Timestamp(4_102_444_800_000),
+            mlkem_pub: None,
+        };
+        let signed = d5.sign_binding(&admin_binding, None);
+        store
+            .put_binding([0xAD; 16], 1, encode(&signed.binding), signed.signature)
+            .await
+            .unwrap();
         let bob_sk = SigningKey::generate();
         store.add_user(
             "bob",
@@ -2154,13 +2299,153 @@ mod tests {
         );
         let audit = Arc::new(MemoryAuditSink::new());
         let router = router(AppState {
-            auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+            auth: Arc::new(AuthService::new(
+                store,
+                AuthConfig::default().with_directory_pub(d5.public_key()),
+            )),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: audit.clone(),
             direct_links_enabled: false,
         })
         .layer(Extension(TlsExporter(EXPORTER)));
         (router, admin_sk, bob_sk, audit)
+    }
+
+    /// An admin-configured app whose pinned D5 has published a `{User, Admin}`
+    /// binding for the admin caller, plus a minted channel-bound admin session
+    /// token. Also seeds a pending `newbie` (registered, no binding) for the
+    /// approval-queue tests. Returns `(router, d5, admin_session_token_hex)`.
+    async fn admin_app_d5() -> (Router, maxsecu_admin_core::DirectorySigner, String) {
+        use maxsecu_admin_core::DirectorySigner;
+        use maxsecu_encoding::encode;
+        use maxsecu_encoding::structs::DirBinding;
+        use maxsecu_encoding::types::{Id, RoleSet};
+
+        let d5 = DirectorySigner::generate();
+        let store = MemoryStore::new();
+        let admin_sk = SigningKey::generate();
+        store.add_user(
+            "admin",
+            UserRecord {
+                user_id: [0xAD; 16],
+                enc_pub: [0xE1; 32],
+                sig_pub: admin_sk.verifying_key().to_bytes(),
+            },
+        );
+        let admin_binding = DirBinding {
+            username: Text::new("admin").unwrap(),
+            user_id: Id([0xAD; 16]),
+            enc_pub: Bytes32([0xE1; 32]),
+            sig_pub: Bytes32(admin_sk.verifying_key().to_bytes()),
+            key_version: 1,
+            roles: RoleSet::new([Role::User, Role::Admin]),
+            not_before: Timestamp(0),
+            not_after: Timestamp(4_102_444_800_000),
+            mlkem_pub: None,
+        };
+        let signed = d5.sign_binding(&admin_binding, None);
+        store
+            .put_binding([0xAD; 16], 1, encode(&signed.binding), signed.signature)
+            .await
+            .unwrap();
+        // A pending newbie: registered, no published binding (the approval queue).
+        store.add_user(
+            "newbie",
+            UserRecord {
+                user_id: [0x0B; 16],
+                enc_pub: [0xE2; 32],
+                sig_pub: [0x52; 32],
+            },
+        );
+        let app = app_with_directory_pub(store, d5.public_key());
+        let token = login(&app, "admin", &admin_sk).await;
+        (app, d5, token)
+    }
+
+    #[tokio::test]
+    async fn pending_list_is_admin_gated_and_lists_unsigned_users() {
+        let (app, _d5, admin_token) = admin_app_d5().await;
+        // No token → 401 (not a session).
+        let (st, _) = get_json(&app, "/v1/pending").await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        // Admin token → 200, lists the pending newbie.
+        let (st, body) = get_json_auth(&app, "/v1/pending", &admin_token).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(body["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["username"] == "newbie"));
+    }
+
+    #[tokio::test]
+    async fn issue_voucher_is_admin_gated_and_enables_registration() {
+        let (app, _d5, admin_token) = admin_app_d5().await;
+        let h = sha256(b"in-person-code");
+        // Non-admin (no token) → 401.
+        let (st, _) = post_json(
+            &app,
+            "/v1/vouchers",
+            serde_json::json!({ "voucher_hash_b64": B64.encode(h) }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        // Admin → 201; the voucher then works on POST /v1/users.
+        let (st, _) = post_json_auth(
+            &app,
+            "/v1/vouchers",
+            serde_json::json!({ "voucher_hash_b64": B64.encode(h) }),
+            &admin_token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (st, _) = post_json(
+            &app,
+            "/v1/users",
+            serde_json::json!({
+                "username": "viaadmin",
+                "enc_pub_b64": B64.encode([3u8; 32]),
+                "sig_pub_b64": B64.encode([4u8; 32]),
+                "enrollment_voucher": "in-person-code",
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn non_admin_session_cannot_post_control_or_list_pending() {
+        use maxsecu_admin_core::DirectorySigner;
+        // A valid session with NO admin binding must be rejected (403, not 401) on
+        // every admin-gated endpoint — the session is authentic, the authority is
+        // not.
+        let d5 = DirectorySigner::generate();
+        let store = MemoryStore::new();
+        let user_sk = SigningKey::generate();
+        store.add_user(
+            "plain",
+            UserRecord {
+                user_id: [0x0C; 16],
+                enc_pub: [0xE3; 32],
+                sig_pub: user_sk.verifying_key().to_bytes(),
+            },
+        );
+        // No binding published for `plain` ⇒ not an admin.
+        let app = app_with_directory_pub(store, d5.public_key());
+        let token = login(&app, "plain", &user_sk).await;
+
+        let (st, _) = get_json_auth(&app, "/v1/pending", &token).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+
+        let (rec, sig) = revocation_b64([0u8; 32], 1, 0x96);
+        let (st, _) = post_json_auth(
+            &app,
+            "/v1/revocations",
+            serde_json::json!({"record_b64": rec, "sig_b64": sig}),
+            &token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
     }
 
     /// Like [`admin_app`] but the blob store is a [`TieredBlobStore`] over a
@@ -2272,7 +2557,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_log_append_serve_and_admin_gate() {
-        let (router, admin_sk, bob_sk) = admin_app();
+        let (router, admin_sk, bob_sk) = admin_app().await;
         let admin = login(&router, "admin", &admin_sk).await;
         let genesis = [0u8; 32];
 
@@ -2541,7 +2826,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_upload_finalize_get_and_listing_over_http() {
-        let (router, admin_sk, bob_sk) = admin_app();
+        let (router, admin_sk, bob_sk) = admin_app().await;
         let owner = [0xADu8; 16]; // admin's user_id
         let token = login(&router, "admin", &admin_sk).await;
         let file = [0xF1u8; 16];
@@ -2681,7 +2966,7 @@ mod tests {
 
     #[tokio::test]
     async fn reshare_then_soft_revoke_over_http() {
-        let (router, admin_sk, bob_sk) = admin_app();
+        let (router, admin_sk, bob_sk) = admin_app().await;
         let owner = [0xADu8; 16];
         let bob_id = [0xB0u8; 16];
         let token = login(&router, "admin", &admin_sk).await;
@@ -2722,7 +3007,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_lists_recipients_over_http_non_owner_404() {
-        let (router, admin_sk, bob_sk) = admin_app();
+        let (router, admin_sk, bob_sk) = admin_app().await;
         let owner = [0xADu8; 16];
         let bob_id = [0xB0u8; 16];
         let token = login(&router, "admin", &admin_sk).await;
@@ -2750,7 +3035,7 @@ mod tests {
     #[tokio::test]
     async fn sharing_emits_grant_edges_to_the_audit_sink() {
         use crate::audit::GrantAction;
-        let (router, admin_sk, bob_sk, audit) = admin_app_audited();
+        let (router, admin_sk, bob_sk, audit) = admin_app_audited().await;
         let _ = &bob_sk;
         let owner = [0xADu8; 16];
         let bob_id = [0xB0u8; 16];
@@ -2787,7 +3072,7 @@ mod tests {
 
     #[tokio::test]
     async fn sink_records_control_head_and_genesis_anchor() {
-        let (router, admin_sk, _bob_sk, audit) = admin_app_audited();
+        let (router, admin_sk, _bob_sk, audit) = admin_app_audited().await;
         let owner = [0xADu8; 16];
         let token = login(&router, "admin", &admin_sk).await;
 
@@ -2814,7 +3099,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_upload_redteam_status_codes() {
-        let (router, admin_sk, bob_sk) = admin_app();
+        let (router, admin_sk, bob_sk) = admin_app().await;
         let owner = [0xADu8; 16];
         let token = login(&router, "admin", &admin_sk).await;
         let file = [0xF2u8; 16];
