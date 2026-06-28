@@ -29,6 +29,14 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[cfg(windows)]
+mod win32;
+#[cfg(windows)]
+pub use win32::{ConfinedOutput, SpawnError};
+
+/// Default per-worker memory cap (decompression-bomb hard kill, media-sandbox §3).
+pub const DEFAULT_WORKER_MEMORY_CAP_BYTES: u64 = 512 * 1024 * 1024;
+
 pub mod proto {
     //! One-shot length-prefixed little-endian protocol (one request → one
     //! response per worker process). Self-contained so the worker binary and the
@@ -250,6 +258,81 @@ impl SandboxedDecoder for SubprocessDecoder {
             return Err(DecodeError::Worker); // worker crashed / killed / I/O error
         }
         match proto::decode_response(&response) {
+            Ok(inner) => inner,
+            Err(_) => Err(DecodeError::Worker),
+        }
+    }
+}
+
+impl SubprocessDecoder {
+    /// Run a worker `--selftest-*` probe **without** OS confinement and return its
+    /// verdict (`true` = the action succeeded). The differential against
+    /// [`AppContainerDecoder`] is what proves the confinement bites: an unconfined
+    /// worker connects / spawns; a confined one is denied.
+    pub fn selftest(&self, args: &[&str]) -> std::io::Result<bool> {
+        let mut cmd = Command::new(&self.worker_path);
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let out = cmd.output()?;
+        Ok(out.stdout.first().copied() == Some(1))
+    }
+}
+
+/// Decode by spawning the `media-worker` binary inside a **Windows AppContainer +
+/// Job Object** (DESIGN §8.1/D30, media-sandbox §2): no network capability, a
+/// low-privilege token that cannot read the user's key blob, no child processes,
+/// and a hard memory cap. Same `SandboxedDecoder` contract as the cross-platform
+/// [`SubprocessDecoder`]; the OS confinement is the only difference.
+#[cfg(windows)]
+pub struct AppContainerDecoder {
+    worker_path: PathBuf,
+    memory_cap_bytes: u64,
+}
+
+#[cfg(windows)]
+impl AppContainerDecoder {
+    pub fn new(worker_path: impl Into<PathBuf>) -> Self {
+        AppContainerDecoder {
+            worker_path: worker_path.into(),
+            memory_cap_bytes: DEFAULT_WORKER_MEMORY_CAP_BYTES,
+        }
+    }
+
+    pub fn with_memory_cap(worker_path: impl Into<PathBuf>, cap: u64) -> Self {
+        AppContainerDecoder {
+            worker_path: worker_path.into(),
+            memory_cap_bytes: cap,
+        }
+    }
+
+    /// Run a worker `--selftest-*` probe **inside** the AppContainer + Job Object
+    /// and return its verdict (`true` = the action succeeded). The containment
+    /// tests assert this is `false` (network / child-spawn denied).
+    pub fn selftest(&self, args: &[&str]) -> Result<bool, SpawnError> {
+        let out = win32::spawn_confined(&self.worker_path, args, &[], self.memory_cap_bytes)?;
+        Ok(out.stdout.first().copied() == Some(1))
+    }
+}
+
+#[cfg(windows)]
+impl SandboxedDecoder for AppContainerDecoder {
+    fn decode_image(
+        &self,
+        canonical: &[u8],
+        bounds: &MediaBounds,
+    ) -> Result<DecodedImage, DecodeError> {
+        let request = proto::encode_request(&proto::DecodeRequest {
+            bounds: *bounds,
+            canonical: canonical.to_vec(),
+        });
+        let out = win32::spawn_confined(&self.worker_path, &[], &request, self.memory_cap_bytes)
+            .map_err(|_| DecodeError::Worker)?;
+        if out.exit_code != 0 {
+            return Err(DecodeError::Worker);
+        }
+        match proto::decode_response(&out.stdout) {
             Ok(inner) => inner,
             Err(_) => Err(DecodeError::Worker),
         }

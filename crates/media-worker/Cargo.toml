@@ -21,10 +21,25 @@ path = "src/main.rs"
 # worker runs the SAME decode, just in an isolated process.
 maxsecu-client-core = { path = "../client-core" }
 
+# Win32 OS-confinement (AppContainer + Job Object) for the decode launcher
+# (6b-ii). Windows-only; FFI bindings to the OS (not a vendored C library), so
+# the no-C posture holds. unsafe is confined to the audited `win32` module.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Isolation",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+] }
+
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [lints.rust]
-# Cross-platform 6b-i has no unsafe; the Win32 AppContainer launcher (6b-ii)
-# relaxes this to `deny` + a contained, audited `#[allow(unsafe_code)]` module.
-unsafe_code = "forbid"
+# `unsafe` is DENIED crate-wide and re-allowed ONLY in the contained, audited
+# `win32` module (the Win32 AppContainer/Job-Object FFI launcher). Everything
+# else — proto, the worker bin, the subprocess launcher — stays unsafe-free.
+unsafe_code = "deny"
