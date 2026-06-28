@@ -30,13 +30,20 @@ use ml_kem::kem::{Decapsulate, Encapsulate, Kem, KeyExport, KeyInit, TryKeyInit}
 use ml_kem::{DecapsulationKey, EncapsulationKey, MlKem768};
 use rand_core::OsRng;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// HKDF `info` domain-separation label for the hybrid wrap (v2 suite).
 const HYBRID_WRAP_LABEL: &[u8] = b"MaxSecu-hybrid-wrap-v2";
 
-/// X25519 public key / shared secret length.
+/// X25519 public key length.
 const X25519_LEN: usize = 32;
+/// KEM shared-secret length (both X25519 DH and ML-KEM-768 produce 32 bytes).
+const SHARED_SECRET_LEN: usize = 32;
+/// The DEK plaintext length (the AEAD payload).
+const DEK_LEN: usize = 32;
+/// The all-zero AES-256-GCM nonce — safe ONLY because the hybrid KEK is
+/// single-use per wrap (fresh ephemeral + fresh ML-KEM encaps).
+const ZERO_NONCE: [u8; 12] = [0u8; 12];
 /// ML-KEM-768 encapsulation (public) key length (FIPS 203).
 const MLKEM_PUB_LEN: usize = 1184;
 /// ML-KEM-768 decapsulation-key *seed* length (the `ml-kem` 0.3 preferred,
@@ -156,9 +163,9 @@ fn derive_kek(
     eph_x_pub: &[u8; X25519_LEN],
     ct_pq: &[u8],
 ) -> Zeroizing<[u8; 32]> {
-    let mut ikm = Zeroizing::new([0u8; 64]);
-    ikm[..32].copy_from_slice(ss1);
-    ikm[32..].copy_from_slice(ss2);
+    let mut ikm = Zeroizing::new([0u8; 2 * SHARED_SECRET_LEN]);
+    ikm[..SHARED_SECRET_LEN].copy_from_slice(ss1);
+    ikm[SHARED_SECRET_LEN..].copy_from_slice(ss2);
 
     let ctx_enc = encode(ctx);
     let mut info =
@@ -187,14 +194,16 @@ pub fn wrap_dek_hybrid(
     // ML-KEM-768 encapsulation → (ct_pq, ss2).
     let ek = <EncapsulationKey<MlKem768> as TryKeyInit>::new_from_slice(&recipient.mlkem)
         .map_err(|_| CryptoError::BadPublicKey)?;
-    let (ct, ss2_arr) = ek.encapsulate();
+    let (ct, mut ss2_arr) = ek.encapsulate();
     let ct_pq = ct.as_slice().to_vec();
-    let mut ss2 = Zeroizing::new([0u8; 32]);
+    let mut ss2 = Zeroizing::new([0u8; SHARED_SECRET_LEN]);
     ss2.copy_from_slice(ss2_arr.as_slice());
+    // The `ml-kem` shared-secret Array is not zeroize-on-drop; wipe our copy.
+    ss2_arr.zeroize();
 
     // Combined single-use KEK, then seal the DEK under a zero nonce.
     let kek = derive_kek(&ss1, &ss2, ctx, &eph_x_pub, &ct_pq);
-    let aead_ct = crate::aead::seal(&kek, &[0u8; 12], &[], dek.expose());
+    let aead_ct = crate::aead::seal(&kek, &ZERO_NONCE, &[], dek.expose());
 
     Ok(HybridWrappedDek {
         eph_x_pub,
@@ -225,20 +234,22 @@ pub fn unwrap_dek_hybrid(
     // pseudo-random ss2, so the KEK simply mismatches and the AEAD open fails).
     let dk = <DecapsulationKey<MlKem768> as KeyInit>::new_from_slice(&recipient.mlkem_seed[..])
         .map_err(|_| CryptoError::WrapOpen)?;
-    let ss2_arr = dk
+    let mut ss2_arr = dk
         .decapsulate_slice(&wrapped.ct_pq)
         .map_err(|_| CryptoError::WrapOpen)?;
-    let mut ss2 = Zeroizing::new([0u8; 32]);
+    let mut ss2 = Zeroizing::new([0u8; SHARED_SECRET_LEN]);
     ss2.copy_from_slice(ss2_arr.as_slice());
+    // The `ml-kem` shared-secret Array is not zeroize-on-drop; wipe our copy.
+    ss2_arr.zeroize();
 
     // Recompute the KEK and open. Any wrong leg / wrong ctx / tamper fails here.
     let kek = derive_kek(&ss1, &ss2, ctx, &wrapped.eph_x_pub, &wrapped.ct_pq);
-    let pt = crate::aead::open(&kek, &[0u8; 12], &[], &wrapped.aead_ct)
+    let pt = crate::aead::open(&kek, &ZERO_NONCE, &[], &wrapped.aead_ct)
         .map_err(|_| CryptoError::WrapOpen)?;
-    if pt.len() != 32 {
+    if pt.len() != DEK_LEN {
         return Err(CryptoError::WrapOpen);
     }
-    let mut k = Zeroizing::new([0u8; 32]);
+    let mut k = Zeroizing::new([0u8; DEK_LEN]);
     k.copy_from_slice(&pt);
     Ok(Dek::from_bytes(*k))
 }
