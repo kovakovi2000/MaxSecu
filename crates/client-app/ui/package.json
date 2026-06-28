@@ -1,0 +1,17 @@
+{
+  "name": "maxsecu-ui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --format=esm --outfile=dist/main.js && cp index.html dist/index.html",
+    "test": "node --experimental-strip-types --test src/core/store.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "2.1.1",
+    "@types/node": "20.14.2",
+    "esbuild": "0.21.5",
+    "typescript": "5.4.5"
+  }
+}
