@@ -81,6 +81,14 @@ pub struct VerifyContext<'a> {
     /// author-rooted wrap never calls it. Pass [`NO_GRANTERS`] when no re-share
     /// chain is expected.
     pub granter_sig_pub: &'a dyn Fn(Id) -> Option<[u8; 32]>,
+    /// The authenticated, sink-anchored tombstone set for the completeness gate
+    /// (§12.5 step 4): the version is **rejected** if its `author_id` is account-
+    /// revoked (a tombstoned author cannot mint, §12.9) or if the downloader is
+    /// revoked from this file at this version. `None` skips the gate — used only
+    /// at first contact / for already-verified reads where no completeness proof
+    /// is required (§7.6); any served version supplies a set proven contiguous to
+    /// the sink head ([`TombstoneSet::verify_authenticated`]).
+    pub tombstones: Option<&'a crate::revocation::TombstoneSet>,
 }
 
 /// A granter resolver that authenticates no one — for callers with no re-share
@@ -191,6 +199,19 @@ fn verify_header(
     // (3) Author-entitlement: owner-only write (D29).
     if manifest.author_id != genesis.owner_id {
         return Err(AuthorNotOwner);
+    }
+
+    // (3b) Tombstone completeness (§12.5 step 4, Phase 5). When the caller supplies
+    // an authenticated, sink-anchored tombstone set, a version whose author is
+    // account-revoked is rejected (a tombstoned author cannot mint, §12.9), as is
+    // one served to a downloader revoked from this file at this version (§11.5).
+    if let Some(ts) = ctx.tombstones {
+        if ts.is_account_revoked(&manifest.author_id.0) {
+            return Err(AuthorRevoked);
+        }
+        if ts.is_revoked(&ctx.recipient_id.0, &ctx.file_id.0, manifest.version) {
+            return Err(RecipientRevoked);
+        }
     }
 
     // (4) Freshness / rollback (clock-independent, §7.5/D23).
@@ -687,6 +708,7 @@ mod tests {
             recipient_secret: built.owner.enc_secret(),
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
+            tombstones: None,
         }
     }
 
@@ -854,9 +876,88 @@ mod tests {
             recipient_secret: &built.recovery_sk,
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
+            tombstones: None,
         };
         let opened = verify_and_open(&c, &db).expect("recovery opens");
         assert_eq!(opened.version, 1);
+    }
+
+    /// Build an authenticated `TombstoneSet` account-wide-revoking `victim`
+    /// (dual-controlled), plus the leak-free issuer resolver for its two admins.
+    fn account_revoke_set(victim: Id) -> crate::revocation::TombstoneSet {
+        use crate::revocation::{ControlRecordIn, IssuerInfo, TombstoneSet};
+        use maxsecu_admin_core::{ControlChain, CoSign, RevokeParams};
+        use maxsecu_crypto::SigningKey;
+        use maxsecu_encoding::types::{FileScope, Role};
+
+        let a1 = SigningKey::generate();
+        let a2 = SigningKey::generate();
+        let a1_id = Id([0xA1; 16]);
+        let a2_id = Id([0xA2; 16]);
+        let mut chain = ControlChain::new();
+        let rev = chain
+            .revoke(
+                &a1,
+                RevokeParams {
+                    scope: FileScope::AccountWide,
+                    revoked_user_id: victim,
+                    revoked_capability: None,
+                    from_version: 1,
+                    issued_by: a1_id,
+                    created_at: NOW,
+                },
+                Some(CoSign { admin_id: a2_id, key: &a2 }),
+            )
+            .unwrap();
+        let (a1_pub, a2_pub) = (a1.verifying_key().to_bytes(), a2.verifying_key().to_bytes());
+        let issuer = move |id: Id| match id {
+            x if x == a1_id => Some(IssuerInfo { sig_pub: a1_pub, roles: vec![Role::Admin], key_version: 1 }),
+            x if x == a2_id => Some(IssuerInfo { sig_pub: a2_pub, roles: vec![Role::Admin], key_version: 1 }),
+            _ => None,
+        };
+        TombstoneSet::verify_authenticated(
+            &[ControlRecordIn { bytes: rev.bytes.clone(), sig: rev.sig, co_sig: rev.co_sig }],
+            chain.head(),
+            &issuer,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tombstoned_author_version_is_rejected() {
+        let built = build();
+        let db = self_bundle(&built.bundle);
+        // The author/owner is under an account-wide tombstone — a tombstoned
+        // author cannot mint an accepted version (§12.9/§12.5 step 4).
+        let ts = account_revoke_set(OWNER_ID);
+        let mut c = ctx(&built);
+        c.tombstones = Some(&ts);
+        assert_eq!(verify_and_open(&c, &db), Err(DownloadError::AuthorRevoked));
+    }
+
+    #[test]
+    fn revoked_recipient_is_rejected() {
+        let built = build();
+        let (bundle, v, r) = reshare_chain(&built);
+        let r_pub = r.sig_pub_bytes();
+        let resolver = move |id: Id| (id == R_ID).then_some(r_pub);
+        // V (the downloader) is account-revoked; the owner/author is not — so the
+        // recipient-revocation arm fires (not AuthorRevoked).
+        let ts = account_revoke_set(V_ID);
+        let mut c = reshare_ctx(&built, &v, &resolver);
+        c.tombstones = Some(&ts);
+        assert_eq!(verify_and_open(&c, &bundle), Err(DownloadError::RecipientRevoked));
+    }
+
+    #[test]
+    fn unrelated_tombstone_still_opens() {
+        let built = build();
+        let db = self_bundle(&built.bundle);
+        // A tombstone naming someone else does not block the owner's own read.
+        let ts = account_revoke_set(Id([0xEE; 16]));
+        let mut c = ctx(&built);
+        c.tombstones = Some(&ts);
+        assert!(verify_and_open(&c, &db).is_ok());
     }
 
     #[test]
@@ -929,6 +1030,7 @@ mod tests {
             recipient_secret: owner.enc_secret(),
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
+            tombstones: None,
         };
         assert!(matches!(
             verify_and_open(&c, &db),
@@ -1114,6 +1216,7 @@ mod tests {
             recipient_secret: v.enc_secret(),
             seen_max_version: None,
             granter_sig_pub: &resolver,
+            tombstones: None,
         };
         let opened = verify_and_open(&vctx, &bundle).expect("re-shared read chains to author");
         let content = opened
@@ -1143,6 +1246,7 @@ mod tests {
             recipient_secret: v.enc_secret(),
             seen_max_version: None,
             granter_sig_pub: resolver,
+            tombstones: None,
         }
     }
 
@@ -1377,6 +1481,7 @@ mod tests {
             recipient_secret: owner.enc_secret(),
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
+            tombstones: None,
         };
         assert!(matches!(
             verify_and_open(&c, &db),

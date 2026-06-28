@@ -162,6 +162,14 @@ pub enum DownloadError {
     /// A stream declared a compression the v1 client cannot yet apply (Phase 3
     /// leaves everything uncompressed; zstd is a later increment).
     CompressionUnsupported,
+    /// The version `author_id` is under an active account-wide tombstone — a
+    /// tombstoned author cannot mint an accepted version (§12.9/§12.5 step 4,
+    /// Phase 5). Evaluated over the sink-anchored, authenticated tombstone set.
+    AuthorRevoked,
+    /// The downloader is revoked from this file at this version (account-wide or
+    /// per-file tombstone, §11.5) — it has lost access to this and future
+    /// versions; fail closed rather than serve it.
+    RecipientRevoked,
 }
 
 impl fmt::Display for DownloadError {
@@ -200,6 +208,8 @@ impl fmt::Display for DownloadError {
             StreamDigestMismatch(_) => write!(f, "stream digest does not match manifest"),
             FramingBoundsExceeded(what) => write!(f, "framing bounds exceeded: {what}"),
             CompressionUnsupported => write!(f, "unsupported stream compression"),
+            AuthorRevoked => write!(f, "version author is under an active tombstone"),
+            RecipientRevoked => write!(f, "recipient is revoked from this file version"),
         }
     }
 }
