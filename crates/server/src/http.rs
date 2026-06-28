@@ -98,6 +98,10 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
             "/v1/files/{file_id}/versions/{v}/streams/{stream_type}/chunks/{index}",
             put(put_chunk::<S>).get(get_chunk::<S>),
         )
+        .route(
+            "/v1/files/{file_id}/versions/{v}/streams/{stream_type}/chunks/{index}/status",
+            get(chunk_status::<S>),
+        )
         .with_state(state)
 }
 
@@ -866,6 +870,69 @@ async fn get_chunk<S: Store + 'static>(
             bytes,
         )
             .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Serialize)]
+struct ChunkStatusOut {
+    source: &'static str,
+    fetched_bytes: u64,
+    total_bytes: u64,
+}
+
+/// `GET /v1/files/{file_id}/versions/{v}/streams/{stream_type}/chunks/{index}/status`
+/// — cache-miss progress (api.md §9.3). Same §8.5 access gate as the chunk
+/// download; reports where the chunk would be served from
+/// (`cache`/`cold-fetching`/`cold-ready`). `404` for missing-or-forbidden (no
+/// oracle). The state is a known, accepted popularity side-channel (§15.3).
+async fn chunk_status<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Path((file_id_hex, version, stream_type, index)): Path<(String, u64, String, u64)>,
+) -> Response {
+    let (Some(file_id), Some(stype)) =
+        (hex_fixed::<16>(&file_id_hex), stream_type_code(&stream_type))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let meta = match st.auth.store().version_meta(file_id, version).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return internal_error(e),
+    };
+    // §8.5 gate: the owner always, else a recipient of this finalized version.
+    let allowed = meta.owner_id == session.user_id
+        || match st
+            .auth
+            .store()
+            .get_file(file_id, VersionSelector::Specific(version), session.user_id)
+            .await
+        {
+            Ok(opt) => opt.is_some(),
+            Err(e) => return internal_error(e),
+        };
+    if !allowed {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(slot) = meta.streams.iter().find(|s| s.stream_type == stype) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match st.blobs.chunk_status(&slot.blob_ref, index).await {
+        Ok(Some(s)) => {
+            let source = match s.source {
+                crate::blob::FetchSource::Cache => "cache",
+                crate::blob::FetchSource::ColdFetching => "cold-fetching",
+                crate::blob::FetchSource::ColdReady => "cold-ready",
+            };
+            Json(ChunkStatusOut {
+                source,
+                fetched_bytes: s.fetched_bytes,
+                total_bytes: s.total_bytes,
+            })
+            .into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => internal_error(e),
     }
@@ -2040,6 +2107,25 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(bytes, vec![0x10; 32]);
 
+        // Cache-miss progress (api §9.3): over a plain (non-tiered) store the
+        // chunk is local, so its status is `cache`; an absent index is 404.
+        let (st, body) = get_json_auth(
+            &router,
+            &format!("{}/status", chunk_uri(file, 1, "content", 0)),
+            &token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["source"], "cache");
+        assert_eq!(body["total_bytes"].as_u64().unwrap(), 32);
+        let (st, _) = get_json_auth(
+            &router,
+            &format!("{}/status", chunk_uri(file, 1, "content", 99)),
+            &token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
         let (st, body) =
             get_json_auth(&router, &format!("/v1/files/{}?version=latest", hex_encode(&file)), &token).await;
         assert_eq!(st, StatusCode::OK);
@@ -2055,6 +2141,14 @@ mod tests {
         let (st, _) = get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &bob).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
         let (st, _) = get_chunk_auth(&router, &chunk_uri(file, 1, "content", 0), &bob).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // Status leaks no access oracle either — same uniform 404.
+        let (st, _) = get_json_auth(
+            &router,
+            &format!("{}/status", chunk_uri(file, 1, "content", 0)),
+            &bob,
+        )
+        .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
 
         // Listing shows the blog with its small (metadata) stream, not content.

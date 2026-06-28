@@ -19,7 +19,7 @@
 //! [`TieredBlobStore`] (next increment) composes a hot [`BlobStore`] cache, a
 //! [`ColdTier`], and a [`CacheIndex`] into a single `BlobStore`.
 
-use crate::blob::{BlobError, BlobStore, FsBlobStore, MemoryBlobStore};
+use crate::blob::{BlobError, BlobStore, ChunkStatus, FetchSource, FsBlobStore, MemoryBlobStore};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -150,6 +150,11 @@ impl CacheIndex {
         self.entries.contains_key(key)
     }
 
+    /// The resident size of `key`, or `None` if not cached.
+    pub fn size_of(&self, key: &ChunkKey) -> Option<u64> {
+        self.entries.get(key).map(|e| e.size)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -180,6 +185,9 @@ pub trait ColdTier: Send + Sync {
     /// Delete a single chunk by index (idempotent — absent is success). Lets the
     /// tiering layer honor a per-chunk delete on the durable tier too.
     async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError>;
+    /// Whether a chunk is durably present, **without** fetching its bytes (a real
+    /// adapter uses a metadata HEAD). Backs the `cold-ready` progress state.
+    async fn has_chunk(&self, blob_ref: &str, index: u64) -> Result<bool, BlobError>;
 }
 
 /// In-memory [`ColdTier`] fake for tests, backed by a [`MemoryBlobStore`].
@@ -217,6 +225,9 @@ impl ColdTier for MemoryColdTier {
     }
     async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError> {
         self.inner.delete_chunk(blob_ref, index).await
+    }
+    async fn has_chunk(&self, blob_ref: &str, index: u64) -> Result<bool, BlobError> {
+        Ok(self.inner.get_chunk(blob_ref, index).await?.is_some())
     }
 }
 
@@ -256,6 +267,9 @@ impl ColdTier for FsColdTier {
     async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError> {
         self.inner.delete_chunk(blob_ref, index).await
     }
+    async fn has_chunk(&self, blob_ref: &str, index: u64) -> Result<bool, BlobError> {
+        Ok(self.inner.get_chunk(blob_ref, index).await?.is_some())
+    }
 }
 
 /// A hot [`BlobStore`] cache in front of a durable [`ColdTier`], presented as a
@@ -270,6 +284,9 @@ pub struct TieredBlobStore {
     cache: Arc<dyn BlobStore>,
     cold: Arc<dyn ColdTier>,
     index: Mutex<CacheIndex>,
+    /// Keys with a proxied cold fetch currently in flight — drives the
+    /// `cold-fetching` progress state (api §9.3).
+    fetching: Mutex<std::collections::HashSet<(String, u64)>>,
 }
 
 impl TieredBlobStore {
@@ -280,6 +297,7 @@ impl TieredBlobStore {
             cache,
             cold,
             index: Mutex::new(CacheIndex::new(capacity_bytes)),
+            fetching: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -323,8 +341,13 @@ impl BlobStore for TieredBlobStore {
                 .record_access(&ChunkKey::new(blob_ref, index));
             return Ok(Some(bytes));
         }
-        // Miss: fetch from the durable cold tier and warm the cache.
-        match self.cold.get_chunk(blob_ref, index).await? {
+        // Miss: fetch from the durable cold tier and warm the cache. Mark the key
+        // in-flight so a concurrent status query reports `cold-fetching`.
+        let fkey = (blob_ref.to_owned(), index);
+        self.fetching.lock().unwrap().insert(fkey.clone());
+        let fetched = self.cold.get_chunk(blob_ref, index).await;
+        self.fetching.lock().unwrap().remove(&fkey);
+        match fetched? {
             Some(bytes) => {
                 let size = bytes.len() as u64;
                 self.cache.put_chunk(blob_ref, index, bytes.clone()).await?;
@@ -355,6 +378,45 @@ impl BlobStore for TieredBlobStore {
             .unwrap()
             .remove(&ChunkKey::new(blob_ref, index));
         Ok(())
+    }
+
+    async fn chunk_status(
+        &self,
+        blob_ref: &str,
+        index: u64,
+    ) -> Result<Option<ChunkStatus>, BlobError> {
+        let key = ChunkKey::new(blob_ref, index);
+        // 1) Warm in the hot cache → a local hit.
+        if let Some(size) = self.index.lock().unwrap().size_of(&key) {
+            return Ok(Some(ChunkStatus {
+                source: FetchSource::Cache,
+                fetched_bytes: size,
+                total_bytes: size,
+            }));
+        }
+        // 2) A proxied fetch is in flight.
+        if self
+            .fetching
+            .lock()
+            .unwrap()
+            .contains(&(blob_ref.to_owned(), index))
+        {
+            return Ok(Some(ChunkStatus {
+                source: FetchSource::ColdFetching,
+                fetched_bytes: 0,
+                total_bytes: 0,
+            }));
+        }
+        // 3) Durable in cold, idle — a GET will fetch it.
+        if self.cold.has_chunk(blob_ref, index).await? {
+            return Ok(Some(ChunkStatus {
+                source: FetchSource::ColdReady,
+                fetched_bytes: 0,
+                total_bytes: 0,
+            }));
+        }
+        // 4) Absent everywhere.
+        Ok(None)
     }
 }
 
@@ -586,6 +648,99 @@ mod tests {
         tier.put_chunk(REF, 2, vec![0xB2; 10]).await.unwrap();
         // All three are durable even though the cache only holds two.
         assert_eq!(tier.chunk_count(REF).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn status_reports_cache_for_a_warm_chunk() {
+        let (tier, _cache, _cold) = tier_with_capacity(1000);
+        tier.put_chunk(REF, 0, vec![0xD0; 10]).await.unwrap();
+        let st = tier.chunk_status(REF, 0).await.unwrap().unwrap();
+        assert_eq!(st.source, crate::blob::FetchSource::Cache);
+        assert_eq!(st.total_bytes, 10);
+    }
+
+    #[tokio::test]
+    async fn status_reports_cold_ready_for_an_uncached_durable_chunk() {
+        let (tier, _cache, cold) = tier_with_capacity(1000);
+        // Lives only in cold (e.g. evicted, or never fetched by this server).
+        cold.put_chunk(REF, 0, vec![0xD1; 10]).await.unwrap();
+        let st = tier.chunk_status(REF, 0).await.unwrap().unwrap();
+        assert_eq!(st.source, crate::blob::FetchSource::ColdReady);
+    }
+
+    #[tokio::test]
+    async fn status_is_none_when_absent_everywhere() {
+        let (tier, _cache, _cold) = tier_with_capacity(1000);
+        assert!(tier.chunk_status(REF, 9).await.unwrap().is_none());
+    }
+
+    /// A [`ColdTier`] whose `get_chunk` parks (cooperatively) until released, so a
+    /// concurrent `chunk_status` can observe the in-flight `cold-fetching` state.
+    struct BlockingColdTier {
+        inner: MemoryColdTier,
+        entered: std::sync::atomic::AtomicBool,
+        released: std::sync::atomic::AtomicBool,
+    }
+    impl BlockingColdTier {
+        fn new() -> Self {
+            BlockingColdTier {
+                inner: MemoryColdTier::new(),
+                entered: std::sync::atomic::AtomicBool::new(false),
+                released: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+    #[async_trait]
+    impl ColdTier for BlockingColdTier {
+        async fn put_chunk(&self, r: &str, i: u64, b: Vec<u8>) -> Result<(), BlobError> {
+            self.inner.put_chunk(r, i, b).await
+        }
+        async fn get_chunk(&self, r: &str, i: u64) -> Result<Option<Vec<u8>>, BlobError> {
+            use std::sync::atomic::Ordering;
+            self.entered.store(true, Ordering::SeqCst);
+            while !self.released.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            self.inner.get_chunk(r, i).await
+        }
+        async fn chunk_count(&self, r: &str) -> Result<u64, BlobError> {
+            self.inner.chunk_count(r).await
+        }
+        async fn delete_stream(&self, r: &str) -> Result<(), BlobError> {
+            self.inner.delete_stream(r).await
+        }
+        async fn delete_chunk(&self, r: &str, i: u64) -> Result<(), BlobError> {
+            self.inner.delete_chunk(r, i).await
+        }
+        async fn has_chunk(&self, r: &str, i: u64) -> Result<bool, BlobError> {
+            self.inner.has_chunk(r, i).await
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_cold_fetching_while_a_proxied_fetch_is_in_flight() {
+        use std::sync::atomic::Ordering;
+        let cold = Arc::new(BlockingColdTier::new());
+        cold.inner.put_chunk(REF, 0, vec![0xD2; 10]).await.unwrap();
+        let cache = Arc::new(MemoryBlobStore::new());
+        let tier = Arc::new(TieredBlobStore::new(cache, cold.clone(), 1000));
+
+        let t2 = tier.clone();
+        let h = tokio::spawn(async move { t2.get_chunk(REF, 0).await });
+
+        // Wait until the fetch has entered the (parked) cold tier.
+        while !cold.entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let st = tier.chunk_status(REF, 0).await.unwrap().unwrap();
+        assert_eq!(st.source, crate::blob::FetchSource::ColdFetching);
+
+        // Release the fetch; once it completes the chunk is warm.
+        cold.released.store(true, Ordering::SeqCst);
+        let got = h.await.unwrap().unwrap().unwrap();
+        assert_eq!(got, vec![0xD2; 10]);
+        let st2 = tier.chunk_status(REF, 0).await.unwrap().unwrap();
+        assert_eq!(st2.source, crate::blob::FetchSource::Cache);
     }
 
     #[tokio::test]

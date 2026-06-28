@@ -42,6 +42,31 @@ impl std::fmt::Display for BlobError {
 
 impl std::error::Error for BlobError {}
 
+/// Where a chunk would be served from right now (api.md §9.3 cache-miss
+/// progress). Generalizes the api's `cache|dropbox-fetching|dropbox-ready` to the
+/// abstract cold tier. A known, accepted popularity/recency side-channel
+/// (DESIGN §15.3) — it carries no plaintext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchSource {
+    /// Resident in the hot local cache — a GET is a local hit.
+    Cache,
+    /// A proxied fetch from the cold tier is currently in flight.
+    ColdFetching,
+    /// Durable in the cold tier, not cached and not being fetched (a GET will
+    /// fetch it).
+    ColdReady,
+}
+
+/// A chunk's serve-state snapshot for the §9.3 progress UI. `fetched`/`total`
+/// bytes are best-effort: a streaming cold adapter fills them during a fetch; the
+/// non-streaming fakes report the resident size (or `0` while fetching).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkStatus {
+    pub source: FetchSource,
+    pub fetched_bytes: u64,
+    pub total_bytes: u64,
+}
+
 /// Inert ciphertext-chunk storage keyed by `(blob_ref, index)`. `Send + Sync`
 /// for sharing across axum request tasks.
 #[async_trait]
@@ -64,6 +89,24 @@ pub trait BlobStore: Send + Sync {
     /// cached chunk when the hot cache is over budget (`server::tier`).
     /// Idempotent — an absent index is success.
     async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError>;
+
+    /// Serve-state of a chunk for the §9.3 progress UI. The default (a plain
+    /// local store) reports [`FetchSource::Cache`] when present and `None` when
+    /// absent — there is no cold tier behind it. [`TieredBlobStore`] overrides
+    /// this with the full cache / cold-fetching / cold-ready machine.
+    ///
+    /// [`TieredBlobStore`]: crate::tier::TieredBlobStore
+    async fn chunk_status(
+        &self,
+        blob_ref: &str,
+        index: u64,
+    ) -> Result<Option<ChunkStatus>, BlobError> {
+        Ok(self.get_chunk(blob_ref, index).await?.map(|b| ChunkStatus {
+            source: FetchSource::Cache,
+            fetched_bytes: b.len() as u64,
+            total_bytes: b.len() as u64,
+        }))
+    }
 }
 
 /// In-memory [`BlobStore`] for tests/dev and the e2e path.
@@ -263,6 +306,18 @@ mod tests {
     #[tokio::test]
     async fn memory_roundtrip_and_idempotency() {
         roundtrip_and_idempotency(&MemoryBlobStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn default_chunk_status_reports_cache_when_present_else_none() {
+        let store = MemoryBlobStore::new();
+        // Absent → no status (a plain store has no cold tier behind it).
+        assert!(store.chunk_status(REF, 0).await.unwrap().is_none());
+        store.put_chunk(REF, 0, vec![0xAA; 12]).await.unwrap();
+        let st = store.chunk_status(REF, 0).await.unwrap().unwrap();
+        assert_eq!(st.source, FetchSource::Cache);
+        assert_eq!(st.fetched_bytes, 12);
+        assert_eq!(st.total_bytes, 12);
     }
 
     fn unique_dir(tag: &str) -> PathBuf {
