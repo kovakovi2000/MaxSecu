@@ -453,13 +453,18 @@ async fn post_control<S: Store + 'static>(
         },
     };
     match st.auth.store().append_control(record, sig, co_sig).await {
-        Ok(head) => (
-            StatusCode::CREATED,
-            Json(ChainHeadRes {
-                chain_head_b64: b64encode(&head),
-            }),
-        )
-            .into_response(),
+        Ok(head) => {
+            // §6 (sink-interface): publish the new head to the external sink so a
+            // server cannot silently swallow a tombstone at write time.
+            st.audit.publish_head(head).await;
+            (
+                StatusCode::CREATED,
+                Json(ChainHeadRes {
+                    chain_head_b64: b64encode(&head),
+                }),
+            )
+                .into_response()
+        }
         Err(ControlAppendError::Conflict) => StatusCode::CONFLICT.into_response(),
         Err(ControlAppendError::Malformed) => StatusCode::BAD_REQUEST.into_response(),
         Err(ControlAppendError::Store(e)) => internal_error(e),
@@ -698,6 +703,10 @@ async fn stage_version<S: Store + 'static>(
 
 async fn stage_and_respond<S: Store>(st: &AppState<S>, input: StageInput) -> Response {
     let file_id = input.file_id;
+    // A v1 create carries the immutable genesis; a rotation does not. The genesis
+    // is anchored in the sink on success so the R27 cutoff (§11.7/D28) can compare
+    // its sink position against a later key_compromise.
+    let has_genesis = input.genesis.is_some();
     let parsed = match parse_stage(input) {
         Ok(p) => p,
         Err(e) => return stage_status(e),
@@ -722,6 +731,9 @@ async fn stage_and_respond<S: Store>(st: &AppState<S>, input: StageInput) -> Res
                         at_ms: now,
                     })
                     .await;
+            }
+            if has_genesis {
+                st.audit.anchor_genesis(file_id).await;
             }
             (
                 StatusCode::CREATED,
@@ -2485,6 +2497,33 @@ mod tests {
         assert!(audit.edges().iter().any(|e| e.action == GrantAction::SoftRevoke
             && e.granted_by == owner
             && e.recipient_id == bob_id));
+    }
+
+    #[tokio::test]
+    async fn sink_records_control_head_and_genesis_anchor() {
+        let (router, admin_sk, _bob_sk, audit) = admin_app_audited();
+        let owner = [0xADu8; 16];
+        let token = login(&router, "admin", &admin_sk).await;
+
+        // A control append publishes the new head to the sink (api.md §7.2/§6).
+        let (rec1, sig1) = revocation_b64([0u8; 32], 1, 0x99);
+        let (st, res) = post_json_auth(
+            &router,
+            "/v1/revocations",
+            serde_json::json!({"record_b64": rec1, "sig_b64": sig1}),
+            &token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (seq, head) = audit.latest_head().expect("head published to the sink");
+        assert_eq!(seq, 1);
+        assert_eq!(b64encode(&head), res["chain_head_b64"].as_str().unwrap());
+
+        // Creating a file (v1) anchors its genesis in the sink (R27/§11.7).
+        let file = [0xFAu8; 16];
+        assert!(audit.genesis_pos(&file).is_none(), "no genesis before create");
+        create_finalize_v1(&router, file, owner, &token).await;
+        assert!(audit.genesis_pos(&file).is_some(), "genesis anchored at create");
     }
 
     #[tokio::test]
