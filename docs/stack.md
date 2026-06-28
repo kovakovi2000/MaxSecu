@@ -78,7 +78,7 @@ Maps every primitive in `DESIGN.md` §5 to a concrete, audited crate. One ecosys
 | Page locking | `region` **or** `windows` (`VirtualLock`) | §8.1 lock secret pages |
 | CSPRNG | `getrandom` / `rand` | OS RNG (`BCryptGenRandom` on Windows) — never `rand`'s userspace PRNG for keys |
 | TLS 1.3 + channel binding | `rustls` + `tokio-rustls` (provider: **`aws-lc-rs`**) | `export_keying_material` (RFC 5705) feeds the §9.2 auth challenge; TLS 1.3 only (no `tls12` feature). Provider note below |
-| Post-quantum (Phase 7) | `ml-kem` (RustCrypto) | Behind the `alg` registry; not in v1 (§5/D20) |
+| Post-quantum (Phase 7) | `ml-kem` (RustCrypto, FIPS 203) **[ADOPTED — P7.1]** + `x25519-dalek` | Hybrid DEK wrap behind the `alg` registry; not in v1 (§5/D20). `ml-kem` v0.3 vetted P7.1: **pure-Rust, no-C** — pulls no `cc`/`*-sys`/second-TLS dep (`cargo tree -i cc -p maxsecu-crypto` finds none; the only `cc` in the workspace stays the sanctioned `aws-lc-rs` TLS provider) and clears `cargo deny`/`cargo audit`. The `aws-lc-rs`-only non-pure-Rust carve-out is unchanged |
 
 > **Pin and audit (D1/§8 supply chain).** Lockfile with hashes, `cargo audit`/`cargo deny` in CI, pinned toolchain. No `build.rs` network access. Vendoring dependencies is acceptable for the air-gapped tooling.
 

@@ -21,6 +21,11 @@ zeroize = "1" # secret hygiene (Zeroizing wrappers)
 subtle = "2" # constant-time equality where needed
 getrandom = "0.2" # OS CSPRNG (BCryptGenRandom on Windows)
 rand_core = { version = "0.6", features = ["getrandom"] } # OsRng for HPKE seal
+# Post-quantum (Phase 7): FIPS 203 ML-KEM (RustCrypto, pure-Rust, no-C — vetted
+# in P7.1) for the PQ half of the hybrid DEK wrap; X25519 (dalek, pure-Rust) is
+# the classical half. `getrandom` feature gives OS-RNG-backed keygen/encaps.
+ml-kem = { version = "0.3", default-features = false, features = ["zeroize", "getrandom"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [dev-dependencies]
 # Randomized round-trip property tests (Phase-0 exit gate, DESIGN §17).

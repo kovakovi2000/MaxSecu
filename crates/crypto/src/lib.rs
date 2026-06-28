@@ -13,6 +13,7 @@
 mod aead;
 mod dek;
 mod hash;
+mod hybrid;
 mod kdf;
 pub mod merkle;
 mod pwkdf;
