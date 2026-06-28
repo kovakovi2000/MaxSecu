@@ -31,15 +31,17 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
 use maxsecu_client_core::{
-    build_upload, safe_export_path, verify_and_open, DownloadBundle, DownloadError, Identity,
-    PlaintextStreams, StreamChunks, UploadParams, VerifyContext, NO_GRANTERS,
+    build_upload, decode_rgba_bounded, safe_export_path, validate_decoded, verify_and_open,
+    DownloadBundle, DownloadError, Identity, MediaBounds, PlaintextStreams, RustImageCodec,
+    StreamChunks, Transcoder, UploadParams, VerifyContext, NO_GRANTERS,
 };
 use maxsecu_crypto::{generate_enc_keypair, sha256, WrappedDek};
 use maxsecu_encoding::structs::Manifest;
 use maxsecu_encoding::types::{FileType, Id, RecipientType, StreamType, Timestamp};
 use maxsecu_encoding::{decode, encode, labels};
 use maxsecu_server::{
-    export_channel_binding, serve, AppState, AuthConfig, AuthService, FsBlobStore, MemoryStore,
+    export_channel_binding, serve, AppState, AuthConfig, AuthService, FsBlobStore, FsColdTier,
+    MemoryStore, TieredBlobStore,
 };
 
 const VOUCHER: &str = "in-person-code-001";
@@ -479,6 +481,258 @@ async fn phase3_exit_gates_over_real_tls() {
     assert!(files > 0, "blobs were actually written to disk");
 
     let _ = std::fs::remove_dir_all(&blob_dir);
+}
+
+/// Phase-4b media exit gates over real TLS: the **real** image transcode →
+/// upload across a **tiered** blob store (hot FS cache over an FS cold tier) →
+/// download → decode/render; plus no-plaintext-on-either-tier and
+/// tampered-cold-blob rejection.
+#[tokio::test]
+async fn phase4b_media_exit_gates_over_real_tls() {
+    use image::{DynamicImage, ImageFormat, RgbImage};
+    use std::io::Cursor;
+
+    const TITLE: &[u8] = b"MEDIA_TITLE_SECRET_MARKER_77";
+    const PNG_SIG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    // ---- Server with a two-tier blob store: FS hot cache over an FS cold tier ----
+    let tag = hex(&maxsecu_crypto::random_array::<8>());
+    let cache_dir = std::env::temp_dir().join(format!("mxmedia_cache_{tag}"));
+    let cold_dir = std::env::temp_dir().join(format!("mxmedia_cold_{tag}"));
+    let store = MemoryStore::new();
+    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    let tiered = TieredBlobStore::new(
+        Arc::new(FsBlobStore::new(&cache_dir)),
+        Arc::new(FsColdTier::new(&cold_dir)),
+        64 * 1024 * 1024,
+    );
+    let state = AppState {
+        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        blobs: Arc::new(tiered),
+        audit: Arc::new(maxsecu_server::NullAuditSink),
+        direct_links_enabled: false,
+    };
+    let pki = test_pki();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve(listener, pki.server_config.clone(), maxsecu_server::router(state)));
+    let mut c = connect(addr, pki.client_config.clone()).await;
+
+    // ---- Register + login ----
+    let owner = Identity::generate();
+    let (st, res) = post(
+        &mut c,
+        "/v1/users",
+        None,
+        serde_json::json!({
+            "username": "mira",
+            "enc_pub_b64": B64.encode(owner.enc_pub_bytes()),
+            "sig_pub_b64": B64.encode(owner.sig_pub_bytes()),
+            "enrollment_voucher": VOUCHER,
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "registration over TLS");
+    let user_id = hex16(res["user_id"].as_str().unwrap());
+    let (_st, ch) = post(&mut c, "/v1/session/challenge", None, serde_json::json!({"username":"mira"})).await;
+    let nonce: [u8; 32] = B64.decode(ch["nonce_b64"].as_str().unwrap()).unwrap().try_into().unwrap();
+    let server_id = ch["server_id"].as_str().unwrap().to_owned();
+    let proof = {
+        use maxsecu_encoding::structs::AuthProofContext;
+        use maxsecu_encoding::types::{Bytes32, Text};
+        let ctx = AuthProofContext {
+            server_id: Text::new(&server_id).unwrap(),
+            tls_exporter: Bytes32(c.exporter),
+            nonce: Bytes32(nonce),
+            timestamp: Timestamp(TS),
+        };
+        B64.encode(owner.signing_key().sign_canonical(labels::AUTH, &ctx))
+    };
+    let (st, res) = post(
+        &mut c,
+        "/v1/session/proof",
+        None,
+        serde_json::json!({"username":"mira","timestamp":TS,"proof_b64":proof}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "login over the bound channel");
+    let token = res["session_token"].as_str().unwrap().to_owned();
+
+    // ---- Real transcode: a source JPEG → canonical PNG content + thumb + preview ----
+    let src = {
+        let mut img = RgbImage::new(96, 72);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([(x % 256) as u8, (y % 256) as u8, 21]);
+        }
+        let mut buf = Vec::new();
+        DynamicImage::ImageRgb8(img)
+            .write_to(&mut Cursor::new(&mut buf), ImageFormat::Jpeg)
+            .unwrap();
+        buf
+    };
+    let canonical = RustImageCodec.transcode(&src, &MediaBounds::default()).unwrap();
+    assert_eq!(canonical.file_type, FileType::Image);
+    let canonical_content = canonical.content.clone();
+    let streams = canonical.into_plaintext_streams(Some(TITLE.to_vec()));
+
+    let file_id = Id(maxsecu_crypto::random_array::<16>());
+    let fid_hex = hex(&file_id.0);
+    let (_recovery_sk, recovery_pub) = generate_enc_keypair();
+    let params = UploadParams {
+        owner: &owner,
+        owner_id: Id(user_id),
+        owner_key_version: 1,
+        file_id,
+        file_type: FileType::Image,
+        chunk_size: 4096,
+        recovery_pub,
+        created_at: Timestamp(TS),
+    };
+    let bundle = build_upload(&params, &streams).unwrap();
+
+    // ---- Stage, upload chunks (write-through to BOTH tiers), finalize ----
+    let stream_specs: Vec<serde_json::Value> = bundle
+        .streams
+        .iter()
+        .map(|s| serde_json::json!({
+            "stream_type": stream_name(s.stream_type),
+            "chunk_count": s.chunk_count,
+            "chunk_size": s.chunk_size,
+            "total_bytes": s.total_bytes,
+        }))
+        .collect();
+    let wraps: Vec<serde_json::Value> = bundle
+        .wraps
+        .iter()
+        .map(|w| {
+            let rid = if w.recipient_type == RecipientType::Recovery { "recovery".to_owned() } else { hex(&w.recipient_id.0) };
+            serde_json::json!({
+                "recipient_id": rid,
+                "recipient_type": if w.recipient_type == RecipientType::Recovery { "recovery" } else { "user" },
+                "wrapped_dek_b64": B64.encode(wrap_bytes(&w.wrapped_dek)),
+                "wrap_alg": 1,
+                "granted_by": hex(&w.granted_by.0),
+                "grant_b64": B64.encode(encode(&w.grant)),
+                "grant_sig_b64": B64.encode(w.grant_sig),
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "file_id": fid_hex,
+        "file_type": "image",
+        "genesis_b64": B64.encode(encode(&bundle.genesis)),
+        "genesis_sig_b64": B64.encode(bundle.genesis_sig),
+        "manifest_b64": B64.encode(encode(&bundle.manifest)),
+        "manifest_sig_b64": B64.encode(bundle.manifest_sig),
+        "streams": stream_specs,
+        "wraps": wraps,
+    });
+    let (st, _res) = post(&mut c, "/v1/files", Some(&token), body).await;
+    assert_eq!(st, StatusCode::CREATED, "stage media v1");
+    for s in &bundle.streams {
+        for (i, chunk) in s.chunks.iter().enumerate() {
+            let uri = format!("/v1/files/{fid_hex}/versions/1/streams/{}/chunks/{i}", stream_name(s.stream_type));
+            assert_eq!(put_raw(&mut c, &uri, &token, chunk.clone()).await, StatusCode::OK);
+        }
+    }
+    let (st, _) = post(&mut c, &format!("/v1/files/{fid_hex}/versions/1/finalize"), Some(&token), serde_json::Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "finalize media");
+
+    // ---- GET records + chunks, rebuild the bundle ----
+    let (st, rec) = get_json(&mut c, &format!("/v1/files/{fid_hex}?version=latest"), &token).await;
+    assert_eq!(st, StatusCode::OK);
+    let mut dl_streams = Vec::new();
+    for s in rec["streams"].as_array().unwrap() {
+        let st_name = s["stream_type"].as_str().unwrap();
+        let count = s["chunk_count"].as_u64().unwrap();
+        let mut chunks = Vec::new();
+        for i in 0..count {
+            let uri = format!("/v1/files/{fid_hex}/versions/1/streams/{st_name}/chunks/{i}");
+            let (cs, bytes) = get_raw(&mut c, &uri, &token).await;
+            assert_eq!(cs, StatusCode::OK);
+            chunks.push(bytes);
+        }
+        dl_streams.push(StreamChunks { stream_type: stream_from_name(st_name), chunks });
+    }
+    let dec = |v: &serde_json::Value| B64.decode(v.as_str().unwrap()).unwrap();
+    let dec64 = |v: &serde_json::Value| -> [u8; 64] { dec(v).try_into().unwrap() };
+    let mw = &rec["my_wrap"];
+    let rg = &rec["recovery_grant"];
+    let good = DownloadBundle {
+        manifest_bytes: dec(&rec["manifest_b64"]),
+        manifest_sig: dec64(&rec["manifest_sig_b64"]),
+        genesis_bytes: dec(&rec["genesis_b64"]),
+        genesis_sig: dec64(&rec["genesis_sig_b64"]),
+        wrapped_dek: wrap_from_bytes(&dec(&mw["wrapped_dek_b64"])),
+        grant_bytes: dec(&mw["grant_b64"]),
+        grant_sig: dec64(&mw["grant_sig_b64"]),
+        ancestor_grants: vec![],
+        recovery_grant_bytes: dec(&rg["grant_b64"]),
+        recovery_grant_sig: dec64(&rg["grant_sig_b64"]),
+        streams: dl_streams,
+    };
+    let ctx = VerifyContext {
+        file_id,
+        author_sig_pub: owner.sig_pub_bytes(),
+        owner_sig_pub: owner.sig_pub_bytes(),
+        recipient_id: Id(user_id),
+        recipient_type: RecipientType::User,
+        recipient_secret: owner.enc_secret(),
+        seen_max_version: None,
+        granter_sig_pub: &NO_GRANTERS,
+    };
+
+    // GATE — transcoded media round-trips: content/thumbnail/preview recovered.
+    let opened = verify_and_open(&ctx, &good).expect("media round-trips");
+    let got_content = &opened.streams.iter().find(|s| s.stream_type == StreamType::Content).unwrap().plaintext;
+    assert_eq!(got_content, &canonical_content);
+    assert!(opened.streams.iter().any(|s| s.stream_type == StreamType::Thumbnail));
+    assert!(opened.streams.iter().any(|s| s.stream_type == StreamType::Preview));
+
+    // GATE — renders: the recovered canonical content decodes to a valid frame,
+    // identical to decoding the freshly-transcoded content.
+    let frame = decode_rgba_bounded(got_content, &MediaBounds::default()).expect("recovered media renders");
+    assert!(validate_decoded(&frame, &MediaBounds::default()).is_ok());
+    assert_eq!((frame.width, frame.height), (96, 72));
+    let canon_frame = decode_rgba_bounded(&canonical_content, &MediaBounds::default()).unwrap();
+    assert_eq!(frame, canon_frame);
+
+    // GATE — no plaintext on EITHER tier: neither the PNG header of any image
+    // stream nor the title text appears in any stored blob (cache or cold).
+    let mut files = 0usize;
+    scan_no_plaintext(&cache_dir, PNG_SIG, &mut files);
+    scan_no_plaintext(&cold_dir, PNG_SIG, &mut files);
+    scan_no_plaintext(&cache_dir, TITLE, &mut files);
+    scan_no_plaintext(&cold_dir, TITLE, &mut files);
+    assert!(files > 0, "blobs were actually written to the tiers");
+
+    // GATE — tampered cold blob: corrupt the cold copy of content chunk 0, drop
+    // the hot cache so the read MUST come from cold, re-GET, and verify rejects.
+    let cold_chunk0 = cold_dir.join(format!("{fid_hex}/1/1/0")); // stream_type Content=1
+    let mut cbytes = std::fs::read(&cold_chunk0).expect("cold content chunk on disk");
+    cbytes[0] ^= 0x01;
+    std::fs::write(&cold_chunk0, &cbytes).unwrap();
+    std::fs::remove_dir_all(&cache_dir).unwrap(); // force the next read to hit cold
+
+    let cidx = good.streams.iter().position(|s| s.stream_type == StreamType::Content).unwrap();
+    let ccount = good.streams[cidx].chunks.len();
+    let mut tampered = clone_bundle(&good);
+    let mut new_chunks = Vec::new();
+    for i in 0..ccount {
+        let uri = format!("/v1/files/{fid_hex}/versions/1/streams/content/chunks/{i}");
+        let (cs, b) = get_raw(&mut c, &uri, &token).await;
+        assert_eq!(cs, StatusCode::OK);
+        new_chunks.push(b);
+    }
+    tampered.streams[cidx].chunks = new_chunks;
+    assert!(matches!(
+        verify_and_open(&ctx, &tampered).unwrap_err(),
+        DownloadError::StreamDigestMismatch(StreamType::Content)
+            | DownloadError::StreamFraming(StreamType::Content)
+    ), "a tampered blob served from the cold tier must be rejected");
+
+    let _ = std::fs::remove_dir_all(&cache_dir);
+    let _ = std::fs::remove_dir_all(&cold_dir);
 }
 
 /// `DownloadBundle` is not `Clone`; rebuild one field-by-field for tampering.

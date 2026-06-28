@@ -1220,6 +1220,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "image",
  "maxsecu-admin-core",
  "maxsecu-client-core",
  "maxsecu-crypto",

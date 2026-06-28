@@ -47,6 +47,9 @@ tokio = { version = "1", features = ["io-util"] }
 # verifies what the server serves over real TLS. Both test-only.
 maxsecu-admin-core = { path = "../admin-core" }
 maxsecu-client-core = { path = "../client-core" }
+# Phase-4b media e2e (tests/file_e2e.rs): build a source image to drive the real
+# RustImageCodec transcode. Pure-Rust png/jpeg (no C), test-only.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [lints.rust]
 unsafe_code = "forbid"
