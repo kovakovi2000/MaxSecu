@@ -22,6 +22,7 @@ pub mod pg;
 pub mod ratelimit;
 pub mod serve;
 pub mod store;
+pub mod tier;
 
 pub use auth::{AuthConfig, AuthService, Challenge, SessionToken};
 pub use audit::{AuditSink, GrantAction, GrantEdge, MemoryAuditSink, NullAuditSink};
@@ -31,6 +32,7 @@ pub use http::{router, AppState, AuthedSession, TlsExporter};
 pub use pg::PgStore;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use serve::{export_channel_binding, serve, CHANNEL_BINDING_LABEL, CHANNEL_BINDING_LEN};
+pub use tier::{CacheIndex, ChunkKey, ColdTier, FsColdTier, MemoryColdTier};
 pub use files::{
     parse_stage, AddWrapError, DeleteWrapError, FinalizeError, GenesisInput, ListFilter,
     ParsedStage, StageError, StageInput, VersionSelector, WrapInput,
