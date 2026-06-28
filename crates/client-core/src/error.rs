@@ -87,6 +87,10 @@ pub enum DownloadError {
     /// First contact (no prior record) and `version` exceeds the absolute sanity
     /// ceiling (parameters §4 / D23).
     FirstContactCeiling { served: u64 },
+    /// The served `version` equals the highest remembered, but its content digest
+    /// differs — a fork/equivocation at a reused version number (§7.5). The
+    /// monotonic-by-1 rule means two distinct contents cannot share a version.
+    VersionForked { version: u64 },
     /// A grant field did not match the manifest/context (file/version/recipient/
     /// dek_commit/granted_by) — the wrap is treated as absent (§12.3a).
     GrantMismatch(&'static str),
@@ -130,6 +134,9 @@ impl fmt::Display for DownloadError {
             }
             FirstContactCeiling { served } => {
                 write!(f, "first-contact version {served} above sanity ceiling")
+            }
+            VersionForked { version } => {
+                write!(f, "version {version} reused with different content (fork)")
             }
             GrantMismatch(what) => write!(f, "grant mismatch: {what}"),
             DekUnwrap => write!(f, "DEK unwrap failed"),

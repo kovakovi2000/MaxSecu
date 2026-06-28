@@ -19,6 +19,7 @@ pub mod limits;
 pub mod password;
 pub mod revocation;
 pub mod upload;
+pub mod version_memory;
 
 pub use directory::{
     AuthorizedRecipient, DirectoryVerifier, MemoryTrustStore, TrustRecord, TrustStore,
@@ -31,6 +32,7 @@ pub use download::{
 pub use error::{ClientError, DownloadError, PasswordError, UploadError};
 pub use revocation::{TombstoneError, TombstoneSet};
 pub use identity::Identity;
+pub use version_memory::{open_and_remember, FileVersionRecord, MemoryVersionStore, VersionStore};
 pub use upload::{
     build_upload, PlaintextStreams, SealedStreamOut, UploadBundle, UploadParams, WrapOut,
 };

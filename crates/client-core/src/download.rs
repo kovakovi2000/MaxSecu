@@ -48,6 +48,7 @@ pub struct DownloadBundle {
 /// What the caller has resolved out of band before opening: the requested
 /// `file_id`, the author's and owner's directory-verified signing keys, who the
 /// downloader is, its unwrap key, and its trust-on-last-use version memory.
+#[derive(Clone)]
 pub struct VerifyContext<'a> {
     pub file_id: Id,
     /// The version author's directory-verified Ed25519 `sig_pub` (verifies the
