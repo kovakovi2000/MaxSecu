@@ -176,7 +176,7 @@ Client-side, **before** encryption, **per file, no shared dictionary**: `zstd` f
 ## 3. What v1 does *not* build (deferred)
 
 - **Mobile client** — out of scope; the §5 "mobile Argon2id floor" (R10) is dormant until a mobile client exists. Don't let the Argon2id wiring hard-code the desktop profile in a way that blocks a future mobile profile.
-- **Recovery-key Shamir/threshold split, PQ-hybrid wrap, key-transparency log** — Phase 7 (§17/§19). **Code now so these aren't wire-format changes later:** keep the `alg` identifier threaded through every record (no hard-coded suite), and model the **recovery recipient as an abstraction that can become K-of-N** rather than a single fixed key.
+- **Recovery-key Shamir/threshold split, PQ-hybrid wrap, key-transparency log** — **SHIPPED in Phase 7** (§17/§19): `crypto::hybrid` X25519+ML-KEM-768 wrap behind the `alg` registry (`Suite::V2`); `crypto::shamir` + `admin-core::recovery` K-of-N recovery-key custody; `client-core::transparency` + `sink-server::dirlog` directory KT log with split-view detection. **Still ops/deferred:** the fleet-wide **PQ re-enrollment ceremony** (runbook `docs/runbooks/pq-reenrollment.md` ready) and a real third-party KT **witness/notary** (the in-repo `sink-server::dirlog` producer is the swap-in).
 
 ---
 
