@@ -4,6 +4,7 @@ mod error;
 mod dto;
 mod keystore;
 mod config;
+mod state;
 
 fn main() {
     tauri::Builder::default()
