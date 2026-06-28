@@ -67,9 +67,12 @@ pub async fn unlock_keystore(
     dir: tauri::State<'_, AppDir>,
     session: tauri::State<'_, Session>,
 ) -> Result<(), UiError> {
+    // Scrub the password buffer on every exit path: `Zeroizing` zeroes the heap
+    // bytes on drop whether unlock succeeds, fails, or panics.
+    let password = zeroize::Zeroizing::new(password);
     // `keystore::unlock` already returns `Result<Identity, UiError>` with the
     // sanitized codes (no_keystore / unauthorized) — no `?`-From needed.
-    let id = keystore::unlock(&dir.0, &password)?;
+    let id = keystore::unlock(&dir.0, password.as_str())?;
     session.0.lock().await.identity = Some(id);
     Ok(())
 }
