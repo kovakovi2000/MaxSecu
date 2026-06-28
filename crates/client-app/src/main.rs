@@ -5,6 +5,7 @@ mod dto;
 mod keystore;
 mod config;
 mod state;
+mod transport;
 
 fn main() {
     tauri::Builder::default()
