@@ -16,14 +16,18 @@ pub mod identity;
 pub mod keyblob;
 pub mod password;
 pub mod revocation;
+pub mod upload;
 
 pub use directory::{
     AuthorizedRecipient, DirectoryVerifier, MemoryTrustStore, TrustRecord, TrustStore,
     VerifiedBinding, VerifyError,
 };
-pub use error::{ClientError, PasswordError};
+pub use error::{ClientError, PasswordError, UploadError};
 pub use revocation::{TombstoneError, TombstoneSet};
 pub use identity::Identity;
+pub use upload::{
+    build_upload, PlaintextStreams, SealedStreamOut, UploadBundle, UploadParams, WrapOut,
+};
 
 // Re-export the Argon2 profiles so callers select a calibrated profile without
 // reaching into the crypto crate directly (parameters §1.1).

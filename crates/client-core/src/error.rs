@@ -22,6 +22,40 @@ pub enum ClientError {
     BadProof,
 }
 
+/// Errors building a file upload (DESIGN §12.2, Phase 3). All fail-closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadError {
+    /// `chunk_size` is outside the accepted framing range [4 KiB, 8 MiB]
+    /// (parameters §1.2 / DESIGN §12.10) — rejected before allocation.
+    ChunkSizeOutOfRange { chunk_size: u32 },
+    /// A cryptographic step (HPKE wrap) failed — e.g. a malformed recipient key.
+    Crypto(maxsecu_crypto::CryptoError),
+    /// A freshly-built wrap did not unwrap back to the committed DEK — the
+    /// author's pre-upload self-check (DESIGN §12.2 step 7 / §12.3) failed.
+    WrapSelfCheckFailed,
+}
+
+impl From<maxsecu_crypto::CryptoError> for UploadError {
+    fn from(e: maxsecu_crypto::CryptoError) -> Self {
+        UploadError::Crypto(e)
+    }
+}
+
+impl fmt::Display for UploadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use UploadError::*;
+        match self {
+            ChunkSizeOutOfRange { chunk_size } => {
+                write!(f, "chunk_size {chunk_size} outside [4 KiB, 8 MiB]")
+            }
+            Crypto(e) => write!(f, "crypto failure: {e}"),
+            WrapSelfCheckFailed => write!(f, "wrap self-check failed (does not open to the DEK)"),
+        }
+    }
+}
+
+impl std::error::Error for UploadError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PasswordError {
     /// Below the minimum length (parameters §2: 15).
