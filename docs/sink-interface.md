@@ -59,6 +59,9 @@ The **global sink position** at which the file's immutable `genesis` was anchore
 
 ---
 
+### 3.5 `GET {sink}/v1/control-log/position?chain_seq=<n>` → `{ position }` (R27/D28 cutoff side)
+The **global sink position** of the `chain_seq`-th control append (1-based; `404` if no such record has been appended). This position is drawn from the **same monotonic counter as genesis anchors** (§3.4), so it is directly comparable to a file's `genesis` position. The client maps a verified `key_compromise` record's chain position (its index in the §3.2/§7.1 ordered record set) to this global position, which becomes `download::CompromiseCheck.cutoff` — the §5 step 4 comparison. A `404` here while an active `key_compromise` covers a genesis's signing key is **fail-closed** at the client (it must not proceed without establishing the cutoff). Together with §3.4 this lets the client source BOTH sides of the R27 cutoff from the real sink.
+
 ## 4. `anchor_proof` — what makes the head trustworthy without a new online signer
 
 `anchor_proof` is an abstraction with a small set of accepted concrete forms (the client ships an allowlist, like the `alg` registry); **at least one** must validate or the head is rejected (fail closed). In rough order of strength:

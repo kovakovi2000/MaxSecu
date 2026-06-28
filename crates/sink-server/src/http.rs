@@ -114,6 +114,7 @@ pub fn router(state: SinkState) -> Router {
             get(get_records).post(post_record),
         )
         .route("/v1/control-log/anchor-log", get(anchor_log))
+        .route("/v1/control-log/position", get(get_control_position))
         .route("/v1/genesis-anchor", post(post_genesis_anchor))
         .route("/v1/genesis-anchor/{file_id}", get(get_genesis_anchor))
         // Directory key-transparency log (P7.11, `sink-interface.md` §8): served by
@@ -355,6 +356,31 @@ async fn post_genesis_anchor(
     let mut inner = st.inner.lock().await;
     let position = inner.positions.anchor_genesis(file_id);
     Json(GenesisPositionJson { position }).into_response()
+}
+
+// ---- GET /v1/control-log/position?chain_seq= (R27/D28 cutoff basis, §3.5) ----
+
+#[derive(Deserialize)]
+struct ControlPositionQuery {
+    chain_seq: u64,
+}
+
+/// Serve the global sink position of the `chain_seq`-th control append (1-based),
+/// or `404` if no such control record has been appended. This is the **cutoff**
+/// side of the R27/D28 comparison: a client maps a verified `key_compromise`
+/// record's chain position to its global sink position here, then compares it
+/// against a durable genesis's anchored position (`get_genesis_anchor`). Both are
+/// drawn from one global counter, so they are directly comparable. Public read —
+/// the position carries no secret.
+async fn get_control_position(
+    State(st): State<SinkState>,
+    Query(q): Query<ControlPositionQuery>,
+) -> Response {
+    let inner = st.inner.lock().await;
+    match inner.positions.control_pos(q.chain_seq) {
+        Some(position) => Json(GenesisPositionJson { position }).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 // ---- GET /v1/genesis-anchor/{file_id_hex} (§4) ----
@@ -712,6 +738,44 @@ mod tests {
         // Malformed hex in the GET path → 400.
         let (st, _) = send(&app, get("/v1/genesis-anchor/not-hex")).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn control_position_route_serves_global_order() {
+        let app = app();
+        let (r1, r2) = two_records();
+
+        // No control appends yet, and chain_seq is 1-based → 404 for 0 and 1.
+        let (st, _) = send(&app, get("/v1/control-log/position?chain_seq=0")).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _) = send(&app, get("/v1/control-log/position?chain_seq=1")).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // Anchor a genesis (global position g), then append r1 (next position).
+        let f = [0xF1u8; 16];
+        let (st, gbody) = send(&app, post_genesis_req(Some(TOKEN), &B64.encode(f))).await;
+        assert_eq!(st, StatusCode::OK);
+        let g = gbody["position"].as_u64().unwrap();
+        let (st, _) = send(&app, post_record_req(Some(TOKEN), &B64.encode(&r1.bytes))).await;
+        assert_eq!(st, StatusCode::OK);
+
+        // chain_seq 1's global position is one past the genesis anchor — the two
+        // event kinds share one ordered space (the R27/D28 cutoff basis).
+        let (st, body) = send(&app, get("/v1/control-log/position?chain_seq=1")).await;
+        assert_eq!(st, StatusCode::OK);
+        let c1 = body["position"].as_u64().unwrap();
+        assert_eq!(c1, g + 1);
+
+        // Append r2 → chain_seq 2 at the next position.
+        let (st, _) = send(&app, post_record_req(Some(TOKEN), &B64.encode(&r2.bytes))).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, body) = send(&app, get("/v1/control-log/position?chain_seq=2")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["position"].as_u64().unwrap(), c1 + 1);
+
+        // Past the end → 404.
+        let (st, _) = send(&app, get("/v1/control-log/position?chain_seq=3")).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
     }
 
     // ---- directory KT log routes (P7.11) ----
