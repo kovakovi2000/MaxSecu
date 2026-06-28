@@ -514,6 +514,7 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS, // V's grant is author-rooted
         tombstones: None,
+        compromise: None,
     };
     let opened = verify_and_open(&v_ctx, &v_bundle).expect("V opens the re-shared file");
     assert_eq!(
@@ -561,6 +562,7 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
         seen_max_version: None,
         granter_sig_pub: &resolver,
         tombstones: None,
+        compromise: None,
     };
     let opened = verify_and_open(&w_ctx, &w_bundle).expect("W opens via the ancestor chain");
     assert_eq!(
@@ -676,6 +678,7 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
         seen_max_version: Some(1),
         granter_sig_pub: &NO_GRANTERS,
         tombstones: None,
+        compromise: None,
     };
     let opened2 = verify_and_open(&w_ctx2, &w_v2).expect("W opens v2 under the rotated DEK");
     assert_eq!(opened2.version, 2);

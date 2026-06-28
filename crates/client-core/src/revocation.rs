@@ -237,6 +237,24 @@ impl TombstoneSet {
     pub fn effective_roles(&self, user_id: &[u8; 16], ceiling: &[Role]) -> Vec<Role> {
         effective_roles_in(&self.records, user_id, ceiling)
     }
+
+    /// The active `key_compromise` cutoff for `(user_id, key_version)`, if any
+    /// (§11.7/D28). Callers pair it with the record's **sink position** to gate a
+    /// durable `genesis` signed under that key (R27) — never with `effective_from`.
+    pub fn key_compromise_for(
+        &self,
+        user_id: &[u8; 16],
+        key_version: u64,
+    ) -> Option<&KeyCompromise> {
+        self.records.iter().find_map(|d| match d {
+            Decoded::KeyCompromise(kc)
+                if kc.user_id.0 == *user_id && kc.key_version == key_version =>
+            {
+                Some(kc)
+            }
+            _ => None,
+        })
+    }
 }
 
 /// Authenticate one record's issuer (and co-signer) authority against the chain
@@ -326,7 +344,7 @@ fn scope_matches_file(scope: FileScope, file_id: &[u8; 16]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maxsecu_admin_core::{ControlChain, CoSign, ReinstateParams, RevokeParams};
+    use maxsecu_admin_core::{ControlChain, CoSign, KeyCompromiseParams, ReinstateParams, RevokeParams};
     use maxsecu_crypto::SigningKey;
     use maxsecu_encoding::types::{Bytes32, Id, Timestamp};
 
@@ -542,6 +560,32 @@ mod tests {
             TombstoneSet::verify_authenticated(&[r0, r1], head1, &res).unwrap_err(),
             TombstoneError::NotAdmin
         );
+    }
+
+    #[test]
+    fn key_compromise_for_finds_the_cutoff() {
+        let admin = SigningKey::generate();
+        let co = SigningKey::generate();
+        let mut chain = ControlChain::new();
+        let kc = chain.key_compromise(
+            &admin,
+            KeyCompromiseParams {
+                user_id: Id([U; 16]),
+                key_version: 3,
+                effective_from: NOW,
+                issued_by: ADMIN_ID,
+                created_at: NOW,
+            },
+            CoSign { admin_id: A2_ID, key: &co },
+        );
+        let res = multi_issuer(vec![
+            (ADMIN_ID, admin.verifying_key().to_bytes(), vec![Role::Admin]),
+            (A2_ID, co.verifying_key().to_bytes(), vec![Role::Admin]),
+        ]);
+        let set = TombstoneSet::verify_authenticated(&[rec_in(&kc)], chain.head(), &res).unwrap();
+        assert!(set.key_compromise_for(&[U; 16], 3).is_some(), "the compromised key");
+        assert!(set.key_compromise_for(&[U; 16], 2).is_none(), "a different key_version");
+        assert!(set.key_compromise_for(&[0x55; 16], 3).is_none(), "a different user");
     }
 
     #[test]

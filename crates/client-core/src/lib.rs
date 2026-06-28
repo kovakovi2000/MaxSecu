@@ -33,8 +33,8 @@ pub use directory::{
     VerifiedBinding, VerifyError,
 };
 pub use download::{
-    verify_and_open, verify_and_stream_content, version_acceptable, DownloadBundle, OpenedFile,
-    OpenedHeader, OpenedStream, StreamChunks, StreamHeader, VerifyContext, NO_GRANTERS,
+    verify_and_open, verify_and_stream_content, version_acceptable, CompromiseCheck, DownloadBundle,
+    OpenedFile, OpenedHeader, OpenedStream, StreamChunks, StreamHeader, VerifyContext, NO_GRANTERS,
 };
 pub use budget::{plan_unlock, AuditEvent, UnlockPlan};
 pub use error::{ClientError, DownloadError, PasswordError, TranscodeError, UploadError};

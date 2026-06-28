@@ -177,6 +177,7 @@ mod tests {
             seen_max_version: Some(999), // deliberately wrong — the store overrides
             granter_sig_pub: &NO_GRANTERS,
             tombstones: None,
+            compromise: None,
         }
     }
 

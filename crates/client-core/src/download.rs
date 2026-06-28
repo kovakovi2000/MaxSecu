@@ -89,6 +89,25 @@ pub struct VerifyContext<'a> {
     /// is required (§7.6); any served version supplies a set proven contiguous to
     /// the sink head ([`TombstoneSet::verify_authenticated`]).
     pub tombstones: Option<&'a crate::revocation::TombstoneSet>,
+    /// The R27 signing-compromise cutoff for the immutable `genesis` (§11.7/D28).
+    /// `None` skips the check (no compromise relevant). When present, a genesis
+    /// signed under a compromised `(owner_id, owner_key_version)` is honored only
+    /// if its **sink-anchoring position predates** the compromise — defeating a
+    /// backdated forgery regardless of its attacker-chosen `created_at`.
+    pub compromise: Option<CompromiseCheck<'a>>,
+}
+
+/// Inputs for the R27 key-compromise cutoff on the durable `genesis` (§11.7/D28).
+/// Both positions are **sink** positions (append order), never timestamps — a
+/// forgery cannot retroactively acquire an earlier sink position.
+#[derive(Clone, Copy)]
+pub struct CompromiseCheck<'a> {
+    /// The genesis record's own sink-anchoring position, or `None` if unknown
+    /// (then a genesis under any compromise fails closed).
+    pub genesis_sink_pos: Option<u64>,
+    /// Resolves `(owner_id, owner_key_version)` to the sink position of an active
+    /// `key_compromise` cutoff for that key, or `None` if the key is uncompromised.
+    pub cutoff: &'a dyn Fn(Id, u64) -> Option<u64>,
 }
 
 /// A granter resolver that authenticates no one — for callers with no re-share
@@ -194,6 +213,19 @@ fn verify_header(
     }
     if !verify(&ctx.owner_sig_pub, labels::GENESIS, &genesis, genesis_sig) {
         return Err(GenesisSignature);
+    }
+
+    // (2b) R27 signing-compromise cutoff for the durable genesis (§11.7/D28). If
+    // the owner's signing key for this genesis is under a key_compromise, the
+    // genesis is honored only if its sink-anchoring position **predates** the
+    // compromise — a backdated forgery cannot acquire an earlier sink position.
+    if let Some(chk) = &ctx.compromise {
+        if let Some(cutoff_pos) = (chk.cutoff)(genesis.owner_id, genesis.owner_key_version) {
+            let predates = chk.genesis_sink_pos.is_some_and(|g| g < cutoff_pos);
+            if !predates {
+                return Err(GenesisAfterCompromise);
+            }
+        }
     }
 
     // (3) Author-entitlement: owner-only write (D29).
@@ -709,6 +741,7 @@ mod tests {
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
             tombstones: None,
+            compromise: None,
         }
     }
 
@@ -877,6 +910,7 @@ mod tests {
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
             tombstones: None,
+            compromise: None,
         };
         let opened = verify_and_open(&c, &db).expect("recovery opens");
         assert_eq!(opened.version, 1);
@@ -961,6 +995,55 @@ mod tests {
     }
 
     #[test]
+    fn backdated_genesis_under_compromised_key_is_rejected() {
+        let built = build(); // genesis owner_key_version == 1
+        let db = self_bundle(&built.bundle);
+        // (owner, kv=1) was compromised; the cutoff is anchored at sink pos 5. The
+        // genesis was actually anchored at pos 9 (AFTER the compromise) — a forgery
+        // backdated via created_at cannot acquire an earlier sink position (D28).
+        let cutoff = |id: Id, kv: u64| (id == OWNER_ID && kv == 1).then_some(5u64);
+        let mut c = ctx(&built);
+        c.compromise = Some(CompromiseCheck { genesis_sink_pos: Some(9), cutoff: &cutoff });
+        assert_eq!(verify_and_open(&c, &db), Err(DownloadError::GenesisAfterCompromise));
+    }
+
+    #[test]
+    fn pre_compromise_genesis_still_opens() {
+        let built = build();
+        let db = self_bundle(&built.bundle);
+        // Genesis anchored at pos 2, before the compromise at pos 5 — a legitimately
+        // old file under a key that was only later compromised; still opens.
+        let cutoff = |id: Id, kv: u64| (id == OWNER_ID && kv == 1).then_some(5u64);
+        let mut c = ctx(&built);
+        c.compromise = Some(CompromiseCheck { genesis_sink_pos: Some(2), cutoff: &cutoff });
+        assert!(verify_and_open(&c, &db).is_ok());
+    }
+
+    #[test]
+    fn unknown_genesis_position_under_compromise_fails_closed() {
+        let built = build();
+        let db = self_bundle(&built.bundle);
+        let cutoff = |id: Id, kv: u64| (id == OWNER_ID && kv == 1).then_some(5u64);
+        let mut c = ctx(&built);
+        // Cannot establish the genesis's sink position while a compromise exists
+        // for its key → fail closed rather than honor a possibly-forged genesis.
+        c.compromise = Some(CompromiseCheck { genesis_sink_pos: None, cutoff: &cutoff });
+        assert_eq!(verify_and_open(&c, &db), Err(DownloadError::GenesisAfterCompromise));
+    }
+
+    #[test]
+    fn uncompromised_key_ignores_the_cutoff() {
+        let built = build();
+        let db = self_bundle(&built.bundle);
+        // The resolver reports no compromise for this key → the genesis position is
+        // irrelevant and the file opens.
+        let cutoff = |_: Id, _: u64| None;
+        let mut c = ctx(&built);
+        c.compromise = Some(CompromiseCheck { genesis_sink_pos: None, cutoff: &cutoff });
+        assert!(verify_and_open(&c, &db).is_ok());
+    }
+
+    #[test]
     fn forged_manifest_signature_is_rejected() {
         let built = build();
         let mut db = self_bundle(&built.bundle);
@@ -1031,6 +1114,7 @@ mod tests {
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
             tombstones: None,
+            compromise: None,
         };
         assert!(matches!(
             verify_and_open(&c, &db),
@@ -1217,6 +1301,7 @@ mod tests {
             seen_max_version: None,
             granter_sig_pub: &resolver,
             tombstones: None,
+            compromise: None,
         };
         let opened = verify_and_open(&vctx, &bundle).expect("re-shared read chains to author");
         let content = opened
@@ -1247,6 +1332,7 @@ mod tests {
             seen_max_version: None,
             granter_sig_pub: resolver,
             tombstones: None,
+            compromise: None,
         }
     }
 
@@ -1482,6 +1568,7 @@ mod tests {
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
             tombstones: None,
+            compromise: None,
         };
         assert!(matches!(
             verify_and_open(&c, &db),

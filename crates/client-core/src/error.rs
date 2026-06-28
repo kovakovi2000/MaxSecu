@@ -170,6 +170,10 @@ pub enum DownloadError {
     /// per-file tombstone, §11.5) — it has lost access to this and future
     /// versions; fail closed rather than serve it.
     RecipientRevoked,
+    /// The `genesis` was signed under a `(owner_id, owner_key_version)` that is
+    /// under a `key_compromise` cutoff, and the genesis's sink-anchoring position
+    /// does **not** predate the compromise — a backdated forgery (R27/§11.7/D28).
+    GenesisAfterCompromise,
 }
 
 impl fmt::Display for DownloadError {
@@ -210,6 +214,9 @@ impl fmt::Display for DownloadError {
             CompressionUnsupported => write!(f, "unsupported stream compression"),
             AuthorRevoked => write!(f, "version author is under an active tombstone"),
             RecipientRevoked => write!(f, "recipient is revoked from this file version"),
+            GenesisAfterCompromise => {
+                write!(f, "genesis anchored after a key-compromise cutoff (forged)")
+            }
         }
     }
 }

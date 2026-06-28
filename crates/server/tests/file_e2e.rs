@@ -421,6 +421,7 @@ async fn phase3_exit_gates_over_real_tls() {
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS,
         tombstones: None,
+        compromise: None,
     };
 
     // GATE — round-trip: the exact plaintext is recovered.
@@ -682,6 +683,7 @@ async fn phase4b_media_exit_gates_over_real_tls() {
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS,
         tombstones: None,
+        compromise: None,
     };
 
     // GATE — transcoded media round-trips: content/thumbnail/preview recovered.
