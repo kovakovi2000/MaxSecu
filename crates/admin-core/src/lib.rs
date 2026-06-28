@@ -17,6 +17,7 @@
 mod control;
 mod directory;
 mod recovery;
+mod subtree;
 
 pub use control::{
     ControlChain, ControlRecord, CoSign, KeyCompromiseParams, ReinstateParams, RevokeParams,
@@ -24,6 +25,7 @@ pub use control::{
 };
 pub use directory::{DirectorySigner, SignedBinding};
 pub use recovery::{build_recovery_grant, RecoveryError, RecoveryGrantOut, RecoveryGrantParams};
+pub use subtree::{revocation_subtree, GrantEdge};
 
 use core::fmt;
 
