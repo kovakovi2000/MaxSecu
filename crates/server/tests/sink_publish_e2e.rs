@@ -33,7 +33,7 @@ use maxsecu_client_core::{confirm_anchored, AnchoredHead, HttpSinkClient, Identi
 use maxsecu_crypto::{sha256, SigningKey};
 use maxsecu_encoding::types::{FileScope, Id, Role, Timestamp};
 use maxsecu_server::{
-    export_channel_binding, serve, AppState, AuthConfig, AuthService, FsBlobStore,
+    export_channel_binding, serve, AppState, AuditSink, AuthConfig, AuthService, FsBlobStore,
     HttpSinkPublisher, MemoryStore, UserRecord,
 };
 use maxsecu_sink_server::{router as sink_router, serve as sink_serve, Anchorer, SinkState};
@@ -271,6 +271,115 @@ fn a_revocation(admin: &Identity) -> SignedControlRecord {
             None,
         )
         .unwrap()
+}
+
+/// GET the sink's recorded global position for `file_id`'s genesis over its own
+/// pinned TLS channel; `None` when the sink returns `404` (file not anchored).
+async fn fetch_genesis_pos(
+    addr: std::net::SocketAddr,
+    client_config: Arc<ClientConfig>,
+    file_id: &[u8; 16],
+) -> Option<u64> {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let connector = TlsConnector::from(client_config);
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let tls = connector.connect(server_name, tcp).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let uri = format!("/v1/genesis-anchor/{}", hex(file_id));
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    if resp.status() == StatusCode::NOT_FOUND {
+        return None;
+    }
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    Some(v["position"].as_u64().unwrap())
+}
+
+/// P7.8: the app server anchors a file `genesis` at a REAL, global-ordered sink
+/// position — the R27/D28 key-compromise cutoff basis, now over real TLS rather
+/// than the in-memory `MemoryAuditSink`. Stands up an in-proc sink, pins a real
+/// `HttpSinkPublisher` to it, and proves: (a) `anchor_genesis` actually records a
+/// position the sink serves back, (b) control appends and genesis anchors share
+/// ONE ordered position space (a genesis anchored after a control append has a
+/// strictly higher position), and (c) anchoring is idempotent (append-only).
+#[tokio::test]
+async fn genesis_anchoring_is_real_and_globally_ordered_over_sink() {
+    // ---- Stand up the sink over loopback TLS (its own pinned identity). ----
+    let sink_pki = test_pki();
+    let anchorer = Anchorer::new(SigningKey::generate(), SigningKey::generate());
+    let sink_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = sink_listener.local_addr().unwrap();
+    tokio::spawn(sink_serve(
+        sink_listener,
+        sink_pki.server_config.clone(),
+        sink_router(SinkState::new(anchorer, TOKEN)),
+    ));
+
+    // A real publisher pinned to the sink's channel (the same transport the app
+    // server's `AuditSink` uses).
+    let publisher =
+        HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
+
+    // An un-anchored file has no sink position.
+    assert!(
+        fetch_genesis_pos(sink_addr, sink_pki.client_config.clone(), &[0xF1; 16])
+            .await
+            .is_none(),
+        "an un-anchored file has no genesis position"
+    );
+
+    // ---- Anchor a first genesis (global event #0) over real TLS. ----
+    publisher.anchor_genesis([0xF1; 16]).await;
+    let g1 = fetch_genesis_pos(sink_addr, sink_pki.client_config.clone(), &[0xF1; 16])
+        .await
+        .expect("first genesis anchored over the real sink");
+
+    // ---- A control append draws the NEXT global position, BETWEEN the two genesis
+    // anchors — proving control appends and genesis anchors share one ordered space.
+    let rev = a_revocation(&Identity::generate());
+    publisher.publish_control_record(rev.bytes.clone()).await;
+
+    // ---- Anchor a second genesis AFTER the control append. ----
+    publisher.anchor_genesis([0xF2; 16]).await;
+    let g2 = fetch_genesis_pos(sink_addr, sink_pki.client_config.clone(), &[0xF2; 16])
+        .await
+        .expect("second genesis anchored over the real sink");
+
+    // Global ordering (R27/D28): the genesis anchored AFTER the control append has a
+    // strictly higher sink position, and the intervening control append consumed
+    // exactly one global position (g1=0, control=1, g2=2) — so "genesis anchored
+    // before/after a key_compromise control record" is decidable over the real sink.
+    assert!(
+        g2 > g1,
+        "a genesis anchored after a control append has a higher global position"
+    );
+    assert_eq!(
+        g2,
+        g1 + 2,
+        "the intervening control append consumed exactly one global position"
+    );
+
+    // ---- Idempotent: re-anchoring never moves a genesis's position. ----
+    publisher.anchor_genesis([0xF1; 16]).await;
+    let g1_again = fetch_genesis_pos(sink_addr, sink_pki.client_config.clone(), &[0xF1; 16])
+        .await
+        .expect("still anchored");
+    assert_eq!(
+        g1, g1_again,
+        "re-anchoring a file is idempotent (append-only position)"
+    );
 }
 
 #[tokio::test]

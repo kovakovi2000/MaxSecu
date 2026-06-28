@@ -13,11 +13,11 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Json, Query, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 
 use crate::anchor::{AnchorBundle, AnchorProofParts, Anchorer};
 use crate::chain::{AnchoredHead, AppendError, ControlLogStore};
+use crate::position::PositionLog;
 
 /// The sink's mutable state, behind one async mutex: the append-only record store
 /// and the anchorer that re-publishes the head on every append. Cloneable (an
@@ -45,6 +46,9 @@ struct Inner {
     /// head fetch never re-derives a proof and always matches `store.head()`.
     current: AnchorBundle,
     head: AnchoredHead,
+    /// Global sink positions for control appends + file-genesis anchors, drawn
+    /// from ONE counter so the R27/D28 cutoff can order them (`position`).
+    positions: PositionLog,
 }
 
 impl SinkState {
@@ -61,14 +65,17 @@ impl SinkState {
                 anchorer,
                 current,
                 head,
+                positions: PositionLog::new(),
             })),
             admin_token: Arc::new(admin_token.into()),
         }
     }
 }
 
-/// The sink control-log routes (`sink-interface.md` §3). `head`/`records`/
-/// `anchor-log` are public reads; `POST records` requires the admin bearer.
+/// The sink control-log routes (`sink-interface.md` §3) plus the genesis-anchor
+/// routes (§4, R27/D28 cutoff basis). `head`/`records`/`anchor-log` and the
+/// genesis-position read are public; `POST records` and `POST genesis-anchor`
+/// require the admin bearer.
 pub fn router(state: SinkState) -> Router {
     Router::new()
         .route("/v1/control-log/head", get(head))
@@ -77,6 +84,8 @@ pub fn router(state: SinkState) -> Router {
             get(get_records).post(post_record),
         )
         .route("/v1/control-log/anchor-log", get(anchor_log))
+        .route("/v1/genesis-anchor", post(post_genesis_anchor))
+        .route("/v1/genesis-anchor/{file_id}", get(get_genesis_anchor))
         .with_state(state)
 }
 
@@ -220,6 +229,9 @@ async fn post_record(
             let bundle = inner.anchorer.anchor(new_head);
             inner.head = new_head;
             inner.current = bundle;
+            // Draw the next GLOBAL sink position so this control append is ordered
+            // against genesis anchors (R27/D28 cutoff basis, `position`).
+            inner.positions.record_control();
             Json(head_json(inner.head, &inner.current)).into_response()
         }
         Err(AppendError::NotAppending) => StatusCode::CONFLICT.into_response(),
@@ -241,6 +253,84 @@ async fn anchor_log(State(st): State<SinkState>) -> Response {
         .map(|(head, bundle)| head_json(*head, bundle))
         .collect();
     Json(out).into_response()
+}
+
+// ---- genesis-anchor (R27/D28 cutoff basis, `docs/sink-interface.md` §4) ----
+
+#[derive(Deserialize)]
+struct GenesisAnchorReq {
+    /// The 16-byte `file_id`, base64 (standard, padded) — matching the `_b64`
+    /// wire convention of the control-log routes.
+    file_id_b64: String,
+}
+
+#[derive(Serialize)]
+struct GenesisPositionJson {
+    /// The global sink position of this file's genesis (comparable against a
+    /// control append's position — the R27 cutoff).
+    position: u64,
+}
+
+/// Decode a 32-char lowercase/uppercase hex string into a 16-byte `file_id`
+/// (path-safe encoding for the GET route); `None` if not exactly 32 hex digits.
+fn decode_file_id_hex(s: &str) -> Option<[u8; 16]> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, o) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        *o = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
+// ---- POST /v1/genesis-anchor (§4) ----
+
+/// Anchor a file's `genesis` at the next global sink position (R27/D28). Requires
+/// the admin bearer (else `403`); undecodable / non-16-byte `file_id` → `400`.
+/// **Idempotent and append-only**: re-anchoring an already-anchored file returns
+/// its EXISTING position (no rewrite) so a genesis position never moves.
+async fn post_genesis_anchor(
+    State(st): State<SinkState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<GenesisAnchorReq>,
+) -> Response {
+    // Coarse admin gate (§6.1) — same constant-shape `403` as `post_record`.
+    let presented = headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "));
+    if presented != Some(st.admin_token.as_str()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Ok(raw) = B64.decode(req.file_id_b64.as_bytes()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(file_id) = <[u8; 16]>::try_from(raw.as_slice()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let mut inner = st.inner.lock().await;
+    let position = inner.positions.anchor_genesis(file_id);
+    Json(GenesisPositionJson { position }).into_response()
+}
+
+// ---- GET /v1/genesis-anchor/{file_id_hex} (§4) ----
+
+/// Serve the global sink position at which `file_id`'s genesis was anchored, or
+/// `404` if the file is not anchored; a malformed (non-hex / wrong-length)
+/// `file_id` is `400`. Public read — the position carries no secret.
+async fn get_genesis_anchor(State(st): State<SinkState>, Path(file_id_hex): Path<String>) -> Response {
+    let Some(file_id) = decode_file_id_hex(&file_id_hex) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let inner = st.inner.lock().await;
+    match inner.positions.genesis_pos(&file_id) {
+        Some(position) => Json(GenesisPositionJson { position }).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -389,5 +479,79 @@ mod tests {
         // Wrong bearer → 403.
         let (st, _) = send(&app, post_record_req(Some("wrong"), &B64.encode(&r1.bytes))).await;
         assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+
+    fn hex16(id: &[u8; 16]) -> String {
+        id.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn post_genesis_req(token: Option<&str>, file_id_b64: &str) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/v1/genesis-anchor")
+            .header("content-type", "application/json");
+        if let Some(t) = token {
+            b = b.header(AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let body = serde_json::json!({ "file_id_b64": file_id_b64 }).to_string();
+        b.body(Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn genesis_anchor_records_global_ordered_position() {
+        let app = app();
+        let f1 = [0xF1u8; 16];
+        let f2 = [0xF2u8; 16];
+        let (r1, _r2) = two_records();
+
+        // An un-anchored file → 404.
+        let (st, _) = send(&app, get(&format!("/v1/genesis-anchor/{}", hex16(&f1)))).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // Anchor f1 (global event #0).
+        let (st, body) = send(&app, post_genesis_req(Some(TOKEN), &B64.encode(f1))).await;
+        assert_eq!(st, StatusCode::OK);
+        let p1 = body["position"].as_u64().unwrap();
+
+        // A control append draws the NEXT global position (between the two anchors).
+        let (st, _) = send(&app, post_record_req(Some(TOKEN), &B64.encode(&r1.bytes))).await;
+        assert_eq!(st, StatusCode::OK);
+
+        // Anchor f2 AFTER the control append → strictly higher position; the
+        // control append consumed exactly one position between them.
+        let (st, body) = send(&app, post_genesis_req(Some(TOKEN), &B64.encode(f2))).await;
+        assert_eq!(st, StatusCode::OK);
+        let p2 = body["position"].as_u64().unwrap();
+        assert!(p2 > p1, "genesis after control append has a higher global position");
+        assert_eq!(p2, p1 + 2, "the intervening control append consumed one position");
+
+        // GET reflects the anchored positions.
+        let (st, body) = send(&app, get(&format!("/v1/genesis-anchor/{}", hex16(&f1)))).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["position"].as_u64().unwrap(), p1);
+
+        // Idempotent: re-anchoring f1 returns its ORIGINAL position (no rewrite).
+        let (st, body) = send(&app, post_genesis_req(Some(TOKEN), &B64.encode(f1))).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["position"].as_u64().unwrap(), p1);
+    }
+
+    #[tokio::test]
+    async fn genesis_anchor_admin_gated_and_input_validated() {
+        let app = app();
+        let f1 = [0x0Au8; 16];
+        // Missing / wrong bearer → 403 (same shape as the control route).
+        let (st, _) = send(&app, post_genesis_req(None, &B64.encode(f1))).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, _) = send(&app, post_genesis_req(Some("wrong"), &B64.encode(f1))).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // Non-16-byte / undecodable file_id → 400.
+        let (st, _) = send(&app, post_genesis_req(Some(TOKEN), &B64.encode([0x01, 0x02, 0x03]))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _) = send(&app, post_genesis_req(Some(TOKEN), "@@not-base64@@")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // Malformed hex in the GET path → 400.
+        let (st, _) = send(&app, get("/v1/genesis-anchor/not-hex")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
     }
 }

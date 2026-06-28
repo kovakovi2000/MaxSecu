@@ -151,8 +151,10 @@ impl AuditSink for NullAuditSink {
 
 /// A real [`AuditSink`] that PUBLISHES each appended control-log record to the
 /// independent external sink over its OWN pinned TLS identity (the sink's
-/// `POST /v1/control-log/records`, `sink-interface.md` §6.1). The sink derives the
-/// head itself; we ship only the canonical record bytes.
+/// `POST /v1/control-log/records`, `sink-interface.md` §6.1) and ANCHORS each
+/// file's `genesis` at a global sink position there (`POST /v1/genesis-anchor`,
+/// §4 — the R27/D28 cutoff basis, real as of P7.8). The sink derives the head
+/// itself; we ship only the canonical record bytes.
 ///
 /// Publication is **best-effort and infallible from the caller** (matching the
 /// seam contract above): a publish failure never denies the admin's append at the
@@ -239,6 +241,55 @@ impl HttpSinkPublisher {
             Err(())
         }
     }
+
+    /// `POST /v1/genesis-anchor {file_id_b64}` with the admin bearer, over the
+    /// sink's pinned TLS channel — anchoring `file_id`'s genesis at a global sink
+    /// position (the R27/D28 cutoff basis, `sink-interface.md` §4). The sink is
+    /// idempotent: re-anchoring is a no-op that returns the existing position.
+    /// Returns `Err(())` on any transport/HTTP failure — the caller swallows it
+    /// (best-effort), so no internal detail escapes. Mirrors [`Self::post_record`].
+    async fn post_genesis(&self, file_id: &[u8; 16]) -> Result<(), ()> {
+        use base64::Engine;
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        use tokio_rustls::rustls::pki_types::ServerName;
+        use tokio_rustls::TlsConnector;
+
+        let tcp = tokio::net::TcpStream::connect(self.addr)
+            .await
+            .map_err(|_| ())?;
+        let connector = TlsConnector::from(self.tls.clone());
+        let server_name = ServerName::try_from(self.server_name.clone()).map_err(|_| ())?;
+        let tls = connector.connect(server_name, tcp).await.map_err(|_| ())?;
+
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .map_err(|_| ())?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let file_id_b64 = base64::engine::general_purpose::STANDARD.encode(file_id);
+        let body = serde_json::json!({ "file_id_b64": file_id_b64 }).to_string();
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri("/v1/genesis-anchor")
+            .header("host", self.server_name.as_str())
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", self.admin_token))
+            .body(Full::<Bytes>::from(body))
+            .map_err(|_| ())?;
+        let resp = sender.send_request(req).await.map_err(|_| ())?;
+        let ok = resp.status().is_success();
+        // Drain so the connection task can finish cleanly.
+        let _ = resp.into_body().collect().await;
+        if ok {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
 }
 
 #[async_trait]
@@ -253,13 +304,15 @@ impl AuditSink for HttpSinkPublisher {
         let _ = self.post_record(&record_bytes).await;
     }
 
-    /// Genesis-position anchoring over the REAL sink is deferred: P6.4's sink has
-    /// no genesis-anchor route, and the R27 cutoff over the real sink (with a
-    /// client-side genesis-position fetch) is a distinct feature. Closing
-    /// write-time withholding of CONTROL records (the P6.5 headline) does not
-    /// require it. No-op here; [`MemoryAuditSink`] keeps the in-memory R27 tracking
-    /// for the existing unit/e2e coverage.
-    async fn anchor_genesis(&self, _file_id: [u8; 16]) {}
+    /// Anchor a file's `genesis` at a global sink position over the REAL sink
+    /// (`POST /v1/genesis-anchor`, `sink-interface.md` §4) — the R27/D28 cutoff
+    /// basis. Best-effort and infallible from the caller: a failed anchor must not
+    /// deny the upload; a client that cannot establish a genesis's sink position
+    /// under an active key-compromise fails closed on download (D28), so a missed
+    /// anchor degrades safely. (P7.8 — was a no-op through Phase 6.)
+    async fn anchor_genesis(&self, file_id: [u8; 16]) {
+        let _ = self.post_genesis(&file_id).await;
+    }
 }
 
 #[cfg(test)]
