@@ -22,6 +22,7 @@ pub mod password;
 pub mod reshare;
 pub mod revocation;
 pub mod rotate;
+pub mod sandbox;
 pub mod sanitize;
 pub mod upload;
 pub mod version_memory;
@@ -39,6 +40,10 @@ pub use error::{ClientError, DownloadError, PasswordError, TranscodeError, Uploa
 pub use media::{
     CanonicalStreams, FfmpegVideo, MediaBounds, RustImageCodec, Transcoder, MEDIA_MAX_PIXELS,
     PREVIEW_MAX_DIM, THUMBNAIL_MAX_DIM,
+};
+pub use sandbox::{
+    validate_decoded, DecodeError, DecodedImage, InProcessFakeDecoder, OutputReject,
+    SandboxedDecoder,
 };
 pub use revocation::{TombstoneError, TombstoneSet};
 pub use sanitize::{safe_export_path, sanitize_filename, SanitizeError};
