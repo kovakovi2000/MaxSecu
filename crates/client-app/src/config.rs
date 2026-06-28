@@ -5,17 +5,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ConnectionConfig {
     pub server: String,
     pub use_tor: bool,
     pub auto_connect: bool,
-}
-
-impl Default for ConnectionConfig {
-    fn default() -> Self {
-        Self { server: String::new(), use_tor: false, auto_connect: false }
-    }
 }
 
 impl ConnectionConfig {
