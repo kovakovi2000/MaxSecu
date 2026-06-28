@@ -227,6 +227,9 @@ pub trait Store: Send + Sync {
         &self,
         user_id: &[u8; 16],
     ) -> Result<Option<StoredBinding>, StoreError>;
+    /// `true` iff at least one signed binding has been published — the first-run
+    /// bootstrap window is **open** only while this is `false` (§4.2).
+    async fn has_any_binding(&self) -> Result<bool, StoreError>;
 
     // ---- Phase 2: revocation control-log (DESIGN §7.6/§11.5, api.md §7) ----
 
@@ -591,6 +594,10 @@ impl Store for MemoryStore {
             .bindings
             .get(user_id)
             .map(|(_, b)| b.clone()))
+    }
+
+    async fn has_any_binding(&self) -> Result<bool, StoreError> {
+        Ok(!self.inner.lock().unwrap().bindings.is_empty())
     }
 
     async fn append_control(
@@ -1043,6 +1050,9 @@ impl Store for FaultyStore {
     ) -> Result<Option<StoredBinding>, StoreError> {
         Err(Self::fault("binding_by_user_id"))
     }
+    async fn has_any_binding(&self) -> Result<bool, StoreError> {
+        Err(Self::fault("has_any_binding"))
+    }
     async fn append_control(
         &self,
         _record_bytes: Vec<u8>,
@@ -1116,5 +1126,34 @@ impl Store for FaultyStore {
         _caller_id: [u8; 16],
     ) -> Result<Option<Vec<RecipientView>>, StoreError> {
         Err(Self::fault("list_recipients"))
+    }
+}
+
+#[cfg(test)]
+mod phase2_store_tests {
+    use super::*;
+    use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
+    use maxsecu_encoding::{encode, structs::DirBinding};
+
+    fn binding_bytes(uid: u8) -> Vec<u8> {
+        encode(&DirBinding {
+            username: Text::new("u").unwrap(),
+            user_id: Id([uid; 16]),
+            enc_pub: Bytes32([uid; 32]),
+            sig_pub: Bytes32([uid; 32]),
+            key_version: 1,
+            roles: RoleSet::new([Role::User]),
+            not_before: Timestamp(0),
+            not_after: Timestamp(4_102_444_800_000),
+            mlkem_pub: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn has_any_binding_flips_after_first_publish() {
+        let s = MemoryStore::new();
+        assert!(!s.has_any_binding().await.unwrap(), "window open with no bindings");
+        s.put_binding([0x0A; 16], 1, binding_bytes(0x0A), [0u8; 64]).await.unwrap();
+        assert!(s.has_any_binding().await.unwrap(), "window closes after first publish");
     }
 }

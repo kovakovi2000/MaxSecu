@@ -335,6 +335,15 @@ impl Store for PgStore {
         binding_from_row(row, "binding_by_user_id")
     }
 
+    async fn has_any_binding(&self) -> Result<bool, StoreError> {
+        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM directory_bindings) AS present")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(store_err("has_any_binding"))?;
+        row.try_get::<bool, _>("present")
+            .map_err(store_err("has_any_binding"))
+    }
+
     async fn append_control(
         &self,
         record_bytes: Vec<u8>,

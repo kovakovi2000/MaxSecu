@@ -147,6 +147,9 @@ impl Store for FaultyStore {
     async fn binding_by_user_id(&self, _u: &[u8; 16]) -> Result<Option<StoredBinding>, StoreError> {
         Err(bait("binding_by_user_id"))
     }
+    async fn has_any_binding(&self) -> Result<bool, StoreError> {
+        Err(bait("has_any_binding"))
+    }
     async fn append_control(
         &self,
         _r: Vec<u8>,
@@ -277,6 +280,9 @@ impl Store for FileFaultyStore {
     }
     async fn binding_by_user_id(&self, u: &[u8; 16]) -> Result<Option<StoredBinding>, StoreError> {
         self.inner.binding_by_user_id(u).await
+    }
+    async fn has_any_binding(&self) -> Result<bool, StoreError> {
+        self.inner.has_any_binding().await
     }
     async fn control_head(&self) -> Result<[u8; 32], StoreError> {
         self.inner.control_head().await
