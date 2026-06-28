@@ -82,7 +82,11 @@ async fn connect_inner(
     //    form, no port-less host — those are not parsed yet), and the host MUST
     //    match a SAN in the pinned cert (e.g. connecting by 127.0.0.1 against a
     //    localhost-SAN cert will not verify).
-    let host = req.server.rsplit_once(':').map(|(h, _)| h).unwrap_or(&req.server);
+    let host = req
+        .server
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(&req.server);
     let server_name = ServerName::try_from(host.to_owned())
         .map_err(|_| UiError::new("tls", "Invalid server name."))?;
     let transport = Transport::new(config, server_name, req.server.clone());

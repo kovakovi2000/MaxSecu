@@ -28,7 +28,10 @@ impl ConnectionConfig {
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
         let p = dir.join("config");
         std::fs::create_dir_all(&p)?;
-        std::fs::write(p.join("connection.json"), serde_json::to_vec_pretty(self).unwrap())
+        std::fs::write(
+            p.join("connection.json"),
+            serde_json::to_vec_pretty(self).unwrap(),
+        )
     }
 }
 
@@ -49,12 +52,19 @@ mod tests {
     fn save_then_load_roundtrips() {
         let dir = std::env::temp_dir().join(format!("maxsecu-cfg-{}", n()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = ConnectionConfig { server: "localhost:8443".into(), use_tor: false, auto_connect: true };
+        let cfg = ConnectionConfig {
+            server: "localhost:8443".into(),
+            use_tor: false,
+            auto_connect: true,
+        };
         cfg.save(&dir).unwrap();
         assert_eq!(ConnectionConfig::load(&dir), cfg);
     }
 
     fn n() -> u128 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     }
 }

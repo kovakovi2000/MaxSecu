@@ -12,7 +12,10 @@ pub struct UiError {
 
 impl UiError {
     pub fn new(code: &str, message: &str) -> Self {
-        Self { code: code.into(), message: message.into() }
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
     }
 }
 

@@ -1,9 +1,9 @@
 //! Login orchestration. The transport does challenge→proof; this module builds
 //! the channel-bound proof from the unlocked Identity and the live exporter.
 
+use crate::error::UiError;
 use maxsecu_client_core::auth::build_login_proof;
 use maxsecu_client_core::Identity;
-use crate::error::UiError;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -138,7 +138,11 @@ pub async fn login_exchange(
         .and_then(|v| v.as_u64())
         .ok_or_else(unauthorized)?;
 
-    Ok(LoginOk { server_id, token, expires_in_s })
+    Ok(LoginOk {
+        server_id,
+        token,
+        expires_in_s,
+    })
 }
 
 #[cfg(test)]
@@ -155,7 +159,15 @@ mod tests {
         let ts = 1_719_500_000_000u64;
         let proof = make_proof(&id, server_id, &exporter, &nonce, ts).unwrap();
         // Exactly what the server runs in api.md §2.2:
-        assert!(verify_login_proof(&id.sig_pub_bytes(), server_id, &exporter, &nonce, ts, &proof).is_ok());
+        assert!(verify_login_proof(
+            &id.sig_pub_bytes(),
+            server_id,
+            &exporter,
+            &nonce,
+            ts,
+            &proof
+        )
+        .is_ok());
     }
 
     #[test]
@@ -163,6 +175,9 @@ mod tests {
         let id = Identity::generate();
         let proof = make_proof(&id, "s", &[1u8; 32], &[2u8; 32], 1).unwrap();
         // A different exporter (relayed connection) must not verify.
-        assert!(verify_login_proof(&id.sig_pub_bytes(), "s", &[9u8; 32], &[2u8; 32], 1, &proof).is_err());
+        assert!(
+            verify_login_proof(&id.sig_pub_bytes(), "s", &[9u8; 32], &[2u8; 32], 1, &proof)
+                .is_err()
+        );
     }
 }

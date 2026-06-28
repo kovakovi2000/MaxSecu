@@ -44,13 +44,23 @@ pub struct Transport {
 
 impl Transport {
     pub fn new(tls: Arc<ClientConfig>, server_name: ServerName<'static>, addr: String) -> Self {
-        Self { tls, server_name, addr }
+        Self {
+            tls,
+            server_name,
+            addr,
+        }
     }
 
     /// Connect, returning the live stream + the 32-byte channel-binding exporter.
     pub async fn connect(
         &self,
-    ) -> Result<(tokio_rustls::client::TlsStream<tokio::net::TcpStream>, [u8; EXPORTER_LEN]), UiError> {
+    ) -> Result<
+        (
+            tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+            [u8; EXPORTER_LEN],
+        ),
+        UiError,
+    > {
         let tcp = tokio::net::TcpStream::connect(&self.addr)
             .await
             .map_err(|_| UiError::new("offline", "Could not reach the server."))?;

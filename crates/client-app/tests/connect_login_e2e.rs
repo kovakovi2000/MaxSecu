@@ -155,7 +155,12 @@ async fn connect_and_login_succeeds() {
     // Fresh channel: full channel-bound login through the production session code.
     let (mut sender, exporter) = open(&transport).await;
     let login = maxsecu_client_app::session::login_exchange(
-        &mut sender, &id, "alice", "localhost", &exporter, TS,
+        &mut sender,
+        &id,
+        "alice",
+        "localhost",
+        &exporter,
+        TS,
     )
     .await
     .expect("login over the bound channel");
@@ -192,7 +197,10 @@ async fn proof_bound_to_channel_is_rejected_on_a_foreign_connection() {
 
     // A separate channel B has a different exporter.
     let (mut b, exporter_b) = open(&transport).await;
-    assert_ne!(exporter_a, exporter_b, "each TLS channel has a unique exporter");
+    assert_ne!(
+        exporter_a, exporter_b,
+        "each TLS channel has a unique exporter"
+    );
 
     // Submitting A's proof over B's channel must be rejected: channel mismatch.
     let (st, _) = post(

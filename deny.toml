@@ -21,6 +21,49 @@ ignore = [
     # RSA password-auth path; the server↔Postgres link is loopback SCRAM/trust).
     # Re-audit when sqlx drops `rsa` or a fixed `rsa` ships, then remove this.
     "RUSTSEC-2023-0071",
+
+    # ---- Tauri desktop-client tree (added for crates/client-app) ----
+    # All entries below are `unmaintained`/`unsound` advisories (NOT exploitable
+    # vulnerabilities) on transitive deps of `tauri`. `cargo deny` errors on these
+    # by default; `cargo audit` only warns. None is a security vuln in our path.
+    #
+    # (a) gtk-rs GTK3 stack — the *Linux* GUI backend pulled via muda/tao/wry.
+    # Our production target is Windows MSVC only (rust-toolchain.toml
+    # `targets = ["x86_64-pc-windows-msvc"]`); these crates are cfg'd to unix and
+    # are NOT compiled into the shipped client — `cargo tree -i <crate> -e normal`
+    # prints "nothing to print" on the host target (they appear only under
+    # `--target all`). Unmaintained gtk-rs bindings; remove if/when Tauri moves
+    # off GTK3 or we drop the Linux target.
+    "RUSTSEC-2024-0413", # atk
+    "RUSTSEC-2024-0416", # atk-sys
+    "RUSTSEC-2024-0412", # gdk
+    "RUSTSEC-2024-0418", # gdk-sys
+    "RUSTSEC-2024-0411", # gdkwayland-sys
+    "RUSTSEC-2024-0417", # gdkx11
+    "RUSTSEC-2024-0414", # gdkx11-sys
+    "RUSTSEC-2024-0415", # gtk
+    "RUSTSEC-2024-0420", # gtk-sys
+    "RUSTSEC-2024-0419", # gtk3-macros
+    # glib `unsound` — VariantStrIter Iterator unsoundness. Same Linux-only GTK
+    # tree (glib → atk → gtk); not compiled on the Windows production target and
+    # our client never constructs a GVariant string iterator. Soundness note, not
+    # a remote vuln. Remove with the GTK3 stack above.
+    "RUSTSEC-2024-0429", # glib
+    # proc-macro-error (unmaintained) — build-time proc-macro, reached ONLY via
+    # glib-macros (the same Linux GTK tree); not in any runtime/attack surface and
+    # not on the Windows target. Remove with the GTK3 stack above.
+    "RUSTSEC-2024-0370", # proc-macro-error
+    #
+    # (b) unic-* (unmaintained) — Unicode property/range data tables pulled via
+    # urlpattern → tauri-utils → tauri. Cross-platform (these DO compile into the
+    # Windows client) but they are pure const Unicode lookup tables: no I/O, no
+    # unsafe security surface — "unmaintained", not vulnerable. Remove if Tauri's
+    # urlpattern drops the unic-* tree (e.g. moves to icu).
+    "RUSTSEC-2025-0081", # unic-char-property
+    "RUSTSEC-2025-0075", # unic-char-range
+    "RUSTSEC-2025-0080", # unic-common
+    "RUSTSEC-2025-0100", # unic-ucd-ident
+    "RUSTSEC-2025-0098", # unic-ucd-version
 ]
 
 [bans]
@@ -59,6 +102,16 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
     "CC0-1.0",
+    # MPL-2.0 — weak, file-level copyleft (per-file, not viral like GPL). Admitted
+    # only for the Tauri desktop-client tree, where it appears solely in transitive,
+    # dynamically-used deps that never touch the zero-knowledge crypto boundary:
+    #   - cssparser, cssparser-macros, dtoa-short, selectors  (CSS parsing, pulled
+    #     via dom_query → tauri-utils / wry webview)
+    #   - option-ext                                          (via dirs-sys → dirs)
+    # MPL only obligates sharing modifications to the MPL files themselves; we ship
+    # them unmodified, so no source-disclosure burden on our code. Remove if the
+    # client drops Tauri/dirs or these crates relicense.
+    "MPL-2.0",
 ]
 confidence-threshold = 0.9
 
