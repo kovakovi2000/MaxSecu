@@ -25,6 +25,7 @@ pub mod rotate;
 pub mod sandbox;
 pub mod sanitize;
 pub mod sink;
+pub mod update;
 pub mod upload;
 pub mod version_memory;
 
@@ -52,6 +53,7 @@ pub use sink::{verify_anchor_proof, AnchorProof, AnchoredHead, FakeSink, SinkCli
 #[cfg(feature = "net")]
 pub use sink::{confirm_anchored, HttpSinkClient};
 pub use sanitize::{safe_export_path, sanitize_filename, SanitizeError};
+pub use update::{verify_update, LogInclusion, UpdateError, UpdateManifest, Verified};
 pub use identity::Identity;
 pub use version_memory::{open_and_remember, FileVersionRecord, MemoryVersionStore, VersionStore};
 pub use upload::{

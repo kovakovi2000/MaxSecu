@@ -179,4 +179,9 @@ pub mod labels {
     /// of [`SINK_HEAD`]: the checkpoint attests the log *state*, while the head
     /// co-signature attests a single `{chain_seq, head}` directly.
     pub const SINK_CHECKPOINT: &str = "MaxSecu-sink-checkpoint-v1";
+    /// A signed software-update **manifest** (DESIGN §8/D1): a pinned release key
+    /// signs `version ‖ min_version ‖ artifact_sha256`. Distinct from and not a
+    /// prefix of any other label, so an update signature can never be reinterpreted
+    /// as a sink/checkpoint/grant/etc. attestation.
+    pub const UPDATE_MANIFEST: &str = "MaxSecu-update-v1";
 }
