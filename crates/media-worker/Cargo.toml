@@ -1,0 +1,30 @@
+[package]
+name = "maxsecu-media-worker"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "MaxSecu sandboxed media-decode worker + launcher (DESIGN §8.1/D30, media-sandbox)."
+
+[lib]
+name = "maxsecu_media_worker"
+path = "src/lib.rs"
+
+# The decode worker: a secret-less, network-less process that reads canonical
+# media bytes on stdin and writes a decoded frame on stdout (media-sandbox §1).
+[[bin]]
+name = "media-worker"
+path = "src/main.rs"
+
+[dependencies]
+# The one decoder + the SandboxedDecoder seam/types live in client-core; the
+# worker runs the SAME decode, just in an isolated process.
+maxsecu-client-core = { path = "../client-core" }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[lints.rust]
+# Cross-platform 6b-i has no unsafe; the Win32 AppContainer launcher (6b-ii)
+# relaxes this to `deny` + a contained, audited `#[allow(unsafe_code)]` module.
+unsafe_code = "forbid"

@@ -42,8 +42,8 @@ pub use media::{
     PREVIEW_MAX_DIM, THUMBNAIL_MAX_DIM,
 };
 pub use sandbox::{
-    validate_decoded, DecodeError, DecodedImage, InProcessFakeDecoder, OutputReject,
-    SandboxedDecoder,
+    decode_rgba_bounded, validate_decoded, DecodeError, DecodedImage, InProcessFakeDecoder,
+    OutputReject, SandboxedDecoder,
 };
 pub use revocation::{TombstoneError, TombstoneSet};
 pub use sanitize::{safe_export_path, sanitize_filename, SanitizeError};

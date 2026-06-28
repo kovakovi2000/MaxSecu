@@ -12,6 +12,7 @@ members = [
     "crates/client-core",
     "crates/admin-core",
     "crates/server",
+    "crates/media-worker",
 ]
 
 [workspace.package]

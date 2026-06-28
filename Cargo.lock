@@ -1202,6 +1202,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxsecu-media-worker"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "maxsecu-client-core",
+]
+
+[[package]]
 name = "maxsecu-server"
 version = "0.0.0"
 dependencies = [

@@ -99,11 +99,56 @@ pub trait SandboxedDecoder {
     ) -> Result<DecodedImage, DecodeError>;
 }
 
+/// Decode canonical image bytes to an RGBA8 [`DecodedImage`] under the pre-decode
+/// bounds (the decompression-bomb guard, media-sandbox §3). Pure Rust (`image`),
+/// no keys, no I/O beyond the in-memory buffer — the **exact decode the isolated
+/// worker runs**, shared so there is one decoder used both in-process (the fake)
+/// and across the process boundary (the `media-worker` bin).
+pub fn decode_rgba_bounded(
+    canonical: &[u8],
+    bounds: &MediaBounds,
+) -> Result<DecodedImage, DecodeError> {
+    use image::ImageReader;
+    use std::io::Cursor;
+
+    if canonical.is_empty() {
+        return Err(DecodeError::Empty);
+    }
+    // Pre-decode bounds: reject oversize on the header dims BEFORE allocating.
+    let header = ImageReader::new(Cursor::new(canonical))
+        .with_guessed_format()
+        .map_err(|_| DecodeError::DecodeFailed)?;
+    let (w, h) = header
+        .into_dimensions()
+        .map_err(|_| DecodeError::DecodeFailed)?;
+    if w > bounds.max_width || h > bounds.max_height || (w as u64) * (h as u64) > bounds.max_pixels {
+        return Err(DecodeError::TooLarge {
+            width: w,
+            height: h,
+        });
+    }
+    // Decode with the same caps as an allocation guard, then flatten to RGBA8.
+    let mut decoder = ImageReader::new(Cursor::new(canonical))
+        .with_guessed_format()
+        .map_err(|_| DecodeError::DecodeFailed)?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(bounds.max_width);
+    limits.max_image_height = Some(bounds.max_height);
+    decoder.limits(limits);
+    let img = decoder.decode().map_err(|_| DecodeError::DecodeFailed)?;
+    let rgba = img.to_rgba8();
+    Ok(DecodedImage {
+        width: rgba.width(),
+        height: rgba.height(),
+        channels: 4,
+        pixels: rgba.into_raw(),
+    })
+}
+
 /// In-process decoder fake (cross-platform) standing in for the real isolated
-/// worker in tests: decodes the canonical PNG with the pure-Rust `image` crate
-/// under the pre-decode bounds and returns RGBA8 frames. The **real**
-/// AppContainer/Job-Object worker (`P4b.6b`) implements the same trait with OS
-/// isolation; both feed [`validate_decoded`].
+/// worker in tests: runs [`decode_rgba_bounded`] directly. The **real**
+/// AppContainer/Job-Object worker (`media-worker`, P4b.6b) runs the same decode
+/// in an OS-isolated process; both feed [`validate_decoded`].
 pub struct InProcessFakeDecoder;
 
 impl SandboxedDecoder for InProcessFakeDecoder {
@@ -112,44 +157,7 @@ impl SandboxedDecoder for InProcessFakeDecoder {
         canonical: &[u8],
         bounds: &MediaBounds,
     ) -> Result<DecodedImage, DecodeError> {
-        use image::ImageReader;
-        use std::io::Cursor;
-
-        if canonical.is_empty() {
-            return Err(DecodeError::Empty);
-        }
-        // Pre-decode bounds: reject oversize on the header dims BEFORE allocating.
-        let header = ImageReader::new(Cursor::new(canonical))
-            .with_guessed_format()
-            .map_err(|_| DecodeError::DecodeFailed)?;
-        let (w, h) = header
-            .into_dimensions()
-            .map_err(|_| DecodeError::DecodeFailed)?;
-        if w > bounds.max_width
-            || h > bounds.max_height
-            || (w as u64) * (h as u64) > bounds.max_pixels
-        {
-            return Err(DecodeError::TooLarge {
-                width: w,
-                height: h,
-            });
-        }
-        // Decode with the same caps as an allocation guard, then flatten to RGBA8.
-        let mut decoder = ImageReader::new(Cursor::new(canonical))
-            .with_guessed_format()
-            .map_err(|_| DecodeError::DecodeFailed)?;
-        let mut limits = image::Limits::default();
-        limits.max_image_width = Some(bounds.max_width);
-        limits.max_image_height = Some(bounds.max_height);
-        decoder.limits(limits);
-        let img = decoder.decode().map_err(|_| DecodeError::DecodeFailed)?;
-        let rgba = img.to_rgba8();
-        Ok(DecodedImage {
-            width: rgba.width(),
-            height: rgba.height(),
-            channels: 4,
-            pixels: rgba.into_raw(),
-        })
+        decode_rgba_bounded(canonical, bounds)
     }
 }
 
