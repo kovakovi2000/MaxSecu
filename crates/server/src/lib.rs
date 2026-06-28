@@ -14,6 +14,7 @@ mod control;
 mod error;
 
 pub mod auth;
+pub mod blob;
 pub mod files;
 pub mod http;
 pub mod pg;
@@ -22,6 +23,7 @@ pub mod serve;
 pub mod store;
 
 pub use auth::{AuthConfig, AuthService, Challenge, SessionToken};
+pub use blob::{BlobError, BlobStore, FsBlobStore, MemoryBlobStore};
 pub use error::{AuthError, ChallengeError, ControlAppendError, ProveError, StoreError};
 pub use http::{router, AppState, AuthedSession, TlsExporter};
 pub use pg::PgStore;
