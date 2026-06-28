@@ -16,6 +16,7 @@
 //! (the authoritative durability is the external sink's, §11.4).
 
 use async_trait::async_trait;
+use maxsecu_crypto::sha256;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -42,17 +43,22 @@ pub struct GrantEdge {
 }
 
 /// The external append-only sink seam (§16.5, `sink-interface.md`). It carries the
-/// sharing-graph grant edges (`record_grant_edge`, Phase 4) and — for Phase 5 —
-/// the control-log **head** the server publishes on each append (`publish_head`,
-/// api.md §7.2/§6) and the **genesis anchoring** position used by the R27 cutoff
-/// (`anchor_genesis`, §11.7/D28). Head/genesis emission default to no-ops so
-/// existing sinks (e.g. [`NullAuditSink`]) need not change. Best-effort,
-/// infallible from the caller — the durable authority is the external sink.
+/// sharing-graph grant edges (`record_grant_edge`, Phase 4) and — for Phase 5/6 —
+/// the **appended control-log record bytes** the server publishes on each append
+/// (`publish_control_record`, api.md §7.2/§6) and the **genesis anchoring**
+/// position used by the R27 cutoff (`anchor_genesis`, §11.7/D28). The real sink
+/// derives the head itself (`sha256(canonical(record))`, mirroring
+/// `sink-server::ControlLogStore::append`), so the seam carries the RECORD bytes,
+/// not a pre-computed head. Record/genesis emission default to no-ops so existing
+/// sinks (e.g. [`NullAuditSink`]) need not change. Best-effort, infallible from
+/// the caller — the durable authority is the external sink, and the *fail-closed*
+/// gate is the issuer-side `confirm_anchored` (client-core), not this publish.
 #[async_trait]
 pub trait AuditSink: Send + Sync {
     async fn record_grant_edge(&self, edge: GrantEdge);
-    /// Publish the new control-log head after an append (§6 of `sink-interface`).
-    async fn publish_head(&self, _head: [u8; 32]) {}
+    /// Publish the appended control-log record to the external sink, which
+    /// re-derives the new head `sha256(canonical(record))` (§6 of `sink-interface`).
+    async fn publish_control_record(&self, _record_bytes: Vec<u8>) {}
     /// Anchor a file's `genesis` at its current sink position (R27/D28).
     async fn anchor_genesis(&self, _file_id: [u8; 16]) {}
 }
@@ -113,7 +119,11 @@ impl AuditSink for MemoryAuditSink {
         self.inner.lock().unwrap().edges.push(edge);
     }
 
-    async fn publish_head(&self, head: [u8; 32]) {
+    async fn publish_control_record(&self, record_bytes: Vec<u8>) {
+        // Mirror the real sink: the head is the record's own digest. Tracking is
+        // otherwise unchanged, so the R27 accessors (`control_pos`/`latest_head`)
+        // keep their meaning.
+        let head = sha256(&record_bytes);
         let mut st = self.inner.lock().unwrap();
         let pos = st.next_pos;
         st.next_pos += 1;
@@ -139,6 +149,119 @@ impl AuditSink for NullAuditSink {
     async fn record_grant_edge(&self, _edge: GrantEdge) {}
 }
 
+/// A real [`AuditSink`] that PUBLISHES each appended control-log record to the
+/// independent external sink over its OWN pinned TLS identity (the sink's
+/// `POST /v1/control-log/records`, `sink-interface.md` §6.1). The sink derives the
+/// head itself; we ship only the canonical record bytes.
+///
+/// Publication is **best-effort and infallible from the caller** (matching the
+/// seam contract above): a publish failure never denies the admin's append at the
+/// app server. The *authoritative*, fail-closed gate is the issuer-side
+/// `confirm_anchored` (client-core) — a server that appended but failed to publish
+/// is caught there, closing write-time withholding (§6: a server that refuses to
+/// publish can only DENY, never forge or hide a revocation).
+///
+/// The publisher is async and runs inside the server runtime, so it does async
+/// HTTP DIRECTLY (async hyper over tokio-rustls, mirroring the app server's own
+/// transport) — it must NOT drive the sync `HttpSinkClient` (nested-runtime panic).
+/// It reuses the SAME TLS/HTTP stack (aws-lc-rs) the app server already depends on
+/// — no second TLS stack.
+pub struct HttpSinkPublisher {
+    addr: std::net::SocketAddr,
+    server_name: String,
+    tls: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+    /// The sink's coarse admin bearer secret (§6.1).
+    admin_token: String,
+}
+
+impl HttpSinkPublisher {
+    /// Build a publisher targeting the sink at `addr`, presenting `server_name`
+    /// for TLS verification against the pinned `tls` config (which holds the
+    /// sink's pinned root). `admin_token` is the bearer secret the sink requires
+    /// to append. `addr`/`server_name` are split so a loopback test can dial an
+    /// ephemeral port while still validating the cert's `localhost` SAN.
+    pub fn new(
+        addr: std::net::SocketAddr,
+        server_name: impl Into<String>,
+        tls: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+        admin_token: impl Into<String>,
+    ) -> HttpSinkPublisher {
+        HttpSinkPublisher {
+            addr,
+            server_name: server_name.into(),
+            tls,
+            admin_token: admin_token.into(),
+        }
+    }
+
+    /// `POST /v1/control-log/records {record_b64}` with the admin bearer, over the
+    /// sink's pinned TLS channel. Returns `Err(())` on any transport/HTTP failure
+    /// — the caller swallows it (best-effort), so no internal detail escapes.
+    async fn post_record(&self, record_bytes: &[u8]) -> Result<(), ()> {
+        use base64::Engine;
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        use tokio_rustls::rustls::pki_types::ServerName;
+        use tokio_rustls::TlsConnector;
+
+        let tcp = tokio::net::TcpStream::connect(self.addr)
+            .await
+            .map_err(|_| ())?;
+        let connector = TlsConnector::from(self.tls.clone());
+        let server_name = ServerName::try_from(self.server_name.clone()).map_err(|_| ())?;
+        let tls = connector.connect(server_name, tcp).await.map_err(|_| ())?;
+
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .map_err(|_| ())?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let record_b64 = base64::engine::general_purpose::STANDARD.encode(record_bytes);
+        let body = serde_json::json!({ "record_b64": record_b64 }).to_string();
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri("/v1/control-log/records")
+            .header("host", self.server_name.as_str())
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", self.admin_token))
+            .body(Full::<Bytes>::from(body))
+            .map_err(|_| ())?;
+        let resp = sender.send_request(req).await.map_err(|_| ())?;
+        let ok = resp.status().is_success();
+        // Drain so the connection task can finish cleanly.
+        let _ = resp.into_body().collect().await;
+        if ok {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
+#[async_trait]
+impl AuditSink for HttpSinkPublisher {
+    /// Grant-edge publication to the real sink is out of scope here (Phase 4 seam);
+    /// no-op for now.
+    async fn record_grant_edge(&self, _edge: GrantEdge) {}
+
+    async fn publish_control_record(&self, record_bytes: Vec<u8>) {
+        // Best-effort: a failed publish must not deny the append. The fail-closed
+        // authority is the issuer-side `confirm_anchored`.
+        let _ = self.post_record(&record_bytes).await;
+    }
+
+    /// Genesis-position anchoring over the REAL sink is deferred: P6.4's sink has
+    /// no genesis-anchor route, and the R27 cutoff over the real sink (with a
+    /// client-side genesis-position fetch) is a distinct feature. Closing
+    /// write-time withholding of CONTROL records (the P6.5 headline) does not
+    /// require it. No-op here; [`MemoryAuditSink`] keeps the in-memory R27 tracking
+    /// for the existing unit/e2e coverage.
+    async fn anchor_genesis(&self, _file_id: [u8; 16]) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,12 +269,14 @@ mod tests {
     #[tokio::test]
     async fn memory_sink_records_head_and_genesis_positions() {
         let s = MemoryAuditSink::new();
-        s.publish_head([0xAB; 32]).await; // control append #1
+        let record = vec![0x00, 0x06, 0xDE, 0xAD, 0xBE, 0xEF]; // opaque control bytes
+        s.publish_control_record(record.clone()).await; // control append #1
         s.anchor_genesis([0xF1; 16]).await; // a file created after it
 
-        // The latest anchored head is the published one; chain_seq counts appends.
+        // The latest anchored head is the record's own digest (mirroring the real
+        // sink); chain_seq counts appends.
         let (seq, head) = s.latest_head().expect("a head was published");
-        assert_eq!(head, [0xAB; 32]);
+        assert_eq!(head, sha256(&record));
         assert_eq!(seq, 1);
 
         // Global sink positions are comparable across event kinds: the genesis was

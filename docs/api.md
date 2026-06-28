@@ -150,14 +150,14 @@ Query the chain. `?scope=account` (the `*` set) or `?file_id=<hex>`; `?since_epo
 - The client checks each `prev_head` links the previous record and that the final `chain_head` matches the **sink-anchored** head (out of band, per `sink-interface.md`). The server's own `chain_head` values are advisory; the sink is the authority.
 
 ### 7.2 `POST /v1/revocations`  ·  `POST /v1/reinstatements`  ·  `POST /v1/key-compromise`
-Append a control-log record (admin-only; mass/`*` and all reinstatements require **dual control** — a second admin's co-signature in the record, §10.1/§11.5a). Body carries the opaque record + signature(s); the server verifies the **coarse** admin capability, appends to the chain, updates the head, and **publishes the new head to the external sink** (§16.5). `403` if the caller lacks the admin effective role.
+Append a control-log record (admin-only; mass/`*` and all reinstatements require **dual control** — a second admin's co-signature in the record, §10.1/§11.5a). Body carries the opaque record + signature(s); the server verifies the **coarse** admin capability, appends to the chain, updates the head, and **publishes the appended record to the external sink** — which independently re-derives the new head `sha256(canonical(record))` (§16.5). `403` if the caller lacks the admin effective role.
 
 ```jsonc
 // req (revocation)
 { "record_b64": "…canonical(revocation)…", "sig_b64": "…issuer Ed25519…", "co_sig_b64": "…second admin, if * / mass…" }
 // res 201 { "chain_head_b64": "…new head…" }
 ```
-> The server's acceptance is not the security event — the **anchoring to the sink** is. A server that refuses to publish can only deny (clients fail closed on an unverifiable head), not forge or hide a revocation past one sink-head refresh.
+> The server's acceptance is not the security event — the **anchoring to the sink** is. The issuer is not done until it **confirms** the sink reflects the new head (the sink-side re-derived `sha256(record)`); a server that appended but refused to publish is caught by that confirm (fail closed). A server that refuses to publish can only deny (clients fail closed on an unverifiable head), not forge or hide a revocation past one sink-head refresh.
 
 ---
 

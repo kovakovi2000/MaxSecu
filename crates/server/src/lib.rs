@@ -25,7 +25,9 @@ pub mod store;
 pub mod tier;
 
 pub use auth::{AuthConfig, AuthService, Challenge, SessionToken};
-pub use audit::{AuditSink, GrantAction, GrantEdge, MemoryAuditSink, NullAuditSink};
+pub use audit::{
+    AuditSink, GrantAction, GrantEdge, HttpSinkPublisher, MemoryAuditSink, NullAuditSink,
+};
 pub use blob::{
     BlobError, BlobStore, ChunkStatus, DirectLink, FetchSource, FsBlobStore, MemoryBlobStore,
 };

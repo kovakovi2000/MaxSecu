@@ -59,6 +59,10 @@ pub enum SinkError {
     BadProof,
     /// The sink could not be reached over its pinned channel.
     Unreachable,
+    /// The sink's verified head does NOT (yet) reflect the expected new head — the
+    /// issuer-side anchoring confirm fails closed (`sink-interface.md` §6 step 2).
+    /// A server that appended but failed to publish lands here.
+    NotAnchored,
 }
 
 /// The exact bytes a custodian signs for a head: the domain-framed, fixed-width
@@ -335,6 +339,45 @@ impl SinkClient for HttpSinkClient {
             .find(|p| matches!(p, AnchorProof::CustodianCoSig { .. }))
             .ok_or(SinkError::Unreachable)?;
         Ok((head, cosig))
+    }
+}
+
+/// The issuer-side anchoring confirm (`sink-interface.md` §6 step 2): after an
+/// admin appends a control record and the app server publishes it, the issuer is
+/// NOT done until the independent sink reflects the new head. This fetches the
+/// sink head over its pinned channel, verifies its anchor proof under the pinned
+/// trust anchors, and checks the verified head EXACTLY equals `expected`
+/// (`{chain_seq, head}`).
+///
+/// Returns `Ok(())` iff the sink's verified head == `expected`; else an error
+/// (fail closed): [`SinkError::Unreachable`] if the sink can't be fetched/parsed,
+/// [`SinkError::BadProof`] if no pinned form validates the served head, or
+/// [`SinkError::NotAnchored`] if the (validly-anchored) sink head does not yet
+/// match `expected` — i.e. the server appended but failed to publish. A revocation
+/// is "not done" until this returns `Ok`, so write-time withholding is caught here.
+///
+/// The underlying [`HttpSinkClient`] fetch is sync (it runs on its own per-call
+/// runtime), so call this from a sync/blocking context — never directly inside an
+/// async task (use `spawn_blocking`), else the nested runtime panics.
+#[cfg(feature = "net")]
+pub fn confirm_anchored(
+    client: &HttpSinkClient,
+    custodian_pubs: &[[u8; 32]],
+    log_pubs: &[[u8; 32]],
+    expected: AnchoredHead,
+) -> Result<(), SinkError> {
+    let (head, proofs) = client.fetch_head_all_proofs()?;
+    // The served head must validate under at least one pinned anchor-proof form.
+    let verified = proofs
+        .iter()
+        .any(|p| verify_anchor_proof(&head, p, custodian_pubs, log_pubs).is_ok());
+    if !verified {
+        return Err(SinkError::BadProof);
+    }
+    if head == expected {
+        Ok(())
+    } else {
+        Err(SinkError::NotAnchored)
     }
 }
 

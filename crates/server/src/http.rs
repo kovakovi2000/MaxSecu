@@ -452,11 +452,13 @@ async fn post_control<S: Store + 'static>(
             None => return StatusCode::BAD_REQUEST.into_response(),
         },
     };
-    match st.auth.store().append_control(record, sig, co_sig).await {
+    match st.auth.store().append_control(record.clone(), sig, co_sig).await {
         Ok(head) => {
-            // §6 (sink-interface): publish the new head to the external sink so a
-            // server cannot silently swallow a tombstone at write time.
-            st.audit.publish_head(head).await;
+            // §6 (sink-interface): publish the appended record to the external
+            // sink (which re-derives the head) so a server cannot silently swallow
+            // a tombstone at write time. Best-effort; the fail-closed authority is
+            // the issuer-side `confirm_anchored`.
+            st.audit.publish_control_record(record).await;
             (
                 StatusCode::CREATED,
                 Json(ChainHeadRes {

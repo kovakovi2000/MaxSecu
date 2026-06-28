@@ -1232,6 +1232,7 @@ dependencies = [
  "maxsecu-client-core",
  "maxsecu-crypto",
  "maxsecu-encoding",
+ "maxsecu-sink-server",
  "rcgen",
  "serde",
  "serde_json",
