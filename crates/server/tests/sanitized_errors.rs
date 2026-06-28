@@ -43,8 +43,9 @@ use maxsecu_encoding::types::{
 use maxsecu_server::{
     router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteWrapError,
     FileListEntry, FileView, FinalizeError, ListFilter, MemoryBlobStore, MemoryStore, NullAuditSink,
-    ParsedStage, RecipientView, SessionRecord, StageError, Store, StoreError, StoredBinding,
-    StoredControlRecord, TlsExporter, UserRecord, VersionMeta, VersionSelector, WrapInput,
+    ParsedStage, PendingUser, RecipientView, SessionRecord, StageError, Store, StoreError,
+    StoredBinding, StoredControlRecord, TlsExporter, UserRecord, VersionMeta, VersionSelector,
+    WrapInput,
 };
 
 const EXPORTER: [u8; 32] = [0xE7; 32];
@@ -149,6 +150,9 @@ impl Store for FaultyStore {
     }
     async fn has_any_binding(&self) -> Result<bool, StoreError> {
         Err(bait("has_any_binding"))
+    }
+    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
+        Err(bait("list_pending_users"))
     }
     async fn append_control(
         &self,
@@ -283,6 +287,9 @@ impl Store for FileFaultyStore {
     }
     async fn has_any_binding(&self) -> Result<bool, StoreError> {
         self.inner.has_any_binding().await
+    }
+    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
+        self.inner.list_pending_users().await
     }
     async fn control_head(&self) -> Result<[u8; 32], StoreError> {
         self.inner.control_head().await

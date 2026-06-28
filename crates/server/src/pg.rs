@@ -36,7 +36,7 @@ use crate::files::{
     VersionSelector, WrapInput,
 };
 use crate::store::{
-    ancestor_chain, ChunkSlot, FileListEntry, FileView, RecipientView, SessionRecord,
+    ancestor_chain, ChunkSlot, FileListEntry, FileView, PendingUser, RecipientView, SessionRecord,
     StoredBinding, StoredControlRecord, Store, StreamView, UserRecord, VersionMeta, WrapView,
 };
 
@@ -342,6 +342,35 @@ impl Store for PgStore {
             .map_err(store_err("has_any_binding"))?;
         row.try_get::<bool, _>("present")
             .map_err(store_err("has_any_binding"))
+    }
+
+    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
+        // `users` has no `created_at`; `enrolled_at` (NOT NULL DEFAULT now()) is the
+        // registration time the pending screen surfaces (schema.sql `users`).
+        let rows = sqlx::query(
+            "SELECT u.user_id, u.username, \
+                    (EXTRACT(EPOCH FROM u.enrolled_at) * 1000)::bigint AS created_ms \
+             FROM users u \
+             WHERE NOT EXISTS (SELECT 1 FROM directory_bindings b WHERE b.user_id = u.user_id) \
+             ORDER BY u.enrolled_at DESC, u.user_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err("list_pending_users"))?;
+        rows.iter()
+            .map(|r| {
+                Ok(PendingUser {
+                    user_id: col_fixed(r, "list_pending_users", "user_id")?,
+                    username: r
+                        .try_get("username")
+                        .map_err(store_err("list_pending_users"))?,
+                    created_at_ms: r
+                        .try_get::<i64, _>("created_ms")
+                        .map_err(store_err("list_pending_users"))?
+                        as u64,
+                })
+            })
+            .collect()
     }
 
     async fn append_control(

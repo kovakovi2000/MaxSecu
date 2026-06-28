@@ -54,6 +54,17 @@ pub struct StoredBinding {
     pub signature: [u8; 64],
 }
 
+/// One un-approved account for the admin queue (`GET /v1/pending`, D-G): a user
+/// record with **no** published binding yet. `created_at_ms` is the account's
+/// `enrolled_at` registration time in epoch ms (0 only if a backend somehow
+/// lacks one), which the pending screen surfaces and sorts newest-first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingUser {
+    pub user_id: [u8; 16],
+    pub username: String,
+    pub created_at_ms: u64,
+}
+
 /// One control-log record as served by `GET /v1/revocations` (api.md §7.1): the
 /// opaque signed bytes, the issuer (and optional co-) signature, and the chain
 /// `head` (advisory — the client recomputes it and checks the anchored head).
@@ -231,6 +242,10 @@ pub trait Store: Send + Sync {
     /// bootstrap window is **open** only while this is `false` (§4.2).
     async fn has_any_binding(&self) -> Result<bool, StoreError>;
 
+    /// Users with a record but no published binding — the admin approval queue
+    /// (§4.2 / D-G). Newest-first by `created_at_ms`.
+    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError>;
+
     // ---- Phase 2: revocation control-log (DESIGN §7.6/§11.5, api.md §7) ----
 
     /// Append a record to the single hash chain (`POST /v1/revocations|...`).
@@ -372,9 +387,19 @@ pub(crate) fn ancestor_chain(
     out
 }
 
+/// Wall-clock epoch-ms (best-effort; the dev `MemoryStore` only).
+fn now_ms_wall() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Default)]
 struct Inner {
     users: HashMap<String, UserRecord>,
+    // Wall-clock creation time per username (best-effort; dev store only).
+    created_ms: HashMap<String, u64>,
     nonces: HashMap<[u8; 32], NonceRecord>,
     sessions: HashMap<[u8; 32], SessionRecord>,
     vouchers: HashSet<[u8; 32]>, // unused enrollment voucher hashes
@@ -426,11 +451,12 @@ impl MemoryStore {
 
     /// Seed an already-enrolled user (test/dev convenience).
     pub fn add_user(&self, username: &str, rec: UserRecord) {
-        self.inner
-            .lock()
-            .unwrap()
-            .users
-            .insert(username.to_owned(), rec);
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .created_ms
+            .entry(username.to_owned())
+            .or_insert_with(now_ms_wall);
+        inner.users.insert(username.to_owned(), rec);
     }
 
     /// Seed a usable enrollment voucher by its `SHA-256` hash (issued in person).
@@ -441,6 +467,17 @@ impl MemoryStore {
     /// Seed a user's advisory roles (test/dev) — drives the coarse admin gate.
     pub fn set_roles(&self, user_id: [u8; 16], roles: Vec<Role>) {
         self.inner.lock().unwrap().roles.insert(user_id, roles);
+    }
+
+    /// Override a user's recorded creation time (tests only — `add_user`/
+    /// `create_user` stamp wall-clock, which a test cannot control).
+    #[cfg(test)]
+    pub(crate) fn set_created_ms(&self, username: &str, ms: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .created_ms
+            .insert(username.to_owned(), ms);
     }
 }
 
@@ -472,6 +509,7 @@ impl Store for MemoryStore {
                 sig_pub,
             },
         );
+        inner.created_ms.insert(username.to_owned(), now_ms_wall());
         Ok(Some(user_id))
     }
 
@@ -598,6 +636,26 @@ impl Store for MemoryStore {
 
     async fn has_any_binding(&self) -> Result<bool, StoreError> {
         Ok(!self.inner.lock().unwrap().bindings.is_empty())
+    }
+
+    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<PendingUser> = inner
+            .users
+            .iter()
+            .filter(|(_, u)| !inner.bindings.contains_key(&u.user_id))
+            .map(|(name, u)| PendingUser {
+                user_id: u.user_id,
+                username: name.clone(),
+                created_at_ms: inner.created_ms.get(name).copied().unwrap_or(0),
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then(a.user_id.cmp(&b.user_id))
+        });
+        Ok(out)
     }
 
     async fn append_control(
@@ -1053,6 +1111,9 @@ impl Store for FaultyStore {
     async fn has_any_binding(&self) -> Result<bool, StoreError> {
         Err(Self::fault("has_any_binding"))
     }
+    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
+        Err(Self::fault("list_pending_users"))
+    }
     async fn append_control(
         &self,
         _record_bytes: Vec<u8>,
@@ -1155,5 +1216,58 @@ mod phase2_store_tests {
         assert!(!s.has_any_binding().await.unwrap(), "window open with no bindings");
         s.put_binding([0x0A; 16], 1, binding_bytes(0x0A), [0u8; 64]).await.unwrap();
         assert!(s.has_any_binding().await.unwrap(), "window closes after first publish");
+    }
+
+    #[tokio::test]
+    async fn list_pending_excludes_users_with_a_binding() {
+        let s = MemoryStore::new();
+        s.add_user("alice", UserRecord { user_id: [0x0A; 16], enc_pub: [1; 32], sig_pub: [1; 32] });
+        s.add_user("bob",   UserRecord { user_id: [0x0B; 16], enc_pub: [2; 32], sig_pub: [2; 32] });
+        // alice gets a binding (approved); bob stays pending.
+        s.put_binding([0x0A; 16], 1, binding_bytes(0x0A), [0u8; 64]).await.unwrap();
+
+        let pending = s.list_pending_users().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].user_id, [0x0B; 16]);
+        assert_eq!(pending[0].username, "bob");
+    }
+
+    #[tokio::test]
+    async fn list_pending_orders_newest_first_then_user_id() {
+        let s = MemoryStore::new();
+        s.add_user(
+            "a",
+            UserRecord {
+                user_id: [0x01; 16],
+                enc_pub: [1; 32],
+                sig_pub: [1; 32],
+            },
+        );
+        s.add_user(
+            "b",
+            UserRecord {
+                user_id: [0x02; 16],
+                enc_pub: [2; 32],
+                sig_pub: [2; 32],
+            },
+        );
+        s.add_user(
+            "c",
+            UserRecord {
+                user_id: [0x03; 16],
+                enc_pub: [3; 32],
+                sig_pub: [3; 32],
+            },
+        );
+        // Deterministic creation times (wall-clock stamps cannot be controlled).
+        s.set_created_ms("a", 300);
+        s.set_created_ms("b", 100);
+        s.set_created_ms("c", 300);
+
+        let pending = s.list_pending_users().await.unwrap();
+        // Newest-first by created_at_ms; ties broken by ascending user_id, so the
+        // two ms=300 rows (a, c) come before b=100, and a precedes c.
+        let order: Vec<[u8; 16]> = pending.iter().map(|p| p.user_id).collect();
+        assert_eq!(order, vec![[0x01; 16], [0x03; 16], [0x02; 16]]);
     }
 }
