@@ -12,7 +12,8 @@
 //! WORM / transparency-log deployment and the transparency-log `anchor_proof`
 //! form are a Phase-6 ops item; the proof allowlist is built to admit them.
 
-use maxsecu_crypto::{SigningKey, VerifyingKey};
+use crate::util::any_key_verifies;
+use maxsecu_crypto::SigningKey;
 use maxsecu_encoding::{sink_checkpoint_signing_input, sink_head_signing_input};
 
 /// The tuple the sink attests (`sink-interface.md` §2): the chain length and its
@@ -78,15 +79,6 @@ fn head_signing_bytes(h: &AnchoredHead) -> Vec<u8> {
 /// source of truth in `maxsecu-encoding` (mirrors [`head_signing_bytes`]).
 fn checkpoint_signing_bytes(tree_size: u64, root: &[u8; 32]) -> Vec<u8> {
     sink_checkpoint_signing_input(tree_size, root)
-}
-
-/// Does any allowlisted key strictly verify `sig` over `msg`?
-fn any_key_verifies(pubs: &[[u8; 32]], msg: &[u8], sig: &[u8; 64]) -> bool {
-    pubs.iter().any(|pk| {
-        VerifyingKey::from_bytes(pk)
-            .and_then(|vk| vk.verify_raw(msg, sig))
-            .is_ok()
-    })
 }
 
 /// Verify a head's `anchor_proof` against the pinned trust anchors (separate

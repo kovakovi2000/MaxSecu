@@ -102,7 +102,10 @@ pub enum VerifyError {
     /// included in the directory key-transparency log under a checkpoint signed
     /// by a pinned log key, or that checkpoint equivocated / rolled back (§7.4).
     /// Only produced when a [`crate::transparency::KtContext`] gate is supplied.
-    NotInLog,
+    /// Carries the underlying [`crate::transparency::KtError`] so an equivocation
+    /// signal (`SplitView`/`Regression`) stays distinguishable from a benign
+    /// missing/stale inclusion proof — detecting equivocation is the gate's point.
+    NotInLog(crate::transparency::KtError),
 }
 
 /// A recipient that passed the **full** §7.2 rule (binding steps 2–4 plus the
@@ -193,8 +196,12 @@ impl DirectoryVerifier {
     /// (no prior TOLU record), the binding's canonical bytes must additionally be
     /// provably included in the directory KT log under a pinned, non-equivocating
     /// checkpoint ([`crate::transparency::verify_binding_in_log`]) — else
-    /// [`VerifyError::NotInLog`] (fail closed). The KT gossip state is advanced
-    /// only when the whole binding verification succeeds.
+    /// [`VerifyError::NotInLog`] (fail closed, carrying the [`crate::transparency::KtError`]
+    /// cause). The KT gossip checkpoint advances when the KT checkpoint
+    /// signature + consistency + inclusion checks pass — independently of the
+    /// later D5-signature / validity-window checks in [`Self::verify_binding`]
+    /// (adopting a checkpoint that passed its own sig + consistency checks as the
+    /// gossip anchor is legitimate regardless of this binding's own fate).
     ///
     /// When `kt` is `None`, behavior is IDENTICAL to [`Self::verify_binding`]
     /// (backward-compatible; the gate is opt-in).
@@ -222,7 +229,7 @@ impl DirectoryVerifier {
                     kt.log_pubs,
                     kt.store,
                 )
-                .map_err(|_| VerifyError::NotInLog)?;
+                .map_err(VerifyError::NotInLog)?;
             }
         }
         self.verify_binding(binding, signature, now_ms, trust)
@@ -591,7 +598,7 @@ mod tests {
     // ---- §7.4 first-contact key-transparency gate ----
 
     use crate::transparency::{
-        InclusionProof, KtCheckpoint, KtContext, MemoryKtCheckpointStore,
+        InclusionProof, KtCheckpoint, KtContext, KtError, MemoryKtCheckpointStore,
     };
     use maxsecu_crypto::merkle;
     use maxsecu_encoding::{encode, kt_checkpoint_signing_input};
@@ -656,7 +663,8 @@ mod tests {
                     store: &mut store2,
                 }),
             ),
-            Err(VerifyError::NotInLog)
+            // The wrong leaf is simply absent under the root → NotIncluded cause.
+            Err(VerifyError::NotInLog(KtError::NotIncluded))
         );
 
         // With NO gate configured: behavior is unchanged — b_out verifies and pins.

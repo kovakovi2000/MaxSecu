@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod util;
 
 pub mod auth;
 pub mod budget;

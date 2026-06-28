@@ -19,7 +19,8 @@
 //! discipline: the first verified checkpoint is pinned; every subsequent one must
 //! be a consistency-proven extension of it.
 
-use maxsecu_crypto::{merkle, VerifyingKey};
+use crate::util::any_key_verifies;
+use maxsecu_crypto::merkle;
 use maxsecu_encoding::kt_checkpoint_signing_input;
 
 /// A directory KT log **checkpoint**: the log's commitment to its current state
@@ -95,16 +96,6 @@ impl KtCheckpointStore for MemoryKtCheckpointStore {
 /// verifier construct identical bytes (mirrors [`crate::sink`]).
 fn checkpoint_signing_bytes(tree_size: u64, root: &[u8; 32]) -> Vec<u8> {
     kt_checkpoint_signing_input(tree_size, root)
-}
-
-/// Does any pinned log key strictly verify `sig` over `msg`? (Mirrors
-/// `sink::any_key_verifies`.) An empty `pubs` ⇒ `false` ⇒ fail closed.
-fn any_key_verifies(pubs: &[[u8; 32]], msg: &[u8], sig: &[u8; 64]) -> bool {
-    pubs.iter().any(|pk| {
-        VerifyingKey::from_bytes(pk)
-            .and_then(|vk| vk.verify_raw(msg, sig))
-            .is_ok()
-    })
 }
 
 /// Accept `binding_bytes` (the canonical `DirBinding` leaf) only if it is provably
@@ -204,7 +195,7 @@ mod tests {
     use maxsecu_crypto::SigningKey;
 
     /// Build a KT log over `leaves`, sign a checkpoint at `tree_size == leaves.len()`
-    /// with `log`, and return the checkpoint. (The prover side a P7.11 log emits.)
+    /// with `log`, and return the checkpoint (the prover side a P7.11 log emits).
     fn checkpoint(log: &SigningKey, leaves: &[Vec<u8>]) -> KtCheckpoint {
         let tree_size = leaves.len() as u64;
         let root = merkle::merkle_root(leaves);
