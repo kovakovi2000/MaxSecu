@@ -14,3 +14,7 @@ secrets/
 # OS / editor noise
 Thumbs.db
 .DS_Store
+
+# Reproducible-build scratch dirs (scripts/reproducible-build.*)
+target-repro-a/
+target-repro-b/
