@@ -81,6 +81,12 @@ pub struct VerifyContext<'a> {
     /// author-rooted wrap never calls it. Pass [`NO_GRANTERS`] when no re-share
     /// chain is expected.
     pub granter_sig_pub: &'a dyn Fn(Id) -> Option<[u8; 32]>,
+    /// Resolves a grant granter to a **directory-verified admin's** Ed25519
+    /// `sig_pub`, or `None` if the id is not a current admin. Consulted only for a
+    /// leaf grant whose `granted_by` is neither the author nor a re-sharer — i.e.
+    /// a **recovery-operator grant** (§12.7), honored for this version only. Pass
+    /// [`NO_ADMINS`] when no recovery-clause grant is expected (the default).
+    pub admin_sig_pub: &'a dyn Fn(Id) -> Option<[u8; 32]>,
     /// The authenticated, sink-anchored tombstone set for the completeness gate
     /// (§12.5 step 4): the version is **rejected** if its `author_id` is account-
     /// revoked (a tombstoned author cannot mint, §12.9) or if the downloader is
@@ -114,6 +120,10 @@ pub struct CompromiseCheck<'a> {
 /// ancestor chain (every grant is author-rooted). `'static`, so it can back a
 /// [`VerifyContext`] returned from a helper.
 pub static NO_GRANTERS: fn(Id) -> Option<[u8; 32]> = no_granters;
+
+/// An admin resolver that authenticates no one — for callers expecting no
+/// recovery-operator (§12.7) grant. `'static`, so it can back a [`VerifyContext`].
+pub static NO_ADMINS: fn(Id) -> Option<[u8; 32]> = no_granters;
 
 fn no_granters(_: Id) -> Option<[u8; 32]> {
     None
@@ -264,6 +274,7 @@ fn verify_header(
         manifest.author_id,
         &ctx.author_sig_pub,
         ctx.granter_sig_pub,
+        Some(ctx.admin_sig_pub),
     )?;
 
     // (6) Recovery-grant presence — an anomaly flag, never a hard rejection.
@@ -416,11 +427,18 @@ fn check_ancestor_fields(
 /// **directory-verified** `sig_pub` (§7.2, resolved by `granter_sig_pub`) and
 /// the granter must itself hold a grant for this version. Both author and
 /// re-share edges entail the granter actually held the DEK, so any verified
-/// chain is possession-entailing (carry-forward-eligible, §12.9). Fail closed on
-/// a broken chain, an unknown granter key, a cycle, or a chain past the depth
-/// cap. Shared by the download ladder and the rotation carry-forward selection
-/// (so the two cannot drift). The leaf's own `file_id`/`version`/`dek_commit`/
-/// `recipient` are checked by the caller.
+/// chain is possession-entailing (carry-forward-eligible, §12.9).
+///
+/// A third terminal exists **only when `admin_sig_pub` is `Some`** (the download
+/// path): a **recovery-operator grant** (§12.7) whose `granted_by` is a directory-
+/// verified **admin** with no further ancestor grant — the admin re-wrapped the
+/// DEK on the air-gapped recovery device. It is honored for *this* version but is
+/// **not** possession-entailing, so the carry-forward path passes `None` and such
+/// a grant is dropped at the next rotation (R24). Fail closed on a broken chain,
+/// an unknown granter key, a cycle, or a chain past the depth cap. Shared by the
+/// download ladder and the rotation carry-forward selection (so the two cannot
+/// drift). The leaf's own `file_id`/`version`/`dek_commit`/`recipient` are checked
+/// by the caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_grant_chain(
     leaf: &Grant,
@@ -432,6 +450,7 @@ pub(crate) fn verify_grant_chain(
     author_id: Id,
     author_sig_pub: &[u8; 32],
     granter_sig_pub: &dyn Fn(Id) -> Option<[u8; 32]>,
+    admin_sig_pub: Option<&dyn Fn(Id) -> Option<[u8; 32]>>,
 ) -> Result<(), DownloadError> {
     use DownloadError::*;
 
@@ -456,6 +475,22 @@ pub(crate) fn verify_grant_chain(
                 return Err(GrantSignature);
             }
             return Ok(());
+        }
+        // No further ancestor grant from this granter: it is either a recovery-
+        // operator terminal (granter is a directory-verified admin, download only)
+        // or a broken chain.
+        if !by_recipient.contains_key(&granter) {
+            if let Some(admin_res) = admin_sig_pub {
+                if let Some(admin_pub) = admin_res(granter) {
+                    // Recovery-clause terminal (§12.7): the admin re-wrapped the
+                    // DEK; honored for this version, not carry-forward-eligible.
+                    if !verify(&admin_pub, labels::GRANT, current, current_sig) {
+                        return Err(GrantSignature);
+                    }
+                    return Ok(());
+                }
+            }
+            return Err(GrantChainBroken);
         }
         // Re-share edge: bounded depth, directory-resolved granter key.
         if depth >= MAX_GRANT_CHAIN_DEPTH {
@@ -740,6 +775,7 @@ mod tests {
             recipient_secret: built.owner.enc_secret(),
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
+            admin_sig_pub: &NO_ADMINS,
             tombstones: None,
             compromise: None,
         }
@@ -909,6 +945,7 @@ mod tests {
             recipient_secret: &built.recovery_sk,
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
+            admin_sig_pub: &NO_ADMINS,
             tombstones: None,
             compromise: None,
         };
@@ -992,6 +1029,104 @@ mod tests {
         let mut c = ctx(&built);
         c.tombstones = Some(&ts);
         assert!(verify_and_open(&c, &db).is_ok());
+    }
+
+    const ADMIN_ID: Id = Id([0xAD; 16]);
+    const RECOVERED_ID: Id = Id([0x55; 16]);
+
+    /// Build a download bundle whose leaf wrap is a **recovery-operator grant**
+    /// (§12.7) issued by `admin` to a fresh recipient, by recovering the DEK as
+    /// the owner. Returns the bundle, the recipient identity, and the admin key.
+    fn recovery_clause_bundle(
+        built: &Built,
+    ) -> (DownloadBundle, Identity, maxsecu_crypto::SigningKey) {
+        use maxsecu_admin_core::{build_recovery_grant, RecoveryGrantParams};
+        let b = &built.bundle;
+        let sw = b.wraps.iter().find(|w| w.recipient_type == RecipientType::User).unwrap();
+        let owner_ctx = WrapContext { file_id: FILE_ID, version: 1, recipient_id: OWNER_ID };
+        let dek = unwrap_dek(built.owner.enc_secret(), &sw.wrapped_dek, &owner_ctx).unwrap();
+
+        let admin = maxsecu_crypto::SigningKey::generate();
+        let recip = Identity::generate();
+        let out = build_recovery_grant(
+            &RecoveryGrantParams {
+                admin_sig: &admin,
+                admin_id: ADMIN_ID,
+                file_id: FILE_ID,
+                version: 1,
+                dek_commit: dek.commit(),
+                recipient_id: RECOVERED_ID,
+                recipient_enc_pub: EncPublicKey::from_bytes(recip.enc_pub_bytes()),
+                created_at: NOW,
+            },
+            &dek,
+        )
+        .unwrap();
+
+        let mut db = self_bundle(b);
+        db.wrapped_dek = out.wrapped_dek;
+        db.grant_bytes = encode(&out.grant);
+        db.grant_sig = out.grant_sig;
+        db.ancestor_grants = vec![];
+        (db, recip, admin)
+    }
+
+    fn recovery_ctx<'a>(
+        built: &'a Built,
+        recip: &'a Identity,
+        admin_res: &'a dyn Fn(Id) -> Option<[u8; 32]>,
+    ) -> VerifyContext<'a> {
+        let owner_pub = built.owner.sig_pub_bytes();
+        VerifyContext {
+            file_id: FILE_ID,
+            author_sig_pub: owner_pub,
+            owner_sig_pub: owner_pub,
+            recipient_id: RECOVERED_ID,
+            recipient_type: RecipientType::User,
+            recipient_secret: recip.enc_secret(),
+            seen_max_version: None,
+            granter_sig_pub: &NO_GRANTERS,
+            admin_sig_pub: admin_res,
+            tombstones: None,
+            compromise: None,
+        }
+    }
+
+    #[test]
+    fn recovery_clause_grant_opens_for_its_version() {
+        let built = build();
+        let (db, recip, admin) = recovery_clause_bundle(&built);
+        let admin_pub = admin.verifying_key().to_bytes();
+        let admin_res = move |id: Id| (id == ADMIN_ID).then_some(admin_pub);
+        let opened = verify_and_open(&recovery_ctx(&built, &recip, &admin_res), &db)
+            .expect("recovery-operator grant opens for its version");
+        let content = opened.streams.iter().find(|s| s.stream_type == StreamType::Content).unwrap();
+        assert_eq!(content.plaintext, b"the quick brown fox jumps over the lazy dog");
+    }
+
+    #[test]
+    fn recovery_clause_rejected_without_an_admin_resolver() {
+        // The exact same bundle, but the caller authenticates no admins
+        // (NO_ADMINS) → the admin-rooted terminal is not honored: GrantChainBroken.
+        let built = build();
+        let (db, recip, _admin) = recovery_clause_bundle(&built);
+        assert_eq!(
+            verify_and_open(&recovery_ctx(&built, &recip, &NO_ADMINS), &db),
+            Err(DownloadError::GrantChainBroken)
+        );
+    }
+
+    #[test]
+    fn recovery_clause_rejected_when_granter_not_resolved_as_admin() {
+        // The resolver knows a *different* admin id, not the grant's granted_by →
+        // the recovery terminal is not authenticated.
+        let built = build();
+        let (db, recip, _admin) = recovery_clause_bundle(&built);
+        let other = |id: Id| (id == Id([0xBB; 16])).then_some([0u8; 32]);
+        assert_eq!(
+            verify_and_open(&recovery_ctx(&built, &recip, &other), &db),
+            Err(DownloadError::GrantChainBroken)
+        );
     }
 
     #[test]
@@ -1113,6 +1248,7 @@ mod tests {
             recipient_secret: owner.enc_secret(),
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
+            admin_sig_pub: &NO_ADMINS,
             tombstones: None,
             compromise: None,
         };
@@ -1300,6 +1436,7 @@ mod tests {
             recipient_secret: v.enc_secret(),
             seen_max_version: None,
             granter_sig_pub: &resolver,
+            admin_sig_pub: &NO_ADMINS,
             tombstones: None,
             compromise: None,
         };
@@ -1331,6 +1468,7 @@ mod tests {
             recipient_secret: v.enc_secret(),
             seen_max_version: None,
             granter_sig_pub: resolver,
+            admin_sig_pub: &NO_ADMINS,
             tombstones: None,
             compromise: None,
         }
@@ -1567,6 +1705,7 @@ mod tests {
             recipient_secret: owner.enc_secret(),
             seen_max_version: None,
             granter_sig_pub: &NO_GRANTERS,
+            admin_sig_pub: &NO_ADMINS,
             tombstones: None,
             compromise: None,
         };

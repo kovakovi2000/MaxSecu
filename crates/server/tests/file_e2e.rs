@@ -33,7 +33,7 @@ use base64::Engine;
 use maxsecu_client_core::{
     build_upload, decode_rgba_bounded, safe_export_path, validate_decoded, verify_and_open,
     DownloadBundle, DownloadError, Identity, MediaBounds, PlaintextStreams, RustImageCodec,
-    StreamChunks, Transcoder, UploadParams, VerifyContext, NO_GRANTERS,
+    StreamChunks, Transcoder, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_crypto::{generate_enc_keypair, sha256, WrappedDek};
 use maxsecu_encoding::structs::Manifest;
@@ -420,6 +420,7 @@ async fn phase3_exit_gates_over_real_tls() {
         recipient_secret: owner.enc_secret(),
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS,
+        admin_sig_pub: &NO_ADMINS,
         tombstones: None,
         compromise: None,
     };
@@ -682,6 +683,7 @@ async fn phase4b_media_exit_gates_over_real_tls() {
         recipient_secret: owner.enc_secret(),
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS,
+        admin_sig_pub: &NO_ADMINS,
         tombstones: None,
         compromise: None,
     };

@@ -94,7 +94,7 @@ pub fn open_and_remember(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::download::{StreamChunks, NO_GRANTERS};
+    use crate::download::{StreamChunks, NO_ADMINS, NO_GRANTERS};
     use crate::identity::Identity;
     use crate::upload::{build_upload, PlaintextStreams, UploadBundle, UploadParams};
     use maxsecu_crypto::generate_enc_keypair;
@@ -176,6 +176,7 @@ mod tests {
             recipient_secret: built.owner.enc_secret(),
             seen_max_version: Some(999), // deliberately wrong — the store overrides
             granter_sig_pub: &NO_GRANTERS,
+            admin_sig_pub: &NO_ADMINS,
             tombstones: None,
             compromise: None,
         }

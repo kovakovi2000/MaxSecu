@@ -16,12 +16,14 @@
 
 mod control;
 mod directory;
+mod recovery;
 
 pub use control::{
     ControlChain, ControlRecord, CoSign, KeyCompromiseParams, ReinstateParams, RevokeParams,
     SignedControlRecord,
 };
 pub use directory::{DirectorySigner, SignedBinding};
+pub use recovery::{build_recovery_grant, RecoveryError, RecoveryGrantOut, RecoveryGrantParams};
 
 use core::fmt;
 

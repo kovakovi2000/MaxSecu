@@ -35,7 +35,7 @@ use maxsecu_client_core::{
     build_next_version, build_reshare, build_upload, verify_and_open, CarryForwardCandidate,
     DownloadBundle, DownloadError, Identity, PlaintextStreams, ReshareParams, RotateParams,
     RotationBundle, StreamChunks, TombstoneSet, UploadBundle, UploadParams, VerifyContext,
-    NO_GRANTERS,
+    NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_crypto::{generate_enc_keypair, sha256, unwrap_dek, Dek, EncPublicKey, WrappedDek};
 use maxsecu_encoding::structs::WrapContext;
@@ -513,6 +513,7 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
         recipient_secret: v.enc_secret(),
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS, // V's grant is author-rooted
+        admin_sig_pub: &NO_ADMINS,
         tombstones: None,
         compromise: None,
     };
@@ -561,6 +562,7 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
         recipient_secret: w.enc_secret(),
         seen_max_version: None,
         granter_sig_pub: &resolver,
+        admin_sig_pub: &NO_ADMINS,
         tombstones: None,
         compromise: None,
     };
@@ -677,6 +679,7 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
         recipient_secret: w.enc_secret(),
         seen_max_version: Some(1),
         granter_sig_pub: &NO_GRANTERS,
+        admin_sig_pub: &NO_ADMINS,
         tombstones: None,
         compromise: None,
     };

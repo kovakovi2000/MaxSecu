@@ -252,6 +252,9 @@ fn candidate_survives(
         return false;
     }
     // The chain must root at the prior author via author/re-share edges only.
+    // `admin_sig_pub = None`: a recovery-operator (admin-rooted) grant is honored
+    // on download for its own version but is **not** possession-entailing, so it
+    // is never carried forward (R24, §12.3a/§12.9).
     if verify_grant_chain(
         &leaf,
         &c.leaf_grant_sig,
@@ -262,6 +265,7 @@ fn candidate_survives(
         params.prior_author_id,
         &params.prior_author_sig_pub,
         granter_sig_pub,
+        None,
     )
     .is_err()
     {
@@ -433,6 +437,48 @@ mod tests {
         assert_eq!(bundle.wraps.len(), 3);
         let ww = bundle.wraps.iter().find(|x| x.recipient_id == W_ID).unwrap();
         assert_eq!(ww.grant.granted_by, OWNER_ID); // re-rooted under the new author
+    }
+
+    #[test]
+    fn drops_a_recovery_clause_candidate_r24() {
+        // A prior recipient holding ONLY a recovery-operator (admin-rooted) grant
+        // is honored on download for its own version but is NOT possession-
+        // entailing — carry-forward passes `admin_sig_pub = None`, so it is dropped
+        // at the next rotation (R24, §12.3a/§12.9).
+        let owner = Identity::generate();
+        let v = Identity::generate();
+        let prior_dek = Dek::generate();
+        let admin = SigningKey::generate();
+        let grant = Grant {
+            file_id: FILE_ID,
+            file_version: 1,
+            recipient_id: V_ID,
+            recipient_type: RecipientType::User,
+            dek_commit: Bytes32(prior_dek.commit()),
+            granted_by: Id([0xAD; 16]), // admin-rooted recovery clause
+            created_at: NOW,
+        };
+        let sig = admin.sign_canonical(labels::GRANT, &grant);
+        let cand = CarryForwardCandidate {
+            recipient_id: V_ID,
+            recipient_enc_pub: EncPublicKey::from_bytes(v.enc_pub_bytes()),
+            leaf_grant_bytes: encode(&grant),
+            leaf_grant_sig: sig,
+            ancestor_grants: vec![],
+        };
+
+        let bundle = build_next_version(
+            &rotate_params(&owner, &prior_dek),
+            &plaintext(),
+            &prior_dek,
+            std::slice::from_ref(&cand),
+            &empty_tombstones(),
+            &NO_GRANTERS,
+        )
+        .unwrap();
+        // owner + recovery only — the recovery-clause recipient is NOT carried.
+        assert_eq!(bundle.wraps.len(), 2);
+        assert!(bundle.wraps.iter().all(|w| w.recipient_id != V_ID));
     }
 
     #[test]
