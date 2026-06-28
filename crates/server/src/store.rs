@@ -246,6 +246,16 @@ pub trait Store: Send + Sync {
     /// (§4.2 / D-G). Newest-first by `created_at_ms`.
     async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError>;
 
+    /// Persist a fresh single-use enrollment voucher by its `SHA-256` hash, with
+    /// an absolute expiry (`POST /v1/vouchers`, admin-issued). Idempotent re-issue
+    /// of the same hash is allowed.
+    async fn issue_voucher(
+        &self,
+        voucher_hash: [u8; 32],
+        issued_by: [u8; 16],
+        expires_at_ms: u64,
+    ) -> Result<(), StoreError>;
+
     // ---- Phase 2: revocation control-log (DESIGN §7.6/§11.5, api.md §7) ----
 
     /// Append a record to the single hash chain (`POST /v1/revocations|...`).
@@ -656,6 +666,16 @@ impl Store for MemoryStore {
                 .then(a.user_id.cmp(&b.user_id))
         });
         Ok(out)
+    }
+
+    async fn issue_voucher(
+        &self,
+        voucher_hash: [u8; 32],
+        _issued_by: [u8; 16],
+        _expires_at_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.inner.lock().unwrap().vouchers.insert(voucher_hash);
+        Ok(())
     }
 
     async fn append_control(
@@ -1114,6 +1134,14 @@ impl Store for FaultyStore {
     async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
         Err(Self::fault("list_pending_users"))
     }
+    async fn issue_voucher(
+        &self,
+        _voucher_hash: [u8; 32],
+        _issued_by: [u8; 16],
+        _expires_at_ms: u64,
+    ) -> Result<(), StoreError> {
+        Err(Self::fault("issue_voucher"))
+    }
     async fn append_control(
         &self,
         _record_bytes: Vec<u8>,
@@ -1269,5 +1297,14 @@ mod phase2_store_tests {
         // two ms=300 rows (a, c) come before b=100, and a precedes c.
         let order: Vec<[u8; 16]> = pending.iter().map(|p| p.user_id).collect();
         assert_eq!(order, vec![[0x01; 16], [0x03; 16], [0x02; 16]]);
+    }
+
+    #[tokio::test]
+    async fn issued_voucher_is_consumable_once() {
+        let s = MemoryStore::new();
+        let h = maxsecu_crypto::sha256(b"invite-code-xyz");
+        s.issue_voucher(h, [0xAD; 16], 4_102_444_800_000).await.unwrap();
+        assert!(s.consume_voucher(&h).await.unwrap(), "fresh issued voucher consumes");
+        assert!(!s.consume_voucher(&h).await.unwrap(), "second consume fails (single-use)");
     }
 }

@@ -154,6 +154,9 @@ impl Store for FaultyStore {
     async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
         Err(bait("list_pending_users"))
     }
+    async fn issue_voucher(&self, _h: [u8; 32], _i: [u8; 16], _e: u64) -> Result<(), StoreError> {
+        Err(bait("issue_voucher"))
+    }
     async fn append_control(
         &self,
         _r: Vec<u8>,
@@ -290,6 +293,9 @@ impl Store for FileFaultyStore {
     }
     async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
         self.inner.list_pending_users().await
+    }
+    async fn issue_voucher(&self, h: [u8; 32], i: [u8; 16], e: u64) -> Result<(), StoreError> {
+        self.inner.issue_voucher(h, i, e).await
     }
     async fn control_head(&self) -> Result<[u8; 32], StoreError> {
         self.inner.control_head().await

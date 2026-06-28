@@ -373,6 +373,25 @@ impl Store for PgStore {
             .collect()
     }
 
+    async fn issue_voucher(
+        &self,
+        voucher_hash: [u8; 32],
+        issued_by: [u8; 16],
+        expires_at_ms: u64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO enrollment_vouchers (voucher_hash, issued_by, expires_at) VALUES ($1, $2, $3) \
+             ON CONFLICT (voucher_hash) DO NOTHING",
+        )
+        .bind(&voucher_hash[..])
+        .bind(&issued_by[..])
+        .bind(try_ms_to_ts(expires_at_ms, "issue_voucher")?)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err("issue_voucher"))?;
+        Ok(())
+    }
+
     async fn append_control(
         &self,
         record_bytes: Vec<u8>,
