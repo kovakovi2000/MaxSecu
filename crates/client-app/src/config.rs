@@ -5,6 +5,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+// Loaded by the UI in a later phase (Task 10) to prefill the connect form /
+// drive auto-connect; Phase-1 `connect` takes its parameters straight from the
+// ConnectRequest, so this type is not yet read by the binary.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ConnectionConfig {
     pub server: String,
@@ -12,6 +16,7 @@ pub struct ConnectionConfig {
     pub auto_connect: bool,
 }
 
+#[allow(dead_code)] // load/save wired by the UI in Task 10 (see type comment).
 impl ConnectionConfig {
     pub fn load(dir: &Path) -> Self {
         std::fs::read(dir.join("config").join("connection.json"))

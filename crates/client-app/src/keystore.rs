@@ -12,11 +12,16 @@ pub fn keystore_path(dir: &Path) -> PathBuf {
     dir.join("keystore").join("local_key_blob")
 }
 
+// `exists`/`create` back the onboarding flow (first-run keystore creation) the
+// UI adds in a later phase (Task 9/10); Phase-1 commands only `unlock` an
+// already-provisioned keystore, so these are not yet called by the binary.
+#[allow(dead_code)]
 pub fn exists(dir: &Path) -> bool {
     keystore_path(dir).exists()
 }
 
 /// Create a fresh identity, seal it under `password`, and write the blob.
+#[allow(dead_code)]
 pub fn create(dir: &Path, password: &str) -> Result<Identity, UiError> {
     // Fail closed before doing anything: overwriting an existing blob would
     // destroy the prior identity (and access to everything sealed to it) with

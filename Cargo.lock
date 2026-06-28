@@ -2371,8 +2371,13 @@ dependencies = [
 name = "maxsecu-client-app"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "maxsecu-client-core",
  "maxsecu-crypto",
+ "rcgen",
  "serde",
  "serde_json",
  "tauri",

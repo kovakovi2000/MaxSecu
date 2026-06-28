@@ -7,6 +7,11 @@ use serde::Serialize;
 pub const EVT_CONNECTION: &str = "maxsecu://connection-state";
 pub const EVT_AUTH: &str = "maxsecu://auth-state";
 
+// The complete connection-state vocabulary streamed to the UI. `connect` emits
+// the connect-flow subset (Resolving/TlsHandshake/ChannelBinding/Connected/
+// Disconnected); Idle/Reconnecting/Degraded are emitted by the reconnect +
+// health logic added in a later phase.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", tag = "state")]
 pub enum ConnectionState {
@@ -20,6 +25,10 @@ pub enum ConnectionState {
     Degraded,
 }
 
+// The complete auth-state vocabulary. `connect` emits Authenticating/LoggedIn/
+// LoggedOut; UnlockingKeystore/SessionExpired/Reauthenticating are emitted by
+// the unlock UI + session-expiry/re-auth logic added in a later phase.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", tag = "state")]
 pub enum AuthState {
