@@ -8,10 +8,15 @@
 
 use maxsecu_crypto::{random_array, sha256, SigningKey};
 use maxsecu_encoding::labels;
-use maxsecu_encoding::structs::{AuthProofContext, DirBinding};
-use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
-use maxsecu_encoding::encode;
-use maxsecu_server::{AuthConfig, AuthService, PgStore, SessionRecord, Store};
+use maxsecu_encoding::structs::{AuthProofContext, DirBinding, Genesis, Manifest, Stream};
+use maxsecu_encoding::types::{
+    Bytes32, Compression, FileType, Id, Role, RoleSet, StreamType, Suite, Text, Timestamp,
+};
+use maxsecu_encoding::{encode, RECOVERY_ID};
+use maxsecu_server::{
+    parse_stage, AuthConfig, AuthService, FinalizeError, GenesisInput, ListFilter, PgStore,
+    SessionRecord, StageError, StageInput, Store, VersionSelector, WrapInput,
+};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
 const SCHEMA_SQL: &str = include_str!("../../../docs/schema.sql");
@@ -116,6 +121,18 @@ impl TestDb {
         .execute(self.store.pool())
         .await
         .unwrap();
+    }
+
+    /// Seed a user with a chosen `user_id` (for `files.owner_id` FK).
+    async fn seed_user(&self, id: [u8; 16], name: &str) {
+        sqlx::query("INSERT INTO users (user_id, username, enc_pub, sig_pub) VALUES ($1,$2,$3,$4)")
+            .bind(&id[..])
+            .bind(name)
+            .bind(&[0xAAu8; 32][..])
+            .bind(&[0xBBu8; 32][..])
+            .execute(self.store.pool())
+            .await
+            .unwrap();
     }
 
     async fn teardown(self) {
@@ -457,5 +474,192 @@ async fn user_by_name_round_trips() {
     assert_eq!(rec.user_id, id);
     assert_eq!(rec.enc_pub, enc);
     assert_eq!(rec.sig_pub, sig);
+    db.teardown().await;
+}
+
+// ---- Phase 3 P3.6: file records over Postgres ----
+
+fn pg_manifest(file: [u8; 16], version: u64, author: [u8; 16], ftype: FileType) -> Vec<u8> {
+    encode(&Manifest {
+        file_id: Id(file),
+        version,
+        file_type: ftype,
+        alg: Suite::V1,
+        chunk_size: 1 << 20,
+        dek_commit: Bytes32([0xDC; 32]),
+        streams: vec![
+            Stream {
+                stream_type: StreamType::Content,
+                compression: Compression::None,
+                chunk_count: 2,
+                digest: Bytes32([0xC0; 32]),
+            },
+            Stream {
+                stream_type: StreamType::Metadata,
+                compression: Compression::None,
+                chunk_count: 1,
+                digest: Bytes32([0x2E; 32]),
+            },
+        ],
+        recovery_present: true,
+        author_id: Id(author),
+        created_at: Timestamp(TS + version),
+    })
+}
+
+fn pg_genesis(file: [u8; 16], owner: [u8; 16]) -> GenesisInput {
+    GenesisInput {
+        genesis_bytes: encode(&Genesis {
+            file_id: Id(file),
+            owner_id: Id(owner),
+            owner_key_version: 1,
+            created_at: Timestamp(TS),
+        }),
+        genesis_sig: [0x9A; 64],
+    }
+}
+
+fn pg_stage(
+    file: [u8; 16],
+    version: u64,
+    owner: [u8; 16],
+    genesis: Option<GenesisInput>,
+    ftype: FileType,
+) -> StageInput {
+    StageInput {
+        file_id: file,
+        caller_id: owner,
+        file_type_advisory: ftype as u8 as i16,
+        genesis,
+        manifest_bytes: pg_manifest(file, version, owner, ftype),
+        manifest_sig: [0x9B; 64],
+        wraps: vec![
+            WrapInput {
+                recipient_id: owner,
+                recipient_type: 1,
+                wrapped_dek: vec![0xA1; 48],
+                wrap_alg: 1,
+                granted_by: owner,
+                grant_bytes: vec![0xB1; 8],
+                grant_sig: [0xC1; 64],
+            },
+            WrapInput {
+                recipient_id: RECOVERY_ID.0,
+                recipient_type: 2,
+                wrapped_dek: vec![0xA2; 48],
+                wrap_alg: 1,
+                granted_by: owner,
+                grant_bytes: vec![0xB2; 8],
+                grant_sig: [0xC2; 64],
+            },
+        ],
+        stream_totals: vec![(1, 2_000_000), (2, 256)],
+        proposed_version: version,
+    }
+}
+
+#[tokio::test]
+async fn file_lifecycle_persists_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let file = [0xF1u8; 16];
+    db.seed_user(owner, "owner").await;
+
+    // Stage v1 — not visible until finalize, even via a fresh pool.
+    let p1 = parse_stage(pg_stage(file, 1, owner, Some(pg_genesis(file, owner)), FileType::Blog)).unwrap();
+    assert_eq!(db.store.stage_version(p1, TS).await.unwrap(), 1);
+    let fresh = db.reopen().await;
+    assert!(fresh.get_file(file, VersionSelector::Latest, owner).await.unwrap().is_none());
+
+    // Finalize v1 → durably visible to the owner with its exact records.
+    db.store.finalize_version(file, 1, owner, TS + 1).await.unwrap();
+    let fresh = db.reopen().await;
+    let view = fresh
+        .get_file(file, VersionSelector::Latest, owner)
+        .await
+        .unwrap()
+        .expect("finalized v1 visible after reopen");
+    assert_eq!(view.version, 1);
+    assert_eq!(view.manifest_bytes, pg_manifest(file, 1, owner, FileType::Blog));
+    assert_eq!(view.my_wrap.wrapped_dek, vec![0xA1; 48]);
+    assert!(view.recovery_grant.is_some());
+    assert_eq!(view.streams.len(), 2);
+
+    // A non-recipient gets None — same as missing (no oracle).
+    assert!(db.store.get_file(file, VersionSelector::Latest, [0x77; 16]).await.unwrap().is_none());
+
+    // Rotate to v2 (strict +1); prior wraps torn down.
+    let p2 = parse_stage(pg_stage(file, 2, owner, None, FileType::Blog)).unwrap();
+    db.store.stage_version(p2, TS + 2).await.unwrap();
+    db.store.finalize_version(file, 2, owner, TS + 3).await.unwrap();
+    assert_eq!(
+        db.store.get_file(file, VersionSelector::Latest, owner).await.unwrap().unwrap().version,
+        2
+    );
+    assert!(db.store.get_file(file, VersionSelector::Specific(1), owner).await.unwrap().is_none());
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn finalize_strict_plus_one_and_non_owner_rejected_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let file = [0xF2u8; 16];
+    db.seed_user(owner, "owner").await;
+
+    let p1 = parse_stage(pg_stage(file, 1, owner, Some(pg_genesis(file, owner)), FileType::Blog)).unwrap();
+    db.store.stage_version(p1, TS).await.unwrap();
+    db.store.finalize_version(file, 1, owner, TS + 1).await.unwrap();
+
+    // Stage v3 (skipping v2) then finalize → VersionConflict (expected 2).
+    let p3 = parse_stage(pg_stage(file, 3, owner, None, FileType::Blog)).unwrap();
+    db.store.stage_version(p3, TS + 2).await.unwrap();
+    assert_eq!(
+        db.store.finalize_version(file, 3, owner, TS + 3).await,
+        Err(FinalizeError::VersionConflict { expected: 2, got: 3 })
+    );
+
+    // Finalizing v1 again → AlreadyFinalized (immutability guard).
+    assert_eq!(
+        db.store.finalize_version(file, 1, owner, TS + 4).await,
+        Err(FinalizeError::AlreadyFinalized)
+    );
+
+    // A stranger cannot rotate the file (coarse owner check, D29).
+    let attacker = parse_stage(pg_stage(file, 2, [0x77; 16], None, FileType::Blog)).unwrap();
+    assert_eq!(db.store.stage_version(attacker, TS + 5).await, Err(StageError::NotOwner));
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn listing_filters_by_type_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    db.seed_user(owner, "owner").await;
+    let blog = [0xB1u8; 16];
+    let video = [0x71u8; 16];
+
+    let pb = parse_stage(pg_stage(blog, 1, owner, Some(pg_genesis(blog, owner)), FileType::Blog)).unwrap();
+    db.store.stage_version(pb, TS).await.unwrap();
+    db.store.finalize_version(blog, 1, owner, TS + 100).await.unwrap();
+    let pv = parse_stage(pg_stage(video, 1, owner, Some(pg_genesis(video, owner)), FileType::Video)).unwrap();
+    db.store.stage_version(pv, TS).await.unwrap();
+    db.store.finalize_version(video, 1, owner, TS + 200).await.unwrap();
+
+    let all = db.store.list_files(ListFilter { file_type: None, limit: 10 }).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].file_id, video); // newest first
+    assert!(all[0].small_streams.iter().all(|(t, _)| *t != 1)); // content excluded
+
+    let blogs = db
+        .store
+        .list_files(ListFilter { file_type: Some(FileType::Blog as u8 as i16), limit: 10 })
+        .await
+        .unwrap();
+    assert_eq!(blogs.len(), 1);
+    assert_eq!(blogs[0].file_id, blog);
+
     db.teardown().await;
 }

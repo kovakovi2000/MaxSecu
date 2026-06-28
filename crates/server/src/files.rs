@@ -151,6 +151,46 @@ impl From<StoreError> for StageError {
     }
 }
 
+/// Why a finalize (the atomic version commit, api.md §8.4 / §12) was rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizeError {
+    /// Coarse owner check failed (caller is not the file owner, D29).
+    NotOwner,
+    /// No staged version `v` exists for the file (nothing to commit).
+    NoSuchVersion,
+    /// Lost the serialize-on-`(file_id, version)` race / stale proposal: `v` is
+    /// not `current_version + 1` (→ 409; the client rebases, §12.9).
+    VersionConflict { expected: u64, got: u64 },
+    /// Version `v` is already finalized (immutable) — idempotent no-op guard.
+    AlreadyFinalized,
+    /// A backend fault (→ 500, logged).
+    Store(StoreError),
+}
+
+impl From<StoreError> for FinalizeError {
+    fn from(e: StoreError) -> Self {
+        FinalizeError::Store(e)
+    }
+}
+
+/// Which version of a file `GET /v1/files/{id}` should return (api.md §8.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionSelector {
+    /// The current finalized version (`?version=latest`).
+    Latest,
+    /// A specific version number (`?version=<v>`).
+    Specific(u64),
+}
+
+/// Filter/limit for `GET /v1/files` listing (api.md §8.6 / D35).
+#[derive(Debug, Clone)]
+pub struct ListFilter {
+    /// Restrict to one `file_type` (1=video 2=image 3=blog), or all if `None`.
+    pub file_type: Option<i16>,
+    /// Max entries to return.
+    pub limit: usize,
+}
+
 /// Decode and coarse-validate a staging request (api.md §8.1/§8.2). Pure: no DB,
 /// no crypto. Existence / strict-`+1` / owner-of-an-existing-file checks that
 /// need stored state are the store's job (`stage_version`/`finalize_version`).

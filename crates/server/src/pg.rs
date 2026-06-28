@@ -31,7 +31,11 @@ use time::OffsetDateTime;
 
 use crate::control::{decode_control, role_from_text, role_text};
 use crate::error::{ControlAppendError, StoreError};
-use crate::store::{SessionRecord, StoredBinding, StoredControlRecord, Store, UserRecord};
+use crate::files::{FinalizeError, ListFilter, ParsedStage, StageError, VersionSelector};
+use crate::store::{
+    FileListEntry, FileView, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
+    UserRecord, WrapView,
+};
 
 /// Postgres [`Store`]. Cheap to clone (the pool is an `Arc` internally).
 #[derive(Clone)]
@@ -415,6 +419,374 @@ impl Store for PgStore {
         let Some(row) = row else { return Ok(Vec::new()) };
         let roles: Vec<String> = row.try_get("roles").map_err(store_err("user_roles"))?;
         Ok(roles.iter().filter_map(|s| role_from_text(s)).collect())
+    }
+
+    async fn stage_version(&self, parsed: ParsedStage, _now_ms: u64) -> Result<u64, StageError> {
+        let op = "stage_version";
+        let serr = |e: sqlx::Error| StageError::Store(store_err(op)(e));
+        let version = parsed.version as i64;
+        let mut tx = self.pool.begin().await.map_err(serr)?;
+
+        // Existing owner, if any (for the coarse owner check on both paths).
+        let owner_row = sqlx::query("SELECT owner_id FROM files WHERE file_id = $1")
+            .bind(&parsed.file_id[..])
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(serr)?;
+        let existing_owner: Option<[u8; 16]> = match owner_row {
+            Some(r) => Some(col_fixed(&r, op, "owner_id").map_err(StageError::Store)?),
+            None => None,
+        };
+
+        // A finalized target version is immutable — cannot re-stage (api.md §12).
+        let finalized: Option<bool> =
+            sqlx::query("SELECT finalized FROM file_versions WHERE file_id = $1 AND version = $2")
+                .bind(&parsed.file_id[..])
+                .bind(version)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(serr)?
+                .map(|r| r.get::<bool, _>("finalized"));
+        if finalized == Some(true) {
+            return Err(StageError::AlreadyFinalized);
+        }
+
+        match &parsed.genesis {
+            // Version 1 / create.
+            Some(g) => {
+                if let Some(owner) = existing_owner {
+                    if owner != g.owner_id {
+                        return Err(StageError::NotOwner); // someone else owns this file_id
+                    }
+                }
+                sqlx::query(
+                    "INSERT INTO files (file_id, owner_id, file_type, current_version) \
+                     VALUES ($1,$2,$3,0) ON CONFLICT (file_id) DO NOTHING",
+                )
+                .bind(&parsed.file_id[..])
+                .bind(&g.owner_id[..])
+                .bind(parsed.file_type)
+                .execute(&mut *tx)
+                .await
+                .map_err(serr)?;
+                sqlx::query(
+                    "INSERT INTO file_genesis \
+                     (file_id, owner_id, owner_key_version, genesis_bytes, genesis_sig) \
+                     VALUES ($1,$2,$3,$4,$5) ON CONFLICT (file_id) DO NOTHING",
+                )
+                .bind(&parsed.file_id[..])
+                .bind(&g.owner_id[..])
+                .bind(g.owner_key_version as i64)
+                .bind(&g.genesis_bytes)
+                .bind(&g.genesis_sig[..])
+                .execute(&mut *tx)
+                .await
+                .map_err(serr)?;
+            }
+            // Rotation (vN): the file must exist and the caller own it (D29).
+            None => match existing_owner {
+                None => return Err(StageError::NoSuchFile),
+                Some(owner) if owner != parsed.author_id => return Err(StageError::NotOwner),
+                Some(_) => {}
+            },
+        }
+
+        // Idempotent overwrite of a still-staged version (cascades streams + wraps).
+        sqlx::query("DELETE FROM file_versions WHERE file_id = $1 AND version = $2 AND finalized = false")
+            .bind(&parsed.file_id[..])
+            .bind(version)
+            .execute(&mut *tx)
+            .await
+            .map_err(serr)?;
+        sqlx::query(
+            "INSERT INTO file_versions \
+             (file_id, version, manifest_bytes, manifest_sig, author_id, alg, finalized) \
+             VALUES ($1,$2,$3,$4,$5,$6,false)",
+        )
+        .bind(&parsed.file_id[..])
+        .bind(version)
+        .bind(&parsed.manifest_bytes)
+        .bind(&parsed.manifest_sig[..])
+        .bind(&parsed.author_id[..])
+        .bind(parsed.alg)
+        .execute(&mut *tx)
+        .await
+        .map_err(serr)?;
+
+        for s in &parsed.streams {
+            sqlx::query(
+                "INSERT INTO file_streams \
+                 (file_id, version, stream_type, compression, chunk_size, chunk_count, \
+                  total_bytes, digest, blob_ref) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            )
+            .bind(&parsed.file_id[..])
+            .bind(version)
+            .bind(s.stream_type)
+            .bind(s.compression)
+            .bind(s.chunk_size as i32)
+            .bind(s.chunk_count as i64)
+            .bind(s.total_bytes as i64)
+            .bind(&s.digest[..])
+            .bind(&s.blob_ref)
+            .execute(&mut *tx)
+            .await
+            .map_err(serr)?;
+        }
+        for w in &parsed.wraps {
+            sqlx::query(
+                "INSERT INTO file_key_wraps \
+                 (file_id, file_version, recipient_id, recipient_type, wrapped_dek, wrap_alg, \
+                  granted_by, grant_bytes, grant_sig) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            )
+            .bind(&parsed.file_id[..])
+            .bind(version)
+            .bind(&w.recipient_id[..])
+            .bind(w.recipient_type)
+            .bind(&w.wrapped_dek)
+            .bind(w.wrap_alg)
+            .bind(&w.granted_by[..])
+            .bind(&w.grant_bytes)
+            .bind(&w.grant_sig[..])
+            .execute(&mut *tx)
+            .await
+            .map_err(serr)?;
+        }
+        tx.commit().await.map_err(serr)?;
+        Ok(parsed.version)
+    }
+
+    async fn finalize_version(
+        &self,
+        file_id: [u8; 16],
+        version: u64,
+        caller_id: [u8; 16],
+        _now_ms: u64,
+    ) -> Result<(), FinalizeError> {
+        let op = "finalize_version";
+        let serr = |e: sqlx::Error| FinalizeError::Store(store_err(op)(e));
+        let v = version as i64;
+        let mut tx = self.pool.begin().await.map_err(serr)?;
+
+        // Lock the file row to serialize concurrent finalizes (the strict +1 race).
+        let frow = sqlx::query("SELECT owner_id, current_version FROM files WHERE file_id = $1 FOR UPDATE")
+            .bind(&file_id[..])
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(serr)?;
+        let Some(frow) = frow else {
+            return Err(FinalizeError::NoSuchVersion);
+        };
+        let owner: [u8; 16] = col_fixed(&frow, op, "owner_id").map_err(FinalizeError::Store)?;
+        if owner != caller_id {
+            return Err(FinalizeError::NotOwner);
+        }
+        let current: i64 = frow.get("current_version");
+
+        let finalized: Option<bool> =
+            sqlx::query("SELECT finalized FROM file_versions WHERE file_id = $1 AND version = $2")
+                .bind(&file_id[..])
+                .bind(v)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(serr)?
+                .map(|r| r.get::<bool, _>("finalized"));
+        match finalized {
+            None => return Err(FinalizeError::NoSuchVersion),
+            Some(true) => return Err(FinalizeError::AlreadyFinalized),
+            Some(false) => {}
+        }
+        let expected = (current as u64) + 1;
+        if version != expected {
+            return Err(FinalizeError::VersionConflict {
+                expected,
+                got: version,
+            });
+        }
+
+        sqlx::query("UPDATE file_versions SET finalized = true WHERE file_id = $1 AND version = $2")
+            .bind(&file_id[..])
+            .bind(v)
+            .execute(&mut *tx)
+            .await
+            .map_err(serr)?;
+        sqlx::query("UPDATE files SET current_version = $2, updated_at = now() WHERE file_id = $1")
+            .bind(&file_id[..])
+            .bind(v)
+            .execute(&mut *tx)
+            .await
+            .map_err(serr)?;
+        // Drop the prior version's chunks (streams) + wraps; genesis + the prior
+        // manifest are retained (api.md §8.4 / §12.9).
+        if current >= 1 {
+            sqlx::query("DELETE FROM file_streams WHERE file_id = $1 AND version = $2")
+                .bind(&file_id[..])
+                .bind(current)
+                .execute(&mut *tx)
+                .await
+                .map_err(serr)?;
+            sqlx::query("DELETE FROM file_key_wraps WHERE file_id = $1 AND file_version = $2")
+                .bind(&file_id[..])
+                .bind(current)
+                .execute(&mut *tx)
+                .await
+                .map_err(serr)?;
+        }
+        tx.commit().await.map_err(serr)?;
+        Ok(())
+    }
+
+    async fn get_file(
+        &self,
+        file_id: [u8; 16],
+        selector: VersionSelector,
+        caller_id: [u8; 16],
+    ) -> Result<Option<FileView>, StoreError> {
+        let op = "get_file";
+        let version: i64 = match selector {
+            VersionSelector::Specific(v) => v as i64,
+            VersionSelector::Latest => {
+                let row = sqlx::query("SELECT current_version FROM files WHERE file_id = $1")
+                    .bind(&file_id[..])
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(store_err(op))?;
+                match row {
+                    Some(r) => r.get::<i64, _>("current_version"),
+                    None => return Ok(None),
+                }
+            }
+        };
+        if version == 0 {
+            return Ok(None); // nothing finalized yet
+        }
+        // The version row, only if finalized (visible).
+        let vrow = sqlx::query(
+            "SELECT manifest_bytes, manifest_sig FROM file_versions \
+             WHERE file_id = $1 AND version = $2 AND finalized = true",
+        )
+        .bind(&file_id[..])
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        let Some(vrow) = vrow else { return Ok(None) };
+
+        // The caller's own wrap — its absence is a 404 (no access oracle).
+        let wrow = sqlx::query(
+            "SELECT wrapped_dek, grant_bytes, grant_sig FROM file_key_wraps \
+             WHERE file_id = $1 AND file_version = $2 AND recipient_id = $3",
+        )
+        .bind(&file_id[..])
+        .bind(version)
+        .bind(&caller_id[..])
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        let Some(wrow) = wrow else { return Ok(None) };
+
+        let grow = sqlx::query(
+            "SELECT genesis_bytes, genesis_sig FROM file_genesis WHERE file_id = $1",
+        )
+        .bind(&file_id[..])
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        let Some(grow) = grow else { return Ok(None) };
+
+        let rrow = sqlx::query(
+            "SELECT grant_bytes, grant_sig FROM file_key_wraps \
+             WHERE file_id = $1 AND file_version = $2 AND recipient_type = 2",
+        )
+        .bind(&file_id[..])
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        let recovery_grant = match rrow {
+            Some(r) => Some((
+                r.try_get::<Vec<u8>, _>("grant_bytes").map_err(store_err(op))?,
+                col_fixed(&r, op, "grant_sig")?,
+            )),
+            None => None,
+        };
+
+        let srows = sqlx::query(
+            "SELECT stream_type, chunk_count, chunk_size, blob_ref FROM file_streams \
+             WHERE file_id = $1 AND version = $2 ORDER BY stream_type",
+        )
+        .bind(&file_id[..])
+        .bind(version)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        let streams = srows
+            .iter()
+            .map(|r| StreamView {
+                stream_type: r.get("stream_type"),
+                chunk_count: r.get::<i64, _>("chunk_count") as u64,
+                chunk_size: r.get::<i32, _>("chunk_size") as u32,
+                blob_ref: r.get("blob_ref"),
+            })
+            .collect();
+
+        Ok(Some(FileView {
+            version: version as u64,
+            manifest_bytes: vrow.try_get("manifest_bytes").map_err(store_err(op))?,
+            manifest_sig: col_fixed(&vrow, op, "manifest_sig")?,
+            genesis_bytes: grow.try_get("genesis_bytes").map_err(store_err(op))?,
+            genesis_sig: col_fixed(&grow, op, "genesis_sig")?,
+            my_wrap: WrapView {
+                wrapped_dek: wrow.try_get("wrapped_dek").map_err(store_err(op))?,
+                grant_bytes: wrow.try_get("grant_bytes").map_err(store_err(op))?,
+                grant_sig: col_fixed(&wrow, op, "grant_sig")?,
+            },
+            recovery_grant,
+            streams,
+        }))
+    }
+
+    async fn list_files(&self, filter: ListFilter) -> Result<Vec<FileListEntry>, StoreError> {
+        let op = "list_files";
+        let rows = sqlx::query(
+            "SELECT file_id, file_type, current_version, updated_at FROM files \
+             WHERE current_version >= 1 AND ($1::smallint IS NULL OR file_type = $1) \
+             ORDER BY updated_at DESC, file_id LIMIT $2",
+        )
+        .bind(filter.file_type)
+        .bind(filter.limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let file_id: [u8; 16] = col_fixed(r, op, "file_id")?;
+            let version: i64 = r.get("current_version");
+            let updated_at: OffsetDateTime = r.try_get("updated_at").map_err(store_err(op))?;
+            let srows = sqlx::query(
+                "SELECT stream_type, total_bytes FROM file_streams \
+                 WHERE file_id = $1 AND version = $2 AND stream_type <> 1 ORDER BY stream_type",
+            )
+            .bind(&file_id[..])
+            .bind(version)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_err(op))?;
+            let small_streams = srows
+                .iter()
+                .map(|s| (s.get::<i16, _>("stream_type"), s.get::<i64, _>("total_bytes") as u64))
+                .collect();
+            out.push(FileListEntry {
+                file_id,
+                file_type: r.get("file_type"),
+                version: version as u64,
+                updated_at_ms: ts_to_ms(updated_at),
+                small_streams,
+            });
+        }
+        Ok(out)
     }
 }
 

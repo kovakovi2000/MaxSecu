@@ -10,6 +10,9 @@
 
 use crate::control::decode_control;
 use crate::error::{ControlAppendError, StoreError};
+use crate::files::{
+    FinalizeError, ListFilter, ParsedStage, StageError, StreamRow, VersionSelector, WrapInput,
+};
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
 use maxsecu_encoding::types::Role;
@@ -60,6 +63,58 @@ pub struct StoredControlRecord {
     pub sig: [u8; 64],
     pub co_sig: Option<[u8; 64]>,
     pub head: [u8; 32],
+}
+
+/// The caller's own key-wrap + read-grant as served by `GET /v1/files` (api.md
+/// §8.5 `my_wrap`). Inert bytes — the client unwraps and verifies them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrapView {
+    pub wrapped_dek: Vec<u8>,
+    pub grant_bytes: Vec<u8>,
+    pub grant_sig: [u8; 64],
+}
+
+/// One stream's framing as served (api.md §8.5 `streams[]`): enough for the
+/// client to fetch its chunks (§9). The per-stream digest is in the manifest the
+/// client already verifies, so it is not repeated here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamView {
+    pub stream_type: i16,
+    pub chunk_count: u64,
+    pub chunk_size: u32,
+    pub blob_ref: String,
+}
+
+/// Everything a downloader needs to verify and decrypt one file version
+/// (`GET /v1/files/{id}`, api.md §8.5). Only the **caller's** wrap is included —
+/// never another user's, never the recovery *wrap* (only its grant, for the
+/// presence check). Absence of a wrap row for the caller is a `404` (no oracle).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileView {
+    pub version: u64,
+    pub manifest_bytes: Vec<u8>,
+    pub manifest_sig: [u8; 64],
+    pub genesis_bytes: Vec<u8>,
+    pub genesis_sig: [u8; 64],
+    pub my_wrap: WrapView,
+    /// The recovery recipient's grant (bytes + sig only) for the §12.5 presence
+    /// check, or `None` if no recovery grant is stored (a flagged anomaly).
+    pub recovery_grant: Option<(Vec<u8>, [u8; 64])>,
+    pub streams: Vec<StreamView>,
+}
+
+/// One listing entry (api.md §8.6 / D35): the authenticated `file_type` + the
+/// small-stream structure/sizes only — never their values. `content` is excluded
+/// (the listing exists precisely to avoid fetching it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileListEntry {
+    pub file_id: [u8; 16],
+    pub file_type: i16,
+    pub version: u64,
+    pub updated_at_ms: u64,
+    /// `(stream_type, total_bytes)` for the small streams (metadata/thumbnail/
+    /// preview) present in the current version.
+    pub small_streams: Vec<(i16, u64)>,
 }
 
 /// Async because the production backing is sqlx/Postgres. `Send + Sync` so the
@@ -153,6 +208,50 @@ pub trait Store: Send + Sync {
     /// writes (§10.1). Not the security boundary — the client re-verifies every
     /// tombstone's authenticity independently.
     async fn user_roles(&self, user_id: &[u8; 16]) -> Result<Vec<Role>, StoreError>;
+
+    // ---- Phase 3: file records (DESIGN §11.2/§11.7/§12.2, api.md §8) ----
+
+    /// Stage a version's record set (`POST /v1/files` / `.../versions`). The
+    /// version is **not visible** until [`finalize_version`](Store::finalize_version).
+    /// For v1 (`parsed.genesis` present) the file is created and its owner
+    /// recorded; for vN the file must already exist and the caller be its owner
+    /// (coarse, D29). Idempotent by `(file_id, version)` while still staged — a
+    /// re-stage overwrites the staged rows (api.md §12); re-staging a *finalized*
+    /// version is `AlreadyFinalized`. Returns the staged `version`.
+    async fn stage_version(
+        &self,
+        parsed: ParsedStage,
+        now_ms: u64,
+    ) -> Result<u64, StageError>;
+
+    /// Atomically commit a staged version (`POST .../finalize`, api.md §8.4).
+    /// Enforces the serialize-on-`(file_id, version)` strict `+1` rule and flips
+    /// the version visible; the prior version's streams + wraps are dropped
+    /// (genesis retained, §12.9). Coarse owner check; `VersionConflict` on a lost
+    /// race (→ 409). *Chunk-completeness verification is added in P3.7.*
+    async fn finalize_version(
+        &self,
+        file_id: [u8; 16],
+        version: u64,
+        caller_id: [u8; 16],
+        now_ms: u64,
+    ) -> Result<(), FinalizeError>;
+
+    /// Serve a finalized version for the caller (`GET /v1/files/{id}`, api.md
+    /// §8.5). `Ok(None)` (→ 404) if the file/version is absent, not yet finalized,
+    /// or the caller holds no wrap row for it — the missing and forbidden cases
+    /// are indistinguishable (no access oracle).
+    async fn get_file(
+        &self,
+        file_id: [u8; 16],
+        selector: VersionSelector,
+        caller_id: [u8; 16],
+    ) -> Result<Option<FileView>, StoreError>;
+
+    /// List finalized files (`GET /v1/files`, api.md §8.6 / D35): the
+    /// authenticated `file_type` + small-stream structure/sizes only, newest
+    /// first, filtered/limited per `filter`.
+    async fn list_files(&self, filter: ListFilter) -> Result<Vec<FileListEntry>, StoreError>;
 }
 
 #[derive(Default)]
@@ -169,6 +268,30 @@ struct Inner {
     control_head: [u8; 32],
     // Advisory roles per user_id for the coarse admin gate (default {user}).
     roles: HashMap<[u8; 16], Vec<Role>>,
+    // Phase 3 file records (schema files/file_genesis/file_versions/file_streams/
+    // file_key_wraps), keyed by file_id.
+    files: HashMap<[u8; 16], FileEntry>,
+}
+
+/// In-memory mirror of one `files` row plus its genesis and versions.
+struct FileEntry {
+    owner_id: [u8; 16],
+    file_type: i16,
+    current_version: u64, // 0 while only-staged (schema files.current_version)
+    updated_at_ms: u64,
+    // Immutable genesis (set on the v1 stage); retained across rotations (§11.7).
+    genesis_bytes: Vec<u8>,
+    genesis_sig: [u8; 64],
+    versions: HashMap<u64, VersionEntry>,
+}
+
+/// In-memory mirror of one `file_versions` row plus its streams and wraps.
+struct VersionEntry {
+    manifest_bytes: Vec<u8>,
+    manifest_sig: [u8; 64],
+    finalized: bool,
+    streams: Vec<StreamRow>,
+    wraps: Vec<WrapInput>,
 }
 
 /// In-memory [`Store`] for tests and local dev.
@@ -395,6 +518,189 @@ impl Store for MemoryStore {
             .cloned()
             .unwrap_or_else(|| vec![Role::User]))
     }
+
+    async fn stage_version(&self, parsed: ParsedStage, now_ms: u64) -> Result<u64, StageError> {
+        let mut inner = self.inner.lock().unwrap();
+        let version = parsed.version;
+        let new_ver = VersionEntry {
+            manifest_bytes: parsed.manifest_bytes,
+            manifest_sig: parsed.manifest_sig,
+            finalized: false,
+            streams: parsed.streams,
+            wraps: parsed.wraps,
+        };
+        match parsed.genesis {
+            // Version 1 / create: the file may be new, or a re-stage of a
+            // still-staged v1 (idempotent overwrite). A finalized v1 is immutable.
+            Some(g) => {
+                if let Some(f) = inner.files.get(&parsed.file_id) {
+                    if f.versions.get(&version).is_some_and(|v| v.finalized) {
+                        return Err(StageError::AlreadyFinalized);
+                    }
+                }
+                let entry = inner.files.entry(parsed.file_id).or_insert_with(|| FileEntry {
+                    owner_id: g.owner_id,
+                    file_type: parsed.file_type,
+                    current_version: 0,
+                    updated_at_ms: now_ms,
+                    genesis_bytes: g.genesis_bytes,
+                    genesis_sig: g.genesis_sig,
+                    versions: HashMap::new(),
+                });
+                entry.versions.insert(version, new_ver);
+            }
+            // Rotation (vN): the file must exist and the caller own it. parse_stage
+            // already required author == caller; here caller == owner closes D29.
+            None => {
+                let Some(entry) = inner.files.get_mut(&parsed.file_id) else {
+                    return Err(StageError::NoSuchFile);
+                };
+                if entry.owner_id != parsed.author_id {
+                    return Err(StageError::NotOwner);
+                }
+                if entry.versions.get(&version).is_some_and(|v| v.finalized) {
+                    return Err(StageError::AlreadyFinalized);
+                }
+                entry.versions.insert(version, new_ver);
+            }
+        }
+        Ok(version)
+    }
+
+    async fn finalize_version(
+        &self,
+        file_id: [u8; 16],
+        version: u64,
+        caller_id: [u8; 16],
+        now_ms: u64,
+    ) -> Result<(), FinalizeError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.files.get_mut(&file_id) else {
+            return Err(FinalizeError::NoSuchVersion);
+        };
+        if entry.owner_id != caller_id {
+            return Err(FinalizeError::NotOwner);
+        }
+        match entry.versions.get(&version) {
+            None => return Err(FinalizeError::NoSuchVersion),
+            Some(v) if v.finalized => return Err(FinalizeError::AlreadyFinalized),
+            Some(_) => {}
+        }
+        // Serialize-on-(file_id, version): accept iff a strict +1 of the current.
+        let expected = entry.current_version + 1;
+        if version != expected {
+            return Err(FinalizeError::VersionConflict {
+                expected,
+                got: version,
+            });
+        }
+        let prior = entry.current_version;
+        entry.versions.get_mut(&version).unwrap().finalized = true;
+        entry.current_version = version;
+        entry.updated_at_ms = now_ms;
+        // Drop the prior version's chunks (streams) + wraps; genesis + the prior
+        // manifest are retained (api.md §8.4 / §12.9).
+        if prior >= 1 {
+            if let Some(pv) = entry.versions.get_mut(&prior) {
+                pv.streams.clear();
+                pv.wraps.clear();
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_file(
+        &self,
+        file_id: [u8; 16],
+        selector: VersionSelector,
+        caller_id: [u8; 16],
+    ) -> Result<Option<FileView>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.files.get(&file_id) else {
+            return Ok(None);
+        };
+        let version = match selector {
+            VersionSelector::Latest => entry.current_version,
+            VersionSelector::Specific(v) => v,
+        };
+        if version == 0 {
+            return Ok(None); // nothing finalized yet
+        }
+        let Some(ver) = entry.versions.get(&version) else {
+            return Ok(None);
+        };
+        if !ver.finalized {
+            return Ok(None); // staged, not yet visible
+        }
+        // Only the caller's own wrap — its absence is indistinguishable from a
+        // missing file (no access oracle, api.md §8.5).
+        let Some(my) = ver.wraps.iter().find(|w| w.recipient_id == caller_id) else {
+            return Ok(None);
+        };
+        let recovery_grant = ver
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == 2) // 2 = recovery (schema file_key_wraps)
+            .map(|w| (w.grant_bytes.clone(), w.grant_sig));
+        let streams = ver
+            .streams
+            .iter()
+            .map(|s| StreamView {
+                stream_type: s.stream_type,
+                chunk_count: s.chunk_count,
+                chunk_size: s.chunk_size,
+                blob_ref: s.blob_ref.clone(),
+            })
+            .collect();
+        Ok(Some(FileView {
+            version,
+            manifest_bytes: ver.manifest_bytes.clone(),
+            manifest_sig: ver.manifest_sig,
+            genesis_bytes: entry.genesis_bytes.clone(),
+            genesis_sig: entry.genesis_sig,
+            my_wrap: WrapView {
+                wrapped_dek: my.wrapped_dek.clone(),
+                grant_bytes: my.grant_bytes.clone(),
+                grant_sig: my.grant_sig,
+            },
+            recovery_grant,
+            streams,
+        }))
+    }
+
+    async fn list_files(&self, filter: ListFilter) -> Result<Vec<FileListEntry>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<FileListEntry> = inner
+            .files
+            .iter()
+            .filter(|(_, f)| f.current_version >= 1) // finalized only
+            .filter(|(_, f)| filter.file_type.is_none_or(|t| t == f.file_type))
+            .filter_map(|(id, f)| {
+                let ver = f.versions.get(&f.current_version)?;
+                let small_streams = ver
+                    .streams
+                    .iter()
+                    .filter(|s| s.stream_type != 1) // exclude content
+                    .map(|s| (s.stream_type, s.total_bytes))
+                    .collect();
+                Some(FileListEntry {
+                    file_id: *id,
+                    file_type: f.file_type,
+                    version: f.current_version,
+                    updated_at_ms: f.updated_at_ms,
+                    small_streams,
+                })
+            })
+            .collect();
+        // Newest first, then file_id for a stable order (schema files_listing_idx).
+        out.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then(a.file_id.cmp(&b.file_id))
+        });
+        out.truncate(filter.limit);
+        Ok(out)
+    }
 }
 
 /// A [`Store`] whose every method returns `Err(StoreError)` — used to prove the
@@ -499,5 +805,28 @@ impl Store for FaultyStore {
     }
     async fn user_roles(&self, _user_id: &[u8; 16]) -> Result<Vec<Role>, StoreError> {
         Err(Self::fault("user_roles"))
+    }
+    async fn stage_version(&self, _parsed: ParsedStage, _now_ms: u64) -> Result<u64, StageError> {
+        Err(StageError::Store(Self::fault("stage_version")))
+    }
+    async fn finalize_version(
+        &self,
+        _file_id: [u8; 16],
+        _version: u64,
+        _caller_id: [u8; 16],
+        _now_ms: u64,
+    ) -> Result<(), FinalizeError> {
+        Err(FinalizeError::Store(Self::fault("finalize_version")))
+    }
+    async fn get_file(
+        &self,
+        _file_id: [u8; 16],
+        _selector: VersionSelector,
+        _caller_id: [u8; 16],
+    ) -> Result<Option<FileView>, StoreError> {
+        Err(Self::fault("get_file"))
+    }
+    async fn list_files(&self, _filter: ListFilter) -> Result<Vec<FileListEntry>, StoreError> {
+        Err(Self::fault("list_files"))
     }
 }
