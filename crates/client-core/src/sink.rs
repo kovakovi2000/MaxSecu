@@ -26,14 +26,28 @@ pub struct AnchoredHead {
 }
 
 /// An accepted anchor-proof form (the client ships an allowlist, like the `alg`
-/// registry; `sink-interface.md` §4). v1 ships the **separate-custodian Ed25519
-/// co-signature** form; the transparency-log form is a Phase-6 addition.
+/// registry; `sink-interface.md` §4). v1 shipped the **separate-custodian
+/// Ed25519 co-signature** form; Phase 6 adds the stronger **transparency-log
+/// inclusion** form.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum AnchorProof {
     /// An Ed25519 signature over `{chain_seq, head}` by a key held by a separate
     /// custodian (not the app operator, not D5/D6), pinned in the build.
     CustodianCoSig { sig: [u8; 64] },
+    /// An RFC 6962 transparency-log proof: a log-signed checkpoint
+    /// `{tree_size, root}` plus a Merkle inclusion proof that the head's signing
+    /// bytes ([`head_signing_bytes`]) are the `index`-th leaf under `root`. Both
+    /// the pinned-log checkpoint signature and the inclusion must hold.
+    TransparencyInclusion {
+        /// The log's Ed25519 signature over
+        /// `signing_input(SINK_CHECKPOINT, tree_size(8 BE) ‖ root(32))`.
+        checkpoint_sig: [u8; 64],
+        tree_size: u64,
+        root: [u8; 32],
+        index: u64,
+        path: Vec<[u8; 32]>,
+    },
 }
 
 /// Why a sink interaction failed. Both are fail-closed: a completeness-requiring
@@ -57,22 +71,63 @@ fn head_signing_bytes(h: &AnchoredHead) -> Vec<u8> {
     signing_input(labels::SINK_HEAD, &m)
 }
 
-/// Verify a head's `anchor_proof` against the **pinned custodian allowlist** (a
-/// separate trust domain from D5/D6 and the app server). At least one allowlisted
-/// key must validate, else the head is rejected — fail closed (`sink-interface`
-/// §4/§5 step 1).
+/// The exact bytes a transparency log signs for a checkpoint: the domain-framed,
+/// fixed-width `tree_size (8, big-endian) ‖ root (32)`. Mirrors
+/// [`head_signing_bytes`] but under the distinct [`labels::SINK_CHECKPOINT`].
+fn checkpoint_signing_bytes(tree_size: u64, root: &[u8; 32]) -> Vec<u8> {
+    let mut m = [0u8; 40];
+    m[..8].copy_from_slice(&tree_size.to_be_bytes());
+    m[8..].copy_from_slice(root);
+    signing_input(labels::SINK_CHECKPOINT, &m)
+}
+
+/// Does any allowlisted key strictly verify `sig` over `msg`?
+fn any_key_verifies(pubs: &[[u8; 32]], msg: &[u8], sig: &[u8; 64]) -> bool {
+    pubs.iter().any(|pk| {
+        VerifyingKey::from_bytes(pk)
+            .and_then(|vk| vk.verify_raw(msg, sig))
+            .is_ok()
+    })
+}
+
+/// Verify a head's `anchor_proof` against the pinned trust anchors (separate
+/// domains from D5/D6 and the app server): a **custodian allowlist** for the
+/// co-signature form and a **transparency-log allowlist** for the inclusion
+/// form. The proof must validate under its form, else the head is rejected —
+/// fail closed (`sink-interface` §4/§5 step 1). An empty allowlist makes the
+/// corresponding form unvalidatable.
 pub fn verify_anchor_proof(
     head: &AnchoredHead,
     proof: &AnchorProof,
     custodian_pubs: &[[u8; 32]],
+    transparency_log_pubs: &[[u8; 32]],
 ) -> Result<(), SinkError> {
-    let AnchorProof::CustodianCoSig { sig } = proof;
-    let msg = head_signing_bytes(head);
-    let ok = custodian_pubs.iter().any(|pk| {
-        VerifyingKey::from_bytes(pk)
-            .and_then(|vk| vk.verify_raw(&msg, sig))
-            .is_ok()
-    });
+    let ok = match proof {
+        AnchorProof::CustodianCoSig { sig } => {
+            any_key_verifies(custodian_pubs, &head_signing_bytes(head), sig)
+        }
+        AnchorProof::TransparencyInclusion {
+            checkpoint_sig,
+            tree_size,
+            root,
+            index,
+            path,
+        } => {
+            // (a) a pinned log key signs the checkpoint AND (b) the head's
+            // signing bytes are included under the checkpoint root.
+            any_key_verifies(
+                transparency_log_pubs,
+                &checkpoint_signing_bytes(*tree_size, root),
+                checkpoint_sig,
+            ) && maxsecu_crypto::merkle::verify_inclusion(
+                &head_signing_bytes(head),
+                *index,
+                *tree_size,
+                path,
+                *root,
+            )
+        }
+    };
     if ok {
         Ok(())
     } else {
@@ -151,7 +206,8 @@ mod tests {
         assert!(verify_anchor_proof(
             &head,
             &AnchorProof::CustodianCoSig { sig },
-            &[custodian.verifying_key().to_bytes()]
+            &[custodian.verifying_key().to_bytes()],
+            &[],
         )
         .is_ok());
     }
@@ -166,7 +222,8 @@ mod tests {
             verify_anchor_proof(
                 &head,
                 &AnchorProof::CustodianCoSig { sig },
-                &[custodian.verifying_key().to_bytes()]
+                &[custodian.verifying_key().to_bytes()],
+                &[],
             ),
             Err(SinkError::BadProof)
         );
@@ -183,7 +240,8 @@ mod tests {
             verify_anchor_proof(
                 &head,
                 &AnchorProof::CustodianCoSig { sig },
-                &[other.verifying_key().to_bytes()]
+                &[other.verifying_key().to_bytes()],
+                &[],
             ),
             Err(SinkError::BadProof)
         );
@@ -201,7 +259,115 @@ mod tests {
             verify_anchor_proof(
                 &lied,
                 &AnchorProof::CustodianCoSig { sig },
-                &[custodian.verifying_key().to_bytes()]
+                &[custodian.verifying_key().to_bytes()],
+                &[],
+            ),
+            Err(SinkError::BadProof)
+        );
+    }
+
+    // ---- Transparency-log inclusion form (RFC 6962). ----
+
+    /// Build a single-leaf transparency-log tree whose only leaf is `leaf`, and
+    /// return its `(tree_size, index, root, path)`. RFC 6962: for a one-leaf tree
+    /// the root is the leaf hash `SHA256(0x00 ‖ leaf)` and the audit path is empty.
+    fn single_leaf_tree(leaf: &[u8]) -> (u64, u64, [u8; 32], Vec<[u8; 32]>) {
+        let mut m = Vec::with_capacity(1 + leaf.len());
+        m.push(0x00);
+        m.extend_from_slice(leaf);
+        (1, 0, maxsecu_crypto::sha256(&m), vec![])
+    }
+
+    #[test]
+    fn transparency_inclusion_anchor_proof_accepts() {
+        let log = SigningKey::generate();
+        let head = a_head();
+        let (tree_size, index, root, path) = single_leaf_tree(&head_signing_bytes(&head));
+        let checkpoint_sig = log.sign_raw(&checkpoint_signing_bytes(tree_size, &root));
+        assert!(verify_anchor_proof(
+            &head,
+            &AnchorProof::TransparencyInclusion {
+                checkpoint_sig,
+                tree_size,
+                root,
+                index,
+                path,
+            },
+            &[],
+            &[log.verifying_key().to_bytes()],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn forged_checkpoint_rejected() {
+        let log = SigningKey::generate();
+        let head = a_head();
+        let (tree_size, index, root, path) = single_leaf_tree(&head_signing_bytes(&head));
+        let mut checkpoint_sig = log.sign_raw(&checkpoint_signing_bytes(tree_size, &root));
+        checkpoint_sig[0] ^= 0x01;
+        assert_eq!(
+            verify_anchor_proof(
+                &head,
+                &AnchorProof::TransparencyInclusion {
+                    checkpoint_sig,
+                    tree_size,
+                    root,
+                    index,
+                    path,
+                },
+                &[],
+                &[log.verifying_key().to_bytes()],
+            ),
+            Err(SinkError::BadProof)
+        );
+    }
+
+    #[test]
+    fn transparency_proof_rejected_when_no_log_key_pinned() {
+        let log = SigningKey::generate();
+        let head = a_head();
+        let (tree_size, index, root, path) = single_leaf_tree(&head_signing_bytes(&head));
+        let checkpoint_sig = log.sign_raw(&checkpoint_signing_bytes(tree_size, &root));
+        // Even a perfectly valid proof is rejected when no log key is pinned.
+        assert_eq!(
+            verify_anchor_proof(
+                &head,
+                &AnchorProof::TransparencyInclusion {
+                    checkpoint_sig,
+                    tree_size,
+                    root,
+                    index,
+                    path,
+                },
+                &[],
+                &[],
+            ),
+            Err(SinkError::BadProof)
+        );
+    }
+
+    #[test]
+    fn transparency_proof_rejected_on_tampered_head() {
+        let log = SigningKey::generate();
+        let head = a_head();
+        let (tree_size, index, root, path) = single_leaf_tree(&head_signing_bytes(&head));
+        let checkpoint_sig = log.sign_raw(&checkpoint_signing_bytes(tree_size, &root));
+        // Server lies about the head; the inclusion no longer holds under root.
+        let mut lied = head;
+        lied.head[0] ^= 0x01;
+        assert_eq!(
+            verify_anchor_proof(
+                &lied,
+                &AnchorProof::TransparencyInclusion {
+                    checkpoint_sig,
+                    tree_size,
+                    root,
+                    index,
+                    path,
+                },
+                &[],
+                &[log.verifying_key().to_bytes()],
             ),
             Err(SinkError::BadProof)
         );
@@ -213,7 +379,7 @@ mod tests {
         sink.anchor(7, [0x5A; 32]);
         let (head, proof) = sink.fetch_head().unwrap();
         assert_eq!(head, AnchoredHead { chain_seq: 7, head: [0x5A; 32] });
-        assert!(verify_anchor_proof(&head, &proof, &[sink.custodian_pub()]).is_ok());
+        assert!(verify_anchor_proof(&head, &proof, &[sink.custodian_pub()], &[]).is_ok());
     }
 
     // ---- Cross-seam: the sink head + the server-served records compose into a
@@ -259,7 +425,7 @@ mod tests {
         let mut sink = FakeSink::new(SigningKey::generate());
         sink.anchor(2, chain.head());
         let (head, proof) = sink.fetch_head().unwrap();
-        verify_anchor_proof(&head, &proof, &[sink.custodian_pub()]).expect("head trusted");
+        verify_anchor_proof(&head, &proof, &[sink.custodian_pub()], &[]).expect("head trusted");
 
         // Full set up to the anchored head verifies.
         let full = [rec_in(&r1), rec_in(&r2)];

@@ -150,4 +150,9 @@ pub mod labels {
     /// `docs/sink-interface.md` §4) — a separate-custodian attestation over
     /// `{chain_seq, head}`, a different trust domain from D5/D6 and the server.
     pub const SINK_HEAD: &str = "MaxSecu-sink-head-v1";
+    /// A transparency log's signed checkpoint over `{tree_size, root}`
+    /// (`docs/sink-interface.md` §4, RFC 6962). Distinct from and not a prefix
+    /// of [`SINK_HEAD`]: the checkpoint attests the log *state*, while the head
+    /// co-signature attests a single `{chain_seq, head}` directly.
+    pub const SINK_CHECKPOINT: &str = "MaxSecu-sink-checkpoint-v1";
 }

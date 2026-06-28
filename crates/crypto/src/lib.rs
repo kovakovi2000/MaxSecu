@@ -14,6 +14,7 @@ mod aead;
 mod dek;
 mod hash;
 mod kdf;
+pub mod merkle;
 mod pwkdf;
 mod rng;
 mod sign;
