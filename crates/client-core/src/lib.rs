@@ -18,6 +18,7 @@ pub mod identity;
 pub mod keyblob;
 pub mod limits;
 pub mod password;
+pub mod reshare;
 pub mod revocation;
 pub mod sanitize;
 pub mod upload;
@@ -40,6 +41,7 @@ pub use version_memory::{open_and_remember, FileVersionRecord, MemoryVersionStor
 pub use upload::{
     build_upload, PlaintextStreams, SealedStreamOut, UploadBundle, UploadParams, WrapOut,
 };
+pub use reshare::{build_reshare, ReshareError, ReshareParams};
 
 // Re-export the Argon2 profiles so callers select a calibrated profile without
 // reaching into the crypto crate directly (parameters §1.1).
