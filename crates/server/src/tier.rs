@@ -188,19 +188,65 @@ pub trait ColdTier: Send + Sync {
     /// Whether a chunk is durably present, **without** fetching its bytes (a real
     /// adapter uses a metadata HEAD). Backs the `cold-ready` progress state.
     async fn has_chunk(&self, blob_ref: &str, index: u64) -> Result<bool, BlobError>;
+    /// Broker a short-lived scoped read-only [`DirectLink`] to one chunk (api.md
+    /// §9.4). The default has no link capability (`None`); tiers that can mint
+    /// scoped links override this. Must **never** embed the tier's master token.
+    async fn broker_direct_link(
+        &self,
+        _blob_ref: &str,
+        _index: u64,
+        _ttl_secs: u64,
+    ) -> Result<Option<crate::blob::DirectLink>, BlobError> {
+        Ok(None)
+    }
 }
 
-/// In-memory [`ColdTier`] fake for tests, backed by a [`MemoryBlobStore`].
-#[derive(Default)]
+/// Mint a scoped, single-blob capability link (api.md §9.4). The `master_token`
+/// only **authorizes** minting (a tier with no master can't broker); the emitted
+/// URL carries a fresh random capability, **never** the master token itself.
+fn mint_direct_link(
+    master_token: &str,
+    blob_ref: &str,
+    index: u64,
+    ttl_secs: u64,
+) -> Option<crate::blob::DirectLink> {
+    if master_token.is_empty() {
+        return None;
+    }
+    let r = maxsecu_crypto::random_array::<16>();
+    let mut cap = String::new();
+    for b in r {
+        cap.push_str(&format!("{b:02x}"));
+    }
+    Some(crate::blob::DirectLink {
+        url: format!("https://cold.invalid/scoped/{blob_ref}/{index}?cap={cap}&exp={ttl_secs}"),
+        expires_in_s: ttl_secs,
+    })
+}
+
+/// In-memory [`ColdTier`] fake for tests, backed by a [`MemoryBlobStore`]. Holds
+/// a `master_token` (a high-value availability secret in prod, §16.6) purely to
+/// prove that brokered direct links never embed it.
 pub struct MemoryColdTier {
     inner: MemoryBlobStore,
+    master_token: String,
 }
 
 impl MemoryColdTier {
     pub fn new() -> Self {
+        Self::with_master_token("memory-cold-master-token-SECRET")
+    }
+    pub fn with_master_token(token: impl Into<String>) -> Self {
         MemoryColdTier {
             inner: MemoryBlobStore::new(),
+            master_token: token.into(),
         }
+    }
+}
+
+impl Default for MemoryColdTier {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -229,18 +275,37 @@ impl ColdTier for MemoryColdTier {
     async fn has_chunk(&self, blob_ref: &str, index: u64) -> Result<bool, BlobError> {
         Ok(self.inner.get_chunk(blob_ref, index).await?.is_some())
     }
+    async fn broker_direct_link(
+        &self,
+        blob_ref: &str,
+        index: u64,
+        ttl_secs: u64,
+    ) -> Result<Option<crate::blob::DirectLink>, BlobError> {
+        if !self.has_chunk(blob_ref, index).await? {
+            return Ok(None);
+        }
+        Ok(mint_direct_link(&self.master_token, blob_ref, index, ttl_secs))
+    }
 }
 
 /// Filesystem-backed [`ColdTier`] fake (models a durable cold store on disk),
 /// backed by an [`FsBlobStore`].
 pub struct FsColdTier {
     inner: FsBlobStore,
+    master_token: String,
 }
 
 impl FsColdTier {
     pub fn new(base: impl Into<std::path::PathBuf>) -> Self {
         FsColdTier {
             inner: FsBlobStore::new(base),
+            master_token: "fs-cold-master-token-SECRET".to_owned(),
+        }
+    }
+    pub fn with_master_token(base: impl Into<std::path::PathBuf>, token: impl Into<String>) -> Self {
+        FsColdTier {
+            inner: FsBlobStore::new(base),
+            master_token: token.into(),
         }
     }
 }
@@ -269,6 +334,17 @@ impl ColdTier for FsColdTier {
     }
     async fn has_chunk(&self, blob_ref: &str, index: u64) -> Result<bool, BlobError> {
         Ok(self.inner.get_chunk(blob_ref, index).await?.is_some())
+    }
+    async fn broker_direct_link(
+        &self,
+        blob_ref: &str,
+        index: u64,
+        ttl_secs: u64,
+    ) -> Result<Option<crate::blob::DirectLink>, BlobError> {
+        if !self.has_chunk(blob_ref, index).await? {
+            return Ok(None);
+        }
+        Ok(mint_direct_link(&self.master_token, blob_ref, index, ttl_secs))
     }
 }
 
@@ -417,6 +493,16 @@ impl BlobStore for TieredBlobStore {
         }
         // 4) Absent everywhere.
         Ok(None)
+    }
+
+    async fn broker_direct_link(
+        &self,
+        blob_ref: &str,
+        index: u64,
+        ttl_secs: u64,
+    ) -> Result<Option<crate::blob::DirectLink>, BlobError> {
+        // Direct links are a cold-tier capability — the cache never brokers.
+        self.cold.broker_direct_link(blob_ref, index, ttl_secs).await
     }
 }
 
@@ -569,6 +655,35 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mxcold_{hex}"));
         cold_roundtrip(&FsColdTier::new(&dir)).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cold_tier_brokers_scoped_link_without_leaking_master_token() {
+        let master = "SUPER-SECRET-MASTER-TOKEN-xyz";
+        let cold = MemoryColdTier::with_master_token(master);
+        cold.put_chunk(REF, 0, vec![0x55; 10]).await.unwrap();
+
+        let link = cold.broker_direct_link(REF, 0, 900).await.unwrap().unwrap();
+        assert_eq!(link.expires_in_s, 900);
+        assert!(link.url.contains(REF)); // scoped to this blob
+        // The master token is NEVER embedded in the brokered URL (the §9.4 gate).
+        assert!(!link.url.contains(master));
+
+        // Absent chunk → no link (the handler maps this to 404, no oracle).
+        assert!(cold.broker_direct_link(REF, 7, 900).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn tiered_broker_delegates_to_cold_and_hides_master() {
+        let master = "another-master-secret-123";
+        let cache = Arc::new(MemoryBlobStore::new());
+        let cold = Arc::new(MemoryColdTier::with_master_token(master));
+        cold.put_chunk(REF, 0, vec![0x66; 10]).await.unwrap();
+        let tier = TieredBlobStore::new(cache, cold, 1000);
+
+        let link = tier.broker_direct_link(REF, 0, 900).await.unwrap().unwrap();
+        assert!(!link.url.contains(master));
+        assert_eq!(link.expires_in_s, 900);
     }
 
     #[tokio::test]

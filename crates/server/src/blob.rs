@@ -67,6 +67,17 @@ pub struct ChunkStatus {
     pub total_bytes: u64,
 }
 
+/// A brokered short-lived, scoped, read-only link to one blob chunk on the cold
+/// tier (api.md §9.4) so a client can fetch it directly (bandwidth optimization).
+/// The tier's **master token is never embedded** — only a freshly-minted,
+/// single-blob scoped capability that expires. The client still verifies every
+/// byte (manifest + AEAD), so a tampering link source is still caught.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectLink {
+    pub url: String,
+    pub expires_in_s: u64,
+}
+
 /// Inert ciphertext-chunk storage keyed by `(blob_ref, index)`. `Send + Sync`
 /// for sharing across axum request tasks.
 #[async_trait]
@@ -106,6 +117,21 @@ pub trait BlobStore: Send + Sync {
             fetched_bytes: b.len() as u64,
             total_bytes: b.len() as u64,
         }))
+    }
+
+    /// Broker a [`DirectLink`] to one chunk valid for `ttl_secs` (api.md §9.4).
+    /// The default — a plain local store — has no external link capability and
+    /// returns `None`. [`TieredBlobStore`] overrides this to delegate to its cold
+    /// tier. `None` also means the chunk is absent (the caller maps it to `404`).
+    ///
+    /// [`TieredBlobStore`]: crate::tier::TieredBlobStore
+    async fn broker_direct_link(
+        &self,
+        _blob_ref: &str,
+        _index: u64,
+        _ttl_secs: u64,
+    ) -> Result<Option<DirectLink>, BlobError> {
+        Ok(None)
     }
 }
 
@@ -306,6 +332,14 @@ mod tests {
     #[tokio::test]
     async fn memory_roundtrip_and_idempotency() {
         roundtrip_and_idempotency(&MemoryBlobStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn default_broker_direct_link_is_unsupported() {
+        let store = MemoryBlobStore::new();
+        store.put_chunk(REF, 0, vec![0xAA; 8]).await.unwrap();
+        // A plain local store has no external-link capability.
+        assert!(store.broker_direct_link(REF, 0, 900).await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -47,6 +47,11 @@ pub struct AppState<S: Store> {
     /// `granted_by → recipient` grant edge here; the real external sink is Phase
     /// 6 (`sink-interface.md`).
     pub audit: Arc<dyn AuditSink>,
+    /// Operator toggle for direct client↔cold-tier links (api.md §9.4, D31).
+    /// **Opt-in** — `false` means the broker endpoint returns `403
+    /// direct_disabled`. A client also forces server-proxy under Tor (D34) by not
+    /// calling it.
+    pub direct_links_enabled: bool,
 }
 
 impl<S: Store> Clone for AppState<S> {
@@ -55,6 +60,7 @@ impl<S: Store> Clone for AppState<S> {
             auth: self.auth.clone(),
             blobs: self.blobs.clone(),
             audit: self.audit.clone(),
+            direct_links_enabled: self.direct_links_enabled,
         }
     }
 }
@@ -102,8 +108,15 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
             "/v1/files/{file_id}/versions/{v}/streams/{stream_type}/chunks/{index}/status",
             get(chunk_status::<S>),
         )
+        .route(
+            "/v1/files/{file_id}/versions/{v}/streams/{stream_type}/chunks/{index}/direct-link",
+            post(direct_link::<S>),
+        )
         .with_state(state)
 }
+
+/// Direct-link TTL — short-lived, scoped, read-only (parameters.md §8, api §9.4).
+const DIRECT_LINK_TTL_S: u64 = 900;
 
 /// Uniform `429 Too Many Requests` + `Retry-After: <seconds>` for a throttled
 /// request (parameters §3). The only response shape distinct from the single
@@ -938,6 +951,71 @@ async fn chunk_status<S: Store + 'static>(
     }
 }
 
+#[derive(Serialize)]
+struct DirectLinkOut {
+    url: String,
+    expires_in_s: u64,
+}
+
+/// `POST /v1/files/{file_id}/versions/{v}/streams/{stream_type}/chunks/{index}/direct-link`
+/// — broker a short-lived scoped read-only cold-tier link (api.md §9.4, D31). The
+/// operator toggle is checked **first** so an off feature returns a uniform `403
+/// direct_disabled` with no access oracle. When on: the §8.5 access gate, then
+/// the broker — `404` if the chunk is absent or the tier has no link capability
+/// (no oracle). The tier's master token is never exposed (`server::tier`).
+async fn direct_link<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Path((file_id_hex, version, stream_type, index)): Path<(String, u64, String, u64)>,
+) -> Response {
+    if !st.direct_links_enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "code": "direct_disabled" })),
+        )
+            .into_response();
+    }
+    let (Some(file_id), Some(stype)) =
+        (hex_fixed::<16>(&file_id_hex), stream_type_code(&stream_type))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let meta = match st.auth.store().version_meta(file_id, version).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return internal_error(e),
+    };
+    let allowed = meta.owner_id == session.user_id
+        || match st
+            .auth
+            .store()
+            .get_file(file_id, VersionSelector::Specific(version), session.user_id)
+            .await
+        {
+            Ok(opt) => opt.is_some(),
+            Err(e) => return internal_error(e),
+        };
+    if !allowed {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(slot) = meta.streams.iter().find(|s| s.stream_type == stype) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match st
+        .blobs
+        .broker_direct_link(&slot.blob_ref, index, DIRECT_LINK_TTL_S)
+        .await
+    {
+        Ok(Some(link)) => Json(DirectLinkOut {
+            url: link.url,
+            expires_in_s: link.expires_in_s,
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
 #[derive(Deserialize)]
 struct GetFileQuery {
     version: Option<String>,
@@ -1330,6 +1408,7 @@ mod tests {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
         };
         let router = router(state).layer(Extension(TlsExporter(exporter)));
         (router, sk)
@@ -1501,6 +1580,7 @@ mod tests {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
         };
         router(state).layer(Extension(TlsExporter(EXPORTER)))
     }
@@ -1660,6 +1740,7 @@ mod tests {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
         })
         .layer(Extension(TlsExporter(EXPORTER)));
 
@@ -1778,9 +1859,95 @@ mod tests {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: audit.clone(),
+            direct_links_enabled: false,
         })
         .layer(Extension(TlsExporter(EXPORTER)));
         (router, admin_sk, bob_sk, audit)
+    }
+
+    /// Like [`admin_app`] but the blob store is a [`TieredBlobStore`] over a
+    /// [`MemoryColdTier`] holding `master`, with direct links **enabled** — for
+    /// the §9.4 brokering path.
+    ///
+    /// [`TieredBlobStore`]: crate::tier::TieredBlobStore
+    /// [`MemoryColdTier`]: crate::tier::MemoryColdTier
+    fn admin_app_direct(master: &'static str) -> (Router, SigningKey, SigningKey) {
+        let store = MemoryStore::new();
+        let admin_sk = SigningKey::generate();
+        store.add_user(
+            "admin",
+            UserRecord {
+                user_id: [0xAD; 16],
+                enc_pub: [0xE1; 32],
+                sig_pub: admin_sk.verifying_key().to_bytes(),
+            },
+        );
+        let bob_sk = SigningKey::generate();
+        store.add_user(
+            "bob",
+            UserRecord {
+                user_id: [0xB0; 16],
+                enc_pub: [0xE2; 32],
+                sig_pub: bob_sk.verifying_key().to_bytes(),
+            },
+        );
+        let cold = Arc::new(crate::tier::MemoryColdTier::with_master_token(master));
+        let cache = Arc::new(MemoryBlobStore::new());
+        let blobs = Arc::new(crate::tier::TieredBlobStore::new(cache, cold, 1 << 20));
+        let router = router(AppState {
+            auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+            blobs,
+            audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: true,
+        })
+        .layer(Extension(TlsExporter(EXPORTER)));
+        (router, admin_sk, bob_sk)
+    }
+
+    #[tokio::test]
+    async fn direct_link_brokers_scoped_url_without_master_and_gates_access() {
+        let master = "PROD-MASTER-TOKEN-never-leak";
+        let (router, admin_sk, bob_sk) = admin_app_direct(master);
+        let token = login(&router, "admin", &admin_sk).await;
+        let owner = [0xAD; 16];
+        let file = [0xF7u8; 16];
+
+        let (st, _) =
+            post_json_auth(&router, "/v1/files", create_file_body(file, owner), &token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        upload_declared_chunks(&router, file, 1, &token).await;
+        let (st, _) = post_json_auth(
+            &router,
+            &format!("/v1/files/{}/versions/1/finalize", hex_encode(&file)),
+            serde_json::json!({}),
+            &token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        // Broker a scoped link for content chunk 0 → 200; the master token never
+        // appears, and the TTL is the §8 value.
+        let dl_uri = format!("{}/direct-link", chunk_uri(file, 1, "content", 0));
+        let (st, body) = post_json_auth(&router, &dl_uri, serde_json::json!({}), &token).await;
+        assert_eq!(st, StatusCode::OK);
+        let url = body["url"].as_str().unwrap();
+        assert!(!url.contains(master), "master token leaked into direct link");
+        assert_eq!(body["expires_in_s"].as_u64().unwrap(), 900);
+
+        // A non-recipient gets the uniform 404 (no access oracle).
+        let bob = login(&router, "bob", &bob_sk).await;
+        let (st, _) = post_json_auth(&router, &dl_uri, serde_json::json!({}), &bob).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // An absent chunk index → 404 (no oracle).
+        let (st, _) = post_json_auth(
+            &router,
+            &format!("{}/direct-link", chunk_uri(file, 1, "content", 99)),
+            serde_json::json!({}),
+            &token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
     }
 
     // Build a single-file revocation chaining to `prev_head` (server doesn't
@@ -1883,6 +2050,7 @@ mod tests {
             auth: Arc::new(AuthService::new(FaultyStore, AuthConfig::default())),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
         };
         let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
 
@@ -2125,6 +2293,18 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // Direct links are off by default (opt-in) → uniform 403 direct_disabled,
+        // short-circuited before any access check (no oracle).
+        let (st, body) = post_json_auth(
+            &router,
+            &format!("{}/direct-link", chunk_uri(file, 1, "content", 0)),
+            serde_json::json!({}),
+            &token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "direct_disabled");
 
         let (st, body) =
             get_json_auth(&router, &format!("/v1/files/{}?version=latest", hex_encode(&file)), &token).await;

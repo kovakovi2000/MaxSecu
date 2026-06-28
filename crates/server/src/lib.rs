@@ -26,7 +26,9 @@ pub mod tier;
 
 pub use auth::{AuthConfig, AuthService, Challenge, SessionToken};
 pub use audit::{AuditSink, GrantAction, GrantEdge, MemoryAuditSink, NullAuditSink};
-pub use blob::{BlobError, BlobStore, FsBlobStore, MemoryBlobStore};
+pub use blob::{
+    BlobError, BlobStore, ChunkStatus, DirectLink, FetchSource, FsBlobStore, MemoryBlobStore,
+};
 pub use error::{AuthError, ChallengeError, ControlAppendError, ProveError, StoreError};
 pub use http::{router, AppState, AuthedSession, TlsExporter};
 pub use pg::PgStore;
