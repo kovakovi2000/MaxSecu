@@ -18,9 +18,12 @@ impl UiError {
 
 impl From<maxsecu_client_core::ClientError> for UiError {
     fn from(_e: maxsecu_client_core::ClientError) -> Self {
-        // Collapse every core error to a single non-oracle shape per kind.
-        // Phase 1 only distinguishes the two the UI must act on; everything
-        // else is a generic failure (no detail leaks).
+        // Fallback `?` converter: any unmapped core error collapses to the
+        // generic fail-closed unauthorized shape, leaking no detail. There is
+        // deliberately no per-kind branching here. Call sites that need a
+        // specific code (e.g. weak_password, no_keystore, offline) must map
+        // explicitly via `UiError::new` instead of relying on `?` — otherwise a
+        // non-login error would surface to the user as "Sign-in failed."
         UiError::new("unauthorized", "Sign-in failed.")
     }
 }
