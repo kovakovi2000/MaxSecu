@@ -929,7 +929,7 @@ This system is zero-knowledge **of the server**: the server learns nothing of fi
 
 ### 16.3 Backups of the trust root
 
-- **Recovery key (D6):** breakglass, kept **cold** (offline; a written-down/sealed copy is acceptable) with a **sealed, encrypted backup in separate physical custody** (e.g., a second safe). Anyone who physically obtains the cold copy can decrypt **everything** (the escrow, §1.2/§6.3), so custody is the whole control: **tamper-evident sealing, dual-custody, access logged**, and a **Shamir / threshold split** (§19) so no single safe or person holds the whole key. Because a lone written copy is itself a single point of total compromise, the threshold split is treated as a **prioritized hardening item (Phase 7, §17), not open-ended "future work."** Plan rotation as a deliberate (expensive) re-wrap project, not an emergency.
+- **Recovery key (D6):** breakglass, kept **cold** (offline; a written-down/sealed copy is acceptable) with a **sealed, encrypted backup in separate physical custody** (e.g., a second safe). Anyone who physically obtains the cold copy can decrypt **everything** (the escrow, §1.2/§6.3), so custody is the whole control: **tamper-evident sealing, dual-custody, access logged**, and a **Shamir / threshold split** (§19) so no single safe or person holds the whole key. Because a lone written copy is itself a single point of total compromise, the threshold split is treated as a **prioritized hardening item (Phase 7, §17), not open-ended "future work."** The **GF(256) k-of-n Shamir secret-sharing primitive** that this split is built on now exists (`crypto::shamir`, Phase 7 / P7.6): any `k` of `n` custodian shares reconstruct the cold secret, any `k-1` reveal nothing; wiring it into recovery-key custody is P7.7. Plan rotation as a deliberate (expensive) re-wrap project, not an emergency.
 - **Signing key (D5):** backed up under equivalent controls; rotation in §16.4 (incl. the emergency runbook). May share D6's cold custody, but keeping them on **separate** cold devices preserves the *forge-future* vs *decrypt-all* separation (§3.1 M-5) — the status signer that used to be a second factor for forgery is removed (§7.6).
 
 ### 16.4 Key rotation procedures
@@ -1101,7 +1101,7 @@ After four review rounds, a deliberate **subtraction** pass removed machinery wh
 
 **Committed to Phase 7 (§17) — promoted out of open-ended "future work" by the second review round (D20):**
 - **Post-quantum hybrid wrap** (X25519 + ML-KEM-768), enabled by algorithm agility (§5) — closes the harvest-now-decrypt-later exposure of v1 (§15.2/§15.3).
-- **Shamir / threshold split** of the recovery key (removes the D6 single-point-of-theft/loss and the lone-cold-copy total-compromise risk, §15.3/§16.3).
+- **Shamir / threshold split** of the recovery key (removes the D6 single-point-of-theft/loss and the lone-cold-copy total-compromise risk, §15.3/§16.3). *In progress (Phase 7): the underlying GF(256) k-of-n secret-sharing primitive is implemented (`crypto::shamir`, P7.6); custody wiring is P7.7.*
 - **Key transparency log** for the directory (defends against signing-key equivocation for never-met pairs, §7.4) — now the *primary* equivocation defense, since peer pinning was removed (D14).
 
 **Still genuinely future / optional:**
