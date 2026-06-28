@@ -161,6 +161,19 @@ pub fn sink_checkpoint_signing_input(tree_size: u64, root: &[u8; 32]) -> Vec<u8>
     signing_input(labels::SINK_CHECKPOINT, &m)
 }
 
+/// The exact bytes the **directory key-transparency log** signs for a
+/// **checkpoint** (DESIGN §7.4, RFC 6962): the domain-framed, fixed-width
+/// `tree_size (8, big-endian) ‖ root (32)` under [`labels::KT_CHECKPOINT`].
+/// Identical framing to [`sink_checkpoint_signing_input`] but a DISTINCT label,
+/// so a sink-head log checkpoint can never be reinterpreted as a directory KT
+/// checkpoint (and vice versa) — the two logs are separate trust domains.
+pub fn kt_checkpoint_signing_input(tree_size: u64, root: &[u8; 32]) -> Vec<u8> {
+    let mut m = [0u8; 40];
+    m[..8].copy_from_slice(&tree_size.to_be_bytes());
+    m[8..].copy_from_slice(root);
+    signing_input(labels::KT_CHECKPOINT, &m)
+}
+
 /// Versioned domain-separation labels for every Ed25519 signature role
 /// (DESIGN §5 / encoding-spec §6). Distinct and mutually non-prefix; combined
 /// with the length-framed [`signing_input`], a signature in one role can never
@@ -183,6 +196,12 @@ pub mod labels {
     /// of [`SINK_HEAD`]: the checkpoint attests the log *state*, while the head
     /// co-signature attests a single `{chain_seq, head}` directly.
     pub const SINK_CHECKPOINT: &str = "MaxSecu-sink-checkpoint-v1";
+    /// The directory **key-transparency** log's signed checkpoint over
+    /// `{tree_size, root}` (DESIGN §7.4, RFC 6962). Distinct from and not a
+    /// prefix of [`SINK_CHECKPOINT`]: the KT log attests the state of the
+    /// *directory binding* log (the first-contact equivocation defense), a
+    /// separate trust domain from the sink-head control-log checkpoint.
+    pub const KT_CHECKPOINT: &str = "MaxSecu-kt-checkpoint-v1";
     /// A signed software-update **manifest** (DESIGN §8/D1): a pinned release key
     /// signs `version ‖ min_version ‖ artifact_sha256`. Distinct from and not a
     /// prefix of any other label, so an update signature can never be reinterpreted

@@ -98,6 +98,11 @@ pub enum VerifyError {
     /// The user is under an active account-wide (`*`) tombstone (§7.2 step 5 /
     /// §7.6) — not usable as a recipient anywhere.
     Revoked,
+    /// At FIRST CONTACT (no prior TOLU record), the binding was not provably
+    /// included in the directory key-transparency log under a checkpoint signed
+    /// by a pinned log key, or that checkpoint equivocated / rolled back (§7.4).
+    /// Only produced when a [`crate::transparency::KtContext`] gate is supplied.
+    NotInLog,
 }
 
 /// A recipient that passed the **full** §7.2 rule (binding steps 2–4 plus the
@@ -181,6 +186,46 @@ impl DirectoryVerifier {
             );
         }
         Ok(self.verified(binding, fp))
+    }
+
+    /// `verify_binding` plus an OPTIONAL first-contact key-transparency gate
+    /// (§7.4). When `kt` is `Some` AND this is first contact for the `user_id`
+    /// (no prior TOLU record), the binding's canonical bytes must additionally be
+    /// provably included in the directory KT log under a pinned, non-equivocating
+    /// checkpoint ([`crate::transparency::verify_binding_in_log`]) — else
+    /// [`VerifyError::NotInLog`] (fail closed). The KT gossip state is advanced
+    /// only when the whole binding verification succeeds.
+    ///
+    /// When `kt` is `None`, behavior is IDENTICAL to [`Self::verify_binding`]
+    /// (backward-compatible; the gate is opt-in).
+    pub fn verify_binding_with_kt(
+        &self,
+        binding: &DirBinding,
+        signature: &[u8; 64],
+        now_ms: u64,
+        trust: &mut dyn TrustStore,
+        kt: Option<crate::transparency::KtContext<'_>>,
+    ) -> Result<VerifiedBinding, VerifyError> {
+        // The KT inclusion gate applies only at FIRST CONTACT (TOFU). After a user
+        // is pinned in the directory TrustStore, §7.5 rollback/key-change rules
+        // govern; re-checking KT inclusion on every fetch is not required.
+        if let Some(kt) = kt {
+            if trust.get(&binding.user_id.0).is_none() {
+                // The KT leaf is the canonical DirBinding bytes (computed here so
+                // they cannot be mismatched against the binding being verified).
+                let leaf = maxsecu_encoding::encode(binding);
+                crate::transparency::verify_binding_in_log(
+                    &leaf,
+                    kt.inclusion,
+                    kt.checkpoint,
+                    kt.consistency,
+                    kt.log_pubs,
+                    kt.store,
+                )
+                .map_err(|_| VerifyError::NotInLog)?;
+            }
+        }
+        self.verify_binding(binding, signature, now_ms, trust)
     }
 
     /// The **full** §7.2 recipient rule: verify the binding (steps 2–4) and then
@@ -541,5 +586,84 @@ mod tests {
             v.authorize_recipient(&b, &sig, NOW, &mut MemoryTrustStore::new(), &tombstones),
             Err(VerifyError::Revoked)
         );
+    }
+
+    // ---- §7.4 first-contact key-transparency gate ----
+
+    use crate::transparency::{
+        InclusionProof, KtCheckpoint, KtContext, MemoryKtCheckpointStore,
+    };
+    use maxsecu_crypto::merkle;
+    use maxsecu_encoding::{encode, kt_checkpoint_signing_input};
+
+    #[test]
+    fn directory_first_contact_requires_kt_inclusion() {
+        let d5 = SigningKey::generate();
+        let v = verifier(&d5);
+        let log = SigningKey::generate();
+        let log_pubs = [log.verifying_key().to_bytes()];
+
+        // A KT log whose leaves are the canonical bytes of two real bindings.
+        let b_in = binding(1, 0xE1, 0x51, 1);
+        let b_out = binding(2, 0xE2, 0x52, 1);
+        let sig_in = sign(&d5, &b_in);
+        let sig_out = sign(&d5, &b_out);
+        let leaves: Vec<Vec<u8>> = vec![encode(&b_in), encode(&b_out)];
+        let tree_size = leaves.len() as u64;
+        let root = merkle::merkle_root(&leaves);
+        let cp = KtCheckpoint {
+            tree_size,
+            root,
+            sig: log.sign_raw(&kt_checkpoint_signing_input(tree_size, &root)),
+        };
+        let incl_in = InclusionProof {
+            index: 0,
+            tree_size,
+            path: merkle::inclusion_path(0, &leaves),
+        };
+
+        // With the gate configured: a binding PROVABLY in the log is accepted.
+        let mut store = MemoryKtCheckpointStore::new();
+        v.verify_binding_with_kt(
+            &b_in,
+            &sig_in,
+            NOW,
+            &mut MemoryTrustStore::new(),
+            Some(KtContext {
+                inclusion: &incl_in,
+                checkpoint: &cp,
+                consistency: &[],
+                log_pubs: &log_pubs,
+                store: &mut store,
+            }),
+        )
+        .expect("a logged binding passes the KT gate");
+
+        // With the gate configured: a first-contact binding NOT in the log (proof is
+        // for the wrong leaf) is rejected.
+        let mut store2 = MemoryKtCheckpointStore::new();
+        assert_eq!(
+            v.verify_binding_with_kt(
+                &b_out,
+                &sig_out,
+                NOW,
+                &mut MemoryTrustStore::new(),
+                Some(KtContext {
+                    inclusion: &incl_in, // proof of b_in, but we present b_out
+                    checkpoint: &cp,
+                    consistency: &[],
+                    log_pubs: &log_pubs,
+                    store: &mut store2,
+                }),
+            ),
+            Err(VerifyError::NotInLog)
+        );
+
+        // With NO gate configured: behavior is unchanged — b_out verifies and pins.
+        let mut trust = MemoryTrustStore::new();
+        assert!(v
+            .verify_binding_with_kt(&b_out, &sig_out, NOW, &mut trust, None)
+            .is_ok());
+        assert_eq!(trust.get(&[2; 16]).unwrap().key_version, 1);
     }
 }

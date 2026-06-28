@@ -25,6 +25,7 @@ pub mod rotate;
 pub mod sandbox;
 pub mod sanitize;
 pub mod sink;
+pub mod transparency;
 pub mod update;
 pub mod upload;
 pub mod version_memory;
@@ -52,6 +53,10 @@ pub use revocation::{ControlRecordIn, IssuerInfo, TombstoneError, TombstoneSet};
 pub use sink::{verify_anchor_proof, AnchorProof, AnchoredHead, FakeSink, SinkClient, SinkError};
 #[cfg(feature = "net")]
 pub use sink::{confirm_anchored, HttpSinkClient};
+pub use transparency::{
+    verify_binding_in_log, InclusionProof, KtCheckpoint, KtCheckpointStore, KtContext, KtError,
+    MemoryKtCheckpointStore,
+};
 pub use sanitize::{safe_export_path, sanitize_filename, SanitizeError};
 pub use update::{verify_update, LogInclusion, UpdateError, UpdateManifest, Verified};
 pub use identity::Identity;
