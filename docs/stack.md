@@ -168,6 +168,8 @@ Large ciphertext blobs (the chunked `content`/`thumbnail`/`preview` streams) are
 
 Client-side, **before** encryption, **per file, no shared dictionary**: `zstd` for text/blog bodies; **skip** already-compressed media (transcoded video, JPEG). The chosen algorithm id rides **inside the signed manifest** (per stream) so it is authenticated. Accept the static size side-channel (folded into the disclosed size residual, `DESIGN.md` §13/§15.2); optional padding/bucketing is the future mitigation.
 
+> **Codec status (Phase 3): DEFERRED — manifest wired to `none`.** The per-stream `compression` id is plumbed through the signed manifest end-to-end, but the only value emitted today is `none` (the downloader rejects a `zstd` stream as `CompressionUnsupported`). Reason: there is **no mature pure-Rust zstd *encoder*** — `ruzstd` (0.8.x) is **decode-only**, and the pure-Rust encoders (`rust-zstd` 0.1.0, `zstd-pure-rs` 0.1.2, `structured-zstd` 0.0.x) are brand-new and unvetted. The mainstream `zstd` crate is a **C** (`libzstd`/`zstd-sys`+`cc`) binding, which would breach the no-C posture that keeps the client TCB pure-Rust beside the single deliberate `aws-lc-rs` carve-out (§1.3 / `deny.toml` bans `ring`/`openssl`). Because compression is **security-irrelevant** here (only the authenticated algorithm id matters; decompression is deterministic regardless of compressor effort, `parameters.md` §1.4), deferring costs only space, not confidentiality/integrity. **Revisit** when a vetted pure-Rust zstd encoder is available, or on an explicit decision to accept a documented C-`libzstd` carve-out.
+
 ---
 
 ## 3. What v1 does *not* build (deferred)
