@@ -18,6 +18,7 @@ pub mod keyblob;
 pub mod limits;
 pub mod password;
 pub mod revocation;
+pub mod sanitize;
 pub mod upload;
 pub mod version_memory;
 
@@ -31,6 +32,7 @@ pub use download::{
 };
 pub use error::{ClientError, DownloadError, PasswordError, UploadError};
 pub use revocation::{TombstoneError, TombstoneSet};
+pub use sanitize::{safe_export_path, sanitize_filename, SanitizeError};
 pub use identity::Identity;
 pub use version_memory::{open_and_remember, FileVersionRecord, MemoryVersionStore, VersionStore};
 pub use upload::{
