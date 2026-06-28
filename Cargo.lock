@@ -1236,6 +1236,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxsecu-sink-server"
+version = "0.0.0"
+dependencies = [
+ "maxsecu-admin-core",
+ "maxsecu-client-core",
+ "maxsecu-crypto",
+ "maxsecu-encoding",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

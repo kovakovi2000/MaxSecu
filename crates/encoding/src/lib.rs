@@ -133,6 +133,30 @@ pub fn signing_message<T: Canonical>(label: &str, v: &T) -> Vec<u8> {
     signing_input(label, &encode(v))
 }
 
+/// The exact bytes signed for an external-sink **anchored head**
+/// (`docs/sink-interface.md` §4): the domain-framed, fixed-width
+/// `chain_seq (8, big-endian) ‖ head (32)` under [`labels::SINK_HEAD`]. This is
+/// the SINGLE source of truth for the head signing bytes — the client verifier
+/// hashes these (the transparency-proof leaf value) and the sink signs these
+/// (custodian co-signature), so the two must construct them identically.
+pub fn sink_head_signing_input(chain_seq: u64, head: &[u8; 32]) -> Vec<u8> {
+    let mut m = [0u8; 40];
+    m[..8].copy_from_slice(&chain_seq.to_be_bytes());
+    m[8..].copy_from_slice(head);
+    signing_input(labels::SINK_HEAD, &m)
+}
+
+/// The exact bytes a transparency log signs for a **checkpoint**
+/// (`docs/sink-interface.md` §4, RFC 6962): the domain-framed, fixed-width
+/// `tree_size (8, big-endian) ‖ root (32)` under [`labels::SINK_CHECKPOINT`].
+/// Mirrors [`sink_head_signing_input`] under the distinct checkpoint label.
+pub fn sink_checkpoint_signing_input(tree_size: u64, root: &[u8; 32]) -> Vec<u8> {
+    let mut m = [0u8; 40];
+    m[..8].copy_from_slice(&tree_size.to_be_bytes());
+    m[8..].copy_from_slice(root);
+    signing_input(labels::SINK_CHECKPOINT, &m)
+}
+
 /// Versioned domain-separation labels for every Ed25519 signature role
 /// (DESIGN §5 / encoding-spec §6). Distinct and mutually non-prefix; combined
 /// with the length-framed [`signing_input`], a signature in one role can never

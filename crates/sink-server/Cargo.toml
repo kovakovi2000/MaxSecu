@@ -1,0 +1,25 @@
+[package]
+name = "maxsecu-sink-server"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "MaxSecu external sink service core (DESIGN.md §7.6/§16.5, docs/sink-interface.md, Phase 6 P6.3)."
+
+# The in-repo realization of the Phase-5 abstract sink seam: an append-only,
+# hash-chained control-log store that recomputes the head EXACTLY as clients do,
+# plus an anchorer that emits both anchor-proof forms (custodian co-signature +
+# RFC 6962 transparency-log inclusion) the client verifier accepts. PURE CORE —
+# no HTTP (a later increment wraps this). Non-dev deps are encoding + crypto only.
+[lib]
+
+[dependencies]
+maxsecu-encoding = { path = "../encoding" }
+maxsecu-crypto = { path = "../crypto" }
+
+[dev-dependencies]
+maxsecu-client-core = { path = "../client-core" }
+maxsecu-admin-core = { path = "../admin-core" }
+
+[lints.rust]
+unsafe_code = "forbid"

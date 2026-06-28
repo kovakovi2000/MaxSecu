@@ -13,7 +13,7 @@
 //! form are a Phase-6 ops item; the proof allowlist is built to admit them.
 
 use maxsecu_crypto::{SigningKey, VerifyingKey};
-use maxsecu_encoding::{labels, signing_input};
+use maxsecu_encoding::{sink_checkpoint_signing_input, sink_head_signing_input};
 
 /// The tuple the sink attests (`sink-interface.md` §2): the chain length and its
 /// head. `chain_seq` pins an exact length (so a withheld tail is a short chain →
@@ -62,23 +62,18 @@ pub enum SinkError {
 }
 
 /// The exact bytes a custodian signs for a head: the domain-framed, fixed-width
-/// `chain_seq (8, big-endian) ‖ head (32)`. Both fields are fixed width, so the
-/// concatenation is unambiguous; [`signing_input`] length-frames the label.
+/// `chain_seq (8, big-endian) ‖ head (32)`. Delegates to the single source of
+/// truth in `maxsecu-encoding` so the sink that PRODUCES proofs and this verifier
+/// construct identical bytes.
 fn head_signing_bytes(h: &AnchoredHead) -> Vec<u8> {
-    let mut m = [0u8; 40];
-    m[..8].copy_from_slice(&h.chain_seq.to_be_bytes());
-    m[8..].copy_from_slice(&h.head);
-    signing_input(labels::SINK_HEAD, &m)
+    sink_head_signing_input(h.chain_seq, &h.head)
 }
 
 /// The exact bytes a transparency log signs for a checkpoint: the domain-framed,
-/// fixed-width `tree_size (8, big-endian) ‖ root (32)`. Mirrors
-/// [`head_signing_bytes`] but under the distinct [`labels::SINK_CHECKPOINT`].
+/// fixed-width `tree_size (8, big-endian) ‖ root (32)`. Delegates to the single
+/// source of truth in `maxsecu-encoding` (mirrors [`head_signing_bytes`]).
 fn checkpoint_signing_bytes(tree_size: u64, root: &[u8; 32]) -> Vec<u8> {
-    let mut m = [0u8; 40];
-    m[..8].copy_from_slice(&tree_size.to_be_bytes());
-    m[8..].copy_from_slice(root);
-    signing_input(labels::SINK_CHECKPOINT, &m)
+    sink_checkpoint_signing_input(tree_size, root)
 }
 
 /// Does any allowlisted key strictly verify `sig` over `msg`?

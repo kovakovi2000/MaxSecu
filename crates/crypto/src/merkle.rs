@@ -28,6 +28,54 @@ fn node_hash(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
     sha256(&m)
 }
 
+/// RFC 6962 §2.1 **Merkle Tree Hash** over the raw leaf values `leaves`. The
+/// empty tree hashes to `SHA256(&[])`; a one-leaf tree to that leaf's
+/// [`leaf_hash`]; otherwise the tree splits at the largest power of two strictly
+/// below `n` and combines the two subtree roots with [`node_hash`]. This is the
+/// prover-side counterpart to [`verify_inclusion`] (a generated `root`/path
+/// round-trips through it).
+pub fn merkle_root(leaves: &[Vec<u8>]) -> [u8; 32] {
+    match leaves.len() {
+        0 => sha256(&[]),
+        1 => leaf_hash(&leaves[0]),
+        n => {
+            let k = largest_pow2_below(n);
+            node_hash(&merkle_root(&leaves[..k]), &merkle_root(&leaves[k..]))
+        }
+    }
+}
+
+/// RFC 6962 §2.1.1 **audit path** (inclusion proof) for the `index`-th leaf of
+/// the `leaves.len()`-leaf tree, bottom-up — exactly the `path` that
+/// [`verify_inclusion`] consumes. A single-leaf (or empty) tree yields an empty
+/// path. Panics on `index >= leaves.len()` (a caller bug, never network input).
+pub fn inclusion_path(index: usize, leaves: &[Vec<u8>]) -> Vec<[u8; 32]> {
+    assert!(index < leaves.len(), "leaf index out of range");
+    let n = leaves.len();
+    if n <= 1 {
+        return vec![];
+    }
+    let k = largest_pow2_below(n);
+    if index < k {
+        let mut p = inclusion_path(index, &leaves[..k]);
+        p.push(merkle_root(&leaves[k..]));
+        p
+    } else {
+        let mut p = inclusion_path(index - k, &leaves[k..]);
+        p.push(merkle_root(&leaves[..k]));
+        p
+    }
+}
+
+/// Largest power of two strictly less than `n` (RFC 6962 split point; `n > 1`).
+fn largest_pow2_below(n: usize) -> usize {
+    let mut k = 1;
+    while k << 1 < n {
+        k <<= 1;
+    }
+    k
+}
+
 /// Verify an RFC 6962 inclusion proof: that `leaf` (raw leaf value, hashed here)
 /// is the `index`-th leaf of a tree of `tree_size` leaves whose Merkle root is
 /// `root`, given the audit `path`. Returns `true` only on an exact root match.
@@ -75,59 +123,40 @@ pub fn verify_inclusion(
 mod tests {
     use super::*;
 
-    // ---- Reference RFC 6962 tree built independently in the test, so the
-    // verifier is checked against a from-scratch Merkle Tree Hash + audit path. ----
-
-    /// RFC 6962 §2.1 Merkle Tree Hash over leaf values `d`.
-    fn mth(d: &[Vec<u8>]) -> [u8; 32] {
-        match d.len() {
-            0 => sha256(&[]),
-            1 => leaf_hash(&d[0]),
-            n => {
-                let k = largest_pow2_below(n);
-                node_hash(&mth(&d[..k]), &mth(&d[k..]))
-            }
-        }
-    }
-
-    /// RFC 6962 §2.1.1 audit path for leaf `m` of the `d.len()`-leaf tree.
-    fn audit_path(m: usize, d: &[Vec<u8>]) -> Vec<[u8; 32]> {
-        let n = d.len();
-        if n <= 1 {
-            return vec![];
-        }
-        let k = largest_pow2_below(n);
-        if m < k {
-            let mut p = audit_path(m, &d[..k]);
-            p.push(mth(&d[k..]));
-            p
-        } else {
-            let mut p = audit_path(m - k, &d[k..]);
-            p.push(mth(&d[..k]));
-            p
-        }
-    }
-
-    /// Largest power of two strictly less than `n` (RFC 6962 split point; `n>1`).
-    fn largest_pow2_below(n: usize) -> usize {
-        let mut k = 1;
-        while k << 1 < n {
-            k <<= 1;
-        }
-        k
-    }
+    // ---- The prover side (`merkle_root`/`inclusion_path`) is the single
+    // implementation; tests check the verifier against proofs it generates. ----
 
     fn leaves(n: usize) -> Vec<Vec<u8>> {
         (0..n).map(|i| format!("leaf-{i}").into_bytes()).collect()
     }
 
     #[test]
+    fn generated_proof_round_trips() {
+        // Every leaf of a 5-leaf tree (an unbalanced size that exercises the
+        // odd-node split): the `root`/`path` the prover emits verify.
+        let d = leaves(5);
+        let root = merkle_root(&d);
+        for (i, leaf) in d.iter().enumerate() {
+            let path = inclusion_path(i, &d);
+            assert!(
+                verify_inclusion(leaf, i as u64, d.len() as u64, &path, root),
+                "leaf {i} should verify"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_tree_root_is_sha256_of_nothing() {
+        assert_eq!(merkle_root(&[]), sha256(&[]));
+    }
+
+    #[test]
     fn inclusion_verifies() {
         // A 5-leaf tree (an unbalanced size that exercises the odd-node split).
         let d = leaves(5);
-        let root = mth(&d);
+        let root = merkle_root(&d);
         for (i, leaf) in d.iter().enumerate() {
-            let path = audit_path(i, &d);
+            let path = inclusion_path(i, &d);
             assert!(
                 verify_inclusion(leaf, i as u64, d.len() as u64, &path, root),
                 "leaf {i} should verify"
@@ -138,16 +167,16 @@ mod tests {
     #[test]
     fn single_leaf_tree_has_empty_path() {
         let d = leaves(1);
-        let root = mth(&d);
+        let root = merkle_root(&d);
         assert!(verify_inclusion(&d[0], 0, 1, &[], root));
     }
 
     #[test]
     fn tampered_leaf_or_path_rejected() {
         let d = leaves(5);
-        let root = mth(&d);
+        let root = merkle_root(&d);
         let idx = 2usize;
-        let path = audit_path(idx, &d);
+        let path = inclusion_path(idx, &d);
 
         // Baseline: the honest proof verifies.
         assert!(verify_inclusion(&d[idx], idx as u64, 5, &path, root));
