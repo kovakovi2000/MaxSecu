@@ -5,7 +5,8 @@ use maxsecu_client_core::auth::build_login_proof;
 use maxsecu_client_core::Identity;
 use crate::error::UiError;
 
-/// Build the base64 proof the client posts to /v1/session/proof.
+/// Build the channel-bound Ed25519 login proof (raw 64-byte signature) the
+/// client base64-encodes and posts to /v1/session/proof in Task 8.
 pub fn make_proof(
     id: &Identity,
     server_id: &str,
