@@ -70,6 +70,7 @@ impl<S: Store> Clone for AppState<S> {
 pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
     Router::new()
         .route("/v1/users", post(register::<S>))
+        .route("/v1/bootstrap", post(bootstrap_register::<S>))
         .route("/v1/session/challenge", post(challenge::<S>))
         .route("/v1/session/proof", post(prove::<S>))
         .route("/v1/session/logout", post(logout::<S>))
@@ -221,6 +222,59 @@ async fn register<S: Store>(
         )),
         Ok(None) => Err(StatusCode::CONFLICT), // username taken
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+// ---- POST /v1/bootstrap — first-run glass-break register (§4.2) ----
+
+#[derive(Deserialize)]
+struct BootstrapReq {
+    username: String,
+    enc_pub_b64: String,
+    sig_pub_b64: String,
+    bootstrap_secret: String,
+}
+
+/// `POST /v1/bootstrap` — first-run glass-break / first-admin registration (§4.2).
+/// Valid ONLY while the bootstrap window is open (no published binding) and the
+/// bootstrap secret matches. Creates the user; **never** confers admin — admin
+/// arrives only when the offline ceremony D5-signs the binding (D-K).
+async fn bootstrap_register<S: Store>(
+    State(st): State<AppState<S>>,
+    Json(req): Json<BootstrapReq>,
+) -> Response {
+    let Some(want) = st.auth.bootstrap_secret_hash() else {
+        return StatusCode::FORBIDDEN.into_response(); // bootstrap disabled
+    };
+    match st.auth.store().has_any_binding().await {
+        Ok(true) => return StatusCode::CONFLICT.into_response(), // bootstrap_closed
+        Ok(false) => {}
+        Err(e) => return internal_error(e),
+    }
+    if maxsecu_crypto::sha256(req.bootstrap_secret.as_bytes()) != want {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let (Some(enc_pub), Some(sig_pub)) = (
+        b64_fixed::<32>(&req.enc_pub_b64),
+        b64_fixed::<32>(&req.sig_pub_b64),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st
+        .auth
+        .store()
+        .create_user(&req.username, enc_pub, sig_pub)
+        .await
+    {
+        Ok(Some(user_id)) => (
+            StatusCode::CREATED,
+            Json(RegisterRes {
+                user_id: hex_encode(&user_id),
+            }),
+        )
+            .into_response(),
+        Ok(None) => StatusCode::CONFLICT.into_response(), // username taken
+        Err(e) => internal_error(e),
     }
 }
 
@@ -1637,6 +1691,107 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
         assert!(res["session_token"].as_str().is_some());
+    }
+
+    fn app_with_bootstrap_secret(secret: &[u8]) -> Router {
+        let store = MemoryStore::new();
+        let state = AppState {
+            auth: Arc::new(AuthService::new(
+                store,
+                AuthConfig::default().with_bootstrap_secret_hash(sha256(secret)),
+            )),
+            blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
+        };
+        router(state).layer(Extension(TlsExporter(EXPORTER)))
+    }
+
+    fn bootstrap_body(sk: &SigningKey, username: &str, secret: &str) -> serde_json::Value {
+        let (_esk, epk) = generate_enc_keypair();
+        serde_json::json!({
+            "username": username,
+            "enc_pub_b64": b64encode(&epk.to_bytes()),
+            "sig_pub_b64": b64encode(&sk.verifying_key().to_bytes()),
+            "bootstrap_secret": secret,
+        })
+    }
+
+    #[tokio::test]
+    async fn bootstrap_wrong_secret_401_right_secret_201() {
+        let router = app_with_bootstrap_secret(b"S3CRET");
+        let sk = SigningKey::generate();
+
+        // Wrong secret → 401 (no user created).
+        let (st, _) = post_json(
+            &router,
+            "/v1/bootstrap",
+            bootstrap_body(&sk, "root", "wrong"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        // Right secret → 201 with a hex-16 user_id.
+        let (st, res) = post_json(
+            &router,
+            "/v1/bootstrap",
+            bootstrap_body(&sk, "root", "S3CRET"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(res["user_id"].as_str().unwrap().len(), 32); // 16 bytes hex
+    }
+
+    #[tokio::test]
+    async fn bootstrap_closes_after_first_binding() {
+        // Seed one published binding BEFORE building the app so the window is
+        // already closed (has_any_binding only checks the map is non-empty —
+        // the bytes need not decode).
+        let store = MemoryStore::new();
+        store
+            .put_binding([0x0A; 16], 1, vec![1u8, 2, 3], [0u8; 64])
+            .await
+            .unwrap();
+        let state = AppState {
+            auth: Arc::new(AuthService::new(
+                store,
+                AuthConfig::default().with_bootstrap_secret_hash(sha256(b"S3CRET")),
+            )),
+            blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
+        };
+        let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
+
+        // Even the CORRECT secret no longer works once the ceremony published.
+        let sk = SigningKey::generate();
+        let (st, _) = post_json(
+            &router,
+            "/v1/bootstrap",
+            bootstrap_body(&sk, "root", "S3CRET"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_disabled_returns_403() {
+        // No bootstrap secret configured → the endpoint is disabled entirely.
+        let state = AppState {
+            auth: Arc::new(AuthService::new(MemoryStore::new(), AuthConfig::default())),
+            blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
+        };
+        let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
+        let sk = SigningKey::generate();
+        let (st, _) = post_json(
+            &router,
+            "/v1/bootstrap",
+            bootstrap_body(&sk, "root", "anything"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
