@@ -3,6 +3,7 @@
 mod error;
 mod dto;
 mod keystore;
+mod config;
 
 fn main() {
     tauri::Builder::default()
