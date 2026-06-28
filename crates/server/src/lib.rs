@@ -14,6 +14,7 @@ mod control;
 mod error;
 
 pub mod auth;
+pub mod files;
 pub mod http;
 pub mod pg;
 pub mod ratelimit;
