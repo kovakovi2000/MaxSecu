@@ -176,6 +176,168 @@ impl SinkClient for FakeSink {
     }
 }
 
+/// A real, pinned-TLS [`SinkClient`] over the sink's HTTP control-log surface
+/// (`sink-interface.md` §3), behind the `net` feature.
+///
+/// It fetches `GET /v1/control-log/head` over the sink's OWN pinned TLS identity
+/// (independent of the app server, §3) and parses the head + its anchor proofs.
+/// It does NOT trust the bytes — the caller validates the returned proof with
+/// [`verify_anchor_proof`]. Any transport/parse failure is [`SinkError::Unreachable`]
+/// (fail closed). The [`SinkClient`] trait is sync; the async HTTP request runs on
+/// a tiny per-call current-thread `tokio` runtime so the rest of the client stays
+/// runtime-agnostic.
+#[cfg(feature = "net")]
+pub struct HttpSinkClient {
+    addr: std::net::SocketAddr,
+    server_name: String,
+    tls: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+}
+
+#[cfg(feature = "net")]
+impl HttpSinkClient {
+    /// Build a client targeting the sink at `addr`, presenting `server_name` for
+    /// TLS verification against the pinned `tls` config (which holds the sink's
+    /// pinned root). `addr` and `server_name` are split so a loopback test can dial
+    /// an ephemeral port while still validating the cert's `localhost` SAN.
+    pub fn new(
+        addr: std::net::SocketAddr,
+        server_name: impl Into<String>,
+        tls: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+    ) -> HttpSinkClient {
+        HttpSinkClient {
+            addr,
+            server_name: server_name.into(),
+            tls,
+        }
+    }
+
+    /// `GET /v1/control-log/head`, returning the parsed head and BOTH anchor-proof
+    /// forms (custodian co-signature + transparency inclusion) so a caller can
+    /// validate the head under whichever form its allowlist pins. The bytes are
+    /// untrusted until [`verify_anchor_proof`] passes.
+    pub fn fetch_head_all_proofs(&self) -> Result<(AnchoredHead, Vec<AnchorProof>), SinkError> {
+        let body = self.get("/v1/control-log/head")?;
+        let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| SinkError::Unreachable)?;
+        parse_head_all_proofs(&v).ok_or(SinkError::Unreachable)
+    }
+
+    /// Run the blocking GET on a tiny current-thread runtime and return the raw
+    /// response body. Any failure collapses to [`SinkError::Unreachable`].
+    fn get(&self, path: &str) -> Result<Vec<u8>, SinkError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| SinkError::Unreachable)?;
+        rt.block_on(self.get_async(path))
+    }
+
+    async fn get_async(&self, path: &str) -> Result<Vec<u8>, SinkError> {
+        use http_body_util::{BodyExt, Empty};
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        use tokio_rustls::rustls::pki_types::ServerName;
+        use tokio_rustls::TlsConnector;
+
+        let tcp = tokio::net::TcpStream::connect(self.addr)
+            .await
+            .map_err(|_| SinkError::Unreachable)?;
+        let connector = TlsConnector::from(self.tls.clone());
+        let server_name = ServerName::try_from(self.server_name.clone())
+            .map_err(|_| SinkError::Unreachable)?;
+        let tls = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|_| SinkError::Unreachable)?;
+
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .map_err(|_| SinkError::Unreachable)?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("host", self.server_name.as_str())
+            .body(Empty::<Bytes>::new())
+            .map_err(|_| SinkError::Unreachable)?;
+        let resp = sender
+            .send_request(req)
+            .await
+            .map_err(|_| SinkError::Unreachable)?;
+        if !resp.status().is_success() {
+            return Err(SinkError::Unreachable);
+        }
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|_| SinkError::Unreachable)?
+            .to_bytes();
+        Ok(bytes.to_vec())
+    }
+}
+
+/// Decode a base64 string into a fixed-width byte array, or `None` on bad
+/// base64 / wrong length.
+#[cfg(feature = "net")]
+fn b64_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
+    use base64::Engine;
+    let v = base64::engine::general_purpose::STANDARD.decode(s).ok()?;
+    v.try_into().ok()
+}
+
+/// Parse the §3.1 head JSON into an [`AnchoredHead`] and BOTH anchor-proof forms.
+/// Returns `None` on any missing/ill-formed field — the caller maps that to
+/// [`SinkError::Unreachable`] (fail closed; an untrustworthy head is unusable).
+#[cfg(feature = "net")]
+fn parse_head_all_proofs(v: &serde_json::Value) -> Option<(AnchoredHead, Vec<AnchorProof>)> {
+    let chain_seq = v.get("chain_seq")?.as_u64()?;
+    let head = b64_fixed::<32>(v.get("head_b64")?.as_str()?)?;
+    let anchored = AnchoredHead { chain_seq, head };
+
+    let cosig = b64_fixed::<64>(v.get("cosig_b64")?.as_str()?)?;
+
+    let t = v.get("transparency")?;
+    let checkpoint_sig = b64_fixed::<64>(t.get("checkpoint_sig_b64")?.as_str()?)?;
+    let tree_size = t.get("tree_size")?.as_u64()?;
+    let root = b64_fixed::<32>(t.get("root_b64")?.as_str()?)?;
+    let index = t.get("index")?.as_u64()?;
+    let path = t
+        .get("path_b64")?
+        .as_array()?
+        .iter()
+        .map(|h| b64_fixed::<32>(h.as_str()?))
+        .collect::<Option<Vec<[u8; 32]>>>()?;
+
+    let proofs = vec![
+        AnchorProof::CustodianCoSig { sig: cosig },
+        AnchorProof::TransparencyInclusion {
+            checkpoint_sig,
+            tree_size,
+            root,
+            index,
+            path,
+        },
+    ];
+    Some((anchored, proofs))
+}
+
+#[cfg(feature = "net")]
+impl SinkClient for HttpSinkClient {
+    fn fetch_head(&self) -> Result<(AnchoredHead, AnchorProof), SinkError> {
+        // Parity with `FakeSink`: return the head + its custodian co-signature
+        // form. The caller validates it via `verify_anchor_proof`.
+        let (head, proofs) = self.fetch_head_all_proofs()?;
+        let cosig = proofs
+            .into_iter()
+            .find(|p| matches!(p, AnchorProof::CustodianCoSig { .. }))
+            .ok_or(SinkError::Unreachable)?;
+        Ok((head, cosig))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

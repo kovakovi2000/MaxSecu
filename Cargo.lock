@@ -1167,11 +1167,18 @@ dependencies = [
 name = "maxsecu-client-core"
 version = "0.0.0"
 dependencies = [
+ "base64",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "image",
  "maxsecu-admin-core",
  "maxsecu-crypto",
  "maxsecu-encoding",
  "proptest",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
  "zeroize",
 ]
 
@@ -1239,10 +1246,21 @@ dependencies = [
 name = "maxsecu-sink-server"
 version = "0.0.0"
 dependencies = [
+ "axum",
+ "base64",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "maxsecu-admin-core",
  "maxsecu-client-core",
  "maxsecu-crypto",
  "maxsecu-encoding",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tower",
 ]
 
 [[package]]

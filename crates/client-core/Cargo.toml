@@ -15,6 +15,30 @@ zeroize = "1" # wipe transient plaintext key material (DESIGN §8.1)
 # keeps the no-C posture; the ffmpeg video path stays behind the Transcoder
 # trait as a separate carve-out decision.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Optional `net` feature (P6.4): a real pinned-TLS HttpSinkClient for the external
+# sink (docs/sink-interface.md §3). All versions/features mirror the app server
+# (crates/server/Cargo.toml) so the workspace resolves ONE copy of each and the
+# default (no-`net`) build stays pure — no TLS stack at all. aws-lc-rs is the only
+# sanctioned provider (deny.toml bans ring/openssl).
+tokio = { version = "1", features = ["rt", "net", "io-util"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"], optional = true }
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+serde_json = { version = "1", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[features]
+# The pinned-TLS sink HTTP client. Default build pulls none of this (stays pure).
+net = [
+    "dep:tokio",
+    "dep:tokio-rustls",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:serde_json",
+    "dep:base64",
+]
 
 [dev-dependencies]
 proptest = "1"
