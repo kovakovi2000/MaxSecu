@@ -12,24 +12,42 @@
 //! downstream X25519-key check that wires this into recovery custody (P7.7).
 //!
 //! Pure, offline ceremony code (no I/O, no async). Performance is irrelevant, so
-//! GF(256) multiplication uses a carry-less (Russian-peasant) loop with a fixed
-//! iteration count rather than lookup tables — clearer and free of table-timing
-//! concerns. Random coefficients come from the OS CSPRNG (`crate::rng`), and all
-//! transient secret-bearing buffers are zeroized.
+//! GF(256) multiplication uses a carry-less (Russian-peasant) loop. It is
+//! implemented branchlessly over a fixed 8-iteration count (mask arithmetic, no
+//! data-dependent branches and no lookup tables) so that — even though one
+//! operand in `combine` is a secret share byte — the work is independent of the
+//! operand values. Random coefficients come from the OS CSPRNG (`crate::rng`),
+//! and all transient secret-bearing buffers are zeroized.
 
 use crate::rng::fill_random;
+use core::fmt;
 use zeroize::Zeroizing;
 
 /// One Shamir share: a non-zero GF(256) x-coordinate and the per-byte y-values.
 ///
 /// The `body` is itself a share (not the secret), but treat it carefully — never
 /// log it. `index` is the evaluation x-coordinate and must be `!= 0`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` deliberately elides `body` (prints only its length): in the `k == 1`
+/// degenerate case `body == secret`, so an accidental `{:?}` must not dump it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Share {
     /// The GF(256) x-coordinate this share was evaluated at (`1..=n`, non-zero).
     pub index: u8,
     /// The per-secret-byte y-values; `body.len() == secret.len()`.
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for Share {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Elide the share bytes; only structure-safe metadata is printed.
+        write!(
+            f,
+            "Share {{ index: {}, body: <{} bytes> }}",
+            self.index,
+            self.body.len()
+        )
+    }
 }
 
 /// A fail-closed Shamir error. Carries no secret material.
@@ -45,6 +63,28 @@ pub enum ShamirError {
     LengthMismatch,
 }
 
+impl fmt::Display for ShamirError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use ShamirError::*;
+        match self {
+            InsufficientShares => write!(f, "fewer than k shares supplied"),
+            DuplicateIndex => write!(f, "duplicate share index"),
+            BadThreshold => write!(f, "invalid threshold (require 1 <= k <= n)"),
+            LengthMismatch => write!(f, "shares have differing body lengths"),
+        }
+    }
+}
+
+impl std::error::Error for ShamirError {}
+
+/// The GF(256) reduction polynomial `0x11B` with its `x^8` bit dropped: the value
+/// XORed in when a left shift carries out of bit 7.
+const GF256_REDUCTION: u8 = 0x1B;
+/// The high bit (`x^7`) whose set state means the next left shift will overflow.
+const GF256_HIGH_BIT: u8 = 0x80;
+/// Exponent for the multiplicative inverse: `a^254 == a^-1` (since `a^255 == 1`).
+const GF256_INV_EXP: u32 = 254;
+
 /// GF(256) addition is XOR.
 #[inline]
 fn gf_add(a: u8, b: u8) -> u8 {
@@ -52,18 +92,20 @@ fn gf_add(a: u8, b: u8) -> u8 {
 }
 
 /// GF(256) multiplication via carry-less Russian-peasant with the `0x11B`
-/// reduction (drop the `x^8` bit, XOR `0x1B`). Fixed 8-iteration loop.
+/// reduction. Branchless over a fixed 8-iteration loop: each step's contribution
+/// is selected by mask arithmetic (`(bit).wrapping_neg()` is `0x00`/`0xFF`), so
+/// control flow is independent of the operand values — important because in
+/// `combine` one operand is a secret share byte.
 fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     let mut product: u8 = 0;
     for _ in 0..8 {
-        if b & 1 != 0 {
-            product ^= a;
-        }
-        let carry = a & 0x80;
+        // Add `a` iff the low bit of `b` is set (mask = 0xFF when set, else 0x00).
+        product ^= a & (b & 1).wrapping_neg();
+        // 1 iff the high bit (`x^7`) is set, i.e. the next shift will overflow.
+        let carry = (a & GF256_HIGH_BIT) >> 7;
         a <<= 1;
-        if carry != 0 {
-            a ^= 0x1B;
-        }
+        // Reduce iff a carry shifted out of bit 7.
+        a ^= GF256_REDUCTION & carry.wrapping_neg();
         b >>= 1;
     }
     product
@@ -87,7 +129,7 @@ fn gf_pow(a: u8, mut n: u32) -> u8 {
 /// `gf_inv(0) == 0`; callers must guarantee a non-zero argument.
 #[inline]
 fn gf_inv(a: u8) -> u8 {
-    gf_pow(a, 254)
+    gf_pow(a, GF256_INV_EXP)
 }
 
 /// Evaluate the polynomial with the given `coeffs` (low-order first) at `x`,
