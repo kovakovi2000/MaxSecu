@@ -10,6 +10,11 @@ description = "MaxSecu client core: identity, local_key_blob, login proof (DESIG
 maxsecu-encoding = { path = "../encoding" }
 maxsecu-crypto = { path = "../crypto" }
 zeroize = "1" # wipe transient plaintext key material (DESIGN §8.1)
+# Canonical image transcode + thumbnail/preview (D30, Phase 4b). Pure-Rust
+# png/jpeg only (default-features off drops gif/webp/avif and any C codec) —
+# keeps the no-C posture; the ffmpeg video path stays behind the Transcoder
+# trait as a separate carve-out decision.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
 proptest = "1"

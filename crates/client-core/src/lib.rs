@@ -17,6 +17,7 @@ pub mod download;
 pub mod identity;
 pub mod keyblob;
 pub mod limits;
+pub mod media;
 pub mod password;
 pub mod reshare;
 pub mod revocation;
@@ -34,7 +35,11 @@ pub use download::{
     OpenedHeader, OpenedStream, StreamChunks, StreamHeader, VerifyContext, NO_GRANTERS,
 };
 pub use budget::{plan_unlock, AuditEvent, UnlockPlan};
-pub use error::{ClientError, DownloadError, PasswordError, UploadError};
+pub use error::{ClientError, DownloadError, PasswordError, TranscodeError, UploadError};
+pub use media::{
+    CanonicalStreams, FfmpegVideo, MediaBounds, RustImageCodec, Transcoder, MEDIA_MAX_PIXELS,
+    PREVIEW_MAX_DIM, THUMBNAIL_MAX_DIM,
+};
 pub use revocation::{TombstoneError, TombstoneSet};
 pub use sanitize::{safe_export_path, sanitize_filename, SanitizeError};
 pub use identity::Identity;

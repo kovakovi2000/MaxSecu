@@ -56,6 +56,44 @@ impl fmt::Display for UploadError {
 
 impl std::error::Error for UploadError {}
 
+/// Errors transcoding source media to the canonical streams before encryption
+/// (DESIGN §8.1/§13/D30, Phase 4b). All fail-closed — a bad/oversized/unsupported
+/// source is rejected, never partially uploaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscodeError {
+    /// Empty source — nothing to transcode.
+    Empty,
+    /// The source could not be decoded as a supported format.
+    DecodeFailed,
+    /// The source's declared dimensions exceed the configured caps — rejected
+    /// **before** allocating frame buffers (the decompression-bomb guard,
+    /// media-sandbox §3).
+    TooLarge { width: u32, height: u32 },
+    /// Re-encoding to the canonical format failed.
+    EncodeFailed,
+    /// No transcoder is wired for this media class yet — the ffmpeg video path is
+    /// a deferred C carve-out behind the [`Transcoder`](crate::media::Transcoder)
+    /// trait (Phase 4b decision).
+    CodecUnavailable,
+}
+
+impl fmt::Display for TranscodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use TranscodeError::*;
+        match self {
+            Empty => write!(f, "empty source media"),
+            DecodeFailed => write!(f, "source media could not be decoded"),
+            TooLarge { width, height } => {
+                write!(f, "source dimensions {width}x{height} exceed caps")
+            }
+            EncodeFailed => write!(f, "canonical re-encode failed"),
+            CodecUnavailable => write!(f, "no transcoder wired for this media class"),
+        }
+    }
+}
+
+impl std::error::Error for TranscodeError {}
+
 /// Errors verifying & opening a downloaded file (DESIGN §12.5, Phase 3). Every
 /// variant means "reject and surface a sanitized error" (§12.5 step 7) — fail
 /// closed. A *missing/invalid recovery grant* is not here: per §12.5 step 5 it
