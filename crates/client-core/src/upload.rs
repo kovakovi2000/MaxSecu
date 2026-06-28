@@ -114,45 +114,9 @@ pub fn build_upload(
     // One fresh DEK per file; only ever a KDF root (L-5).
     let dek = Dek::generate();
     let dek_commit = dek.commit();
-    let frame = params.chunk_size as usize;
 
-    // Seal each present stream under its own subkey, in ascending `stream_type`
-    // order (content < metadata < thumbnail < preview) — the manifest's required
-    // ordering (encoding-spec V-13) holds by construction.
-    let mut inputs: Vec<(StreamType, &[u8])> = vec![(StreamType::Content, &streams.content)];
-    if let Some(m) = &streams.metadata {
-        inputs.push((StreamType::Metadata, m));
-    }
-    if let Some(t) = &streams.thumbnail {
-        inputs.push((StreamType::Thumbnail, t));
-    }
-    if let Some(p) = &streams.preview {
-        inputs.push((StreamType::Preview, p));
-    }
-
-    let mut manifest_streams: Vec<Stream> = Vec::with_capacity(inputs.len());
-    let mut sealed_out: Vec<SealedStreamOut> = Vec::with_capacity(inputs.len());
-    for (st, plaintext) in inputs {
-        let ck = dek.stream_subkey(st);
-        let sealed = seal_stream(&ck, params.file_id, FIRST_VERSION, st, frame, plaintext);
-        let total_bytes = sealed.chunks.iter().map(|c| c.len() as u64).sum();
-        // Phase 3: every stream uncompressed (selective compression is later).
-        manifest_streams.push(Stream {
-            stream_type: st,
-            compression: Compression::None,
-            chunk_count: sealed.chunk_count,
-            digest: Bytes32(sealed.digest),
-        });
-        sealed_out.push(SealedStreamOut {
-            stream_type: st,
-            compression: Compression::None,
-            chunk_size: params.chunk_size,
-            chunk_count: sealed.chunk_count,
-            digest: sealed.digest,
-            total_bytes,
-            chunks: sealed.chunks,
-        });
-    }
+    let (manifest_streams, sealed_out) =
+        seal_streams(&dek, params.file_id, FIRST_VERSION, params.chunk_size, streams);
 
     let signer = params.owner.signing_key();
 
@@ -182,25 +146,31 @@ pub fn build_upload(
     // standing recovery recipient. Owner-only write ⇒ no other recipients (D29).
     let owner_enc_pub = EncPublicKey::from_bytes(params.owner.enc_pub_bytes());
     let wraps = vec![
-        build_wrap(
-            params,
-            &dek,
-            dek_commit,
+        wrap_and_grant(
+            signer,
+            params.file_id,
+            FIRST_VERSION,
             params.owner_id,
             RecipientType::User,
             &owner_enc_pub,
-            Some(params.owner.enc_secret()),
-            signer,
-        )?,
-        build_wrap(
-            params,
             &dek,
             dek_commit,
+            params.owner_id,
+            params.created_at,
+            Some(params.owner.enc_secret()),
+        )?,
+        wrap_and_grant(
+            signer,
+            params.file_id,
+            FIRST_VERSION,
             RECOVERY_ID,
             RecipientType::Recovery,
             &params.recovery_pub,
+            &dek,
+            dek_commit,
+            params.owner_id,
+            params.created_at,
             None,
-            signer,
         )?,
     ];
 
@@ -216,23 +186,76 @@ pub fn build_upload(
     })
 }
 
-/// Wrap the DEK to one recipient and sign its author read-grant. When the
-/// caller holds the recipient's secret (the self wrap), the wrap is re-opened
-/// and checked against `dek_commit` — the pre-upload self-check (§12.2 step 7).
-#[allow(clippy::too_many_arguments)]
-fn build_wrap(
-    params: &UploadParams,
+/// Seal each present plaintext stream under its own DEK subkey, in ascending
+/// `stream_type` order (content < metadata < thumbnail < preview) — the
+/// manifest's required ordering (encoding-spec V-13) holds by construction.
+/// Phase 3 leaves every stream uncompressed (`Compression::None`). Shared by
+/// [`build_upload`] (version 1) and rotation (a new version under a fresh DEK).
+pub(crate) fn seal_streams(
     dek: &Dek,
-    dek_commit: [u8; 32],
+    file_id: Id,
+    version: u64,
+    chunk_size: u32,
+    streams: &PlaintextStreams,
+) -> (Vec<Stream>, Vec<SealedStreamOut>) {
+    let frame = chunk_size as usize;
+    let mut inputs: Vec<(StreamType, &[u8])> = vec![(StreamType::Content, &streams.content)];
+    if let Some(m) = &streams.metadata {
+        inputs.push((StreamType::Metadata, m));
+    }
+    if let Some(t) = &streams.thumbnail {
+        inputs.push((StreamType::Thumbnail, t));
+    }
+    if let Some(p) = &streams.preview {
+        inputs.push((StreamType::Preview, p));
+    }
+
+    let mut manifest_streams: Vec<Stream> = Vec::with_capacity(inputs.len());
+    let mut sealed_out: Vec<SealedStreamOut> = Vec::with_capacity(inputs.len());
+    for (st, plaintext) in inputs {
+        let ck = dek.stream_subkey(st);
+        let sealed = seal_stream(&ck, file_id, version, st, frame, plaintext);
+        let total_bytes = sealed.chunks.iter().map(|c| c.len() as u64).sum();
+        manifest_streams.push(Stream {
+            stream_type: st,
+            compression: Compression::None,
+            chunk_count: sealed.chunk_count,
+            digest: Bytes32(sealed.digest),
+        });
+        sealed_out.push(SealedStreamOut {
+            stream_type: st,
+            compression: Compression::None,
+            chunk_size,
+            chunk_count: sealed.chunk_count,
+            digest: sealed.digest,
+            total_bytes,
+            chunks: sealed.chunks,
+        });
+    }
+    (manifest_streams, sealed_out)
+}
+
+/// Wrap the DEK to one recipient and sign its read-grant rooted at `granted_by`
+/// for `(file_id, version)`. When the caller holds the recipient's secret (the
+/// self wrap), the wrap is re-opened and checked against `dek_commit` — the
+/// pre-upload self-check (§12.2 step 7). Shared by upload and rotation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrap_and_grant(
+    signer: &SigningKey,
+    file_id: Id,
+    version: u64,
     recipient_id: Id,
     recipient_type: RecipientType,
     recipient_pub: &EncPublicKey,
+    dek: &Dek,
+    dek_commit: [u8; 32],
+    granted_by: Id,
+    created_at: Timestamp,
     self_secret: Option<&EncSecretKey>,
-    signer: &SigningKey,
 ) -> Result<WrapOut, UploadError> {
     let ctx = WrapContext {
-        file_id: params.file_id,
-        version: FIRST_VERSION,
+        file_id,
+        version,
         recipient_id,
     };
     let wrapped_dek = wrap_dek(recipient_pub, dek, &ctx)?;
@@ -243,20 +266,20 @@ fn build_wrap(
         }
     }
     let grant = Grant {
-        file_id: params.file_id,
-        file_version: FIRST_VERSION,
+        file_id,
+        file_version: version,
         recipient_id,
         recipient_type,
         dek_commit: Bytes32(dek_commit),
-        granted_by: params.owner_id,
-        created_at: params.created_at,
+        granted_by,
+        created_at,
     };
     let grant_sig = signer.sign_canonical(labels::GRANT, &grant);
     Ok(WrapOut {
         recipient_id,
         recipient_type,
         wrapped_dek,
-        granted_by: params.owner_id,
+        granted_by,
         grant,
         grant_sig,
     })

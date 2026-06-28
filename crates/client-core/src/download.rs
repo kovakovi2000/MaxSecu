@@ -201,7 +201,17 @@ fn verify_header(
     // directly (author edge) or via re-share edges (§12.3a/§12.5).
     let grant: Grant = decode(grant_bytes).map_err(|_| BadGrant)?;
     check_grant_fields(&grant, &manifest, ctx)?;
-    verify_grant_chain(&grant, grant_sig, ancestor_grants, &manifest, ctx)?;
+    verify_grant_chain(
+        &grant,
+        grant_sig,
+        ancestor_grants,
+        manifest.file_id,
+        manifest.version,
+        manifest.dek_commit,
+        manifest.author_id,
+        &ctx.author_sig_pub,
+        ctx.granter_sig_pub,
+    )?;
 
     // (6) Recovery-grant presence — an anomaly flag, never a hard rejection.
     let recovery_grant_ok = recovery_grant_valid(
@@ -324,15 +334,20 @@ fn check_grant_fields(g: &Grant, m: &Manifest, ctx: &VerifyContext) -> Result<()
 
 /// An ancestor (re-share) grant must bind this exact file/version/DEK and grant
 /// to a `user` recipient (a re-sharer held a real wrap, §12.3a).
-fn check_ancestor_fields(g: &Grant, m: &Manifest) -> Result<(), DownloadError> {
+fn check_ancestor_fields(
+    g: &Grant,
+    file_id: Id,
+    version: u64,
+    dek_commit: maxsecu_encoding::types::Hash,
+) -> Result<(), DownloadError> {
     use DownloadError::GrantMismatch;
-    if g.file_id != m.file_id {
+    if g.file_id != file_id {
         return Err(GrantMismatch("ancestor file_id"));
     }
-    if g.file_version != m.version {
+    if g.file_version != version {
         return Err(GrantMismatch("ancestor file_version"));
     }
-    if g.dek_commit != m.dek_commit {
+    if g.dek_commit != dek_commit {
         return Err(GrantMismatch("ancestor dek_commit"));
     }
     if g.recipient_type != RecipientType::User {
@@ -341,21 +356,29 @@ fn check_ancestor_fields(g: &Grant, m: &Manifest) -> Result<(), DownloadError> {
     Ok(())
 }
 
-/// Verify the caller's leaf grant chains to the version author (§12.5 step 5):
-/// directly when `granted_by == author_id` (author edge, verified under the
-/// author's directory key), or via a re-share chain where each intermediate
-/// granter's grant is verified under that granter's **directory-verified**
-/// `sig_pub` (§7.2, resolved by `ctx.granter_sig_pub`) and the granter must
-/// itself hold a grant for this version. Both author and re-share edges entail
-/// the granter actually held the DEK, so any verified chain is
-/// possession-entailing (carry-forward-eligible, §12.9). Fail closed on a broken
-/// chain, an unknown granter key, a cycle, or a chain past the depth cap.
-fn verify_grant_chain(
+/// Verify a leaf grant chains to the version author (§12.5 step 5 / §12.9 step 2
+/// carry-forward): directly when `granted_by == author_id` (author edge,
+/// verified under the author's directory key), or via a re-share chain where
+/// each intermediate granter's grant is verified under that granter's
+/// **directory-verified** `sig_pub` (§7.2, resolved by `granter_sig_pub`) and
+/// the granter must itself hold a grant for this version. Both author and
+/// re-share edges entail the granter actually held the DEK, so any verified
+/// chain is possession-entailing (carry-forward-eligible, §12.9). Fail closed on
+/// a broken chain, an unknown granter key, a cycle, or a chain past the depth
+/// cap. Shared by the download ladder and the rotation carry-forward selection
+/// (so the two cannot drift). The leaf's own `file_id`/`version`/`dek_commit`/
+/// `recipient` are checked by the caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_grant_chain(
     leaf: &Grant,
     leaf_sig: &[u8; 64],
     ancestors: &[(Vec<u8>, [u8; 64])],
-    m: &Manifest,
-    ctx: &VerifyContext,
+    file_id: Id,
+    version: u64,
+    dek_commit: maxsecu_encoding::types::Hash,
+    author_id: Id,
+    author_sig_pub: &[u8; 32],
+    granter_sig_pub: &dyn Fn(Id) -> Option<[u8; 32]>,
 ) -> Result<(), DownloadError> {
     use DownloadError::*;
 
@@ -364,20 +387,19 @@ fn verify_grant_chain(
     let mut by_recipient: HashMap<Id, (Grant, [u8; 64])> = HashMap::new();
     for (bytes, sig) in ancestors {
         let g: Grant = decode(bytes).map_err(|_| BadGrant)?;
-        check_ancestor_fields(&g, m)?;
+        check_ancestor_fields(&g, file_id, version, dek_commit)?;
         by_recipient.insert(g.recipient_id, (g, *sig));
     }
 
-    let author = m.author_id;
     let mut visited: HashSet<Id> = HashSet::new();
     let mut current: &Grant = leaf;
     let mut current_sig: &[u8; 64] = leaf_sig;
     let mut depth = 0usize;
     loop {
         let granter = current.granted_by;
-        if granter == author {
+        if granter == author_id {
             // Author edge: the root, verified under the author's directory key.
-            if !verify(&ctx.author_sig_pub, labels::GRANT, current, current_sig) {
+            if !verify(author_sig_pub, labels::GRANT, current, current_sig) {
                 return Err(GrantSignature);
             }
             return Ok(());
@@ -386,7 +408,7 @@ fn verify_grant_chain(
         if depth >= MAX_GRANT_CHAIN_DEPTH {
             return Err(GrantChainTooDeep);
         }
-        let granter_pub = (ctx.granter_sig_pub)(granter).ok_or(GranterKeyUnknown)?;
+        let granter_pub = granter_sig_pub(granter).ok_or(GranterKeyUnknown)?;
         if !verify(&granter_pub, labels::GRANT, current, current_sig) {
             return Err(GrantSignature);
         }

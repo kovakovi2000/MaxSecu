@@ -20,6 +20,7 @@ pub mod limits;
 pub mod password;
 pub mod reshare;
 pub mod revocation;
+pub mod rotate;
 pub mod sanitize;
 pub mod upload;
 pub mod version_memory;
@@ -42,6 +43,9 @@ pub use upload::{
     build_upload, PlaintextStreams, SealedStreamOut, UploadBundle, UploadParams, WrapOut,
 };
 pub use reshare::{build_reshare, ReshareError, ReshareParams};
+pub use rotate::{
+    build_next_version, CarryForwardCandidate, RotateError, RotateParams, RotationBundle,
+};
 
 // Re-export the Argon2 profiles so callers select a calibrated profile without
 // reaching into the crypto crate directly (parameters §1.1).
