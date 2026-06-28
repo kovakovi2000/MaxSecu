@@ -13,6 +13,7 @@ description = "MaxSecu offline ceremony / signing core (DESIGN.md §7.1/§11.5/�
 [dependencies]
 maxsecu-encoding = { path = "../encoding" }
 maxsecu-crypto = { path = "../crypto" }
+zeroize = "1" # transient recovery-scalar hygiene at the offline ceremony (§16.3)
 
 [lints.rust]
 unsafe_code = "forbid"

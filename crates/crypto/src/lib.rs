@@ -18,7 +18,7 @@ mod kdf;
 pub mod merkle;
 mod pwkdf;
 mod rng;
-mod shamir;
+pub mod shamir;
 mod sign;
 mod wrap;
 
