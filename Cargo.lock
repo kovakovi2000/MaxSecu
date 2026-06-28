@@ -2377,6 +2377,8 @@ dependencies = [
  "hyper-util",
  "maxsecu-client-core",
  "maxsecu-crypto",
+ "maxsecu-encoding",
+ "maxsecu-server",
  "rcgen",
  "serde",
  "serde_json",

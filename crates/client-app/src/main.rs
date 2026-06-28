@@ -1,15 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod error;
-mod dto;
-mod config;
-mod keystore;
-mod state;
-mod transport;
-mod session;
-mod commands;
-
-use commands::auth::{AppDir, ConnectLock, Session};
+use maxsecu_client_app::commands::auth::{AppDir, ConnectLock, Session};
 
 fn main() {
     // Portable layout: keystore/config/pinned-cert live beside the exe so the
@@ -24,11 +15,11 @@ fn main() {
         .manage(Session::new())
         .manage(ConnectLock::new())
         .invoke_handler(tauri::generate_handler![
-            commands::connection::connect,
-            commands::auth::unlock_keystore,
-            commands::auth::logout,
-            commands::stubs::list_feed,
-            commands::stubs::register_glassbreak,
+            maxsecu_client_app::commands::connection::connect,
+            maxsecu_client_app::commands::auth::unlock_keystore,
+            maxsecu_client_app::commands::auth::logout,
+            maxsecu_client_app::commands::stubs::list_feed,
+            maxsecu_client_app::commands::stubs::register_glassbreak,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MaxSecu client");
