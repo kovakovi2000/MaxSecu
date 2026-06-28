@@ -55,8 +55,8 @@ pub use sink::{verify_anchor_proof, AnchorProof, AnchoredHead, FakeSink, SinkCli
 #[cfg(feature = "net")]
 pub use sink::{confirm_anchored, HttpSinkClient};
 pub use transparency::{
-    verify_binding_in_log, InclusionProof, KtCheckpoint, KtCheckpointStore, KtContext, KtError,
-    MemoryKtCheckpointStore,
+    confirm_binding_logged, verify_binding_in_log, InclusionProof, KtCheckpoint, KtCheckpointStore,
+    KtContext, KtError, MemoryKtCheckpointStore,
 };
 pub use sanitize::{safe_export_path, sanitize_filename, SanitizeError};
 pub use update::{verify_update, LogInclusion, UpdateError, UpdateManifest, Verified};

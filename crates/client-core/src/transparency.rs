@@ -176,6 +176,38 @@ pub fn verify_binding_in_log(
     Ok(())
 }
 
+/// The issuer-side **"the binding is in the KT log" confirm** (DESIGN §7.4,
+/// `docs/sink-interface.md` §8) — the directory-KT analogue of
+/// [`crate::sink::confirm_anchored`] (the §6 control-log issuer-side *anchoring*
+/// confirm). After the D5 enrollment ceremony signs a `DirBinding` and the
+/// directory publishes its canonical bytes to the KT log
+/// (`POST /v1/dir-log/bindings`), the enrollment is **not done** until the issuer
+/// confirms the binding is provably *included* under a checkpoint signed by the
+/// pinned KT log key — so a first-contact client (P7.10
+/// [`verify_binding_in_log`]) can pass its KT exit gate for the enrolled user.
+///
+/// This DELEGATES to [`verify_binding_in_log`] (the single verified path — it does
+/// NOT re-implement any verification) with an **empty consistency proof**: an
+/// issuer confirm is a fresh, one-shot establishment against the *current*
+/// checkpoint (run it with a fresh `store`), not long-lived client gossip, so TOFU
+/// pins the current checkpoint and the freshly-fetched inclusion must hold under
+/// it. Returns `Ok(())` iff the binding is provably logged; every failure is
+/// fail-closed ([`KtError`]) and means the enrollment is **not** complete.
+///
+/// If the issuer instead holds a *prior* persisted checkpoint and wants the
+/// consistency-proven advance too, call [`verify_binding_in_log`] directly with
+/// the proper `consistency` proof; this helper is the common fresh-confirm case
+/// the enrollment runbook invokes.
+pub fn confirm_binding_logged(
+    binding_bytes: &[u8],
+    inclusion: &InclusionProof,
+    checkpoint: &KtCheckpoint,
+    log_pubs: &[[u8; 32]],
+    store: &mut dyn KtCheckpointStore,
+) -> Result<(), KtError> {
+    verify_binding_in_log(binding_bytes, inclusion, checkpoint, &[], log_pubs, store)
+}
+
 /// The first-contact KT gate the caller passes to
 /// [`crate::directory::DirectoryVerifier::verify_binding_with_kt`]: the inclusion
 /// proof + signed checkpoint + consistency proof + pinned log keys + the persisted
@@ -359,6 +391,45 @@ mod tests {
                 &mut MemoryKtCheckpointStore::new(),
             ),
             Err(KtError::NotIncluded)
+        );
+    }
+
+    #[test]
+    fn confirm_binding_logged_accepts_included_and_rejects_absent() {
+        let log = SigningKey::generate();
+        let pin = [log.verifying_key().to_bytes()];
+        let leaves: Vec<Vec<u8>> = (0..4).map(leaf).collect();
+        let cp = checkpoint(&log, &leaves);
+
+        // The issuer-side confirm: a published binding (leaf 2) is provably logged
+        // under the pinned-KT checkpoint (fresh store ⇒ TOFU pins it).
+        let mut store = MemoryKtCheckpointStore::new();
+        confirm_binding_logged(&leaves[2], &inclusion(2, &leaves), &cp, &pin, &mut store)
+            .expect("a logged binding is confirmed included");
+        assert_eq!(store.latest(), Some(cp));
+
+        // A NOT-published binding fails the confirm (fail closed).
+        assert_eq!(
+            confirm_binding_logged(
+                &leaf(0xFF),
+                &inclusion(0, &leaves),
+                &cp,
+                &pin,
+                &mut MemoryKtCheckpointStore::new(),
+            ),
+            Err(KtError::NotIncluded)
+        );
+
+        // An empty KT pin set never validates the checkpoint (fail closed).
+        assert_eq!(
+            confirm_binding_logged(
+                &leaves[2],
+                &inclusion(2, &leaves),
+                &cp,
+                &[],
+                &mut MemoryKtCheckpointStore::new(),
+            ),
+            Err(KtError::BadCheckpoint)
         );
     }
 
