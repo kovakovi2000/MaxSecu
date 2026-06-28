@@ -201,6 +201,31 @@ Everything else in this file is settled. These are the **⚙ confirm** rows — 
 
 ---
 
+## 10. Monitoring / alert thresholds (`DESIGN.md` §16.5 — anomaly detection)
+
+The pure anomaly analyzer (`server::detect`) consumes the external audit-event
+stream and raises typed alerts for the §16.5 anomalies. These are the
+`Thresholds::default()` values; SIEM/dashboard forwarding is a runbook (P6.11),
+not a coded threshold. All are **⚙ confirm** — operational risk-tolerance knobs
+with conservative closed-deployment defaults.
+
+| Parameter | Default | Tradeoff direction |
+|---|---|---|
+| Auth-failure spike | **> 20** `AuthDenied` within any **60 s** sliding window | lower = catches slower brute-force, more noise from fat-fingering |
+| Re-share fan-out | **> 10** `Reshare` grants by one granter within any **1 h** sliding window | lower = flags over-sharing sooner, more false positives for power users (§14.5) |
+| Grant-by-soon-revoked | grant by `G` then `UserRevoked{G}` within **24 h** after | longer = catches slower insider clean-up, more incidental matches (§14.5) |
+| Tombstone-set gap | **always alert** (no threshold) | security-critical: a withheld tombstone below the anchored head (D22/§7.6) |
+| Missing recovery grant | **always alert** on any `VersionFinalized{recovery_present:false}` | a finalized version with no recovery clause (§12.3a) |
+| Off-ceremony directory change | a `DirectoryBindingChanged` outside **every** configured ceremony window | windows are deployment-specific; **empty by default** ⇒ every change flagged until windows are set (§12.1) |
+
+> The sliding-window rules emit **once** with the peak window count, so a sustained
+> spike is one alert, not one per event. Ceremony windows are inclusive `[start, end]`
+> epoch-ms intervals supplied per deployment (the daily enrollment ceremony, §7);
+> until populated the analyzer treats every binding change as off-ceremony, which is
+> the safe default (alert, don't silently allow).
+
+---
+
 ## Cross-references
 
 - Primitive choices & rationale: `DESIGN.md` §5; per-record bytes: `docs/encoding-spec.md`.

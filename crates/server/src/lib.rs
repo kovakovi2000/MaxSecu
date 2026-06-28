@@ -16,6 +16,7 @@ mod error;
 pub mod audit;
 pub mod auth;
 pub mod blob;
+pub mod detect;
 pub mod files;
 pub mod http;
 pub mod pg;
@@ -30,6 +31,9 @@ pub use audit::{
 };
 pub use blob::{
     BlobError, BlobStore, ChunkStatus, DirectLink, FetchSource, FsBlobStore, MemoryBlobStore,
+};
+pub use detect::{
+    analyze, Alert, AlertSink, AuditEvent, MemoryAlertSink, NullAlertSink, Thresholds,
 };
 pub use error::{AuthError, ChallengeError, ControlAppendError, ProveError, StoreError};
 pub use http::{router, AppState, AuthedSession, TlsExporter};
