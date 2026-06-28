@@ -27,7 +27,6 @@ base64 = "0.22"
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 maxsecu-server = { path = "../server" }
-maxsecu-encoding = { path = "../encoding" }
 
 [lints.rust]
 unsafe_code = "forbid"
