@@ -111,10 +111,16 @@ impl Identity {
         &self.enc_sk
     }
 
-    /// The 64-byte ML-KEM-768 decapsulation-key seed, for a PQ-enrolled identity.
-    /// Crate-internal: only the keyblob-sealing path and the (P7.5) hybrid-unwrap
-    /// path may touch it; it never leaves the crate or the device.
-    pub(crate) fn mlkem_seed(&self) -> Option<[u8; 64]> {
+    /// The 64-byte ML-KEM-768 decapsulation-key seed, for a PQ-enrolled identity
+    /// (`None` for a legacy v1-blob identity). This is the post-quantum leg of the
+    /// hybrid unwrap key: paired with [`Self::enc_secret`] it opens a `Suite::V2`
+    /// hybrid wrap on a *local* download (`VerifyContext.recipient_mlkem_seed`).
+    ///
+    /// Like [`maxsecu_crypto::EncSecretKey::expose_bytes`] (and the X25519 secret it
+    /// already reaches), this exposes secret key material: **never send this
+    /// anywhere**. It is only for the at-rest `local_key_blob` and the local hybrid
+    /// download/unwrap path; it never leaves the device.
+    pub fn mlkem_seed(&self) -> Option<[u8; 64]> {
         self.mlkem.as_ref().map(|m| *m.seed)
     }
 
