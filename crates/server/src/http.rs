@@ -78,6 +78,10 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         .route("/v1/files", get(list_files::<S>).post(create_file::<S>))
         .route("/v1/files/{file_id}", get(get_file::<S>))
         .route(
+            "/v1/files/{file_id}/recipients",
+            get(list_recipients::<S>),
+        )
+        .route(
             "/v1/files/{file_id}/wraps",
             post(add_wrap::<S>),
         )
@@ -1056,6 +1060,64 @@ async fn delete_wrap<S: Store + 'static>(
         Err(DeleteWrapError::NotAuthorized) => StatusCode::FORBIDDEN.into_response(),
         Err(DeleteWrapError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(DeleteWrapError::Store(e)) => internal_error(e),
+    }
+}
+
+#[derive(Serialize)]
+struct RecipientOut {
+    recipient_id: String,
+    granted_by: String,
+    grant_b64: String,
+    grant_sig_b64: String,
+    ancestor_grants: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct RecipientsRes {
+    recipients: Vec<RecipientOut>,
+}
+
+/// `GET /v1/files/{file_id}/recipients` — the owner reads its file's current
+/// user recipients + grant chains to drive rotation carry-forward (§12.9 step
+/// 2). Owner-only; `404` for a missing file or a non-owner caller (no oracle).
+async fn list_recipients<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Path(file_id_hex): Path<String>,
+) -> Response {
+    let Some(file_id) = hex_fixed::<16>(&file_id_hex) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st
+        .auth
+        .store()
+        .list_recipients(file_id, session.user_id)
+        .await
+    {
+        Ok(Some(rs)) => {
+            let recipients = rs
+                .iter()
+                .map(|r| RecipientOut {
+                    recipient_id: hex_encode(&r.recipient_id),
+                    granted_by: hex_encode(&r.granted_by),
+                    grant_b64: b64encode(&r.grant_bytes),
+                    grant_sig_b64: b64encode(&r.grant_sig),
+                    ancestor_grants: r
+                        .ancestor_grants
+                        .iter()
+                        .map(|(b, s)| {
+                            serde_json::json!({
+                                "grant_b64": b64encode(b),
+                                "grant_sig_b64": b64encode(s),
+                            })
+                        })
+                        .collect(),
+                })
+                .collect();
+            Json(RecipientsRes { recipients }).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => internal_error(e),
     }
 }
 
@@ -2083,6 +2145,33 @@ mod tests {
         assert_eq!(delete_auth(&router, &revoke_uri, &token).await, StatusCode::NO_CONTENT);
         let (st, _) =
             get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &bob).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn owner_lists_recipients_over_http_non_owner_404() {
+        let (router, admin_sk, bob_sk) = admin_app();
+        let owner = [0xADu8; 16];
+        let bob_id = [0xB0u8; 16];
+        let token = login(&router, "admin", &admin_sk).await;
+        let file = [0xF9u8; 16];
+        create_finalize_v1(&router, file, owner, &token).await;
+
+        // Re-share to bob, then the owner enumerates recipients (owner + bob).
+        let wraps_uri = format!("/v1/files/{}/wraps", hex_encode(&file));
+        let (st, _) = post_json_auth(&router, &wraps_uri, reshare_body(bob_id, owner), &token).await;
+        assert_eq!(st, StatusCode::CREATED);
+
+        let recips_uri = format!("/v1/files/{}/recipients", hex_encode(&file));
+        let (st, body) = get_json_auth(&router, &recips_uri, &token).await;
+        assert_eq!(st, StatusCode::OK);
+        let rs = body["recipients"].as_array().unwrap();
+        assert_eq!(rs.len(), 2); // owner self + bob (recovery excluded)
+        assert!(rs.iter().any(|r| r["recipient_id"] == hex_encode(&bob_id)));
+
+        // bob (a recipient, not the owner) cannot enumerate → 404 (no oracle).
+        let bob = login(&router, "bob", &bob_sk).await;
+        let (st, _) = get_json_auth(&router, &recips_uri, &bob).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
     }
 

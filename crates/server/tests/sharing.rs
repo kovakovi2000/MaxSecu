@@ -15,6 +15,8 @@ use maxsecu_server::{
     VersionSelector, WrapInput,
 };
 
+const W: [u8; 16] = [0x55; 16];
+
 const OWNER: [u8; 16] = [0x11; 16];
 const R: [u8; 16] = [0x22; 16];
 const V: [u8; 16] = [0x33; 16];
@@ -269,4 +271,53 @@ async fn soft_revoke_by_an_unrelated_user_is_refused() {
         store.delete_wrap(FILE, V, R).await,
         Err(DeleteWrapError::NotAuthorized)
     );
+}
+
+#[tokio::test]
+async fn owner_lists_recipients_with_chains_for_rotation() {
+    let store = MemoryStore::new();
+    // owner + recovery + R (author-rooted) + W (re-shared by R).
+    finalized_v1(
+        &store,
+        vec![
+            wrap(OWNER, 1, OWNER, 0xA0),
+            wrap(RECOVERY_ID.0, 2, OWNER, 0x5E),
+            wrap(R, 1, OWNER, 0xB0),
+            wrap(W, 1, R, 0xD0),
+        ],
+    )
+    .await;
+
+    let recips = store
+        .list_recipients(FILE, OWNER)
+        .await
+        .unwrap()
+        .expect("owner may list recipients");
+    // Three user recipients (owner, R, W); recovery is excluded.
+    assert_eq!(recips.len(), 3);
+    assert!(recips.iter().all(|r| r.recipient_id != RECOVERY_ID.0));
+
+    // W's entry carries the ancestor chain [R's grant]; R's is author-rooted.
+    let w = recips.iter().find(|r| r.recipient_id == W).unwrap();
+    assert_eq!(w.grant_bytes, vec![0xD0; 8]);
+    assert_eq!(w.ancestor_grants, vec![(vec![0xB0; 8], [0xB0; 64])]);
+    let r = recips.iter().find(|x| x.recipient_id == R).unwrap();
+    assert!(r.ancestor_grants.is_empty());
+}
+
+#[tokio::test]
+async fn non_owner_listing_recipients_is_indistinguishable_404() {
+    let store = MemoryStore::new();
+    finalized_v1(
+        &store,
+        vec![wrap(OWNER, 1, OWNER, 0xA0), wrap(RECOVERY_ID.0, 2, OWNER, 0x5E)],
+    )
+    .await;
+    // A non-owner (even a recipient) cannot enumerate recipients — None (404).
+    store
+        .add_wrap(FILE, wrap(V, 1, OWNER, 0xC0), OWNER, 2000)
+        .await
+        .unwrap();
+    assert!(store.list_recipients(FILE, V).await.unwrap().is_none());
+    assert!(store.list_recipients(FILE, STRANGER).await.unwrap().is_none());
 }

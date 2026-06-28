@@ -80,6 +80,22 @@ pub struct WrapView {
     pub ancestor_grants: Vec<(Vec<u8>, [u8; 64])>,
 }
 
+/// One **user** recipient of a file's current version, as served to the **owner**
+/// for rotation carry-forward (`GET /v1/files/{id}/recipients`, §12.9 step 2).
+/// Carries the recipient's leaf grant + its ancestor chain so the owner can
+/// re-verify the §12.5 chain before carrying it forward. The wrapped DEK is
+/// *not* included — the owner re-wraps the fresh DEK to the recipient's
+/// directory-verified `enc_pub` (resolved out of band), it does not need anyone
+/// else's ciphertext.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipientView {
+    pub recipient_id: [u8; 16],
+    pub granted_by: [u8; 16],
+    pub grant_bytes: Vec<u8>,
+    pub grant_sig: [u8; 64],
+    pub ancestor_grants: Vec<(Vec<u8>, [u8; 64])>,
+}
+
 /// One stream's framing as served (api.md §8.5 `streams[]`): enough for the
 /// client to fetch its chunks (§9). The per-stream digest is in the manifest the
 /// client already verifies, so it is not repeated here.
@@ -313,6 +329,17 @@ pub trait Store: Send + Sync {
         recipient_id: [u8; 16],
         caller_id: [u8; 16],
     ) -> Result<(), DeleteWrapError>;
+
+    /// List the **user** recipients of a file's current finalized version with
+    /// their grant chains, for the **owner** to drive rotation carry-forward
+    /// (`GET /v1/files/{id}/recipients`, §12.9 step 2). `Ok(None)` (→ 404) if the
+    /// file is absent **or** the caller is not the owner — same code, no oracle.
+    /// Excludes the recovery recipient (the owner always re-adds it).
+    async fn list_recipients(
+        &self,
+        file_id: [u8; 16],
+        caller_id: [u8; 16],
+    ) -> Result<Option<Vec<RecipientView>>, StoreError>;
 }
 
 /// Defensive cap on the server-assembled re-share ancestor chain (mirrors the
@@ -893,6 +920,41 @@ impl Store for MemoryStore {
         ver.wraps.retain(|w| w.recipient_id != recipient_id);
         Ok(())
     }
+
+    async fn list_recipients(
+        &self,
+        file_id: [u8; 16],
+        caller_id: [u8; 16],
+    ) -> Result<Option<Vec<RecipientView>>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.files.get(&file_id) else {
+            return Ok(None);
+        };
+        // Owner-only (no oracle: a non-owner is indistinguishable from missing).
+        if entry.owner_id != caller_id {
+            return Ok(None);
+        }
+        let version = entry.current_version;
+        if version == 0 {
+            return Ok(None);
+        }
+        let Some(ver) = entry.versions.get(&version) else {
+            return Ok(None);
+        };
+        let out = ver
+            .wraps
+            .iter()
+            .filter(|w| w.recipient_type == 1) // user recipients only (no recovery)
+            .map(|w| RecipientView {
+                recipient_id: w.recipient_id,
+                granted_by: w.granted_by,
+                grant_bytes: w.grant_bytes.clone(),
+                grant_sig: w.grant_sig,
+                ancestor_grants: ancestor_chain(&ver.wraps, w, entry.owner_id),
+            })
+            .collect();
+        Ok(Some(out))
+    }
 }
 
 /// A [`Store`] whose every method returns `Err(StoreError)` — used to prove the
@@ -1046,5 +1108,13 @@ impl Store for FaultyStore {
         _caller_id: [u8; 16],
     ) -> Result<(), DeleteWrapError> {
         Err(DeleteWrapError::Store(Self::fault("delete_wrap")))
+    }
+
+    async fn list_recipients(
+        &self,
+        _file_id: [u8; 16],
+        _caller_id: [u8; 16],
+    ) -> Result<Option<Vec<RecipientView>>, StoreError> {
+        Err(Self::fault("list_recipients"))
     }
 }

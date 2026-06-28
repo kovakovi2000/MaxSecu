@@ -713,6 +713,14 @@ async fn reshare_and_soft_revoke_persist_in_postgres() {
     assert_eq!(vv.my_wrap.grant_bytes, vec![0xC0; 8]);
     assert_eq!(vv.my_wrap.ancestor_grants, vec![(vec![0xB0; 8], [0xB0; 64])]);
 
+    // The owner enumerates recipients for rotation: owner + R + V, V chained to
+    // the author via R; a non-owner gets None (no oracle).
+    let recips = fresh.list_recipients(file, owner).await.unwrap().expect("owner lists");
+    assert_eq!(recips.len(), 3);
+    let vr = recips.iter().find(|r| r.recipient_id == v).unwrap();
+    assert_eq!(vr.ancestor_grants, vec![(vec![0xB0; 8], [0xB0; 64])]);
+    assert!(fresh.list_recipients(file, v).await.unwrap().is_none());
+
     // A non-holder cannot re-share (no oracle → NoAccess).
     assert_eq!(
         db.store

@@ -208,6 +208,18 @@ Returns everything a downloader needs to verify and decrypt (`DESIGN.md` §12.5)
 ```
 - The server returns **only the caller's** wrap (never another user's, never the recovery *wrap*). The client then: verifies manifest + genesis, runs the **author-entitlement check** (`author_id == genesis.owner_id`), checks freshness/rollback + tombstone completeness, verifies its grant chain, and unwraps + checks `dek_commit` (§12.5). All server-independent.
 
+### 8.5a `GET /v1/files/{file_id}/recipients` — owner recipient set (rotation, §12.9)
+The file **owner** reads the current version's **user** recipients + each one's grant chain, to drive **carry-forward** at rotation (§12.9 step 2) — necessary because a recipient may re-share onward (§12.4b) without the owner's knowledge, so the owner cannot track the set client-side. **Owner-only** (coarse caller `== genesis.owner_id`); `404` for a missing file **or** a non-owner caller — same code, **no oracle** (a non-owner cannot enumerate a file's readers). The recovery recipient is excluded (the owner always re-adds it). Wrapped DEKs are **not** returned — the owner re-wraps the fresh DEK to each recipient's directory-verified `enc_pub`.
+
+```jsonc
+// res 200
+{ "recipients": [ { "recipient_id":"…", "granted_by":"…",
+                    "grant_b64":"…", "grant_sig_b64":"…",
+                    "ancestor_grants": [ { "grant_b64":"…","grant_sig_b64":"…" }, … ] }, … ] }
+// res 404 if the file is absent or the caller is not the owner
+```
+The owner re-verifies each chain to the prior author (author/re-share edges only — possession-entailing) and drops any tombstoned or unverifiable recipient before re-wrapping `DEK'` (§12.9 step 2). The grant bytes are inert; the server cannot forge a recipient onto the carry-forward set.
+
 ### 8.6 `GET /v1/files` — listing (D35)
 `?type=video&cursor=…&limit=…`. Returns the **authenticated `file_type`** + small-stream **structure/sizes** only — never values:
 

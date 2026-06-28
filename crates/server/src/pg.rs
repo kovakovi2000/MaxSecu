@@ -36,8 +36,8 @@ use crate::files::{
     VersionSelector, WrapInput,
 };
 use crate::store::{
-    ChunkSlot, FileListEntry, FileView, SessionRecord, StoredBinding, StoredControlRecord, Store,
-    StreamView, UserRecord, VersionMeta, WrapView,
+    ancestor_chain, ChunkSlot, FileListEntry, FileView, RecipientView, SessionRecord,
+    StoredBinding, StoredControlRecord, Store, StreamView, UserRecord, VersionMeta, WrapView,
 };
 
 /// Postgres [`Store`]. Cheap to clone (the pool is an `Arc` internally).
@@ -716,7 +716,7 @@ impl Store for PgStore {
             .map_err(store_err(op))?;
         let Some(orow) = orow else { return Ok(None) };
         let owner_id: [u8; 16] = col_fixed(&orow, op, "owner_id")?;
-        let ancestor_grants = crate::store::ancestor_chain(&wraps, my, owner_id);
+        let ancestor_grants = ancestor_chain(&wraps, my, owner_id);
 
         let grow = sqlx::query(
             "SELECT genesis_bytes, genesis_sig FROM file_genesis WHERE file_id = $1",
@@ -973,6 +973,63 @@ impl Store for PgStore {
         .await
         .map_err(store_err(op))?;
         Ok(())
+    }
+
+    async fn list_recipients(
+        &self,
+        file_id: [u8; 16],
+        caller_id: [u8; 16],
+    ) -> Result<Option<Vec<RecipientView>>, StoreError> {
+        let op = "list_recipients";
+        // Owner-only; absent file or non-owner caller ⇒ None (no oracle).
+        let frow = sqlx::query("SELECT owner_id, current_version FROM files WHERE file_id = $1")
+            .bind(&file_id[..])
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_err(op))?;
+        let Some(frow) = frow else { return Ok(None) };
+        let owner_id: [u8; 16] = col_fixed(&frow, op, "owner_id")?;
+        if owner_id != caller_id {
+            return Ok(None);
+        }
+        let version: i64 = frow.get("current_version");
+        if version == 0 {
+            return Ok(None);
+        }
+        // All wraps for the current version — to assemble each recipient's chain.
+        let wrows = sqlx::query(
+            "SELECT recipient_id, recipient_type, wrapped_dek, granted_by, grant_bytes, grant_sig \
+             FROM file_key_wraps WHERE file_id = $1 AND file_version = $2",
+        )
+        .bind(&file_id[..])
+        .bind(version)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        let mut wraps: Vec<WrapInput> = Vec::with_capacity(wrows.len());
+        for r in &wrows {
+            wraps.push(WrapInput {
+                recipient_id: col_fixed(r, op, "recipient_id")?,
+                recipient_type: r.get("recipient_type"),
+                wrapped_dek: r.try_get("wrapped_dek").map_err(store_err(op))?,
+                wrap_alg: 1,
+                granted_by: col_fixed(r, op, "granted_by")?,
+                grant_bytes: r.try_get("grant_bytes").map_err(store_err(op))?,
+                grant_sig: col_fixed(r, op, "grant_sig")?,
+            });
+        }
+        let out = wraps
+            .iter()
+            .filter(|w| w.recipient_type == 1)
+            .map(|w| RecipientView {
+                recipient_id: w.recipient_id,
+                granted_by: w.granted_by,
+                grant_bytes: w.grant_bytes.clone(),
+                grant_sig: w.grant_sig,
+                ancestor_grants: ancestor_chain(&wraps, w, owner_id),
+            })
+            .collect();
+        Ok(Some(out))
     }
 }
 
