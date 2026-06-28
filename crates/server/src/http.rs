@@ -14,6 +14,7 @@ use crate::files::{
     parse_stage, AddWrapError, DeleteWrapError, FinalizeError, GenesisInput, ListFilter, StageError,
     StageInput, VersionSelector, WrapInput,
 };
+use crate::audit::{AuditSink, GrantAction, GrantEdge};
 use crate::blob::BlobStore;
 use crate::store::{FileView, Store};
 use maxsecu_encoding::structs::Manifest;
@@ -42,6 +43,10 @@ pub struct AppState<S: Store> {
     /// concrete impl (Memory for e2e, FS for the Postgres path) is chosen by the
     /// caller that builds the state.
     pub blobs: Arc<dyn BlobStore>,
+    /// The sharing-graph audit-sink seam (§16.5). Handlers emit every
+    /// `granted_by → recipient` grant edge here; the real external sink is Phase
+    /// 6 (`sink-interface.md`).
+    pub audit: Arc<dyn AuditSink>,
 }
 
 impl<S: Store> Clone for AppState<S> {
@@ -49,6 +54,7 @@ impl<S: Store> Clone for AppState<S> {
         AppState {
             auth: self.auth.clone(),
             blobs: self.blobs.clone(),
+            audit: self.audit.clone(),
         }
     }
 }
@@ -675,15 +681,36 @@ async fn stage_and_respond<S: Store>(st: &AppState<S>, input: StageInput) -> Res
         Ok(p) => p,
         Err(e) => return stage_status(e),
     };
+    // Capture the authored grant edges (upload + rotation carry-forward) before
+    // the parse is consumed; emit them to the sink on a successful stage (§16.5).
+    let edges: Vec<([u8; 16], [u8; 16])> = parsed
+        .wraps
+        .iter()
+        .map(|w| (w.granted_by, w.recipient_id))
+        .collect();
     match st.auth.store().stage_version(parsed, now_ms()).await {
-        Ok(version) => (
-            StatusCode::CREATED,
-            Json(StageRes {
-                upload_token: upload_token(&file_id, version),
-                version,
-            }),
-        )
-            .into_response(),
+        Ok(version) => {
+            let now = now_ms();
+            for (granted_by, recipient_id) in edges {
+                st.audit
+                    .record_grant_edge(GrantEdge {
+                        file_id,
+                        granted_by,
+                        recipient_id,
+                        action: GrantAction::Author,
+                        at_ms: now,
+                    })
+                    .await;
+            }
+            (
+                StatusCode::CREATED,
+                Json(StageRes {
+                    upload_token: upload_token(&file_id, version),
+                    version,
+                }),
+            )
+                .into_response()
+        }
         Err(e) => stage_status(e),
     }
 }
@@ -967,13 +994,26 @@ async fn add_wrap<S: Store + 'static>(
     let Some(wrap) = build_wraps(std::slice::from_ref(&req)).and_then(|mut v| v.pop()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let (granted_by, recipient_id) = (wrap.granted_by, wrap.recipient_id);
     match st
         .auth
         .store()
         .add_wrap(file_id, wrap, session.user_id, now_ms())
         .await
     {
-        Ok(()) => StatusCode::CREATED.into_response(),
+        Ok(()) => {
+            // §16.5: record the re-share grant edge to the (external) audit sink.
+            st.audit
+                .record_grant_edge(GrantEdge {
+                    file_id,
+                    granted_by,
+                    recipient_id,
+                    action: GrantAction::Reshare,
+                    at_ms: now_ms(),
+                })
+                .await;
+            StatusCode::CREATED.into_response()
+        }
         Err(AddWrapError::BadRequest) => StatusCode::BAD_REQUEST.into_response(),
         Err(AddWrapError::NoAccess) => StatusCode::NOT_FOUND.into_response(),
         Err(AddWrapError::Store(e)) => internal_error(e),
@@ -1000,7 +1040,19 @@ async fn delete_wrap<S: Store + 'static>(
         .delete_wrap(file_id, recipient, session.user_id)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // §16.5: record the soft-revoke edge (granted_by = the acting caller).
+            st.audit
+                .record_grant_edge(GrantEdge {
+                    file_id,
+                    granted_by: session.user_id,
+                    recipient_id: recipient,
+                    action: GrantAction::SoftRevoke,
+                    at_ms: now_ms(),
+                })
+                .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(DeleteWrapError::NotAuthorized) => StatusCode::FORBIDDEN.into_response(),
         Err(DeleteWrapError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(DeleteWrapError::Store(e)) => internal_error(e),
@@ -1148,6 +1200,7 @@ mod tests {
         let state = AppState {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
             blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
         };
         let router = router(state).layer(Extension(TlsExporter(exporter)));
         (router, sk)
@@ -1318,6 +1371,7 @@ mod tests {
         let state = AppState {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
             blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
         };
         router(state).layer(Extension(TlsExporter(EXPORTER)))
     }
@@ -1476,6 +1530,7 @@ mod tests {
         let router = router(AppState {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
             blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
         })
         .layer(Extension(TlsExporter(EXPORTER)));
 
@@ -1556,6 +1611,19 @@ mod tests {
     }
 
     fn admin_app() -> (Router, SigningKey, SigningKey) {
+        let (router, admin_sk, bob_sk, _audit) = admin_app_audited();
+        (router, admin_sk, bob_sk)
+    }
+
+    /// Like [`admin_app`] but returns a handle to the `MemoryAuditSink` so a
+    /// test can assert the grant edges the handlers emit (§16.5).
+    fn admin_app_audited() -> (
+        Router,
+        SigningKey,
+        SigningKey,
+        Arc<crate::audit::MemoryAuditSink>,
+    ) {
+        use crate::audit::MemoryAuditSink;
         let store = MemoryStore::new();
         let admin_sk = SigningKey::generate();
         store.add_user(
@@ -1576,12 +1644,14 @@ mod tests {
                 sig_pub: bob_sk.verifying_key().to_bytes(),
             },
         );
+        let audit = Arc::new(MemoryAuditSink::new());
         let router = router(AppState {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
             blobs: Arc::new(MemoryBlobStore::new()),
+            audit: audit.clone(),
         })
         .layer(Extension(TlsExporter(EXPORTER)));
-        (router, admin_sk, bob_sk)
+        (router, admin_sk, bob_sk, audit)
     }
 
     // Build a single-file revocation chaining to `prev_head` (server doesn't
@@ -1683,6 +1753,7 @@ mod tests {
         let state = AppState {
             auth: Arc::new(AuthService::new(FaultyStore, AuthConfig::default())),
             blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
         };
         let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
 
@@ -2013,6 +2084,44 @@ mod tests {
         let (st, _) =
             get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &bob).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn sharing_emits_grant_edges_to_the_audit_sink() {
+        use crate::audit::GrantAction;
+        let (router, admin_sk, bob_sk, audit) = admin_app_audited();
+        let _ = &bob_sk;
+        let owner = [0xADu8; 16];
+        let bob_id = [0xB0u8; 16];
+        let recovery = [0u8; 16];
+        let token = login(&router, "admin", &admin_sk).await;
+        let file = [0xF8u8; 16];
+        create_finalize_v1(&router, file, owner, &token).await;
+
+        // Author edges at upload: owner self + recovery, both granted_by = owner.
+        let authored = audit.edges();
+        assert!(authored.iter().any(|e| e.action == GrantAction::Author
+            && e.granted_by == owner
+            && e.recipient_id == owner));
+        assert!(authored.iter().any(|e| e.action == GrantAction::Author
+            && e.granted_by == owner
+            && e.recipient_id == recovery));
+
+        // Re-share to bob → a Reshare edge.
+        let wraps_uri = format!("/v1/files/{}/wraps", hex_encode(&file));
+        let (st, _) = post_json_auth(&router, &wraps_uri, reshare_body(bob_id, owner), &token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert!(audit.edges().iter().any(|e| e.action == GrantAction::Reshare
+            && e.file_id == file
+            && e.granted_by == owner
+            && e.recipient_id == bob_id));
+
+        // Soft-revoke bob → a SoftRevoke edge (granted_by = the acting caller).
+        let revoke_uri = format!("/v1/files/{}/wraps/{}", hex_encode(&file), hex_encode(&bob_id));
+        assert_eq!(delete_auth(&router, &revoke_uri, &token).await, StatusCode::NO_CONTENT);
+        assert!(audit.edges().iter().any(|e| e.action == GrantAction::SoftRevoke
+            && e.granted_by == owner
+            && e.recipient_id == bob_id));
     }
 
     #[tokio::test]

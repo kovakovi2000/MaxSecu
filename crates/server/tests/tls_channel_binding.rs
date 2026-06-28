@@ -73,6 +73,7 @@ fn router() -> axum::Router {
     let state = AppState {
         auth: Arc::new(AuthService::new(store, AuthConfig::default())),
         blobs: Arc::new(maxsecu_server::MemoryBlobStore::new()),
+        audit: Arc::new(maxsecu_server::NullAuditSink),
     };
     maxsecu_server::router(state)
 }

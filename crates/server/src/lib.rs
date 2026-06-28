@@ -13,6 +13,7 @@
 mod control;
 mod error;
 
+pub mod audit;
 pub mod auth;
 pub mod blob;
 pub mod files;
@@ -23,6 +24,7 @@ pub mod serve;
 pub mod store;
 
 pub use auth::{AuthConfig, AuthService, Challenge, SessionToken};
+pub use audit::{AuditSink, GrantAction, GrantEdge, MemoryAuditSink, NullAuditSink};
 pub use blob::{BlobError, BlobStore, FsBlobStore, MemoryBlobStore};
 pub use error::{AuthError, ChallengeError, ControlAppendError, ProveError, StoreError};
 pub use http::{router, AppState, AuthedSession, TlsExporter};
