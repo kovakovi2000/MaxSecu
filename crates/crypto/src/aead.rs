@@ -19,6 +19,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use maxsecu_encoding::encode;
 use maxsecu_encoding::structs::ChunkAad;
 use maxsecu_encoding::types::{Id, StreamType};
+use std::io::Read;
 
 const TAG_LEN: usize = 16;
 
@@ -136,6 +137,112 @@ pub fn open_stream(
         out.extend_from_slice(&open_chunk(ck, &aad, ct)?);
     }
     Ok(out)
+}
+
+/// Read up to `cap` bytes, looping over partial reads, so a short result
+/// reliably means end-of-input (not a small `read`).
+fn read_upto<R: Read>(r: &mut R, cap: usize) -> Result<Vec<u8>, CryptoError> {
+    let mut buf = Vec::with_capacity(cap.min(1 << 16));
+    let mut tmp = [0u8; 8192];
+    while buf.len() < cap {
+        let want = (cap - buf.len()).min(tmp.len());
+        let n = r
+            .read(&mut tmp[..want])
+            .map_err(|_| CryptoError::Framing("stream read"))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    Ok(buf)
+}
+
+/// Seal a stream **chunk-at-a-time** from a reader (DESIGN §8.1 / §12.10): reads
+/// one `chunk_size` frame, seals it, and hands the ciphertext to `emit(index,
+/// ct)` — never holding more than one frame + its ciphertext in memory, so an
+/// arbitrarily large source is processed within an O(chunk_size) budget. Returns
+/// the `(chunk_count, digest)` to commit in the manifest (identical to
+/// [`seal_stream`] for the same input). An empty source yields one empty
+/// `is_last` chunk.
+pub fn seal_stream_streaming<R, E>(
+    ck: &[u8; 32],
+    file_id: Id,
+    version: u64,
+    stream_type: StreamType,
+    chunk_size: usize,
+    reader: &mut R,
+    mut emit: E,
+) -> Result<(u64, [u8; 32]), CryptoError>
+where
+    R: Read,
+    E: FnMut(u64, &[u8]) -> Result<(), CryptoError>,
+{
+    assert!(chunk_size > 0, "chunk_size must be positive");
+    let mut tags: Vec<u8> = Vec::new();
+    let mut index = 0u64;
+    let mut cur = read_upto(reader, chunk_size)?;
+    loop {
+        // A short read already signalled EOF, so there is no following frame.
+        let next = if cur.len() < chunk_size {
+            Vec::new()
+        } else {
+            read_upto(reader, chunk_size)?
+        };
+        let is_last = next.is_empty();
+        let aad = ChunkAad {
+            file_id,
+            version,
+            stream_type,
+            chunk_index: index,
+            is_last,
+        };
+        let ct = seal_chunk(ck, &aad, &cur);
+        tags.extend_from_slice(&ct[ct.len().saturating_sub(TAG_LEN)..]);
+        emit(index, &ct)?;
+        index += 1;
+        if is_last {
+            break;
+        }
+        cur = next;
+    }
+    Ok((index, sha256(&tags)))
+}
+
+/// Open a stream **chunk-at-a-time** (DESIGN §8.1 line 361 — decrypt-while-play):
+/// for each index in `0..chunk_count`, `fetch(i)` supplies the ciphertext chunk
+/// (e.g. a lazy network GET), its AEAD tag is verified **before** the plaintext
+/// is handed to `sink`, and only one chunk of plaintext is ever in memory. The
+/// signed `chunk_count` + the `is_last` AAD catch truncation/extension; any
+/// tamper/reorder fails closed. No whole-stream plaintext is materialized.
+pub fn open_stream_streaming<Fetch, Sink>(
+    ck: &[u8; 32],
+    file_id: Id,
+    version: u64,
+    stream_type: StreamType,
+    chunk_count: u64,
+    mut fetch: Fetch,
+    mut sink: Sink,
+) -> Result<(), CryptoError>
+where
+    Fetch: FnMut(u64) -> Result<Vec<u8>, CryptoError>,
+    Sink: FnMut(&[u8]) -> Result<(), CryptoError>,
+{
+    if chunk_count == 0 {
+        return Err(CryptoError::Framing("empty stream"));
+    }
+    for i in 0..chunk_count {
+        let ct = fetch(i)?;
+        let aad = ChunkAad {
+            file_id,
+            version,
+            stream_type,
+            chunk_index: i,
+            is_last: i == chunk_count - 1,
+        };
+        let pt = open_chunk(ck, &aad, &ct)?; // verified before release to the sink
+        sink(&pt)?;
+    }
+    Ok(())
 }
 
 /// Single-shot AES-256-GCM (not chunk-framed): the on-device `local_key_blob`
@@ -319,6 +426,122 @@ mod tests {
             open_stream(&CK, FID, 2, StreamType::Content, &sealed.chunks),
             Err(CryptoError::Aead)
         );
+    }
+
+    #[test]
+    fn streaming_seal_matches_whole_buffer() {
+        let pt = body();
+        let whole = seal_stream(&CK, FID, 1, StreamType::Content, 1024, &pt);
+        let mut emitted: Vec<Vec<u8>> = Vec::new();
+        let mut cursor = std::io::Cursor::new(pt.clone());
+        let (count, digest) = seal_stream_streaming(
+            &CK,
+            FID,
+            1,
+            StreamType::Content,
+            1024,
+            &mut cursor,
+            |i, ct| {
+                assert_eq!(i as usize, emitted.len());
+                emitted.push(ct.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(count, whole.chunk_count);
+        assert_eq!(digest, whole.digest);
+        assert_eq!(emitted, whole.chunks); // deterministic counter nonce
+    }
+
+    #[test]
+    fn streaming_seal_empty_is_one_last_chunk() {
+        let whole = seal_stream(&CK, FID, 1, StreamType::Preview, 1024, &[]);
+        let mut emitted = Vec::new();
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let (count, digest) = seal_stream_streaming(
+            &CK, FID, 1, StreamType::Preview, 1024, &mut cursor,
+            |_, ct| { emitted.push(ct.to_vec()); Ok(()) },
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(digest, whole.digest);
+        assert_eq!(emitted, whole.chunks);
+    }
+
+    #[test]
+    fn streaming_open_round_trips_without_a_whole_plaintext_buffer() {
+        let pt = body();
+        let sealed = seal_stream(&CK, FID, 1, StreamType::Content, 1024, &pt);
+        // The sink only folds each frame into a running hash + a max-window check;
+        // it never concatenates the plaintext, proving streaming needs no whole buffer.
+        let mut acc_tags = Vec::new();
+        let mut max_window = 0usize;
+        open_stream_streaming(
+            &CK,
+            FID,
+            1,
+            StreamType::Content,
+            sealed.chunk_count,
+            |i| Ok(sealed.chunks[i as usize].clone()),
+            |frame| {
+                max_window = max_window.max(frame.len());
+                acc_tags.extend_from_slice(&sha256(frame));
+                Ok(())
+            },
+        )
+        .unwrap();
+        // No single observed frame ever exceeded the chunk size (O(chunk_size) RAM).
+        assert!(max_window <= 1024);
+        // The streamed bytes reconstruct the same plaintext (verified via the
+        // whole-buffer opener as an independent oracle).
+        let whole = open_stream(&CK, FID, 1, StreamType::Content, &sealed.chunks).unwrap();
+        let expected: Vec<u8> = whole.chunks(1024).flat_map(sha256).collect();
+        assert_eq!(acc_tags, expected);
+    }
+
+    #[test]
+    fn streaming_open_detects_truncation_via_chunk_count() {
+        let pt = body();
+        let sealed = seal_stream(&CK, FID, 1, StreamType::Content, 1024, &pt);
+        // Claim one fewer chunk: the chunk now at the "last" position was sealed
+        // with is_last=false, so its AAD mismatches and the open fails closed.
+        let short = sealed.chunk_count - 1;
+        let err = open_stream_streaming(
+            &CK, FID, 1, StreamType::Content, short,
+            |i| Ok(sealed.chunks[i as usize].clone()),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(err, CryptoError::Aead);
+    }
+
+    #[test]
+    fn streaming_open_rejects_a_tampered_chunk_before_release() {
+        let pt = body();
+        let sealed = seal_stream(&CK, FID, 1, StreamType::Content, 1024, &pt);
+        let mut released = 0usize;
+        let err = open_stream_streaming(
+            &CK,
+            FID,
+            1,
+            StreamType::Content,
+            sealed.chunk_count,
+            |i| {
+                let mut ct = sealed.chunks[i as usize].clone();
+                if i == 2 {
+                    ct[0] ^= 0x01; // tamper chunk 2's ciphertext
+                }
+                Ok(ct)
+            },
+            |_| {
+                released += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, CryptoError::Aead);
+        // Chunks 0 and 1 released; the tampered chunk 2 was NOT released to the sink.
+        assert_eq!(released, 2);
     }
 
     #[test]

@@ -20,7 +20,8 @@ mod sign;
 mod wrap;
 
 pub use aead::{
-    open, open_chunk, open_stream, seal, seal_chunk, seal_stream, stream_digest, SealedStream,
+    open, open_chunk, open_stream, open_stream_streaming, seal, seal_chunk, seal_stream,
+    seal_stream_streaming, stream_digest, SealedStream,
 };
 pub use dek::{fingerprint, Dek};
 pub use hash::sha256;
