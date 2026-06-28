@@ -40,16 +40,16 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
 use maxsecu_admin_core::{
-    reconstruct_recovery_key, split_recovery_key, validate_recovery_wrap, ControlChain,
-    DirectorySigner, RecoveryWrapCtx, RevokeParams,
+    reconstruct_recovery_key, split_recovery_key, validate_recovery_wrap, ControlChain, CoSign,
+    DirectorySigner, KeyCompromiseParams, RecoveryWrapCtx, RevokeParams,
 };
 use maxsecu_client_core::transparency::{
     confirm_binding_logged, verify_binding_in_log, InclusionProof, KtCheckpoint, KtCheckpointStore,
     KtError, MemoryKtCheckpointStore,
 };
 use maxsecu_client_core::{
-    build_upload, verify_and_open, DownloadBundle, Identity, PlaintextStreams, StreamChunks,
-    UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
+    build_upload, verify_and_open, CompromiseCheck, DownloadBundle, DownloadError, Identity,
+    PlaintextStreams, StreamChunks, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_crypto::{
     deserialize_hybrid_wrap, generate_enc_keypair, generate_mlkem_keypair, sha256, shamir,
@@ -63,7 +63,7 @@ use maxsecu_encoding::types::{
 use maxsecu_encoding::{encode, labels, RECOVERY_ID};
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuditSink, AuthConfig, AuthService, FsBlobStore,
-    HttpSinkPublisher, MemoryStore,
+    HttpSinkPublisher, MemoryStore, UserRecord,
 };
 use maxsecu_sink_server::{router as sink_router, serve as sink_serve, Anchorer, SinkState};
 
@@ -990,6 +990,204 @@ async fn phase7_exit_gates_over_real_tls() {
         g2,
         g1 + 2,
         "the intervening control append consumed exactly one global position"
+    );
+
+    let _ = std::fs::remove_dir_all(&blob_dir);
+}
+
+/// **R27/D28 key-compromise cutoff over the REAL sink** (DESIGN §11.7, closing the
+/// last Phase-7 add-on residual). Earlier the cutoff comparison sourced the
+/// `key_compromise` position from `MemoryAuditSink` because the sink served no
+/// control-record position route. Now the production `HttpSinkClient` reads BOTH
+/// sides of the comparison — a file's genesis anchor position AND the
+/// `key_compromise` control record's unified global position — from the real sink
+/// over TLS (P7.16/P7.17), so the whole R27 gate runs against the real sink:
+///
+///   1. owner uploads `file_before` → its genesis is anchored at sink pos `a`;
+///   2. an admin issues a `key_compromise(owner, kv=1)`, which the app server
+///      publishes to the sink at pos `b` (`b > a`);
+///   3. owner uploads `file_after` → its genesis is anchored at pos `c` (`c > b`).
+///
+/// A genesis whose anchored position **predates** the compromise (`a < b`) is
+/// honored; one that **postdates** it (`c > b`) is a backdated forgery and is
+/// rejected `GenesisAfterCompromise`, regardless of its attacker-chosen
+/// `created_at` — the position cannot be retroactively lowered.
+#[tokio::test]
+async fn r27_cutoff_over_real_sink() {
+    // ---- Stand up the external sink over loopback TLS. ----
+    let sink_pki = test_pki();
+    let sink_state = SinkState::new(
+        Anchorer::new(SigningKey::generate(), SigningKey::generate()),
+        TOKEN,
+    );
+    let sink_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = sink_listener.local_addr().unwrap();
+    tokio::spawn(sink_serve(
+        sink_listener,
+        sink_pki.server_config.clone(),
+        sink_router(sink_state),
+    ));
+
+    // ---- App server with a real HttpSinkPublisher pinned to the sink: a file
+    // create anchors its genesis there, and a control append publishes there. ----
+    // An admin (fixed id + Admin role) drives the coarse control-log gate; admin2
+    // only co-signs offline (structural dual control), never seen by the server.
+    let admin1 = Identity::generate();
+    let admin2 = Identity::generate();
+    let a1_id = [0xA1u8; 16];
+    let a2_id = [0xA2u8; 16];
+    let store = MemoryStore::new();
+    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    store.add_user(
+        "admin1",
+        UserRecord {
+            user_id: a1_id,
+            enc_pub: admin1.enc_pub_bytes(),
+            sig_pub: admin1.sig_pub_bytes(),
+        },
+    );
+    store.set_roles(a1_id, vec![Role::User, Role::Admin]);
+
+    let publisher =
+        HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
+    let blob_dir =
+        std::env::temp_dir().join(format!("mxr27_{}", hex(&maxsecu_crypto::random_array::<8>())));
+    let state = AppState {
+        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        blobs: Arc::new(FsBlobStore::new(&blob_dir)),
+        audit: Arc::new(publisher),
+        direct_links_enabled: false,
+    };
+    let app_pki = test_pki();
+    let app_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_addr = app_listener.local_addr().unwrap();
+    tokio::spawn(serve(
+        app_listener,
+        app_pki.server_config.clone(),
+        maxsecu_server::router(state),
+    ));
+
+    let mut c = connect(app_addr, app_pki.client_config.clone()).await;
+    let mut c_admin = connect(app_addr, app_pki.client_config.clone()).await;
+    let owner = Identity::generate();
+    let user_id = register(&mut c, "owner", &owner).await;
+    let token = login(&mut c, "owner", &owner).await;
+    let admin_tok = login(&mut c_admin, "admin1", &admin1).await;
+
+    // A PQ recovery binding so the uploads are real V2 (the cutoff is suite-agnostic).
+    let (_rec_x_sk, rec_x_pk) = generate_enc_keypair();
+    let (_rec_mlkem_seed, rec_mlkem_pub) = generate_mlkem_keypair();
+    let content = CONTENT.repeat(64);
+    let streams = PlaintextStreams {
+        content: content.clone(),
+        metadata: None,
+        thumbnail: None,
+        preview: None,
+    };
+    let params_for = |file_id: Id| UploadParams {
+        owner: &owner,
+        owner_id: Id(user_id),
+        owner_key_version: 1,
+        file_id,
+        file_type: FileType::Blog,
+        chunk_size: 4096,
+        recovery_pub: rec_x_pk,
+        recovery_mlkem_pub: Some(rec_mlkem_pub),
+        created_at: Timestamp(TS),
+    };
+
+    // ---- (1) file_before: genesis anchored at sink pos a. ----
+    let file_before = Id(maxsecu_crypto::random_array::<16>());
+    let bundle_before = build_upload(&params_for(file_before), &streams).unwrap();
+    let fid_before = stage_upload(&mut c, &token, &bundle_before, "blog").await;
+
+    // ---- (2) key_compromise(owner, kv=1): app server appends it AND publishes it
+    // to the sink at the next global position (b > a). ----
+    let mut chain = ControlChain::new();
+    let kc = chain.key_compromise(
+        admin1.signing_key(),
+        KeyCompromiseParams {
+            user_id: Id(user_id),
+            key_version: 1,
+            effective_from: Timestamp(TS),
+            issued_by: Id(a1_id),
+            created_at: Timestamp(TS),
+        },
+        CoSign {
+            admin_id: Id(a2_id),
+            key: admin2.signing_key(),
+        },
+    );
+    let kc_body = serde_json::json!({
+        "record_b64": B64.encode(&kc.bytes),
+        "sig_b64": B64.encode(kc.sig),
+        "co_sig_b64": kc.co_sig.map(|cs| B64.encode(cs)),
+    });
+    let (st, _) = post(&mut c_admin, "/v1/key-compromise", Some(&admin_tok), kc_body).await;
+    assert_eq!(st, StatusCode::CREATED, "key_compromise appended + published to sink");
+
+    // ---- (3) file_after: genesis anchored at sink pos c (> b). ----
+    let file_after = Id(maxsecu_crypto::random_array::<16>());
+    let bundle_after = build_upload(&params_for(file_after), &streams).unwrap();
+    let fid_after = stage_upload(&mut c, &token, &bundle_after, "blog").await;
+
+    // ---- Read ALL THREE positions from the REAL sink via the production client. ----
+    let cc = sink_pki.client_config.clone();
+    let (fb, fa) = (file_before.0, file_after.0);
+    let (a, b, c_pos) = tokio::task::spawn_blocking(move || {
+        let sink = maxsecu_client_core::sink::HttpSinkClient::new(sink_addr, "localhost", cc);
+        let a = sink.fetch_genesis_pos(&fb).unwrap().expect("file_before anchored");
+        let b = sink.fetch_control_pos(1).expect("key_compromise position at the sink");
+        let c = sink.fetch_genesis_pos(&fa).unwrap().expect("file_after anchored");
+        (a, b, c)
+    })
+    .await
+    .unwrap();
+    assert!(
+        a < b && b < c_pos,
+        "one global order: genesis_before {a} < key_compromise {b} < genesis_after {c_pos}"
+    );
+
+    // The cutoff closure is assembled AFTER the fetch — had any fetch errored we
+    // would refuse to build it (fail closed). It encodes the real sink position `b`.
+    let owner_id = user_id;
+    let cutoff = move |id: Id, kv: u64| (id.0 == owner_id && kv == 1).then_some(b);
+
+    // file_before's genesis predates the compromise → R27 passes → full V2 download.
+    let good = fetch_download_bundle(&mut c, &token, &fid_before).await;
+    let mut ok_ctx = VerifyContext {
+        file_id: file_before,
+        author_sig_pub: owner.sig_pub_bytes(),
+        owner_sig_pub: owner.sig_pub_bytes(),
+        recipient_id: Id(user_id),
+        recipient_type: RecipientType::User,
+        recipient_secret: owner.enc_secret(),
+        recipient_mlkem_seed: owner.mlkem_seed(),
+        seen_max_version: None,
+        granter_sig_pub: &NO_GRANTERS,
+        admin_sig_pub: &NO_ADMINS,
+        tombstones: None,
+        compromise: Some(CompromiseCheck {
+            genesis_sink_pos: Some(a),
+            cutoff: &cutoff,
+        }),
+    };
+    assert!(
+        verify_and_open(&ok_ctx, &good).is_ok(),
+        "a genesis anchored before the compromise is honored"
+    );
+
+    // file_after's genesis postdates the compromise → rejected as a backdated forgery.
+    let bad = fetch_download_bundle(&mut c, &token, &fid_after).await;
+    ok_ctx.file_id = file_after;
+    ok_ctx.compromise = Some(CompromiseCheck {
+        genesis_sink_pos: Some(c_pos),
+        cutoff: &cutoff,
+    });
+    assert_eq!(
+        verify_and_open(&ok_ctx, &bad),
+        Err(DownloadError::GenesisAfterCompromise),
+        "a genesis anchored after the compromise is a forgery (real-sink cutoff)"
     );
 
     let _ = std::fs::remove_dir_all(&blob_dir);
