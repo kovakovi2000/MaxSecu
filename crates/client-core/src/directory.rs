@@ -279,6 +279,7 @@ mod tests {
             roles: RoleSet::new([Role::User]),
             not_before: Timestamp(NOW - YEAR_MS),
             not_after: Timestamp(NOW + YEAR_MS),
+            mlkem_pub: None,
         }
     }
 
@@ -439,6 +440,7 @@ mod tests {
             roles: RoleSet::new([Role::User, Role::Admin]),
             not_before: Timestamp(NOW - YEAR_MS),
             not_after: Timestamp(NOW + YEAR_MS),
+            mlkem_pub: None,
         };
         (sign(d5, &b), b)
     }

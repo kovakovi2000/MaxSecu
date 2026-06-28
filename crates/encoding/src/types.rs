@@ -190,23 +190,29 @@ impl Field for FileScope {
     }
 }
 
-/// `Suite` (§3): the algorithm-agility identifier, `enum16`. Only `0x0001` is
-/// defined in v1; unknown/below-floor suites are rejected (DESIGN §5.1).
+/// `Suite` (§3): the algorithm-agility identifier, `enum16`. `0x0001` is the v1
+/// suite; `0x0002` adds the X25519+ML-KEM-768 hybrid KEM (Phase 7). Unknown /
+/// below-floor suites are rejected (DESIGN §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Suite {
     /// {AEAD AES-256-GCM, KDF HKDF-SHA256, KEM X25519, SIG Ed25519, PWKDF Argon2id}
     V1,
+    /// {AEAD AES-256-GCM, KDF HKDF-SHA256, KEM X25519+ML-KEM-768 hybrid,
+    /// SIG Ed25519, PWKDF Argon2id} — the PQ-hybrid wrap suite (Phase 7).
+    V2,
 }
 
 impl Field for Suite {
     fn put(&self, w: &mut Writer) {
         match self {
             Suite::V1 => w.u16(0x0001),
+            Suite::V2 => w.u16(0x0002),
         }
     }
     fn get(r: &mut Reader) -> Result<Self, DecodeError> {
         match r.u16()? {
             0x0001 => Ok(Suite::V1),
+            0x0002 => Ok(Suite::V2),
             other => Err(DecodeError::UnknownEnum {
                 kind: "Suite",
                 value: other as u32,

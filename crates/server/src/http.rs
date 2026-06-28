@@ -1745,6 +1745,7 @@ mod tests {
             roles: RoleSet::new([Role::User]),
             not_before: Timestamp(0),
             not_after: Timestamp(4_102_444_800_000), // 2100-01-01
+            mlkem_pub: None,
         };
         let bytes = encode(&binding);
         let sig = d5.sign_canonical(labels::DIRBINDING, &binding);

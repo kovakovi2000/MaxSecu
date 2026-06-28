@@ -36,6 +36,10 @@ pub const GENESIS_HEAD: Hash = Bytes32([0u8; 32]);
 /// Current algorithm-suite codepoint (encoding-spec §3, parameters §1.5).
 pub const SUITE_V1: u16 = 0x0001;
 
+/// PQ-hybrid algorithm-suite codepoint (encoding-spec §3, Phase 7): adds the
+/// X25519+ML-KEM-768 hybrid KEM over the v1 primitive set.
+pub const SUITE_V2: u16 = 0x0002;
+
 // ---- The canonical struct trait & registry (encoding-spec §4, §5) ----
 
 /// A top-level signed/hashed structure: a `u16 type_id` (§5) followed by its

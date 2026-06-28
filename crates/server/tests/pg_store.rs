@@ -372,6 +372,7 @@ fn dir_binding(user_id: [u8; 16], username: &str, enc: u8, sig: u8, key_version:
         roles: RoleSet::new([Role::User]),
         not_before: Timestamp(0),
         not_after: Timestamp(4_102_444_800_000), // 2100-01-01, a valid TIMESTAMPTZ
+        mlkem_pub: None,
     }
 }
 

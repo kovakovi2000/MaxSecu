@@ -9,7 +9,9 @@
 
 use maxsecu_encoding::structs::*;
 use maxsecu_encoding::types::*;
-use maxsecu_encoding::{decode, encode, labels, signing_input, DecodeError, RECOVERY_ID, SUITE_V1};
+use maxsecu_encoding::{
+    decode, encode, labels, signing_input, DecodeError, RECOVERY_ID, SUITE_V1, SUITE_V2,
+};
 
 // ---------- builders for canonical, valid instances ----------
 
@@ -81,6 +83,7 @@ fn valid_dirbinding() -> DirBinding {
         roles: RoleSet::new([Role::User, Role::Admin]),
         not_before: ts(1_700_000_000_000),
         not_after: ts(1_731_536_000_000),
+        mlkem_pub: None,
     }
 }
 
@@ -507,5 +510,93 @@ fn v13_stream_list_order_and_dup() {
     assert_eq!(
         decode::<Manifest>(&m),
         Err(DecodeError::UnknownTypeId(0x0004))
+    );
+}
+
+// ======================================================================
+// Phase 7 (P7.3): Suite::V2 + optional ML-KEM pubkey on the binding
+// ======================================================================
+
+#[test]
+fn suite_v2_roundtrips() {
+    // Suite::V2 encodes to 0x0002 and decodes back. Observed through a manifest
+    // whose `alg` field is the Suite u16 at offset 27 (see v7_unknown_enum).
+    let mut m = valid_manifest(vec![stream(StreamType::Content, 1, 0xC0)]);
+    m.alg = Suite::V2;
+    let b = encode(&m);
+    assert_eq!(&b[27..29], &[0x00, 0x02], "Suite::V2 codepoint");
+    let back: Manifest = decode(&b).expect("V2 manifest decodes");
+    assert_eq!(back.alg, Suite::V2);
+    assert_eq!(SUITE_V2, 0x0002);
+    assert_eq!(SUITE_V1, 0x0001);
+
+    // An unknown suite (0x0003) is still rejected.
+    let mut bad = b.clone();
+    bad[27] = 0x00;
+    bad[28] = 0x03;
+    assert_eq!(
+        decode::<Manifest>(&bad),
+        Err(DecodeError::UnknownEnum {
+            kind: "Suite",
+            value: 0x0003
+        })
+    );
+}
+
+#[test]
+fn binding_without_pq_roundtrips() {
+    // A binding with mlkem_pub: None round-trips and ends in the 0x00 flag.
+    let v = valid_dirbinding();
+    assert_eq!(v.mlkem_pub, None);
+    let b = encode(&v);
+    assert_eq!(*b.last().unwrap(), 0x00, "absent PQ key ⇒ trailing 0x00 flag");
+    let back: DirBinding = decode(&b).expect("non-PQ binding decodes");
+    assert_eq!(back, v, "value round-trip");
+    assert_eq!(back.mlkem_pub, None);
+    assert_eq!(encode(&back), b, "canonical guard for the None shape");
+}
+
+#[test]
+fn binding_with_pq_roundtrips() {
+    // A binding with mlkem_pub: Some([..1184..]) round-trips exactly.
+    let mut v = valid_dirbinding();
+    let key = [0xABu8; 1184];
+    v.mlkem_pub = Some(key);
+    let b = encode(&v);
+    // Tail layout: flag(1) ‖ key(1184).
+    assert_eq!(b[b.len() - 1185], 0x01, "present flag");
+    assert_eq!(&b[b.len() - 1184..], &key[..], "fixed 1184-byte key, no prefix");
+    let back: DirBinding = decode(&b).expect("PQ binding decodes");
+    assert_eq!(back, v, "value round-trip");
+    assert_eq!(back.mlkem_pub, Some(key));
+    assert_eq!(encode(&back), b, "canonical guard for the Some shape");
+}
+
+#[test]
+fn binding_pq_flag_set_but_short_key_rejected() {
+    // Flag 0x01 but fewer than 1184 trailing bytes → reject, no panic / no OOB.
+    let mut v = valid_dirbinding();
+    v.mlkem_pub = Some([0xABu8; 1184]);
+    let full = encode(&v);
+    let short = &full[..full.len() - 1]; // 1183 key bytes left after the flag
+    assert!(matches!(
+        decode::<DirBinding>(short),
+        Err(DecodeError::ShortInput { .. })
+    ));
+}
+
+#[test]
+fn binding_pq_bad_flag_rejected() {
+    // A presence byte that is neither 0x00 nor 0x01 → reject.
+    let mut b = encode(&valid_dirbinding());
+    let last = b.len() - 1;
+    assert_eq!(b[last], 0x00, "fixture is the None shape");
+    b[last] = 0x02;
+    assert_eq!(
+        decode::<DirBinding>(&b),
+        Err(DecodeError::UnknownEnum {
+            kind: "PqPresence",
+            value: 0x02
+        })
     );
 }

@@ -7,7 +7,19 @@ use crate::primitives::{Reader, Writer};
 use crate::types::*;
 use crate::{read_struct, Canonical};
 
+/// ML-KEM-768 encapsulation (public) key size in bytes (Phase 7 / P7.2).
+pub const MLKEM768_PUB_LEN: usize = 1184;
+
 /// `dirbinding` — `0x0001` (DESIGN §7.1).
+///
+/// `mlkem_pub` (Phase 7, P7.3) is an **optional** ML-KEM-768 encapsulation key
+/// carried after the v1 fields, wire-encoded as a 1-byte presence flag
+/// (`0x00` absent / `0x01` present) followed, when present, by the fixed
+/// [`MLKEM768_PUB_LEN`]-byte key (no length prefix — the size is structural).
+/// It is **not** part of the fingerprint (which stays
+/// `SHA-256(canonical(enc_pub ‖ sig_pub))`, see [`FingerprintInput`]); the PQ
+/// key is authenticated for free by the existing D5 Ed25519 signature over
+/// `canonical(binding)`, which now covers the trailing field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirBinding {
     pub username: Text,
@@ -18,6 +30,8 @@ pub struct DirBinding {
     pub roles: RoleSet,
     pub not_before: Timestamp,
     pub not_after: Timestamp,
+    /// Optional ML-KEM-768 encapsulation key (Suite::V2 enrollment, P7.4).
+    pub mlkem_pub: Option<[u8; MLKEM768_PUB_LEN]>,
 }
 
 impl Canonical for DirBinding {
@@ -31,17 +45,47 @@ impl Canonical for DirBinding {
         self.roles.put(w);
         self.not_before.put(w);
         self.not_after.put(w);
+        // Optional PQ key: presence flag then, if present, the fixed-width key.
+        // Hand-rolled (not the generic `Option<T>` Field) because the payload is
+        // a 1184-byte array emitted via `fixed` with no length prefix, mirroring
+        // how `enc_pub`/`sig_pub` are written.
+        match &self.mlkem_pub {
+            None => w.u8(0x00),
+            Some(key) => {
+                w.u8(0x01);
+                w.fixed(key);
+            }
+        }
     }
     fn decode_body(r: &mut Reader) -> Result<Self, DecodeError> {
+        let username = Text::get(r)?;
+        let user_id = Id::get(r)?;
+        let enc_pub = Bytes32::get(r)?;
+        let sig_pub = Bytes32::get(r)?;
+        let key_version = u64::get(r)?;
+        let roles = RoleSet::get(r)?;
+        let not_before = Timestamp::get(r)?;
+        let not_after = Timestamp::get(r)?;
+        let mlkem_pub = match r.u8()? {
+            0x00 => None,
+            0x01 => Some(r.fixed::<MLKEM768_PUB_LEN>()?),
+            other => {
+                return Err(DecodeError::UnknownEnum {
+                    kind: "PqPresence",
+                    value: other as u32,
+                })
+            }
+        };
         Ok(DirBinding {
-            username: Text::get(r)?,
-            user_id: Id::get(r)?,
-            enc_pub: Bytes32::get(r)?,
-            sig_pub: Bytes32::get(r)?,
-            key_version: u64::get(r)?,
-            roles: RoleSet::get(r)?,
-            not_before: Timestamp::get(r)?,
-            not_after: Timestamp::get(r)?,
+            username,
+            user_id,
+            enc_pub,
+            sig_pub,
+            key_version,
+            roles,
+            not_before,
+            not_after,
+            mlkem_pub,
         })
     }
 }

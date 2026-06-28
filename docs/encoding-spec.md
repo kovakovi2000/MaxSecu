@@ -52,7 +52,7 @@ All integers are **fixed-width, big-endian, unsigned**, exactly the stated byte 
 | `X25519Pub` / `Ed25519Pub` | `bytes_fixed(32)` | raw public keys |
 | `Hash` | `bytes_fixed(32)` | SHA-256 output (`content_digest`, `enc_metadata_digest`, `dek_commit`, `prev_head`) |
 | `Timestamp` | `u64` | milliseconds since Unix epoch, UTC. **Informational** except `dirbinding.not_before/not_after` (coarse identity lifetime). Never the basis of a revocation-freshness decision (§7.5 is clock-independent). |
-| `Suite` | `enum16`: `0x0001` = {AEAD AES-256-GCM, KDF HKDF-SHA256, KEM X25519, SIG Ed25519, PWKDF Argon2id} | the algorithm-agility identifier (§5.1). New suites get new codepoints; clients reject unknown/below-floor suites |
+| `Suite` | `enum16`: `0x0001` = {AEAD AES-256-GCM, KDF HKDF-SHA256, KEM X25519, SIG Ed25519, PWKDF Argon2id}; `0x0002` = same set but **KEM X25519+ML-KEM-768 hybrid** (PQ-hybrid wrap, Phase 7) | the algorithm-agility identifier (§5.1). New suites get new codepoints; clients reject unknown/below-floor suites |
 | `Role` | `enum8`: `user = 0x01`, `admin = 0x02` | |
 | `RecipientType` | `enum8`: `user = 0x01`, `recovery = 0x02` | when `recovery`, the paired `recipient_id` MUST be `RECOVERY_ID` (16 zero bytes); decoder enforces |
 | `StreamType` | `enum8`: `content = 0x01`, `metadata = 0x02`, `thumbnail = 0x03`, `preview = 0x04` | identifies a file's encrypted streams (§13 / D33) |
@@ -68,7 +68,8 @@ Constants: `RECOVERY_ID = 0x00…00` (16 bytes). `GENESIS_HEAD = 0x00…00` (32 
 Each begins with its `u16 type_id`, then fields in this exact order. These field sets are the canonical source for the tables in `DESIGN.md` §11 (post-simplification: no `status_attestation`, no `dek_poss`, no `revcheckpoint`).
 
 ### `dirbinding` — `0x0001` (§7.1)
-`username:text` · `user_id:Id` · `enc_pub:X25519Pub` · `sig_pub:Ed25519Pub` · `key_version:u64` · `roles:set<Role>` · `not_before:Timestamp` · `not_after:Timestamp`
+`username:text` · `user_id:Id` · `enc_pub:X25519Pub` · `sig_pub:Ed25519Pub` · `key_version:u64` · `roles:set<Role>` · `not_before:Timestamp` · `not_after:Timestamp` · `mlkem_pub:option<bytes_fixed(1184)>`
+*(`mlkem_pub` (Phase 7, P7.3) is the optional ML-KEM-768 encapsulation key for Suite-V2 enrollment. Wire order: it is the **last** field, encoded as a 1-byte presence flag — `0x00` absent / `0x01` present, any other value rejected — followed, when present, by the fixed **1184**-byte key with no length prefix (the size is structural, like `enc_pub`/`sig_pub`). It is **not** folded into the `fingerprint`, which stays `SHA-256(canonical(fingerprint_input))` over `enc_pub ‖ sig_pub` only; the PQ key is authenticated by the existing D5 Ed25519 signature over `canonical(dirbinding)`, which now covers the trailing field.)*
 
 ### `manifest` — `0x0002` (§12.3, multi-stream per D33)
 `file_id:Id` · `version:u64` · `file_type:FileType` · `alg:Suite` · `chunk_size:u32` · `dek_commit:Hash` · `streams:list<Stream>` · `recovery_present:bool` · `author_id:Id` · `created_at:Timestamp`

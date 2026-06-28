@@ -67,6 +67,7 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
                 roles: RoleSet::new([Role::User, Role::Admin]),
                 not_before: ts(1_700_000_000_000),
                 not_after: ts(1_731_536_000_000),
+                mlkem_pub: None,
             }),
         ),
         (

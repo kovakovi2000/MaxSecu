@@ -49,6 +49,7 @@ fn binding(username: &str, uid: u8, enc: u8, sig: u8, key_version: u64) -> DirBi
         roles: RoleSet::new([Role::User]),
         not_before: Timestamp(0),
         not_after: Timestamp(4_102_444_800_000), // 2100
+        mlkem_pub: None,
     }
 }
 

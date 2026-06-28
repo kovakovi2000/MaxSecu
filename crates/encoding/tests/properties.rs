@@ -22,6 +22,16 @@ fn id() -> impl Strategy<Value = Id> {
 fn b32() -> impl Strategy<Value = Bytes32> {
     any::<[u8; 32]>().prop_map(Bytes32)
 }
+fn mlkem_pub() -> impl Strategy<Value = Option<[u8; 1184]>> {
+    // Arbitrary-for-[u8; N] is not provided for N=1184; build the array from a
+    // fixed-length byte vec instead.
+    let key = proptest::collection::vec(any::<u8>(), 1184).prop_map(|v| {
+        let mut a = [0u8; 1184];
+        a.copy_from_slice(&v);
+        a
+    });
+    proptest::option::of(key)
+}
 fn timestamp() -> impl Strategy<Value = Timestamp> {
     any::<u64>().prop_map(Timestamp)
 }
@@ -92,8 +102,9 @@ prop_compose! {
         username in text(), user_id in id(), enc_pub in b32(), sig_pub in b32(),
         key_version in any::<u64>(), roles in role_set(),
         not_before in timestamp(), not_after in timestamp(),
+        mlkem_pub in mlkem_pub(),
     ) -> DirBinding {
-        DirBinding { username, user_id, enc_pub, sig_pub, key_version, roles, not_before, not_after }
+        DirBinding { username, user_id, enc_pub, sig_pub, key_version, roles, not_before, not_after, mlkem_pub }
     }
 }
 
