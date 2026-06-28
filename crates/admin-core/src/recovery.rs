@@ -10,10 +10,11 @@
 //! download but is **not** carry-forward-eligible (R24, §12.3a/§12.9) — that
 //! exclusion lives in the rotation carry-forward selection, not here.
 
-use maxsecu_crypto::{wrap_dek, Dek, EncPublicKey, SigningKey, WrappedDek};
+use maxsecu_crypto::{unwrap_dek, wrap_dek, Dek, EncPublicKey, EncSecretKey, SigningKey, WrappedDek};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::{Grant, WrapContext};
 use maxsecu_encoding::types::{Bytes32, Id, RecipientType, Timestamp};
+use maxsecu_encoding::RECOVERY_ID;
 
 /// Inputs for a recovery-operator grant (§12.7 steps 3–5). The admin has already
 /// unwrapped `dek` with `recovery_priv` on the air-gapped device.
@@ -93,10 +94,133 @@ pub fn build_recovery_grant(
     })
 }
 
+// ---- Offline recovery-wrap validation sweep (DESIGN §16.1 / D27 / R26) ----
+//
+// The downloader-side recovery check only proves the author *signed a grant*
+// over the right `dek_commit` (§12.5) — it cannot prove the recovery *wrap
+// ciphertext* actually opens to that DEK, because only `recovery_priv` can open
+// it. A malicious writer could therefore sign a valid grant yet upload a bad
+// wrap, silently breaking recoverability. This offline check, run on the
+// air-gapped recovery device, confirms each wrap really decrypts to its
+// committed DEK.
+
+/// Identifies the file-version whose recovery wrap is under test (carried into
+/// the [`SweepReport`] for any failing sample).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryWrapCtx {
+    pub file_id: Id,
+    pub version: u64,
+}
+
+/// A recovery wrap failed offline validation — a fail-closed finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SweepError {
+    /// HPKE-open with `recovery_priv` failed — wrong/corrupt ciphertext or a
+    /// wrap that is not bound to this file-version's recovery context.
+    WrapUndecryptable,
+    /// The wrap opened, but the recovered DEK does not match the committed
+    /// `dek_commit` — the writer wrapped a DEK other than the manifest's.
+    WrapMismatch,
+}
+
+/// Offline-validate one recovery wrap with the recovery private key.
+///
+/// HPKE-opens `wrap` (the wire form `enc(32) ‖ ct`) under the SAME context the
+/// upload path bound it to — `(file_id, version, recipient_id = RECOVERY_ID)`
+/// (§5 / `upload::wrap_and_grant`) — then re-derives `dek_commit'` from the
+/// recovered DEK and checks it against the committed value. An open failure maps
+/// to [`SweepError::WrapUndecryptable`]; a commitment mismatch to
+/// [`SweepError::WrapMismatch`].
+pub fn validate_recovery_wrap(
+    recovery_priv: &EncSecretKey,
+    wrap: &[u8],
+    dek_commit: [u8; 32],
+    ctx: &RecoveryWrapCtx,
+) -> Result<(), SweepError> {
+    use SweepError::*;
+
+    // Split the wire wrap `enc(32) ‖ ct`; a runt that cannot carry the 32-byte
+    // encapsulated key is unopenable by definition.
+    if wrap.len() < 32 {
+        return Err(WrapUndecryptable);
+    }
+    let mut enc = [0u8; 32];
+    enc.copy_from_slice(&wrap[..32]);
+    let wrapped = WrappedDek {
+        enc,
+        ct: wrap[32..].to_vec(),
+    };
+
+    // The recovery wrap is bound to RECOVERY_ID, exactly as the upload/rotate
+    // path wrapped it — a different context here would itself fail the open.
+    let wrap_ctx = WrapContext {
+        file_id: ctx.file_id,
+        version: ctx.version,
+        recipient_id: RECOVERY_ID,
+    };
+    let dek = unwrap_dek(recovery_priv, &wrapped, &wrap_ctx).map_err(|_| WrapUndecryptable)?;
+
+    // Recompute the commitment from the recovered DEK and compare. The commit is
+    // a public value, so a plain byte compare suffices (mirrors §12.7 step 3).
+    if dek.commit() != dek_commit {
+        return Err(WrapMismatch);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use maxsecu_crypto::{generate_enc_keypair, unwrap_dek};
+
+    /// Build the wire recovery wrap `enc(32) ‖ ct` exactly as the upload path
+    /// does: `wrap_dek` to the recovery key under the RECOVERY_ID-bound context.
+    fn recovery_wire_wrap(rpk: &EncPublicKey, dek: &Dek, file_id: Id, version: u64) -> Vec<u8> {
+        let ctx = WrapContext {
+            file_id,
+            version,
+            recipient_id: RECOVERY_ID,
+        };
+        let w = wrap_dek(rpk, dek, &ctx).unwrap();
+        let mut wire = w.enc.to_vec();
+        wire.extend_from_slice(&w.ct);
+        wire
+    }
+
+    #[test]
+    fn good_recovery_wrap_passes() {
+        let (rsk, rpk) = generate_enc_keypair();
+        let dek = Dek::generate();
+        let wire = recovery_wire_wrap(&rpk, &dek, FILE, 3);
+        assert_eq!(
+            validate_recovery_wrap(&rsk, &wire, dek.commit(), &RecoveryWrapCtx { file_id: FILE, version: 3 }),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bad_recovery_wrap_is_caught() {
+        let (rsk, rpk) = generate_enc_keypair();
+        let dek = Dek::generate();
+        let other = Dek::generate();
+
+        // A valid HPKE wrap of a DIFFERENT DEK against the committed value: the
+        // wrap opens, but the recovered DEK does not match → WrapMismatch.
+        let wrong = recovery_wire_wrap(&rpk, &other, FILE, 3);
+        assert_eq!(
+            validate_recovery_wrap(&rsk, &wrong, dek.commit(), &RecoveryWrapCtx { file_id: FILE, version: 3 }),
+            Err(SweepError::WrapMismatch)
+        );
+
+        // A corrupted ciphertext cannot open at all → WrapUndecryptable.
+        let mut corrupt = recovery_wire_wrap(&rpk, &dek, FILE, 3);
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0x01;
+        assert_eq!(
+            validate_recovery_wrap(&rsk, &corrupt, dek.commit(), &RecoveryWrapCtx { file_id: FILE, version: 3 }),
+            Err(SweepError::WrapUndecryptable)
+        );
+    }
 
     const ADMIN_ID: Id = Id([0xAD; 16]);
     const FILE: Id = Id([0xF1; 16]);
