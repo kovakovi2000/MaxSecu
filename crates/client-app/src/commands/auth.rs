@@ -42,6 +42,25 @@ impl Default for Session {
     }
 }
 
+/// Serializes `connect`: Tauri commands can be invoked re-entrantly (double-click
+/// / retry-while-pending). Because `connect` takes the `Identity` out of `Session`
+/// and releases that lock across its HTTP awaits, two concurrent connects would
+/// race (B sees `None`, fails spuriously, and could clobber A's terminal state).
+/// `connect` `try_lock`s this for its whole duration so only one runs at a time.
+pub struct ConnectLock(pub Mutex<()>);
+
+impl ConnectLock {
+    pub fn new() -> Self {
+        Self(Mutex::new(()))
+    }
+}
+
+impl Default for ConnectLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[tauri::command]
 pub async fn unlock_keystore(
     password: String,

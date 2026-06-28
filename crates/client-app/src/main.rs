@@ -9,7 +9,7 @@ mod transport;
 mod session;
 mod commands;
 
-use commands::auth::{AppDir, Session};
+use commands::auth::{AppDir, ConnectLock, Session};
 
 fn main() {
     // Portable layout: keystore/config/pinned-cert live beside the exe so the
@@ -22,6 +22,7 @@ fn main() {
     tauri::Builder::default()
         .manage(AppDir(app_dir))
         .manage(Session::new())
+        .manage(ConnectLock::new())
         .invoke_handler(tauri::generate_handler![
             commands::connection::connect,
             commands::auth::unlock_keystore,

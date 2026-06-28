@@ -84,13 +84,13 @@ pub async fn login_exchange(
     sender: &mut SendRequest<Full<Bytes>>,
     id: &Identity,
     username: &str,
+    host: &str,
     exporter: &[u8; 32],
     now_ms: u64,
 ) -> Result<LoginOk, UiError> {
-    // The host header is informational for our axum router; "localhost" matches
-    // the pinned-cert SAN used in test/dev. The TLS SNI (transport.rs) is what
-    // actually selects/validates the server identity.
-    let host = "localhost";
+    // `host` is the connect host (the cert-SAN/SNI name). The TLS SNI + pinned
+    // cert (transport.rs) are the real identity check; the Host header is carried
+    // through for the server's routing/vhost rather than left hardcoded.
 
     // 1) challenge
     let (status, ch) = post_json(
