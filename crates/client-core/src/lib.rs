@@ -11,6 +11,7 @@
 mod error;
 
 pub mod auth;
+pub mod budget;
 pub mod directory;
 pub mod download;
 pub mod identity;
@@ -27,9 +28,10 @@ pub use directory::{
     VerifiedBinding, VerifyError,
 };
 pub use download::{
-    verify_and_open, version_acceptable, DownloadBundle, OpenedFile, OpenedStream, StreamChunks,
-    VerifyContext,
+    verify_and_open, verify_and_stream_content, version_acceptable, DownloadBundle, OpenedFile,
+    OpenedHeader, OpenedStream, StreamChunks, StreamHeader, VerifyContext,
 };
+pub use budget::{plan_unlock, AuditEvent, UnlockPlan};
 pub use error::{ClientError, DownloadError, PasswordError, UploadError};
 pub use revocation::{TombstoneError, TombstoneSet};
 pub use sanitize::{safe_export_path, sanitize_filename, SanitizeError};

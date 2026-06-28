@@ -12,7 +12,10 @@
 //! so a grant chains directly to the author; the re-share ancestor chain
 //! (§12.4b) and full tombstone-completeness evaluation are Phase 4/5.
 
-use maxsecu_crypto::{open_stream, stream_digest, unwrap_dek, EncSecretKey, VerifyingKey, WrappedDek};
+use maxsecu_crypto::{
+    open_stream, open_stream_streaming, stream_digest, unwrap_dek, Dek, EncSecretKey, VerifyingKey,
+    WrappedDek,
+};
 use maxsecu_encoding::structs::{Genesis, Grant, Manifest, WrapContext};
 use maxsecu_encoding::types::{Compression, FileType, Id, RecipientType, StreamType};
 use maxsecu_encoding::{decode, labels, Canonical, RECOVERY_ID};
@@ -118,32 +121,45 @@ pub fn version_acceptable(served: u64, seen_max: Option<u64>) -> Result<(), Down
     }
 }
 
-/// Run the §12.5 download verification ladder and decrypt, fail-closed.
-pub fn verify_and_open(
+/// Verify the §12.5 header ladder (steps 1–7): strict-decode + signatures of the
+/// manifest/genesis/grant, author-entitlement (D29), freshness/rollback, and the
+/// DEK unwrap + self-validation against the manifest commitment. Returns the
+/// verified manifest, the unwrapped DEK, and whether a valid recovery grant was
+/// present. Shared by the whole-buffer [`verify_and_open`] and the streaming
+/// [`verify_and_stream_content`] paths so the access proof is identical.
+#[allow(clippy::too_many_arguments)]
+fn verify_header(
     ctx: &VerifyContext,
-    bundle: &DownloadBundle,
-) -> Result<OpenedFile, DownloadError> {
+    manifest_bytes: &[u8],
+    manifest_sig: &[u8; 64],
+    genesis_bytes: &[u8],
+    genesis_sig: &[u8; 64],
+    grant_bytes: &[u8],
+    grant_sig: &[u8; 64],
+    recovery_grant_bytes: &[u8],
+    recovery_grant_sig: &[u8; 64],
+    wrapped_dek: &WrappedDek,
+) -> Result<(Manifest, Dek, bool), DownloadError> {
     use DownloadError::*;
 
-    // (1) Manifest: strict decode (re-encode guard), file_id, framing bound,
-    // then the author's signature.
-    let manifest: Manifest = decode(&bundle.manifest_bytes).map_err(|_| BadManifest)?;
+    // (1) Manifest: strict decode (re-encode guard), file_id, framing bound, sig.
+    let manifest: Manifest = decode(manifest_bytes).map_err(|_| BadManifest)?;
     if manifest.file_id != ctx.file_id {
         return Err(FileIdMismatch);
     }
     if manifest.chunk_size < CHUNK_SIZE_MIN || manifest.chunk_size > CHUNK_SIZE_MAX {
         return Err(FramingBoundsExceeded("chunk_size out of range"));
     }
-    if !verify(&ctx.author_sig_pub, labels::MANIFEST, &manifest, &bundle.manifest_sig) {
+    if !verify(&ctx.author_sig_pub, labels::MANIFEST, &manifest, manifest_sig) {
         return Err(ManifestSignature);
     }
 
     // (2) Genesis: decode + the owner's signature (owner binding).
-    let genesis: Genesis = decode(&bundle.genesis_bytes).map_err(|_| BadGenesis)?;
+    let genesis: Genesis = decode(genesis_bytes).map_err(|_| BadGenesis)?;
     if genesis.file_id != ctx.file_id {
         return Err(FileIdMismatch);
     }
-    if !verify(&ctx.owner_sig_pub, labels::GENESIS, &genesis, &bundle.genesis_sig) {
+    if !verify(&ctx.owner_sig_pub, labels::GENESIS, &genesis, genesis_sig) {
         return Err(GenesisSignature);
     }
 
@@ -156,15 +172,20 @@ pub fn verify_and_open(
     version_acceptable(manifest.version, ctx.seen_max_version)?;
 
     // (5) The caller's own read-grant: decode, verify, chain to the author.
-    let grant: Grant = decode(&bundle.grant_bytes).map_err(|_| BadGrant)?;
-    if !verify(&ctx.author_sig_pub, labels::GRANT, &grant, &bundle.grant_sig) {
+    let grant: Grant = decode(grant_bytes).map_err(|_| BadGrant)?;
+    if !verify(&ctx.author_sig_pub, labels::GRANT, &grant, grant_sig) {
         return Err(GrantSignature);
     }
     check_grant(&grant, &manifest, ctx, genesis.owner_id)?;
 
-    // (6) Recovery-grant presence — an anomaly flag, never a hard rejection of
-    // the downloader's own read (§12.5 step 5).
-    let recovery_grant_ok = recovery_grant_valid(bundle, &manifest, &ctx.author_sig_pub, genesis.owner_id);
+    // (6) Recovery-grant presence — an anomaly flag, never a hard rejection.
+    let recovery_grant_ok = recovery_grant_valid(
+        recovery_grant_bytes,
+        recovery_grant_sig,
+        &manifest,
+        &ctx.author_sig_pub,
+        genesis.owner_id,
+    );
 
     // (7) Unwrap the DEK and self-validate against the manifest commitment.
     let wrap_ctx = WrapContext {
@@ -172,10 +193,34 @@ pub fn verify_and_open(
         version: manifest.version,
         recipient_id: ctx.recipient_id,
     };
-    let dek = unwrap_dek(ctx.recipient_secret, &bundle.wrapped_dek, &wrap_ctx).map_err(|_| DekUnwrap)?;
+    let dek = unwrap_dek(ctx.recipient_secret, wrapped_dek, &wrap_ctx).map_err(|_| DekUnwrap)?;
     if dek.commit() != manifest.dek_commit.0 {
         return Err(DekCommitMismatch);
     }
+    Ok((manifest, dek, recovery_grant_ok))
+}
+
+/// Run the §12.5 download verification ladder and decrypt **whole-buffer**,
+/// fail-closed. For large content that should not be materialized, use
+/// [`verify_and_stream_content`] instead.
+pub fn verify_and_open(
+    ctx: &VerifyContext,
+    bundle: &DownloadBundle,
+) -> Result<OpenedFile, DownloadError> {
+    use DownloadError::*;
+
+    let (manifest, dek, recovery_grant_ok) = verify_header(
+        ctx,
+        &bundle.manifest_bytes,
+        &bundle.manifest_sig,
+        &bundle.genesis_bytes,
+        &bundle.genesis_sig,
+        &bundle.grant_bytes,
+        &bundle.grant_sig,
+        &bundle.recovery_grant_bytes,
+        &bundle.recovery_grant_sig,
+        &bundle.wrapped_dek,
+    )?;
 
     // (8) Per stream: bound-check framing before allocating, verify the manifest
     // digest, then decrypt (framing tags re-checked by open_stream).
@@ -263,22 +308,172 @@ fn check_grant(
 /// Is a valid author recovery grant present for this version? (Presence check
 /// only — the recovery *wrap* is never served to a downloader, §12.5 step 2.)
 fn recovery_grant_valid(
-    bundle: &DownloadBundle,
+    recovery_grant_bytes: &[u8],
+    recovery_grant_sig: &[u8; 64],
     m: &Manifest,
     author_pub: &[u8; 32],
     owner_id: Id,
 ) -> bool {
-    let g: Grant = match decode(&bundle.recovery_grant_bytes) {
+    let g: Grant = match decode(recovery_grant_bytes) {
         Ok(g) => g,
         Err(_) => return false,
     };
-    verify(author_pub, labels::GRANT, &g, &bundle.recovery_grant_sig)
+    verify(author_pub, labels::GRANT, &g, recovery_grant_sig)
         && g.recipient_type == RecipientType::Recovery
         && g.recipient_id == RECOVERY_ID
         && g.file_id == m.file_id
         && g.file_version == m.version
         && g.dek_commit == m.dek_commit
         && g.granted_by == owner_id
+}
+
+/// The verification records + the **non-content** (small) streams a streaming
+/// open needs up front (api.md §8.5). The `content` stream is *not* here — it is
+/// fetched chunk-by-chunk by [`verify_and_stream_content`]'s `fetch` closure so
+/// it is never materialized whole (DESIGN §8.1).
+pub struct StreamHeader {
+    pub manifest_bytes: Vec<u8>,
+    pub manifest_sig: [u8; 64],
+    pub genesis_bytes: Vec<u8>,
+    pub genesis_sig: [u8; 64],
+    pub wrapped_dek: WrappedDek,
+    pub grant_bytes: Vec<u8>,
+    pub grant_sig: [u8; 64],
+    pub recovery_grant_bytes: Vec<u8>,
+    pub recovery_grant_sig: [u8; 64],
+    /// Every manifest stream except `content`, served whole (these are small —
+    /// `metadata`/`thumbnail`/`preview`, D35).
+    pub small_streams: Vec<StreamChunks>,
+}
+
+/// The result of a streaming open: the verified header facts plus the decoded
+/// small streams. The `content` bytes were delivered to the caller's sink, not
+/// returned (they are never held whole).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedHeader {
+    pub version: u64,
+    pub file_type: FileType,
+    /// The `content` stream's manifest digest (committed) — recorded in
+    /// trust-on-last-use memory alongside `version` (§7.5).
+    pub content_digest: [u8; 32],
+    pub recovery_grant_ok: bool,
+    /// Number of `content` chunks (the manifest framing the caller fetched).
+    pub content_chunk_count: u64,
+    pub small_streams: Vec<OpenedStream>,
+}
+
+/// Run the §12.5 ladder, then **stream** the `content` stream chunk-at-a-time to
+/// `sink` while decoding the small streams whole (DESIGN §8.1 line 360–361).
+///
+/// `fetch(i)` supplies content ciphertext chunk `i` (a lazy network GET); each
+/// chunk's AEAD tag is verified **before** its plaintext reaches `sink`, and only
+/// one content chunk of plaintext is ever in memory — so an arbitrarily large
+/// `content` round-trips within an O(chunk_size) budget with no whole plaintext
+/// in RAM. Streaming relies on per-chunk AEAD under the committed DEK + the
+/// signed `chunk_count`/`is_last` (truncation/extension), not the whole-stream
+/// digest (which cannot be checked before release); the small streams keep the
+/// full digest check. Fail-closed throughout.
+pub fn verify_and_stream_content<Fetch, Sink>(
+    ctx: &VerifyContext,
+    header: &StreamHeader,
+    mut fetch: Fetch,
+    mut sink: Sink,
+) -> Result<OpenedHeader, DownloadError>
+where
+    Fetch: FnMut(u64) -> Result<Vec<u8>, DownloadError>,
+    Sink: FnMut(&[u8]) -> Result<(), DownloadError>,
+{
+    use DownloadError::*;
+
+    let (manifest, dek, recovery_grant_ok) = verify_header(
+        ctx,
+        &header.manifest_bytes,
+        &header.manifest_sig,
+        &header.genesis_bytes,
+        &header.genesis_sig,
+        &header.grant_bytes,
+        &header.grant_sig,
+        &header.recovery_grant_bytes,
+        &header.recovery_grant_sig,
+        &header.wrapped_dek,
+    )?;
+
+    // Small streams (everything except content) decode whole, fully digest-checked.
+    let mut small = Vec::new();
+    let mut content_ms: Option<&maxsecu_encoding::structs::Stream> = None;
+    for ms in &manifest.streams {
+        if ms.compression != Compression::None {
+            return Err(CompressionUnsupported);
+        }
+        if ms.stream_type == StreamType::Content {
+            content_ms = Some(ms);
+            continue;
+        }
+        let provided = header
+            .small_streams
+            .iter()
+            .find(|s| s.stream_type == ms.stream_type)
+            .ok_or(StreamMissing(ms.stream_type))?;
+        if provided.chunks.len() as u64 != ms.chunk_count {
+            return Err(FramingBoundsExceeded("chunk_count mismatch"));
+        }
+        if stream_digest(&provided.chunks) != ms.digest.0 {
+            return Err(StreamDigestMismatch(ms.stream_type));
+        }
+        let ck = dek.stream_subkey(ms.stream_type);
+        let plaintext = open_stream(&ck, ctx.file_id, manifest.version, ms.stream_type, &provided.chunks)
+            .map_err(|_| StreamFraming(ms.stream_type))?;
+        small.push(OpenedStream {
+            stream_type: ms.stream_type,
+            plaintext,
+        });
+    }
+
+    // The content stream must be declared in the manifest (DESIGN §12.3).
+    let content_ms = content_ms.ok_or(StreamMissing(StreamType::Content))?;
+    match content_ms.chunk_count.checked_mul(manifest.chunk_size as u64) {
+        Some(b) if b <= MAX_ADDRESSABLE_BYTES => {}
+        _ => return Err(FramingBoundsExceeded("addressable size")),
+    }
+    let ck = dek.stream_subkey(StreamType::Content);
+    // Bridge the caller's DownloadError fetch/sink into the crypto layer's
+    // CryptoError closures: stash any caller error in a cell and surface a
+    // sentinel, so a fetch/sink failure propagates faithfully (a genuine AEAD
+    // failure, with no caller error stashed, becomes StreamFraming).
+    let user_err: core::cell::RefCell<Option<DownloadError>> = core::cell::RefCell::new(None);
+    let res = open_stream_streaming(
+        &ck,
+        ctx.file_id,
+        manifest.version,
+        StreamType::Content,
+        content_ms.chunk_count,
+        |i| {
+            fetch(i).map_err(|e| {
+                *user_err.borrow_mut() = Some(e);
+                maxsecu_crypto::CryptoError::Framing("fetch")
+            })
+        },
+        |frame| {
+            sink(frame).map_err(|e| {
+                *user_err.borrow_mut() = Some(e);
+                maxsecu_crypto::CryptoError::Framing("sink")
+            })
+        },
+    );
+    if res.is_err() {
+        return Err(user_err
+            .into_inner()
+            .unwrap_or(StreamFraming(StreamType::Content)));
+    }
+
+    Ok(OpenedHeader {
+        version: manifest.version,
+        file_type: manifest.file_type,
+        content_digest: content_ms.digest.0,
+        recovery_grant_ok,
+        content_chunk_count: content_ms.chunk_count,
+        small_streams: small,
+    })
 }
 
 #[cfg(test)]
@@ -370,6 +565,122 @@ mod tests {
             recipient_secret: built.owner.enc_secret(),
             seen_max_version: None,
         }
+    }
+
+    /// A multi-chunk build (content spans several 4 KiB chunks) for streaming.
+    fn build_large() -> (Built, Vec<u8>) {
+        let owner = Identity::generate();
+        let (recovery_sk, recovery_pk) = generate_enc_keypair();
+        let params = UploadParams {
+            owner: &owner,
+            owner_id: OWNER_ID,
+            owner_key_version: 1,
+            file_id: FILE_ID,
+            file_type: FileType::Blog,
+            chunk_size: 4096,
+            recovery_pub: recovery_pk,
+            created_at: NOW,
+        };
+        let content: Vec<u8> = (0..(4096 * 3 + 123)).map(|i| (i % 251) as u8).collect();
+        let streams = PlaintextStreams {
+            content: content.clone(),
+            metadata: Some(b"title=big".to_vec()),
+            thumbnail: None,
+            preview: None,
+        };
+        let bundle = build_upload(&params, &streams).unwrap();
+        (Built { owner, recovery_sk, bundle }, content)
+    }
+
+    /// Split an UploadBundle into a streaming header (small streams) + the
+    /// content stream's ciphertext chunks (fetched lazily by the test).
+    fn stream_header(b: &UploadBundle) -> (StreamHeader, Vec<Vec<u8>>) {
+        let sw = b.wraps.iter().find(|w| w.recipient_type == RecipientType::User).unwrap();
+        let rw = b.wraps.iter().find(|w| w.recipient_type == RecipientType::Recovery).unwrap();
+        let content = b.streams.iter().find(|s| s.stream_type == StreamType::Content).unwrap();
+        let small = b
+            .streams
+            .iter()
+            .filter(|s| s.stream_type != StreamType::Content)
+            .map(|s| StreamChunks { stream_type: s.stream_type, chunks: s.chunks.clone() })
+            .collect();
+        let header = StreamHeader {
+            manifest_bytes: encode(&b.manifest),
+            manifest_sig: b.manifest_sig,
+            genesis_bytes: encode(&b.genesis),
+            genesis_sig: b.genesis_sig,
+            wrapped_dek: sw.wrapped_dek.clone(),
+            grant_bytes: encode(&sw.grant),
+            grant_sig: sw.grant_sig,
+            recovery_grant_bytes: encode(&rw.grant),
+            recovery_grant_sig: rw.grant_sig,
+            small_streams: small,
+        };
+        (header, content.chunks.clone())
+    }
+
+    #[test]
+    fn streaming_content_round_trips_without_a_whole_buffer() {
+        let (built, content) = build_large();
+        let (header, chunks) = stream_header(&built.bundle);
+        assert!(chunks.len() >= 4, "content spans multiple chunks");
+
+        let mut out = Vec::new();
+        let mut max_frame = 0usize;
+        let opened = verify_and_stream_content(
+            &ctx(&built),
+            &header,
+            |i| Ok(chunks[i as usize].clone()),
+            |frame| {
+                max_frame = max_frame.max(frame.len());
+                out.extend_from_slice(frame);
+                Ok(())
+            },
+        )
+        .expect("streams");
+
+        assert_eq!(opened.version, 1);
+        assert!(opened.recovery_grant_ok);
+        assert_eq!(opened.content_chunk_count, chunks.len() as u64);
+        assert!(max_frame <= 4096, "no frame exceeds the chunk size (O(chunk_size) RAM)");
+        assert_eq!(out, content, "streamed content reconstructs the plaintext");
+        // The small metadata stream is decoded whole and digest-checked.
+        let meta = opened.small_streams.iter().find(|s| s.stream_type == StreamType::Metadata).unwrap();
+        assert_eq!(meta.plaintext, b"title=big");
+    }
+
+    #[test]
+    fn streaming_rejects_a_tampered_content_chunk() {
+        let (built, _content) = build_large();
+        let (header, mut chunks) = stream_header(&built.bundle);
+        chunks[1][0] ^= 0x01; // tamper the second content chunk
+        let mut released = 0usize;
+        let err = verify_and_stream_content(
+            &ctx(&built),
+            &header,
+            |i| Ok(chunks[i as usize].clone()),
+            |_| {
+                released += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, DownloadError::StreamFraming(StreamType::Content));
+        assert_eq!(released, 1, "only the first (valid) chunk was released");
+    }
+
+    #[test]
+    fn streaming_propagates_a_fetch_error() {
+        let (built, _content) = build_large();
+        let (header, _chunks) = stream_header(&built.bundle);
+        let err = verify_and_stream_content(
+            &ctx(&built),
+            &header,
+            |_| Err(DownloadError::StreamMissing(StreamType::Content)),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(err, DownloadError::StreamMissing(StreamType::Content));
     }
 
     #[test]
