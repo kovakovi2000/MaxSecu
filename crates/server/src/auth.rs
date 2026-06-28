@@ -44,6 +44,27 @@ pub struct AuthConfig {
     pub session_ttl_ms: u64,
     /// Anti-automation tunables (parameters §3).
     pub rate_limit: RateLimitConfig,
+    /// The pinned offline **directory-signing (D5) public key** (DESIGN §7.3).
+    /// `Some` enables D5-verified admin authz + the binding-publish gate; `None`
+    /// fails those closed. The server holds only the *public* half — it verifies
+    /// bindings, it cannot forge them.
+    pub directory_pub: Option<[u8; 32]>,
+    /// `SHA-256(bootstrap_secret)` for the first-run bootstrap window (§4.2). The
+    /// plaintext is printed once by the operator/launcher and never stored.
+    pub bootstrap_secret_hash: Option<[u8; 32]>,
+}
+
+impl AuthConfig {
+    /// Pin the offline D5 directory-signing public key (enables admin authz).
+    pub fn with_directory_pub(mut self, dir_pub: [u8; 32]) -> Self {
+        self.directory_pub = Some(dir_pub);
+        self
+    }
+    /// Configure the first-run bootstrap secret by its `SHA-256` hash.
+    pub fn with_bootstrap_secret_hash(mut self, h: [u8; 32]) -> Self {
+        self.bootstrap_secret_hash = Some(h);
+        self
+    }
 }
 
 impl Default for AuthConfig {
@@ -53,6 +74,8 @@ impl Default for AuthConfig {
             nonce_ttl_ms: 60_000,      // 60 s (parameters §2)
             session_ttl_ms: 3_600_000, // 60 min (parameters §2)
             rate_limit: RateLimitConfig::default(),
+            directory_pub: None,
+            bootstrap_secret_hash: None,
         }
     }
 }
@@ -79,6 +102,15 @@ impl<S: Store> AuthService<S> {
 
     pub fn server_id(&self) -> &str {
         &self.cfg.server_id
+    }
+
+    /// The pinned D5 directory-signing public key, if configured (§7.3).
+    pub fn directory_pub(&self) -> Option<[u8; 32]> {
+        self.cfg.directory_pub
+    }
+    /// The configured bootstrap-secret hash, if the bootstrap window is enabled.
+    pub fn bootstrap_secret_hash(&self) -> Option<[u8; 32]> {
+        self.cfg.bootstrap_secret_hash
     }
 
     /// Issue a fresh single-use challenge. A well-formed challenge is returned
@@ -296,6 +328,20 @@ mod tests {
 
     fn service() -> AuthService<MemoryStore> {
         AuthService::new(MemoryStore::new(), AuthConfig::default())
+    }
+
+    #[test]
+    fn config_carries_pinned_d5_and_bootstrap_secret() {
+        let cfg = AuthConfig::default()
+            .with_directory_pub([0x7D; 32])
+            .with_bootstrap_secret_hash([0xB5; 32]);
+        let svc = AuthService::new(MemoryStore::new(), cfg);
+        assert_eq!(svc.directory_pub(), Some([0x7D; 32]));
+        assert_eq!(svc.bootstrap_secret_hash(), Some([0xB5; 32]));
+        // Defaults are absent (admin endpoints fail closed until configured).
+        let bare = AuthService::new(MemoryStore::new(), AuthConfig::default());
+        assert_eq!(bare.directory_pub(), None);
+        assert_eq!(bare.bootstrap_secret_hash(), None);
     }
 
     #[tokio::test]
