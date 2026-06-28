@@ -558,17 +558,17 @@ fn binding_without_pq_roundtrips() {
 
 #[test]
 fn binding_with_pq_roundtrips() {
-    // A binding with mlkem_pub: Some([..1184..]) round-trips exactly.
+    // A binding with mlkem_pub: Some(MlKemPub([..1184..])) round-trips exactly.
     let mut v = valid_dirbinding();
     let key = [0xABu8; 1184];
-    v.mlkem_pub = Some(key);
+    v.mlkem_pub = Some(MlKemPub(key));
     let b = encode(&v);
     // Tail layout: flag(1) ‖ key(1184).
     assert_eq!(b[b.len() - 1185], 0x01, "present flag");
     assert_eq!(&b[b.len() - 1184..], &key[..], "fixed 1184-byte key, no prefix");
     let back: DirBinding = decode(&b).expect("PQ binding decodes");
     assert_eq!(back, v, "value round-trip");
-    assert_eq!(back.mlkem_pub, Some(key));
+    assert_eq!(back.mlkem_pub, Some(MlKemPub(key)));
     assert_eq!(encode(&back), b, "canonical guard for the Some shape");
 }
 
@@ -576,7 +576,7 @@ fn binding_with_pq_roundtrips() {
 fn binding_pq_flag_set_but_short_key_rejected() {
     // Flag 0x01 but fewer than 1184 trailing bytes → reject, no panic / no OOB.
     let mut v = valid_dirbinding();
-    v.mlkem_pub = Some([0xABu8; 1184]);
+    v.mlkem_pub = Some(MlKemPub([0xABu8; 1184]));
     let full = encode(&v);
     let short = &full[..full.len() - 1]; // 1183 key bytes left after the flag
     assert!(matches!(
@@ -587,16 +587,14 @@ fn binding_pq_flag_set_but_short_key_rejected() {
 
 #[test]
 fn binding_pq_bad_flag_rejected() {
-    // A presence byte that is neither 0x00 nor 0x01 → reject.
+    // A presence byte that is neither 0x00 nor 0x01 → reject, exactly like every
+    // other `option` field (the generic Option<T> path returns InvalidPresenceByte).
     let mut b = encode(&valid_dirbinding());
     let last = b.len() - 1;
     assert_eq!(b[last], 0x00, "fixture is the None shape");
     b[last] = 0x02;
     assert_eq!(
         decode::<DirBinding>(&b),
-        Err(DecodeError::UnknownEnum {
-            kind: "PqPresence",
-            value: 0x02
-        })
+        Err(DecodeError::InvalidPresenceByte(0x02))
     );
 }

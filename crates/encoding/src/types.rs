@@ -7,6 +7,7 @@
 
 use crate::error::DecodeError;
 use crate::primitives::{to_nfc, Reader, Writer};
+use crate::structs::MLKEM768_PUB_LEN;
 use crate::MAX_TEXT;
 
 /// A field that has exactly one canonical byte form.
@@ -104,6 +105,22 @@ impl Field for Bytes32 {
     }
     fn get(r: &mut Reader) -> Result<Self, DecodeError> {
         Ok(Bytes32(r.fixed::<32>()?))
+    }
+}
+
+/// An ML-KEM-768 encapsulation (public) key, `bytes_fixed(1184)` (Phase 7,
+/// P7.3). A distinct newtype (not a `Bytes32`) so the optional binding field can
+/// reuse the generic `Option<T>` Field machinery — the presence flag, and its
+/// `InvalidPresenceByte` rejection, come for free like every other `option`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlKemPub(pub [u8; MLKEM768_PUB_LEN]);
+
+impl Field for MlKemPub {
+    fn put(&self, w: &mut Writer) {
+        w.fixed(&self.0);
+    }
+    fn get(r: &mut Reader) -> Result<Self, DecodeError> {
+        Ok(MlKemPub(r.fixed::<MLKEM768_PUB_LEN>()?))
     }
 }
 

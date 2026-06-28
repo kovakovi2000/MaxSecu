@@ -22,14 +22,11 @@ fn id() -> impl Strategy<Value = Id> {
 fn b32() -> impl Strategy<Value = Bytes32> {
     any::<[u8; 32]>().prop_map(Bytes32)
 }
-fn mlkem_pub() -> impl Strategy<Value = Option<[u8; 1184]>> {
+fn mlkem_pub() -> impl Strategy<Value = Option<MlKemPub>> {
     // Arbitrary-for-[u8; N] is not provided for N=1184; build the array from a
-    // fixed-length byte vec instead.
-    let key = proptest::collection::vec(any::<u8>(), 1184).prop_map(|v| {
-        let mut a = [0u8; 1184];
-        a.copy_from_slice(&v);
-        a
-    });
+    // fixed-length (exactly 1184) byte vec instead.
+    let key = proptest::collection::vec(any::<u8>(), 1184)
+        .prop_map(|v| MlKemPub(v.try_into().unwrap()));
     proptest::option::of(key)
 }
 fn timestamp() -> impl Strategy<Value = Timestamp> {
