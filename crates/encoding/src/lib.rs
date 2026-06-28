@@ -146,4 +146,8 @@ pub mod labels {
     pub const REINSTATEMENT: &str = "MaxSecu-reinstatement-v1";
     pub const KEY_COMPROMISE: &str = "MaxSecu-key-compromise-v1";
     pub const AUTH: &str = "MaxSecu-auth-v1";
+    /// The external sink's anchored-head co-signature (DESIGN §7.6/§16.5,
+    /// `docs/sink-interface.md` §4) — a separate-custodian attestation over
+    /// `{chain_seq, head}`, a different trust domain from D5/D6 and the server.
+    pub const SINK_HEAD: &str = "MaxSecu-sink-head-v1";
 }
