@@ -10,9 +10,15 @@
 
 use crate::auth::AuthService;
 use crate::error::{AuthError, ChallengeError, ControlAppendError, ProveError};
-use crate::store::Store;
+use crate::files::{
+    parse_stage, FinalizeError, GenesisInput, ListFilter, StageError, StageInput, VersionSelector,
+    WrapInput,
+};
+use crate::store::{FileView, Store};
+use maxsecu_encoding::structs::Manifest;
 use maxsecu_encoding::types::Role;
-use axum::extract::{FromRequestParts, Json, Path, State};
+use maxsecu_encoding::decode;
+use axum::extract::{FromRequestParts, Json, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -57,6 +63,13 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         )
         .route("/v1/reinstatements", post(post_control::<S>))
         .route("/v1/key-compromise", post(post_control::<S>))
+        .route("/v1/files", get(list_files::<S>).post(create_file::<S>))
+        .route("/v1/files/{file_id}", get(get_file::<S>))
+        .route("/v1/files/{file_id}/versions", post(stage_version::<S>))
+        .route(
+            "/v1/files/{file_id}/versions/{v}/finalize",
+            post(finalize_version::<S>),
+        )
         .with_state(state)
 }
 
@@ -405,6 +418,449 @@ async fn post_control<S: Store + 'static>(
         Err(ControlAppendError::Conflict) => StatusCode::CONFLICT.into_response(),
         Err(ControlAppendError::Malformed) => StatusCode::BAD_REQUEST.into_response(),
         Err(ControlAppendError::Store(e)) => internal_error(e),
+    }
+}
+
+// ---- Files — records (api.md §8) ----
+
+fn file_type_code(s: &str) -> Option<i16> {
+    match s {
+        "video" => Some(1),
+        "image" => Some(2),
+        "blog" => Some(3),
+        _ => None,
+    }
+}
+fn file_type_name(c: i16) -> &'static str {
+    match c {
+        1 => "video",
+        2 => "image",
+        3 => "blog",
+        _ => "unknown",
+    }
+}
+fn stream_type_code(s: &str) -> Option<i16> {
+    match s {
+        "content" => Some(1),
+        "metadata" => Some(2),
+        "thumbnail" => Some(3),
+        "preview" => Some(4),
+        _ => None,
+    }
+}
+fn stream_type_name(c: i16) -> &'static str {
+    match c {
+        1 => "content",
+        2 => "metadata",
+        3 => "thumbnail",
+        4 => "preview",
+        _ => "unknown",
+    }
+}
+fn recipient_type_code(s: &str) -> Option<i16> {
+    match s {
+        "user" => Some(1),
+        "recovery" => Some(2),
+        _ => None,
+    }
+}
+
+/// A wrap recipient id: the literal `"recovery"` maps to the all-zero
+/// `RECOVERY_ID`; anything else is a hex-16 `user_id` (api.md §1.4).
+fn recipient_id(s: &str) -> Option<[u8; 16]> {
+    if s == "recovery" {
+        Some([0u8; 16])
+    } else {
+        hex_fixed::<16>(s)
+    }
+}
+
+#[derive(Deserialize)]
+struct StreamReq {
+    stream_type: String,
+    total_bytes: u64,
+    // chunk_count/chunk_size also ride here (api.md §8.1) but the manifest is
+    // authoritative; the server reads framing from it, not from these.
+}
+
+#[derive(Deserialize)]
+struct WrapReq {
+    recipient_id: String,
+    recipient_type: String,
+    wrapped_dek_b64: String,
+    wrap_alg: Option<u32>,
+    granted_by: String,
+    grant_b64: String,
+    grant_sig_b64: String,
+}
+
+#[derive(Deserialize)]
+struct CreateFileReq {
+    file_id: String,
+    file_type: String,
+    genesis_b64: String,
+    genesis_sig_b64: String,
+    manifest_b64: String,
+    manifest_sig_b64: String,
+    streams: Vec<StreamReq>,
+    wraps: Vec<WrapReq>,
+}
+
+#[derive(Deserialize)]
+struct StageVersionReq {
+    file_type: String,
+    manifest_b64: String,
+    manifest_sig_b64: String,
+    streams: Vec<StreamReq>,
+    wraps: Vec<WrapReq>,
+}
+
+#[derive(Serialize)]
+struct StageRes {
+    upload_token: String,
+    version: u64,
+}
+
+fn build_wraps(reqs: &[WrapReq]) -> Option<Vec<WrapInput>> {
+    reqs.iter()
+        .map(|w| {
+            Some(WrapInput {
+                recipient_id: recipient_id(&w.recipient_id)?,
+                recipient_type: recipient_type_code(&w.recipient_type)?,
+                wrapped_dek: b64_vec(&w.wrapped_dek_b64)?,
+                wrap_alg: w.wrap_alg.unwrap_or(1) as i32,
+                granted_by: hex_fixed::<16>(&w.granted_by)?,
+                grant_bytes: b64_vec(&w.grant_b64)?,
+                grant_sig: b64_fixed::<64>(&w.grant_sig_b64)?,
+            })
+        })
+        .collect()
+}
+
+fn build_stream_totals(reqs: &[StreamReq]) -> Option<Vec<(i16, u64)>> {
+    reqs.iter()
+        .map(|s| Some((stream_type_code(&s.stream_type)?, s.total_bytes)))
+        .collect()
+}
+
+/// The `upload_token` scoping the chunk PUTs (api.md §8.1/§9.1). In P3.6 it
+/// echoes `(file_id, version)`; P3.7 binds it to the staged blob slots.
+fn upload_token(file_id: &[u8; 16], version: u64) -> String {
+    format!("{}.{version}", hex_encode(file_id))
+}
+
+/// Map a stage rejection to its HTTP status (api.md §8.1: 400/413 bounds; 403
+/// non-owner; 404 unknown file; 409 already finalized; 500 backend fault).
+fn stage_status(e: StageError) -> Response {
+    use StageError::*;
+    match e {
+        SizeBoundExceeded => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        NotOwner => StatusCode::FORBIDDEN.into_response(),
+        NoSuchFile => StatusCode::NOT_FOUND.into_response(),
+        AlreadyFinalized => StatusCode::CONFLICT.into_response(),
+        Store(e) => internal_error(e),
+        // Every remaining cause is a malformed/inconsistent request.
+        BadManifest | BadGenesis | FileIdMismatch | ChunkSizeOutOfRange | MissingRecoveryWrap
+        | VersionMismatch | GenesisRequired | GenesisUnexpected => {
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+/// `POST /v1/files` — stage version 1 of a new file (api.md §8.1).
+async fn create_file<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Json(req): Json<CreateFileReq>,
+) -> Response {
+    let (Some(file_id), Some(file_type)) =
+        (hex_fixed::<16>(&req.file_id), file_type_code(&req.file_type))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let (Some(manifest_bytes), Some(manifest_sig), Some(genesis_bytes), Some(genesis_sig)) = (
+        b64_vec(&req.manifest_b64),
+        b64_fixed::<64>(&req.manifest_sig_b64),
+        b64_vec(&req.genesis_b64),
+        b64_fixed::<64>(&req.genesis_sig_b64),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let (Some(wraps), Some(stream_totals)) =
+        (build_wraps(&req.wraps), build_stream_totals(&req.streams))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let input = StageInput {
+        file_id,
+        caller_id: session.user_id,
+        file_type_advisory: file_type,
+        genesis: Some(GenesisInput {
+            genesis_bytes,
+            genesis_sig,
+        }),
+        manifest_bytes,
+        manifest_sig,
+        wraps,
+        stream_totals,
+        proposed_version: 1, // POST /v1/files is the version-1 endpoint
+    };
+    stage_and_respond(&st, input).await
+}
+
+/// `POST /v1/files/{file_id}/versions` — stage a rotation (api.md §8.2).
+async fn stage_version<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Path(file_id_hex): Path<String>,
+    Json(req): Json<StageVersionReq>,
+) -> Response {
+    let (Some(file_id), Some(file_type)) = (
+        hex_fixed::<16>(&file_id_hex),
+        file_type_code(&req.file_type),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let (Some(manifest_bytes), Some(manifest_sig)) = (
+        b64_vec(&req.manifest_b64),
+        b64_fixed::<64>(&req.manifest_sig_b64),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let (Some(wraps), Some(stream_totals)) =
+        (build_wraps(&req.wraps), build_stream_totals(&req.streams))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    // The client proposes the version inside the manifest (api.md §8.2); read it
+    // back so parse_stage's proposed==manifest check is consistent.
+    let proposed_version = decode::<Manifest>(&manifest_bytes)
+        .map(|m| m.version)
+        .unwrap_or(0);
+    let input = StageInput {
+        file_id,
+        caller_id: session.user_id,
+        file_type_advisory: file_type,
+        genesis: None,
+        manifest_bytes,
+        manifest_sig,
+        wraps,
+        stream_totals,
+        proposed_version,
+    };
+    stage_and_respond(&st, input).await
+}
+
+async fn stage_and_respond<S: Store>(st: &AppState<S>, input: StageInput) -> Response {
+    let file_id = input.file_id;
+    let parsed = match parse_stage(input) {
+        Ok(p) => p,
+        Err(e) => return stage_status(e),
+    };
+    match st.auth.store().stage_version(parsed, now_ms()).await {
+        Ok(version) => (
+            StatusCode::CREATED,
+            Json(StageRes {
+                upload_token: upload_token(&file_id, version),
+                version,
+            }),
+        )
+            .into_response(),
+        Err(e) => stage_status(e),
+    }
+}
+
+/// `POST /v1/files/{file_id}/versions/{v}/finalize` — atomic commit (api.md §8.4).
+async fn finalize_version<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Path((file_id_hex, version)): Path<(String, u64)>,
+) -> Response {
+    let Some(file_id) = hex_fixed::<16>(&file_id_hex) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st
+        .auth
+        .store()
+        .finalize_version(file_id, version, session.user_id, now_ms())
+        .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(FinalizeError::NotOwner) => StatusCode::FORBIDDEN.into_response(),
+        Err(FinalizeError::NoSuchVersion) => StatusCode::NOT_FOUND.into_response(),
+        Err(FinalizeError::VersionConflict { .. }) | Err(FinalizeError::AlreadyFinalized) => {
+            StatusCode::CONFLICT.into_response()
+        }
+        Err(FinalizeError::Store(e)) => internal_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct GetFileQuery {
+    version: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StreamOut {
+    stream_type: String,
+    chunk_count: u64,
+    chunk_size: u32,
+    blob_ref: String,
+}
+
+#[derive(Serialize)]
+struct WrapOut {
+    wrapped_dek_b64: String,
+    grant_b64: String,
+    grant_sig_b64: String,
+    ancestor_grants: Vec<serde_json::Value>, // empty in Phase 3 (no re-share chain)
+}
+
+#[derive(Serialize)]
+struct RecoveryGrantOut {
+    grant_b64: String,
+    grant_sig_b64: String,
+}
+
+#[derive(Serialize)]
+struct FileRes {
+    version: u64,
+    manifest_b64: String,
+    manifest_sig_b64: String,
+    genesis_b64: String,
+    genesis_sig_b64: String,
+    my_wrap: WrapOut,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_grant: Option<RecoveryGrantOut>,
+    streams: Vec<StreamOut>,
+}
+
+fn file_view_to_res(v: FileView) -> FileRes {
+    FileRes {
+        version: v.version,
+        manifest_b64: b64encode(&v.manifest_bytes),
+        manifest_sig_b64: b64encode(&v.manifest_sig),
+        genesis_b64: b64encode(&v.genesis_bytes),
+        genesis_sig_b64: b64encode(&v.genesis_sig),
+        my_wrap: WrapOut {
+            wrapped_dek_b64: b64encode(&v.my_wrap.wrapped_dek),
+            grant_b64: b64encode(&v.my_wrap.grant_bytes),
+            grant_sig_b64: b64encode(&v.my_wrap.grant_sig),
+            ancestor_grants: Vec::new(),
+        },
+        recovery_grant: v.recovery_grant.map(|(b, s)| RecoveryGrantOut {
+            grant_b64: b64encode(&b),
+            grant_sig_b64: b64encode(&s),
+        }),
+        streams: v
+            .streams
+            .iter()
+            .map(|s| StreamOut {
+                stream_type: stream_type_name(s.stream_type).to_owned(),
+                chunk_count: s.chunk_count,
+                chunk_size: s.chunk_size,
+                blob_ref: s.blob_ref.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// `GET /v1/files/{file_id}?version=<v|latest>` (api.md §8.5). `404` for both a
+/// missing file/version and a caller with no wrap — no access oracle.
+async fn get_file<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Path(file_id_hex): Path<String>,
+    Query(q): Query<GetFileQuery>,
+) -> Response {
+    let Some(file_id) = hex_fixed::<16>(&file_id_hex) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let selector = match q.version.as_deref() {
+        None | Some("latest") => VersionSelector::Latest,
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => VersionSelector::Specific(n),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+    };
+    match st
+        .auth
+        .store()
+        .get_file(file_id, selector, session.user_id)
+        .await
+    {
+        Ok(Some(view)) => Json(file_view_to_res(view)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ListQuery {
+    #[serde(rename = "type")]
+    file_type: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct ListEntryRes {
+    file_id: String,
+    file_type: String,
+    version: u64,
+    updated_at: u64,
+    streams: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct ListRes {
+    files: Vec<ListEntryRes>,
+    next_cursor: Option<String>,
+}
+
+/// `GET /v1/files?type=&limit=` — D35 listing (api.md §8.6). `file_type` +
+/// small-stream structure/sizes only; never values.
+async fn list_files<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    _session: AuthedSession,
+    Query(q): Query<ListQuery>,
+) -> Response {
+    // An unknown type filter matches nothing rather than erroring the browse.
+    let file_type = match q.file_type.as_deref() {
+        None => None,
+        Some(s) => match file_type_code(s) {
+            Some(c) => Some(c),
+            None => return Json(ListRes { files: Vec::new(), next_cursor: None }).into_response(),
+        },
+    };
+    let limit = q.limit.unwrap_or(50).min(200);
+    match st.auth.store().list_files(ListFilter { file_type, limit }).await {
+        Ok(entries) => {
+            let files = entries
+                .iter()
+                .map(|e| {
+                    let mut streams = serde_json::Map::new();
+                    for (st_code, size) in &e.small_streams {
+                        streams.insert(
+                            stream_type_name(*st_code).to_owned(),
+                            serde_json::json!({ "size": size }),
+                        );
+                    }
+                    ListEntryRes {
+                        file_id: hex_encode(&e.file_id),
+                        file_type: file_type_name(e.file_type).to_owned(),
+                        version: e.version,
+                        updated_at: e.updated_at_ms,
+                        streams,
+                    }
+                })
+                .collect();
+            Json(ListRes {
+                files,
+                next_cursor: None,
+            })
+            .into_response()
+        }
+        Err(e) => internal_error(e),
     }
 }
 
@@ -1036,6 +1492,211 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "register over a faulty store");
+    }
+
+    async fn get_json_auth(
+        router: &Router,
+        uri: &str,
+        token: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header(AUTHORIZATION, format!("MaxSecu-Session {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, json)
+    }
+
+    // Build a manifest for the file HTTP tests (sigs are placeholders — the server
+    // never verifies them; the downloader does).
+    fn file_manifest_b64(file: [u8; 16], version: u64, author: [u8; 16]) -> String {
+        use maxsecu_encoding::structs::{Manifest, Stream};
+        use maxsecu_encoding::types::{Compression, FileType, Id, StreamType, Suite};
+        let m = Manifest {
+            file_id: Id(file),
+            version,
+            file_type: FileType::Blog,
+            alg: Suite::V1,
+            chunk_size: 1 << 20,
+            dek_commit: Bytes32([0xDC; 32]),
+            streams: vec![
+                Stream {
+                    stream_type: StreamType::Content,
+                    compression: Compression::None,
+                    chunk_count: 2,
+                    digest: Bytes32([0xC0; 32]),
+                },
+                Stream {
+                    stream_type: StreamType::Metadata,
+                    compression: Compression::None,
+                    chunk_count: 1,
+                    digest: Bytes32([0x2E; 32]),
+                },
+            ],
+            recovery_present: true,
+            author_id: Id(author),
+            created_at: Timestamp(1_719_500_000_000 + version),
+        };
+        b64encode(&maxsecu_encoding::encode(&m))
+    }
+
+    fn file_genesis_b64(file: [u8; 16], owner: [u8; 16]) -> String {
+        use maxsecu_encoding::structs::Genesis;
+        use maxsecu_encoding::types::Id;
+        b64encode(&maxsecu_encoding::encode(&Genesis {
+            file_id: Id(file),
+            owner_id: Id(owner),
+            owner_key_version: 1,
+            created_at: Timestamp(1_719_500_000_000),
+        }))
+    }
+
+    fn file_wraps_json(owner: [u8; 16]) -> serde_json::Value {
+        serde_json::json!([
+            { "recipient_id": hex_encode(&owner), "recipient_type": "user",
+              "wrapped_dek_b64": b64encode(&[0xA1u8; 48]), "wrap_alg": 1,
+              "granted_by": hex_encode(&owner), "grant_b64": b64encode(&[0xB1u8; 8]),
+              "grant_sig_b64": b64encode(&[0xC1u8; 64]) },
+            { "recipient_id": "recovery", "recipient_type": "recovery",
+              "wrapped_dek_b64": b64encode(&[0xA2u8; 48]), "wrap_alg": 1,
+              "granted_by": hex_encode(&owner), "grant_b64": b64encode(&[0xB2u8; 8]),
+              "grant_sig_b64": b64encode(&[0xC2u8; 64]) },
+        ])
+    }
+
+    fn create_file_body(file: [u8; 16], owner: [u8; 16]) -> serde_json::Value {
+        serde_json::json!({
+            "file_id": hex_encode(&file),
+            "file_type": "blog",
+            "genesis_b64": file_genesis_b64(file, owner),
+            "genesis_sig_b64": b64encode(&[0x9Au8; 64]),
+            "manifest_b64": file_manifest_b64(file, 1, owner),
+            "manifest_sig_b64": b64encode(&[0x9Bu8; 64]),
+            "streams": [ {"stream_type":"content","chunk_count":2,"chunk_size":1048576,"total_bytes":2000000},
+                         {"stream_type":"metadata","chunk_count":1,"chunk_size":1048576,"total_bytes":256} ],
+            "wraps": file_wraps_json(owner),
+        })
+    }
+
+    #[tokio::test]
+    async fn file_upload_finalize_get_and_listing_over_http() {
+        let (router, admin_sk, bob_sk) = admin_app();
+        let owner = [0xADu8; 16]; // admin's user_id
+        let token = login(&router, "admin", &admin_sk).await;
+        let file = [0xF1u8; 16];
+
+        // Stage v1 → 201 with version + an upload token.
+        let (st, res) =
+            post_json_auth(&router, "/v1/files", create_file_body(file, owner), &token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(res["version"].as_u64().unwrap(), 1);
+        assert!(res["upload_token"].as_str().is_some());
+
+        // Not visible until finalize.
+        let (st, _) = get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &token).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // Finalize → 200, then GET returns the records + caller's wrap.
+        let (st, _) = post_json_auth(
+            &router,
+            &format!("/v1/files/{}/versions/1/finalize", hex_encode(&file)),
+            serde_json::json!({}),
+            &token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        let (st, body) =
+            get_json_auth(&router, &format!("/v1/files/{}?version=latest", hex_encode(&file)), &token).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["version"].as_u64().unwrap(), 1);
+        assert_eq!(body["manifest_b64"].as_str().unwrap(), file_manifest_b64(file, 1, owner));
+        assert!(body["my_wrap"]["wrapped_dek_b64"].as_str().is_some());
+        assert!(body["recovery_grant"]["grant_b64"].as_str().is_some());
+        assert_eq!(body["streams"].as_array().unwrap().len(), 2);
+
+        // A different authenticated user holds no wrap → 404 (no access oracle).
+        let bob = login(&router, "bob", &bob_sk).await;
+        let (st, _) = get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &bob).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // Listing shows the blog with its small (metadata) stream, not content.
+        let (st, body) = get_json_auth(&router, "/v1/files?type=blog", &token).await;
+        assert_eq!(st, StatusCode::OK);
+        let files = body["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["file_type"], "blog");
+        assert!(files[0]["streams"]["metadata"]["size"].as_u64().is_some());
+        assert!(files[0]["streams"].get("content").is_none());
+    }
+
+    #[tokio::test]
+    async fn file_upload_redteam_status_codes() {
+        let (router, admin_sk, _bob_sk) = admin_app();
+        let owner = [0xADu8; 16];
+        let token = login(&router, "admin", &admin_sk).await;
+        let file = [0xF2u8; 16];
+
+        // A manifest authored by someone other than the caller → 403 (D29).
+        let mut body = create_file_body(file, owner);
+        body["manifest_b64"] = serde_json::Value::String(file_manifest_b64(file, 1, [0x22; 16]));
+        let (st, _) = post_json_auth(&router, "/v1/files", body, &token).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+
+        // Malformed manifest bytes → 400.
+        let mut body = create_file_body(file, owner);
+        body["manifest_b64"] = serde_json::Value::String(b64encode(&[0x00u8, 0x02, 0xFF]));
+        let (st, _) = post_json_auth(&router, "/v1/files", body, &token).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // Stage a real v1 and finalize, then a +1-violating finalize → 409.
+        let (st, _) = post_json_auth(&router, "/v1/files", create_file_body(file, owner), &token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (st, _) = post_json_auth(
+            &router,
+            &format!("/v1/files/{}/versions/1/finalize", hex_encode(&file)),
+            serde_json::json!({}),
+            &token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        // Stage v3 (skips v2) and finalize → strict-+1 conflict 409.
+        let v3 = serde_json::json!({
+            "file_type": "blog",
+            "manifest_b64": file_manifest_b64(file, 3, owner),
+            "manifest_sig_b64": b64encode(&[0x9Bu8; 64]),
+            "streams": [ {"stream_type":"content","chunk_count":2,"chunk_size":1048576,"total_bytes":2000000},
+                         {"stream_type":"metadata","chunk_count":1,"chunk_size":1048576,"total_bytes":256} ],
+            "wraps": file_wraps_json(owner),
+        });
+        let (st, _) = post_json_auth(&router, &format!("/v1/files/{}/versions", hex_encode(&file)), v3, &token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (st, _) = post_json_auth(
+            &router,
+            &format!("/v1/files/{}/versions/3/finalize", hex_encode(&file)),
+            serde_json::json!({}),
+            &token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
+
+        // An unauthenticated stage → 401.
+        let (st, _) = post_json(&router, "/v1/files", create_file_body([0xF9; 16], owner)).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
