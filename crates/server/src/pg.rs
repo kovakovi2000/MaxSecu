@@ -33,8 +33,8 @@ use crate::control::{decode_control, role_from_text, role_text};
 use crate::error::{ControlAppendError, StoreError};
 use crate::files::{FinalizeError, ListFilter, ParsedStage, StageError, VersionSelector};
 use crate::store::{
-    FileListEntry, FileView, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
-    UserRecord, WrapView,
+    ChunkSlot, FileListEntry, FileView, SessionRecord, StoredBinding, StoredControlRecord, Store,
+    StreamView, UserRecord, VersionMeta, WrapView,
 };
 
 /// Postgres [`Store`]. Cheap to clone (the pool is an `Arc` internally).
@@ -787,6 +787,50 @@ impl Store for PgStore {
             });
         }
         Ok(out)
+    }
+
+    async fn version_meta(
+        &self,
+        file_id: [u8; 16],
+        version: u64,
+    ) -> Result<Option<VersionMeta>, StoreError> {
+        let op = "version_meta";
+        let v = version as i64;
+        let frow = sqlx::query(
+            "SELECT f.owner_id, fv.finalized FROM file_versions fv \
+             JOIN files f ON f.file_id = fv.file_id \
+             WHERE fv.file_id = $1 AND fv.version = $2",
+        )
+        .bind(&file_id[..])
+        .bind(v)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        let Some(frow) = frow else { return Ok(None) };
+
+        let srows = sqlx::query(
+            "SELECT stream_type, blob_ref, chunk_count, chunk_size FROM file_streams \
+             WHERE file_id = $1 AND version = $2 ORDER BY stream_type",
+        )
+        .bind(&file_id[..])
+        .bind(v)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        let streams = srows
+            .iter()
+            .map(|s| ChunkSlot {
+                stream_type: s.get("stream_type"),
+                blob_ref: s.get("blob_ref"),
+                chunk_count: s.get::<i64, _>("chunk_count") as u64,
+                chunk_size: s.get::<i32, _>("chunk_size") as u32,
+            })
+            .collect();
+        Ok(Some(VersionMeta {
+            owner_id: col_fixed(&frow, op, "owner_id")?,
+            finalized: frow.get("finalized"),
+            streams,
+        }))
     }
 }
 

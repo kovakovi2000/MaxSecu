@@ -117,6 +117,26 @@ pub struct FileListEntry {
     pub small_streams: Vec<(i16, u64)>,
 }
 
+/// One stream's chunk-slot framing for the blob tier (api.md §9): its
+/// server-assigned `blob_ref`, expected `chunk_count`, and `chunk_size` bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkSlot {
+    pub stream_type: i16,
+    pub blob_ref: String,
+    pub chunk_count: u64,
+    pub chunk_size: u32,
+}
+
+/// Staging/visibility metadata for one file version, used by the chunk endpoints
+/// (api.md §9) and the finalize completeness check (§8.4): the coarse `owner_id`,
+/// whether the version is `finalized` (visible / immutable), and its stream slots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionMeta {
+    pub owner_id: [u8; 16],
+    pub finalized: bool,
+    pub streams: Vec<ChunkSlot>,
+}
+
 /// Async because the production backing is sqlx/Postgres. `Send + Sync` so the
 /// service can be shared across axum request tasks.
 ///
@@ -252,6 +272,15 @@ pub trait Store: Send + Sync {
     /// authenticated `file_type` + small-stream structure/sizes only, newest
     /// first, filtered/limited per `filter`.
     async fn list_files(&self, filter: ListFilter) -> Result<Vec<FileListEntry>, StoreError>;
+
+    /// Staging metadata for one version — owner, finalized flag, and stream
+    /// slots — for the chunk PUT/GET bound checks and the finalize completeness
+    /// check (api.md §9 / §8.4). `Ok(None)` if no such (file, version) is staged.
+    async fn version_meta(
+        &self,
+        file_id: [u8; 16],
+        version: u64,
+    ) -> Result<Option<VersionMeta>, StoreError>;
 }
 
 #[derive(Default)]
@@ -701,6 +730,35 @@ impl Store for MemoryStore {
         out.truncate(filter.limit);
         Ok(out)
     }
+
+    async fn version_meta(
+        &self,
+        file_id: [u8; 16],
+        version: u64,
+    ) -> Result<Option<VersionMeta>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.files.get(&file_id) else {
+            return Ok(None);
+        };
+        let Some(ver) = entry.versions.get(&version) else {
+            return Ok(None);
+        };
+        let streams = ver
+            .streams
+            .iter()
+            .map(|s| ChunkSlot {
+                stream_type: s.stream_type,
+                blob_ref: s.blob_ref.clone(),
+                chunk_count: s.chunk_count,
+                chunk_size: s.chunk_size,
+            })
+            .collect();
+        Ok(Some(VersionMeta {
+            owner_id: entry.owner_id,
+            finalized: ver.finalized,
+            streams,
+        }))
+    }
 }
 
 /// A [`Store`] whose every method returns `Err(StoreError)` — used to prove the
@@ -828,5 +886,12 @@ impl Store for FaultyStore {
     }
     async fn list_files(&self, _filter: ListFilter) -> Result<Vec<FileListEntry>, StoreError> {
         Err(Self::fault("list_files"))
+    }
+    async fn version_meta(
+        &self,
+        _file_id: [u8; 16],
+        _version: u64,
+    ) -> Result<Option<VersionMeta>, StoreError> {
+        Err(Self::fault("version_meta"))
     }
 }

@@ -72,6 +72,7 @@ fn router() -> axum::Router {
     store.add_voucher(sha256(VOUCHER.as_bytes()));
     let state = AppState {
         auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        blobs: Arc::new(maxsecu_server::MemoryBlobStore::new()),
     };
     maxsecu_server::router(state)
 }

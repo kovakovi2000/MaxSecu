@@ -14,6 +14,7 @@ use crate::files::{
     parse_stage, FinalizeError, GenesisInput, ListFilter, StageError, StageInput, VersionSelector,
     WrapInput,
 };
+use crate::blob::BlobStore;
 use crate::store::{FileView, Store};
 use maxsecu_encoding::structs::Manifest;
 use maxsecu_encoding::types::Role;
@@ -22,7 +23,7 @@ use axum::extract::{FromRequestParts, Json, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Extension, Router};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -37,12 +38,17 @@ pub struct TlsExporter(pub [u8; 32]);
 /// Shared handler state. Cloneable (an `Arc` bump) for axum.
 pub struct AppState<S: Store> {
     pub auth: Arc<AuthService<S>>,
+    /// The ciphertext-chunk tier (api.md §9 / D31). Shared across requests; the
+    /// concrete impl (Memory for e2e, FS for the Postgres path) is chosen by the
+    /// caller that builds the state.
+    pub blobs: Arc<dyn BlobStore>,
 }
 
 impl<S: Store> Clone for AppState<S> {
     fn clone(&self) -> Self {
         AppState {
             auth: self.auth.clone(),
+            blobs: self.blobs.clone(),
         }
     }
 }
@@ -69,6 +75,10 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         .route(
             "/v1/files/{file_id}/versions/{v}/finalize",
             post(finalize_version::<S>),
+        )
+        .route(
+            "/v1/files/{file_id}/versions/{v}/streams/{stream_type}/chunks/{index}",
+            put(put_chunk::<S>).get(get_chunk::<S>),
         )
         .with_state(state)
 }
@@ -671,6 +681,9 @@ async fn stage_and_respond<S: Store>(st: &AppState<S>, input: StageInput) -> Res
 }
 
 /// `POST /v1/files/{file_id}/versions/{v}/finalize` — atomic commit (api.md §8.4).
+/// Verifies every stream received exactly its `chunk_count` chunks before the
+/// commit, then (on success) deletes the prior version's chunks (api.md §8.4 /
+/// §12.9 — its DB streams/wraps are dropped by `finalize_version`).
 async fn finalize_version<S: Store + 'static>(
     State(st): State<AppState<S>>,
     session: AuthedSession,
@@ -679,19 +692,143 @@ async fn finalize_version<S: Store + 'static>(
     let Some(file_id) = hex_fixed::<16>(&file_id_hex) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    // Completeness: each staged stream must hold exactly chunk_count chunks.
+    let meta = match st.auth.store().version_meta(file_id, version).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return internal_error(e),
+    };
+    for s in &meta.streams {
+        match st.blobs.chunk_count(&s.blob_ref).await {
+            Ok(got) if got == s.chunk_count => {}
+            Ok(_) => return StatusCode::BAD_REQUEST.into_response(), // incomplete stream
+            Err(e) => return internal_error(e),
+        }
+    }
+    // Capture the prior version's blob_refs before the commit drops its DB rows.
+    let prior_refs: Vec<String> = if version >= 2 {
+        match st.auth.store().version_meta(file_id, version - 1).await {
+            Ok(Some(m)) => m.streams.into_iter().map(|s| s.blob_ref).collect(),
+            Ok(None) => Vec::new(),
+            Err(e) => return internal_error(e),
+        }
+    } else {
+        Vec::new()
+    };
+
     match st
         .auth
         .store()
         .finalize_version(file_id, version, session.user_id, now_ms())
         .await
     {
-        Ok(()) => StatusCode::OK.into_response(),
+        Ok(()) => {
+            // Best-effort prior-chunk teardown; the commit already stands, so a
+            // blob-delete fault is logged, not surfaced (it leaves only dead bytes).
+            for r in &prior_refs {
+                if let Err(e) = st.blobs.delete_stream(r).await {
+                    log_internal(e);
+                }
+            }
+            StatusCode::OK.into_response()
+        }
         Err(FinalizeError::NotOwner) => StatusCode::FORBIDDEN.into_response(),
         Err(FinalizeError::NoSuchVersion) => StatusCode::NOT_FOUND.into_response(),
         Err(FinalizeError::VersionConflict { .. }) | Err(FinalizeError::AlreadyFinalized) => {
             StatusCode::CONFLICT.into_response()
         }
         Err(FinalizeError::Store(e)) => internal_error(e),
+    }
+}
+
+/// Per-chunk AEAD overhead (the 128-bit GCM tag, parameters §1.2): a ciphertext
+/// chunk is at most `chunk_size` plaintext + this tag.
+const AEAD_TAG_LEN: u64 = 16;
+
+/// `PUT /v1/files/{file_id}/versions/{v}/streams/{stream_type}/chunks/{index}` —
+/// upload one ciphertext chunk (api.md §9.1). Owner-only (D29); idempotent by
+/// index; `409` once finalized; `413` over the bound.
+async fn put_chunk<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Path((file_id_hex, version, stream_type, index)): Path<(String, u64, String, u64)>,
+    body: axum::body::Bytes,
+) -> Response {
+    let (Some(file_id), Some(stype)) =
+        (hex_fixed::<16>(&file_id_hex), stream_type_code(&stream_type))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let meta = match st.auth.store().version_meta(file_id, version).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return internal_error(e),
+    };
+    if meta.owner_id != session.user_id {
+        return StatusCode::FORBIDDEN.into_response(); // only the owner writes chunks
+    }
+    if meta.finalized {
+        return StatusCode::CONFLICT.into_response(); // immutable after finalize
+    }
+    let Some(slot) = meta.streams.iter().find(|s| s.stream_type == stype) else {
+        return StatusCode::NOT_FOUND.into_response(); // no such stream in this version
+    };
+    if index >= slot.chunk_count {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response(); // index past the framing
+    }
+    if body.len() as u64 > slot.chunk_size as u64 + AEAD_TAG_LEN {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response(); // oversized chunk
+    }
+    match st.blobs.put_chunk(&slot.blob_ref, index, body.to_vec()).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// `GET /v1/files/{file_id}/versions/{v}/streams/{stream_type}/chunks/{index}` —
+/// download one ciphertext chunk (api.md §9.2). Gated like §8.5: the owner, or a
+/// recipient of a finalized version; otherwise `404` (no oracle).
+async fn get_chunk<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Path((file_id_hex, version, stream_type, index)): Path<(String, u64, String, u64)>,
+) -> Response {
+    let (Some(file_id), Some(stype)) =
+        (hex_fixed::<16>(&file_id_hex), stream_type_code(&stream_type))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let meta = match st.auth.store().version_meta(file_id, version).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return internal_error(e),
+    };
+    // Access: the owner always; otherwise only a recipient of a *finalized*
+    // version (a wrap row exists) — exactly the §8.5 gate, reused.
+    let allowed = meta.owner_id == session.user_id
+        || match st
+            .auth
+            .store()
+            .get_file(file_id, VersionSelector::Specific(version), session.user_id)
+            .await
+        {
+            Ok(opt) => opt.is_some(),
+            Err(e) => return internal_error(e),
+        };
+    if !allowed {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(slot) = meta.streams.iter().find(|s| s.stream_type == stype) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match st.blobs.get_chunk(&slot.blob_ref, index).await {
+        Ok(Some(bytes)) => (
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => internal_error(e),
     }
 }
 
@@ -910,6 +1047,7 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AuthedSession {
 mod tests {
     use super::*;
     use crate::auth::AuthConfig;
+    use crate::blob::MemoryBlobStore;
     use crate::store::{FaultyStore, MemoryStore, UserRecord};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -934,6 +1072,7 @@ mod tests {
         );
         let state = AppState {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+            blobs: Arc::new(MemoryBlobStore::new()),
         };
         let router = router(state).layer(Extension(TlsExporter(exporter)));
         (router, sk)
@@ -1103,6 +1242,7 @@ mod tests {
         }
         let state = AppState {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+            blobs: Arc::new(MemoryBlobStore::new()),
         };
         router(state).layer(Extension(TlsExporter(EXPORTER)))
     }
@@ -1260,6 +1400,7 @@ mod tests {
 
         let router = router(AppState {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+            blobs: Arc::new(MemoryBlobStore::new()),
         })
         .layer(Extension(TlsExporter(EXPORTER)));
 
@@ -1362,6 +1503,7 @@ mod tests {
         );
         let router = router(AppState {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+            blobs: Arc::new(MemoryBlobStore::new()),
         })
         .layer(Extension(TlsExporter(EXPORTER)));
         (router, admin_sk, bob_sk)
@@ -1465,6 +1607,7 @@ mod tests {
         // 500 (server health) — NOT a swallowed 200/401/403 that hides the fault.
         let state = AppState {
             auth: Arc::new(AuthService::new(FaultyStore, AuthConfig::default())),
+            blobs: Arc::new(MemoryBlobStore::new()),
         };
         let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
 
@@ -1578,6 +1721,69 @@ mod tests {
         ])
     }
 
+    async fn put_chunk_auth(
+        router: &Router,
+        uri: &str,
+        body: Vec<u8>,
+        token: &str,
+    ) -> StatusCode {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/octet-stream")
+                    .header(AUTHORIZATION, format!("MaxSecu-Session {token}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn get_chunk_auth(router: &Router, uri: &str, token: &str) -> (StatusCode, Vec<u8>) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header(AUTHORIZATION, format!("MaxSecu-Session {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 21).await.unwrap();
+        (status, bytes.to_vec())
+    }
+
+    fn chunk_uri(file: [u8; 16], version: u64, stream: &str, index: u64) -> String {
+        format!(
+            "/v1/files/{}/versions/{version}/streams/{stream}/chunks/{index}",
+            hex_encode(&file)
+        )
+    }
+
+    /// Upload the chunks the fixture manifest declares (content: 2, metadata: 1).
+    async fn upload_declared_chunks(router: &Router, file: [u8; 16], version: u64, token: &str) {
+        assert_eq!(
+            put_chunk_auth(router, &chunk_uri(file, version, "content", 0), vec![0x10; 32], token).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            put_chunk_auth(router, &chunk_uri(file, version, "content", 1), vec![0x11; 32], token).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            put_chunk_auth(router, &chunk_uri(file, version, "metadata", 0), vec![0x20; 16], token).await,
+            StatusCode::OK
+        );
+    }
+
     fn create_file_body(file: [u8; 16], owner: [u8; 16]) -> serde_json::Value {
         serde_json::json!({
             "file_id": hex_encode(&file),
@@ -1610,7 +1816,8 @@ mod tests {
         let (st, _) = get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &token).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
 
-        // Finalize → 200, then GET returns the records + caller's wrap.
+        // Upload the declared chunks, then finalize → 200.
+        upload_declared_chunks(&router, file, 1, &token).await;
         let (st, _) = post_json_auth(
             &router,
             &format!("/v1/files/{}/versions/1/finalize", hex_encode(&file)),
@@ -1619,6 +1826,11 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK);
+
+        // The uploaded ciphertext chunk reads back byte-exactly.
+        let (st, bytes) = get_chunk_auth(&router, &chunk_uri(file, 1, "content", 0), &token).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(bytes, vec![0x10; 32]);
 
         let (st, body) =
             get_json_auth(&router, &format!("/v1/files/{}?version=latest", hex_encode(&file)), &token).await;
@@ -1629,9 +1841,12 @@ mod tests {
         assert!(body["recovery_grant"]["grant_b64"].as_str().is_some());
         assert_eq!(body["streams"].as_array().unwrap().len(), 2);
 
-        // A different authenticated user holds no wrap → 404 (no access oracle).
+        // A different authenticated user holds no wrap → 404 (no access oracle),
+        // for both the record and its chunks.
         let bob = login(&router, "bob", &bob_sk).await;
         let (st, _) = get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &bob).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _) = get_chunk_auth(&router, &chunk_uri(file, 1, "content", 0), &bob).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
 
         // Listing shows the blog with its small (metadata) stream, not content.
@@ -1646,7 +1861,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_upload_redteam_status_codes() {
-        let (router, admin_sk, _bob_sk) = admin_app();
+        let (router, admin_sk, bob_sk) = admin_app();
         let owner = [0xADu8; 16];
         let token = login(&router, "admin", &admin_sk).await;
         let file = [0xF2u8; 16];
@@ -1663,7 +1878,7 @@ mod tests {
         let (st, _) = post_json_auth(&router, "/v1/files", body, &token).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
 
-        // Stage a real v1 and finalize, then a +1-violating finalize → 409.
+        // Stage a real v1; finalizing before the chunks arrive → 400 (incomplete).
         let (st, _) = post_json_auth(&router, "/v1/files", create_file_body(file, owner), &token).await;
         assert_eq!(st, StatusCode::CREATED);
         let (st, _) = post_json_auth(
@@ -1673,8 +1888,23 @@ mod tests {
             &token,
         )
         .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "finalize with missing chunks is incomplete");
+        // Now upload the chunks and finalize → 200.
+        upload_declared_chunks(&router, file, 1, &token).await;
+        let (st, _) = post_json_auth(
+            &router,
+            &format!("/v1/files/{}/versions/1/finalize", hex_encode(&file)),
+            serde_json::json!({}),
+            &token,
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
-        // Stage v3 (skips v2) and finalize → strict-+1 conflict 409.
+        // A chunk PUT after finalize → 409 (immutable).
+        assert_eq!(
+            put_chunk_auth(&router, &chunk_uri(file, 1, "content", 0), vec![0x10; 32], &token).await,
+            StatusCode::CONFLICT
+        );
+        // Stage v3 (skips v2), upload its chunks, then finalize → strict-+1 409.
         let v3 = serde_json::json!({
             "file_type": "blog",
             "manifest_b64": file_manifest_b64(file, 3, owner),
@@ -1685,6 +1915,7 @@ mod tests {
         });
         let (st, _) = post_json_auth(&router, &format!("/v1/files/{}/versions", hex_encode(&file)), v3, &token).await;
         assert_eq!(st, StatusCode::CREATED);
+        upload_declared_chunks(&router, file, 3, &token).await;
         let (st, _) = post_json_auth(
             &router,
             &format!("/v1/files/{}/versions/3/finalize", hex_encode(&file)),
@@ -1693,6 +1924,21 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::CONFLICT);
+
+        // Index past the declared chunk_count → 413 (bound-check before storage).
+        let file2 = [0xF3u8; 16];
+        let (st, _) = post_json_auth(&router, "/v1/files", create_file_body(file2, owner), &token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(
+            put_chunk_auth(&router, &chunk_uri(file2, 1, "content", 9), vec![0x10; 32], &token).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        // A non-owner cannot upload chunks (owner-only write, D29) → 403.
+        let other = login(&router, "bob", &bob_sk).await;
+        assert_eq!(
+            put_chunk_auth(&router, &chunk_uri(file2, 1, "content", 0), vec![0x10; 32], &other).await,
+            StatusCode::FORBIDDEN
+        );
 
         // An unauthenticated stage → 401.
         let (st, _) = post_json(&router, "/v1/files", create_file_body([0xF9; 16], owner)).await;

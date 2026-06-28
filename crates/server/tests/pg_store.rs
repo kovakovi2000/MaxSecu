@@ -571,6 +571,13 @@ async fn file_lifecycle_persists_in_postgres() {
     let fresh = db.reopen().await;
     assert!(fresh.get_file(file, VersionSelector::Latest, owner).await.unwrap().is_none());
 
+    // version_meta projects the staged slots (owner, not-yet-finalized, streams).
+    let meta = db.store.version_meta(file, 1).await.unwrap().expect("staged meta");
+    assert_eq!(meta.owner_id, owner);
+    assert!(!meta.finalized);
+    assert_eq!(meta.streams.len(), 2);
+    assert!(meta.streams.iter().any(|s| s.stream_type == 1 && s.chunk_count == 2));
+
     // Finalize v1 → durably visible to the owner with its exact records.
     db.store.finalize_version(file, 1, owner, TS + 1).await.unwrap();
     let fresh = db.reopen().await;

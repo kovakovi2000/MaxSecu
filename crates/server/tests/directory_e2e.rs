@@ -238,6 +238,7 @@ async fn phase2_exit_gates_over_real_tls() {
 
     let state = AppState {
         auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        blobs: Arc::new(maxsecu_server::MemoryBlobStore::new()),
     };
     let pki = test_pki();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

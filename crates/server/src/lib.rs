@@ -34,6 +34,6 @@ pub use files::{
     VersionSelector, WrapInput,
 };
 pub use store::{
-    FileListEntry, FileView, MemoryStore, NonceRecord, SessionRecord, StoredBinding,
-    StoredControlRecord, Store, StreamView, UserRecord, WrapView,
+    ChunkSlot, FileListEntry, FileView, MemoryStore, NonceRecord, SessionRecord, StoredBinding,
+    StoredControlRecord, Store, StreamView, UserRecord, VersionMeta, WrapView,
 };
