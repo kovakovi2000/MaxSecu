@@ -17,9 +17,11 @@ use crate::files::{
 use crate::audit::{AuditSink, GrantAction, GrantEdge};
 use crate::blob::BlobStore;
 use crate::store::{FileView, Store};
-use maxsecu_encoding::structs::Manifest;
+use maxsecu_encoding::labels::DIRBINDING;
+use maxsecu_encoding::structs::{DirBinding, Manifest};
 use maxsecu_encoding::types::Role;
 use maxsecu_encoding::decode;
+use maxsecu_crypto::VerifyingKey;
 use axum::extract::{FromRequestParts, Json, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{request::Parts, StatusCode};
@@ -74,6 +76,7 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         .route("/v1/session/challenge", post(challenge::<S>))
         .route("/v1/session/proof", post(prove::<S>))
         .route("/v1/session/logout", post(logout::<S>))
+        .route("/v1/directory", post(publish_binding::<S>))
         .route("/v1/directory/by-id/{user_id}", get(directory_by_id::<S>))
         .route("/v1/directory/{username}", get(directory_by_username::<S>))
         .route(
@@ -408,6 +411,53 @@ async fn directory_by_id<S: Store>(
     };
     match st.auth.store().binding_by_user_id(&user_id).await {
         Ok(b) => binding_response(b),
+        Err(e) => internal_error(e),
+    }
+}
+
+// ---- POST /v1/directory — publish a D5-signed binding (§7.1) ----
+
+#[derive(Deserialize)]
+struct PublishBindingReq {
+    binding_b64: String,
+    directory_signature_b64: String,
+}
+
+/// `POST /v1/directory` — publish a ceremony-signed identity binding (§7.1). The
+/// server verifies it against the **pinned D5 public key** (anti-pollution) and
+/// stores the opaque bytes; it cannot forge a binding (it lacks D5's private key)
+/// and the client re-verifies everything served. Unauthenticated by design — the
+/// D5 signature is the authority, and bootstrap admins' bindings publish before
+/// any admin session exists.
+async fn publish_binding<S: Store>(
+    State(st): State<AppState<S>>,
+    Json(req): Json<PublishBindingReq>,
+) -> Response {
+    let Some(dir_pub) = st.auth.directory_pub() else {
+        return StatusCode::FORBIDDEN.into_response(); // publishing disabled (no pinned D5)
+    };
+    let (Some(bytes), Some(sig)) = (
+        b64_vec(&req.binding_b64),
+        b64_fixed::<64>(&req.directory_signature_b64),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(binding) = maxsecu_encoding::decode::<DirBinding>(&bytes) else {
+        return StatusCode::BAD_REQUEST.into_response(); // non-canonical
+    };
+    let verified = VerifyingKey::from_bytes(&dir_pub)
+        .and_then(|vk| vk.verify_canonical(DIRBINDING, &binding, &sig))
+        .is_ok();
+    if !verified {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match st
+        .auth
+        .store()
+        .put_binding(binding.user_id.0, binding.key_version, bytes, sig)
+        .await
+    {
+        Ok(()) => StatusCode::CREATED.into_response(),
         Err(e) => internal_error(e),
     }
 }
@@ -1637,6 +1687,84 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Build a router whose `AuthConfig` pins `dir_pub` as the D5 public key, over
+    /// a `store` seeded by the caller (so the GET-by-username path can resolve).
+    fn app_with_directory_pub(store: MemoryStore, dir_pub: [u8; 32]) -> Router {
+        let state = AppState {
+            auth: Arc::new(AuthService::new(
+                store,
+                AuthConfig::default().with_directory_pub(dir_pub),
+            )),
+            blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
+        };
+        router(state).layer(Extension(TlsExporter(EXPORTER)))
+    }
+
+    #[tokio::test]
+    async fn publish_binding_requires_a_valid_d5_signature() {
+        use maxsecu_admin_core::DirectorySigner;
+        use maxsecu_encoding::encode;
+        use maxsecu_encoding::structs::DirBinding;
+        use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
+
+        let d5 = DirectorySigner::generate();
+        // The GET-by-username path joins users → bindings (store.rs
+        // `binding_by_username`), so seed the user row with the SAME user_id the
+        // binding carries ([0x0A; 16]) for the genuine-publish GET to resolve.
+        let store = MemoryStore::new();
+        store.add_user(
+            "alice",
+            UserRecord {
+                user_id: [0x0A; 16],
+                enc_pub: [0xE1; 32],
+                sig_pub: [0x51; 32],
+            },
+        );
+        let app = app_with_directory_pub(store, d5.public_key());
+
+        let b = DirBinding {
+            username: Text::new("alice").unwrap(),
+            user_id: Id([0x0A; 16]),
+            enc_pub: Bytes32([0xE1; 32]),
+            sig_pub: Bytes32([0x51; 32]),
+            key_version: 1,
+            roles: RoleSet::new([Role::User]),
+            not_before: Timestamp(0),
+            not_after: Timestamp(4_102_444_800_000),
+            mlkem_pub: None,
+        };
+        let signed = d5.sign_binding(&b, None);
+
+        // Forged signature → 403.
+        let (st, _) = post_json(
+            &app,
+            "/v1/directory",
+            serde_json::json!({
+                "binding_b64": B64.encode(encode(&b)),
+                "directory_signature_b64": B64.encode([0u8; 64]),
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+
+        // Genuine D5 signature → 201, then served by GET /v1/directory/alice.
+        let (st, _) = post_json(
+            &app,
+            "/v1/directory",
+            serde_json::json!({
+                "binding_b64": B64.encode(encode(&signed.binding)),
+                "directory_signature_b64": B64.encode(signed.signature),
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (st, body) = get_json(&app, "/v1/directory/alice").await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(body["binding_b64"].as_str().is_some());
     }
 
     fn app_with_vouchers(vouchers: &[&str]) -> Router {
