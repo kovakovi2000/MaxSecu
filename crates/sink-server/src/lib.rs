@@ -25,12 +25,14 @@
 
 pub mod anchor;
 pub mod chain;
+pub mod dirlog;
 pub mod http;
 pub mod position;
 pub mod serve;
 
 pub use anchor::{AnchorBundle, AnchorProofParts, Anchorer};
 pub use chain::{AnchoredHead, AppendError, ControlLogStore};
+pub use dirlog::{DirLog, InclusionOut, KtCheckpointOut};
 pub use http::{router, SinkState};
 pub use position::PositionLog;
 pub use serve::serve;

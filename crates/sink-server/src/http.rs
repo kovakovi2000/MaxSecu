@@ -26,7 +26,9 @@ use tokio::sync::Mutex;
 
 use crate::anchor::{AnchorBundle, AnchorProofParts, Anchorer};
 use crate::chain::{AnchoredHead, AppendError, ControlLogStore};
+use crate::dirlog::DirLog;
 use crate::position::PositionLog;
+use maxsecu_crypto::SigningKey;
 
 /// The sink's mutable state, behind one async mutex: the append-only record store
 /// and the anchorer that re-publishes the head on every append. Cloneable (an
@@ -37,6 +39,9 @@ pub struct SinkState {
     /// The admin bearer secret authorizing appends (§6.1). Held behind an `Arc`
     /// so the state stays cheap to clone.
     admin_token: Arc<String>,
+    /// The directory KT log's pinned public key, copied out of the mutex so it can
+    /// be read (for client pinning) without taking the async lock (`dirlog`).
+    dir_log_pub: [u8; 32],
 }
 
 struct Inner {
@@ -49,16 +54,34 @@ struct Inner {
     /// Global sink positions for control appends + file-genesis anchors, drawn
     /// from ONE counter so the R27/D28 cutoff can order them (`position`).
     positions: PositionLog,
+    /// The directory key-transparency log (P7.11): a SEPARATE Merkle tree + log
+    /// key from the control-log, served by this same process (`dirlog`).
+    dirlog: DirLog,
 }
 
 impl SinkState {
     /// Build the sink state over a fresh store and the given anchorer, anchoring
     /// the genesis (empty-chain) head up front so `GET …/head` works before any
     /// append. `admin_token` is the bearer secret required to append.
-    pub fn new(mut anchorer: Anchorer, admin_token: impl Into<String>) -> SinkState {
+    pub fn new(anchorer: Anchorer, admin_token: impl Into<String>) -> SinkState {
+        // The directory KT log gets a FRESH log key per process (in-repo; the real
+        // deployment pins a long-lived KT key — see `dirlog` / `sink-interface.md`
+        // §8). It is a separate Merkle tree + key from the control-log anchorer.
+        SinkState::with_dir_log_key(anchorer, admin_token, SigningKey::generate())
+    }
+
+    /// Like [`SinkState::new`] but with an explicit directory KT log key, so a
+    /// test/ops caller can PIN the produced KT pubkey (`dir_log_public`).
+    pub fn with_dir_log_key(
+        mut anchorer: Anchorer,
+        admin_token: impl Into<String>,
+        dir_log_key: SigningKey,
+    ) -> SinkState {
         let store = ControlLogStore::new();
         let head = store.head();
         let current = anchorer.anchor(head);
+        let dirlog = DirLog::new(dir_log_key);
+        let dir_log_pub = dirlog.log_public();
         SinkState {
             inner: Arc::new(Mutex::new(Inner {
                 store,
@@ -66,9 +89,16 @@ impl SinkState {
                 current,
                 head,
                 positions: PositionLog::new(),
+                dirlog,
             })),
             admin_token: Arc::new(admin_token.into()),
+            dir_log_pub,
         }
+    }
+
+    /// The directory KT log's public key — clients PIN this in their KT allowlist.
+    pub fn dir_log_public(&self) -> [u8; 32] {
+        self.dir_log_pub
     }
 }
 
@@ -86,6 +116,13 @@ pub fn router(state: SinkState) -> Router {
         .route("/v1/control-log/anchor-log", get(anchor_log))
         .route("/v1/genesis-anchor", post(post_genesis_anchor))
         .route("/v1/genesis-anchor/{file_id}", get(get_genesis_anchor))
+        // Directory key-transparency log (P7.11, `sink-interface.md` §8): served by
+        // this same process over a SEPARATE Merkle tree + log key. The three GETs
+        // are public; `POST bindings` requires the admin bearer.
+        .route("/v1/dir-log/checkpoint", get(dir_checkpoint))
+        .route("/v1/dir-log/inclusion", get(dir_inclusion))
+        .route("/v1/dir-log/consistency", get(dir_consistency))
+        .route("/v1/dir-log/bindings", post(post_dir_binding))
         .with_state(state)
 }
 
@@ -336,6 +373,125 @@ async fn get_genesis_anchor(State(st): State<SinkState>, Path(file_id_hex): Path
     }
 }
 
+// ---- directory key-transparency log (P7.11, `sink-interface.md` §8) ----
+
+#[derive(Serialize)]
+struct KtCheckpointJson {
+    tree_size: u64,
+    root_b64: String,
+    sig_b64: String,
+}
+
+#[derive(Serialize)]
+struct KtInclusionJson {
+    index: u64,
+    tree_size: u64,
+    path_b64: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct KtConsistencyJson {
+    path_b64: Vec<String>,
+}
+
+// ---- GET /v1/dir-log/checkpoint ----
+
+/// Serve the KT log's current signed checkpoint `{tree_size, root, sig}` — the
+/// shape the client's `transparency::KtCheckpoint` accepts. Public read.
+async fn dir_checkpoint(State(st): State<SinkState>) -> Response {
+    let inner = st.inner.lock().await;
+    let cp = inner.dirlog.checkpoint();
+    Json(KtCheckpointJson {
+        tree_size: cp.tree_size,
+        root_b64: b64(&cp.root),
+        sig_b64: b64(&cp.sig),
+    })
+    .into_response()
+}
+
+// ---- GET /v1/dir-log/inclusion?index= ----
+
+#[derive(Deserialize)]
+struct DirInclusionQuery {
+    index: u64,
+}
+
+/// Serve an inclusion proof for the `index`-th binding leaf against the current
+/// tree (the shape `transparency::InclusionProof` accepts); `404` if `index` is
+/// out of range (≥ current `tree_size`). Public read.
+async fn dir_inclusion(State(st): State<SinkState>, Query(q): Query<DirInclusionQuery>) -> Response {
+    let inner = st.inner.lock().await;
+    match inner.dirlog.inclusion(q.index) {
+        Some(inc) => Json(KtInclusionJson {
+            index: inc.index,
+            tree_size: inc.tree_size,
+            path_b64: inc.path.iter().map(|h| b64(h)).collect(),
+        })
+        .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// ---- GET /v1/dir-log/consistency?from= ----
+
+#[derive(Deserialize)]
+struct DirConsistencyQuery {
+    from: u64,
+}
+
+/// Serve a consistency proof `from → current` so a client holding a persisted
+/// size-`from` checkpoint can prove the current checkpoint is an append-only
+/// extension (else it detects a split view). `400` if `from` exceeds the current
+/// size (a nonsensical request). Public read.
+async fn dir_consistency(
+    State(st): State<SinkState>,
+    Query(q): Query<DirConsistencyQuery>,
+) -> Response {
+    let inner = st.inner.lock().await;
+    if q.from > inner.dirlog.tree_size() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let path = inner.dirlog.consistency(q.from);
+    Json(KtConsistencyJson {
+        path_b64: path.iter().map(|h| b64(h)).collect(),
+    })
+    .into_response()
+}
+
+// ---- POST /v1/dir-log/bindings ----
+
+#[derive(Deserialize)]
+struct DirBindingReq {
+    /// The canonical `DirBinding` leaf bytes, base64 (standard, padded).
+    binding_b64: String,
+}
+
+#[derive(Serialize)]
+struct DirBindingResp {
+    index: u64,
+}
+
+/// Append one canonical `DirBinding` leaf to the directory KT log. Requires the
+/// admin bearer (else `403`); undecodable base64 → `400`. Append-only-grow: the
+/// sink records the leaf verbatim and returns its new index (the directory dedups
+/// upstream — a duplicate leaf is allowed, as in a real CT log).
+async fn post_dir_binding(
+    State(st): State<SinkState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<DirBindingReq>,
+) -> Response {
+    // Same coarse admin gate (§6.1) as the control-log / genesis routes.
+    if !admin_ok(&headers, &st.admin_token) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Ok(bytes) = B64.decode(req.binding_b64.as_bytes()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let mut inner = st.inner.lock().await;
+    let index = inner.dirlog.append(bytes);
+    Json(DirBindingResp { index }).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +712,91 @@ mod tests {
         // Malformed hex in the GET path → 400.
         let (st, _) = send(&app, get("/v1/genesis-anchor/not-hex")).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    // ---- directory KT log routes (P7.11) ----
+
+    fn post_binding_req(token: Option<&str>, binding_b64: &str) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/v1/dir-log/bindings")
+            .header("content-type", "application/json");
+        if let Some(t) = token {
+            b = b.header(AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let body = serde_json::json!({ "binding_b64": binding_b64 }).to_string();
+        b.body(Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dir_log_routes_round_trip() {
+        let app = app();
+
+        // Empty log: a checkpoint at tree_size 0 still serves.
+        let (st, cp) = send(&app, get("/v1/dir-log/checkpoint")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(cp["tree_size"].as_u64().unwrap(), 0);
+        assert!(!cp["root_b64"].as_str().unwrap().is_empty());
+        assert!(!cp["sig_b64"].as_str().unwrap().is_empty());
+
+        // Inclusion of an out-of-range index on the empty log → 404.
+        let (st, _) = send(&app, get("/v1/dir-log/inclusion?index=0")).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // Append three binding leaves (admin-gated) → indices 0,1,2.
+        for (i, expect) in [0u64, 1, 2].into_iter().enumerate() {
+            let leaf = B64.encode(vec![i as u8 + 1; 32]);
+            let (st, body) = send(&app, post_binding_req(Some(TOKEN), &leaf)).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(body["index"].as_u64().unwrap(), expect);
+        }
+
+        // The checkpoint now reflects tree_size 3.
+        let (_st, cp) = send(&app, get("/v1/dir-log/checkpoint")).await;
+        assert_eq!(cp["tree_size"].as_u64().unwrap(), 3);
+
+        // Inclusion for index 1 round-trips with matching tree_size.
+        let (st, inc) = send(&app, get("/v1/dir-log/inclusion?index=1")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(inc["index"].as_u64().unwrap(), 1);
+        assert_eq!(inc["tree_size"].as_u64().unwrap(), 3);
+        assert!(inc["path_b64"].is_array());
+
+        // Inclusion past the end → 404.
+        let (st, _) = send(&app, get("/v1/dir-log/inclusion?index=3")).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // Consistency from a valid earlier size serves a (possibly empty) path.
+        let (st, cons) = send(&app, get("/v1/dir-log/consistency?from=1")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(cons["path_b64"].is_array());
+
+        // Consistency from beyond the current size → 400.
+        let (st, _) = send(&app, get("/v1/dir-log/consistency?from=4")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dir_log_post_admin_gated_and_validated() {
+        let app = app();
+        let leaf = B64.encode([0xAA; 32]);
+
+        // Missing / wrong bearer → 403 (same shape as the control route).
+        let (st, _) = send(&app, post_binding_req(None, &leaf)).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, _) = send(&app, post_binding_req(Some("wrong"), &leaf)).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+
+        // Undecodable base64 body → 400.
+        let (st, _) = send(&app, post_binding_req(Some(TOKEN), "@@not-base64@@")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // Append-only-grow: the SAME leaf appended twice yields two indices.
+        let (st, b0) = send(&app, post_binding_req(Some(TOKEN), &leaf)).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, b1) = send(&app, post_binding_req(Some(TOKEN), &leaf)).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(b0["index"].as_u64().unwrap(), 0);
+        assert_eq!(b1["index"].as_u64().unwrap(), 1);
     }
 }

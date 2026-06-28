@@ -113,9 +113,21 @@ On a file's first version (genesis create), the app server anchors the file's `g
 
 ---
 
-## 8. What this does not cover
+## 8. Directory key-transparency log (Phase 7, served by the same sink process)
+The **directory key-transparency (KT) log** (DESIGN §7.4) is a *second* RFC 6962 append-only Merkle log served by the **same `sink-server` process** over the same TLS listener, but built over a **separate Merkle tree and a separate Ed25519 log key** from the control-log head (§2). Its leaves are the canonical `DirBinding` bytes the directory publishes (`encoding-spec.md` §4); a client (`client-core::transparency::verify_binding_in_log`, P7.10) accepts a binding at first contact only if it is provably *included* under a checkpoint signed by the **pinned KT log key**, and rejects any later checkpoint that is not a consistency-proven (append-only) extension of the one it persisted — catching a **split-view / equivocation** (`KtError::SplitView`). The checkpoint signing bytes use the **distinct** `MaxSecu-kt-checkpoint-v1` domain label (`encoding::kt_checkpoint_signing_input`), so a control-log head checkpoint (§4, `MaxSecu-sink-checkpoint-v1`) can never be replayed as a KT checkpoint.
+
+Routes (`crates/sink-server::dirlog` / `http.rs`, P7.11) — three public GETs, one admin-gated POST:
+- `GET /v1/dir-log/checkpoint` → `{ tree_size, root_b64, sig_b64 }` — the KT log's current signed checkpoint.
+- `GET /v1/dir-log/inclusion?index=<i>` → `{ index, tree_size, path_b64[] }` — RFC 6962 inclusion proof for the `i`-th leaf (`tree_size` equals the checkpoint's); **404** if `index ≥ tree_size`.
+- `GET /v1/dir-log/consistency?from=<m>` → `{ path_b64[] }` — prev(`m`)→current consistency proof; **400** if `from > tree_size`.
+- `POST /v1/dir-log/bindings { binding_b64 }` (admin bearer, §6.1; else **403**) → `{ index }`, the new leaf index. **Append-only-grow**: leaves only ever grow and a duplicate leaf is allowed (each gets its own index — as a real CT log behaves; the directory dedups upstream). Undecodable base64 → **400**.
+
+**Ops swap-in:** the in-repo log generates a *fresh* KT log key per process; the real deployment **pins a long-lived KT key** and **gossips** its signed checkpoints to an independent **witness / notary** (and cross-publishes, as in §1 leg 2) so equivocation is caught off-box, not only by the client's own persisted-checkpoint gossip. P7.12 wires *enrollment* to the `POST bindings` route so first-contact bindings are inclusion-provable.
+
+---
+
+## 9. What this does not cover
 - The **full audit event stream** (auth attempts, grants, exports, anomalies, §16.5) is also shipped to the sink for detection, but its query/retention interface is operational tooling, not a client hot path — out of scope here (this doc is specifically the **revocation-completeness head**).
-- The **Phase-7 key-transparency log** for *directory* equivocation (§7.4) is a related but distinct append-only structure; the transparency-log `anchor_proof` form (§4) is the natural place the two converge later.
 
 ---
 
