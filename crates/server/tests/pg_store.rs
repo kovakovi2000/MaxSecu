@@ -2,9 +2,9 @@
 //! role/db `maxsecu`). Each test loads the **real** `docs/schema.sql` into a
 //! fresh, uniquely-named schema (drift-free, parallel-safe) and drops it after.
 //!
-//! Set `MAXSECU_TEST_PG` to override the connection string; if Postgres is
-//! unreachable (e.g. on the Windows client box) the tests **skip** loudly rather
-//! than fail — they are meant to run in the WSL server environment.
+//! Set `MAXSECU_TEST_PG` to override the connection string. An unreachable
+//! Postgres **fails** the suite (the gate must run, never pass vacuously) unless
+//! `MAXSECU_PG_OPTIONAL=1` is set, which downgrades it to a loud skip (P5.0b).
 
 use maxsecu_crypto::{random_array, sha256, SigningKey};
 use maxsecu_encoding::labels;
@@ -29,6 +29,19 @@ fn base_url() -> String {
         .unwrap_or_else(|_| "postgres://maxsecu:maxsecu@localhost/maxsecu?sslmode=disable".to_owned())
 }
 
+/// Policy (P5.0b): an unreachable Postgres is a **hard failure** — the PG gate
+/// must actually run, never pass vacuously — unless the operator explicitly opts
+/// out (a dev box with no Postgres). Pure so it is unit-tested without env races.
+fn pg_unreachable_is_fatal(pg_optional: bool) -> bool {
+    !pg_optional
+}
+
+/// The opt-out switch: `MAXSECU_PG_OPTIONAL=1` downgrades an unreachable PG from
+/// a suite failure to a loud skip.
+fn pg_optional_env() -> bool {
+    std::env::var("MAXSECU_PG_OPTIONAL").as_deref() == Ok("1")
+}
+
 fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     for x in b {
@@ -46,13 +59,23 @@ struct TestDb {
 }
 
 impl TestDb {
-    /// Returns `None` (skip) if Postgres is unreachable.
+    /// Connects to Postgres. **Fails the suite** if unreachable (the PG gate must
+    /// run), unless `MAXSECU_PG_OPTIONAL=1`, in which case it returns `None`
+    /// (loud skip). It never silently passes when PG is down (P5.0b).
     async fn setup() -> Option<TestDb> {
         let url = base_url();
         let admin = match PgPoolOptions::new().max_connections(1).connect(&url).await {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIP pg_store: cannot reach Postgres at {url}: {e}");
+                if pg_unreachable_is_fatal(pg_optional_env()) {
+                    panic!(
+                        "pg_store: cannot reach Postgres at {url}: {e}\n\
+                         The PG integration gate must run on both targets. Start Postgres \
+                         (WSL Ubuntu-22.04, role/db `maxsecu`) or set MAXSECU_PG_OPTIONAL=1 \
+                         to skip the PG suite on a box without Postgres."
+                    );
+                }
+                eprintln!("SKIP pg_store (MAXSECU_PG_OPTIONAL=1): cannot reach Postgres at {url}: {e}");
                 return None;
             }
         };
@@ -151,6 +174,21 @@ macro_rules! db_or_skip {
             None => return,
         }
     };
+}
+
+#[test]
+fn unreachable_pg_is_fatal_unless_opted_out() {
+    // Default posture: an unreachable Postgres must FAIL the suite (the PG gate
+    // is not allowed to pass vacuously). Only the explicit opt-out downgrades it
+    // to a skip.
+    assert!(
+        pg_unreachable_is_fatal(false),
+        "default: unreachable Postgres fails the suite"
+    );
+    assert!(
+        !pg_unreachable_is_fatal(true),
+        "MAXSECU_PG_OPTIONAL=1: unreachable Postgres skips instead"
+    );
 }
 
 fn make_proof(sk: &SigningKey, server_id: &str, nonce: &[u8; 32], ts: u64) -> [u8; 64] {
