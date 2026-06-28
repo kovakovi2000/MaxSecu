@@ -563,6 +563,52 @@ mod tests {
     }
 
     #[test]
+    fn reenrollment_does_not_clear_a_tombstone_only_reinstatement_does() {
+        // §12.6/R28: a strong-revoked user's tombstone keys on the **stable
+        // user_id**, not key_version — so re-enrolling on a new device (a new
+        // key_version binding) does NOT clear it. Only an explicit, dual-controlled
+        // reinstatement naming the revocation's epoch re-admits the user.
+        let admin = SigningKey::generate();
+        let co = SigningKey::generate();
+        let res = multi_issuer(vec![
+            (ADMIN_ID, admin.verifying_key().to_bytes(), vec![Role::Admin]),
+            (A2_ID, co.verifying_key().to_bytes(), vec![Role::Admin]),
+        ]);
+        let cosign = || CoSign { admin_id: A2_ID, key: &co };
+
+        let mut chain = ControlChain::new();
+        let rev = chain
+            .revoke(&admin, rp(FileScope::AccountWide, U, None, 1), Some(cosign()))
+            .unwrap();
+        let set = TombstoneSet::verify_authenticated(&[rec_in(&rev)], chain.head(), &res).unwrap();
+        assert!(
+            set.is_account_revoked(&[U; 16]),
+            "revoked by user_id — a re-enrollment (new key_version) would not change this"
+        );
+
+        // The only thing that clears it: a dual-controlled reinstatement naming the
+        // exact revocation epoch (R28 — by explicit reference, not counter compare).
+        let rein = chain.reinstate(
+            &admin,
+            ReinstateParams {
+                scope: FileScope::AccountWide,
+                reinstated_user_id: Id([U; 16]),
+                supersedes_epoch: rev.epoch().unwrap(),
+                issued_by: ADMIN_ID,
+                created_at: NOW,
+            },
+            cosign(),
+        );
+        let set =
+            TombstoneSet::verify_authenticated(&[rec_in(&rev), rec_in(&rein)], chain.head(), &res)
+                .unwrap();
+        assert!(
+            !set.is_account_revoked(&[U; 16]),
+            "explicit dual-controlled reinstatement re-admits the user"
+        );
+    }
+
+    #[test]
     fn key_compromise_for_finds_the_cutoff() {
         let admin = SigningKey::generate();
         let co = SigningKey::generate();
