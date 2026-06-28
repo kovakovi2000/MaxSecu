@@ -18,6 +18,15 @@ pub fn exists(dir: &Path) -> bool {
 
 /// Create a fresh identity, seal it under `password`, and write the blob.
 pub fn create(dir: &Path, password: &str) -> Result<Identity, UiError> {
+    // Fail closed before doing anything: overwriting an existing blob would
+    // destroy the prior identity (and access to everything sealed to it) with
+    // no recovery. `exists()` is the contract; enforce it here.
+    if exists(dir) {
+        return Err(UiError::new(
+            "keystore_exists",
+            "A keystore already exists on this device.",
+        ));
+    }
     password::check(password).map_err(|_| UiError::new("weak_password", "Password is too weak."))?;
     let id = Identity::generate();
     let blob = keyblob::seal(password, &id, ARGON2_DESKTOP_TARGET)
@@ -71,6 +80,18 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.code, "no_keystore");
+    }
+
+    #[test]
+    fn create_refuses_to_overwrite_existing_keystore() {
+        let dir = tempdir();
+        let pw = "correct horse battery staple 9!";
+        create(&dir, pw).unwrap();
+        let err = match create(&dir, pw) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "keystore_exists");
     }
 
     fn tempdir() -> std::path::PathBuf {
