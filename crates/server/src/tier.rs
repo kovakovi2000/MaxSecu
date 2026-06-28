@@ -22,6 +22,7 @@
 use crate::blob::{BlobError, BlobStore, FsBlobStore, MemoryBlobStore};
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Identifies one resident ciphertext chunk in the cache: its stream `blob_ref`
 /// (`server::files`, of the form `hex/version/stream_type`) and chunk `index`.
@@ -116,6 +117,23 @@ impl CacheIndex {
         }
     }
 
+    /// Drop **every** resident chunk of `blob_ref` from the index (stream
+    /// teardown), freeing their bytes. Returns how many entries were removed.
+    pub fn remove_stream(&mut self, blob_ref: &str) -> usize {
+        let victims: Vec<ChunkKey> = self
+            .entries
+            .keys()
+            .filter(|k| k.blob_ref == blob_ref)
+            .cloned()
+            .collect();
+        for k in &victims {
+            if let Some(e) = self.entries.remove(k) {
+                self.total_bytes -= e.size;
+            }
+        }
+        victims.len()
+    }
+
     /// Drop `key` from the index (explicit teardown / overwrite), freeing its
     /// bytes. Returns whether it was resident.
     pub fn remove(&mut self, key: &ChunkKey) -> bool {
@@ -159,6 +177,9 @@ pub trait ColdTier: Send + Sync {
     async fn get_chunk(&self, blob_ref: &str, index: u64) -> Result<Option<Vec<u8>>, BlobError>;
     async fn chunk_count(&self, blob_ref: &str) -> Result<u64, BlobError>;
     async fn delete_stream(&self, blob_ref: &str) -> Result<(), BlobError>;
+    /// Delete a single chunk by index (idempotent — absent is success). Lets the
+    /// tiering layer honor a per-chunk delete on the durable tier too.
+    async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError>;
 }
 
 /// In-memory [`ColdTier`] fake for tests, backed by a [`MemoryBlobStore`].
@@ -194,6 +215,9 @@ impl ColdTier for MemoryColdTier {
     async fn delete_stream(&self, blob_ref: &str) -> Result<(), BlobError> {
         self.inner.delete_stream(blob_ref).await
     }
+    async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError> {
+        self.inner.delete_chunk(blob_ref, index).await
+    }
 }
 
 /// Filesystem-backed [`ColdTier`] fake (models a durable cold store on disk),
@@ -228,6 +252,109 @@ impl ColdTier for FsColdTier {
     }
     async fn delete_stream(&self, blob_ref: &str) -> Result<(), BlobError> {
         self.inner.delete_stream(blob_ref).await
+    }
+    async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError> {
+        self.inner.delete_chunk(blob_ref, index).await
+    }
+}
+
+/// A hot [`BlobStore`] cache in front of a durable [`ColdTier`], presented as a
+/// single [`BlobStore`] so it drops into `AppState` transparently (DESIGN D31,
+/// stack.md §2.4). Reads are served from the cache; a miss fetches from the cold
+/// tier and populates the cache (evicting the LRU per [`CacheIndex`]). Writes are
+/// **write-through**: the cold tier is the durable record (written first), the
+/// cache a populated copy. `chunk_count` reports the **cold** (authoritative)
+/// count so the finalize completeness check (api §8.4) sees durable truth, not
+/// cache residency.
+pub struct TieredBlobStore {
+    cache: Arc<dyn BlobStore>,
+    cold: Arc<dyn ColdTier>,
+    index: Mutex<CacheIndex>,
+}
+
+impl TieredBlobStore {
+    /// New tier: `cache` is the hot local store, `cold` the durable backing,
+    /// `capacity_bytes` the cache byte budget enforced by the [`CacheIndex`].
+    pub fn new(cache: Arc<dyn BlobStore>, cold: Arc<dyn ColdTier>, capacity_bytes: u64) -> Self {
+        TieredBlobStore {
+            cache,
+            cold,
+            index: Mutex::new(CacheIndex::new(capacity_bytes)),
+        }
+    }
+
+    /// Record `key` (size bytes) as freshly cached and physically evict whatever
+    /// the index says no longer fits. The index lock is never held across an
+    /// `await`.
+    async fn cache_and_evict(&self, blob_ref: &str, index: u64, size: u64) -> Result<(), BlobError> {
+        let evicted = {
+            let mut idx = self.index.lock().unwrap();
+            idx.record_insert(ChunkKey::new(blob_ref, index), size)
+        };
+        for k in evicted {
+            self.cache.delete_chunk(&k.blob_ref, k.index).await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl BlobStore for TieredBlobStore {
+    async fn put_chunk(
+        &self,
+        blob_ref: &str,
+        index: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), BlobError> {
+        // Write-through: the cold tier is the durable record (written first), the
+        // cache a populated hot copy.
+        let size = bytes.len() as u64;
+        self.cold.put_chunk(blob_ref, index, bytes.clone()).await?;
+        self.cache.put_chunk(blob_ref, index, bytes).await?;
+        self.cache_and_evict(blob_ref, index, size).await
+    }
+
+    async fn get_chunk(&self, blob_ref: &str, index: u64) -> Result<Option<Vec<u8>>, BlobError> {
+        // Cache hit: serve and bump recency.
+        if let Some(bytes) = self.cache.get_chunk(blob_ref, index).await? {
+            self.index
+                .lock()
+                .unwrap()
+                .record_access(&ChunkKey::new(blob_ref, index));
+            return Ok(Some(bytes));
+        }
+        // Miss: fetch from the durable cold tier and warm the cache.
+        match self.cold.get_chunk(blob_ref, index).await? {
+            Some(bytes) => {
+                let size = bytes.len() as u64;
+                self.cache.put_chunk(blob_ref, index, bytes.clone()).await?;
+                self.cache_and_evict(blob_ref, index, size).await?;
+                Ok(Some(bytes))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn chunk_count(&self, blob_ref: &str) -> Result<u64, BlobError> {
+        // The cold tier is authoritative — the cache may hold only a subset.
+        self.cold.chunk_count(blob_ref).await
+    }
+
+    async fn delete_stream(&self, blob_ref: &str) -> Result<(), BlobError> {
+        self.cold.delete_stream(blob_ref).await?;
+        self.cache.delete_stream(blob_ref).await?;
+        self.index.lock().unwrap().remove_stream(blob_ref);
+        Ok(())
+    }
+
+    async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError> {
+        self.cold.delete_chunk(blob_ref, index).await?;
+        self.cache.delete_chunk(blob_ref, index).await?;
+        self.index
+            .lock()
+            .unwrap()
+            .remove(&ChunkKey::new(blob_ref, index));
+        Ok(())
     }
 }
 
@@ -326,6 +453,20 @@ mod tests {
         assert!(idx.contains(&key("e", 0)));
     }
 
+    #[test]
+    fn remove_stream_drops_all_indices_of_one_blob_ref() {
+        let mut idx = CacheIndex::new(100);
+        idx.record_insert(key("a", 0), 10);
+        idx.record_insert(key("a", 1), 10);
+        idx.record_insert(key("b", 0), 10);
+        assert_eq!(idx.remove_stream("a"), 2);
+        assert!(!idx.contains(&key("a", 0)));
+        assert!(!idx.contains(&key("a", 1)));
+        assert!(idx.contains(&key("b", 0)));
+        assert_eq!(idx.total_bytes(), 10);
+        assert_eq!(idx.remove_stream("a"), 0); // idempotent
+    }
+
     // ---- ColdTier fakes ----
 
     const REF: &str = "aabbccddeeff00112233445566778899/1/1";
@@ -338,6 +479,13 @@ mod tests {
         tier.put_chunk(REF, 1, vec![0xBB; 16]).await.unwrap();
         assert_eq!(tier.chunk_count(REF).await.unwrap(), 2);
         assert_eq!(tier.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xAA; 16]);
+
+        // Per-chunk delete removes only that index.
+        tier.delete_chunk(REF, 0).await.unwrap();
+        assert!(tier.get_chunk(REF, 0).await.unwrap().is_none());
+        assert_eq!(tier.chunk_count(REF).await.unwrap(), 1);
+        tier.delete_chunk(REF, 0).await.unwrap(); // idempotent
+        tier.put_chunk(REF, 0, vec![0xAA; 16]).await.unwrap();
 
         tier.delete_stream(REF).await.unwrap();
         assert_eq!(tier.chunk_count(REF).await.unwrap(), 0);
@@ -365,5 +513,92 @@ mod tests {
     async fn fs_cold_tier_rejects_unsafe_blob_ref() {
         let tier = FsColdTier::new(std::env::temp_dir().join("mxcold_guard"));
         assert!(tier.put_chunk("../escape", 0, vec![1]).await.is_err());
+    }
+
+    // ---- TieredBlobStore (cache over cold) ----
+
+    fn tier_with_capacity(cap: u64) -> (TieredBlobStore, Arc<MemoryBlobStore>, Arc<MemoryColdTier>) {
+        let cache = Arc::new(MemoryBlobStore::new());
+        let cold = Arc::new(MemoryColdTier::new());
+        let tier = TieredBlobStore::new(cache.clone(), cold.clone(), cap);
+        (tier, cache, cold)
+    }
+
+    #[tokio::test]
+    async fn tiered_put_is_write_through_to_cold_and_cache() {
+        let (tier, cache, cold) = tier_with_capacity(1000);
+        tier.put_chunk(REF, 0, vec![0x11; 10]).await.unwrap();
+        // Durable record landed in cold AND a hot copy in the cache.
+        assert_eq!(cold.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0x11; 10]);
+        assert_eq!(cache.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0x11; 10]);
+    }
+
+    #[tokio::test]
+    async fn tiered_get_miss_fetches_from_cold_and_populates_cache() {
+        let (tier, cache, cold) = tier_with_capacity(1000);
+        // Pre-load only the cold tier (as if this server never cached it yet).
+        cold.put_chunk(REF, 0, vec![0x22; 10]).await.unwrap();
+        assert!(cache.get_chunk(REF, 0).await.unwrap().is_none());
+
+        let got = tier.get_chunk(REF, 0).await.unwrap().unwrap();
+        assert_eq!(got, vec![0x22; 10]);
+        // The cache is now warm for the next read.
+        assert_eq!(cache.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0x22; 10]);
+    }
+
+    #[tokio::test]
+    async fn tiered_get_hit_serves_from_cache_without_cold() {
+        let (tier, _cache, cold) = tier_with_capacity(1000);
+        tier.put_chunk(REF, 0, vec![0x33; 10]).await.unwrap();
+        // Even if the cold tier loses the chunk, a cache hit still serves it.
+        cold.delete_stream(REF).await.unwrap();
+        assert_eq!(tier.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0x33; 10]);
+    }
+
+    #[tokio::test]
+    async fn tiered_get_absent_everywhere_is_none() {
+        let (tier, _cache, _cold) = tier_with_capacity(1000);
+        assert!(tier.get_chunk(REF, 7).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn tiered_eviction_drops_lru_from_cache_but_keeps_it_durable() {
+        // Capacity for two 10-byte chunks.
+        let (tier, cache, cold) = tier_with_capacity(20);
+        tier.put_chunk(REF, 0, vec![0xA0; 10]).await.unwrap();
+        tier.put_chunk(REF, 1, vec![0xA1; 10]).await.unwrap();
+        tier.put_chunk(REF, 2, vec![0xA2; 10]).await.unwrap(); // overflow → evict index 0
+
+        // Index 0 left the hot cache but remains durable in cold.
+        assert!(cache.get_chunk(REF, 0).await.unwrap().is_none());
+        assert_eq!(cold.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xA0; 10]);
+        assert!(cache.get_chunk(REF, 2).await.unwrap().is_some());
+
+        // A read of the evicted chunk transparently re-fetches from cold.
+        assert_eq!(tier.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xA0; 10]);
+    }
+
+    #[tokio::test]
+    async fn tiered_chunk_count_reflects_durable_cold_not_cache() {
+        let (tier, _cache, _cold) = tier_with_capacity(20); // cache holds 2 of 3
+        tier.put_chunk(REF, 0, vec![0xB0; 10]).await.unwrap();
+        tier.put_chunk(REF, 1, vec![0xB1; 10]).await.unwrap();
+        tier.put_chunk(REF, 2, vec![0xB2; 10]).await.unwrap();
+        // All three are durable even though the cache only holds two.
+        assert_eq!(tier.chunk_count(REF).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn tiered_delete_stream_clears_both_tiers_and_index() {
+        let (tier, cache, cold) = tier_with_capacity(1000);
+        tier.put_chunk(REF, 0, vec![0xC0; 10]).await.unwrap();
+        tier.put_chunk(REF, 1, vec![0xC1; 10]).await.unwrap();
+
+        tier.delete_stream(REF).await.unwrap();
+        assert_eq!(cold.chunk_count(REF).await.unwrap(), 0);
+        assert_eq!(cache.chunk_count(REF).await.unwrap(), 0);
+        assert_eq!(tier.chunk_count(REF).await.unwrap(), 0);
+        // Index freed too: a later fill is unaffected by stale bookkeeping.
+        assert!(tier.index.lock().unwrap().is_empty());
     }
 }

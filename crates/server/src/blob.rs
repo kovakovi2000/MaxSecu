@@ -60,6 +60,10 @@ pub trait BlobStore: Send + Sync {
     /// Delete every chunk of a stream (prior-version teardown on finalize, and
     /// staged-cleanup). Idempotent — absent is success.
     async fn delete_stream(&self, blob_ref: &str) -> Result<(), BlobError>;
+    /// Delete a **single** chunk by index. Used by the tiering layer to evict one
+    /// cached chunk when the hot cache is over budget (`server::tier`).
+    /// Idempotent — an absent index is success.
+    async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError>;
 }
 
 /// In-memory [`BlobStore`] for tests/dev and the e2e path.
@@ -114,6 +118,13 @@ impl BlobStore for MemoryBlobStore {
 
     async fn delete_stream(&self, blob_ref: &str) -> Result<(), BlobError> {
         self.inner.lock().unwrap().remove(blob_ref);
+        Ok(())
+    }
+
+    async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError> {
+        if let Some(m) = self.inner.lock().unwrap().get_mut(blob_ref) {
+            m.remove(&index);
+        }
         Ok(())
     }
 }
@@ -202,6 +213,15 @@ impl BlobStore for FsBlobStore {
             Err(e) => Err(BlobError::new("delete_stream", e.to_string())),
         }
     }
+
+    async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError> {
+        let path = self.stream_dir(blob_ref)?.join(index.to_string());
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(BlobError::new("delete_chunk", e.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +244,15 @@ mod tests {
         store.put_chunk(REF, 0, vec![0xCC; 16]).await.unwrap();
         assert_eq!(store.chunk_count(REF).await.unwrap(), 2);
         assert_eq!(store.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xCC; 16]);
+
+        // Single-chunk delete (cache eviction primitive): removes only that index,
+        // leaves the rest, and is idempotent on a repeat.
+        store.delete_chunk(REF, 0).await.unwrap();
+        assert!(store.get_chunk(REF, 0).await.unwrap().is_none());
+        assert_eq!(store.get_chunk(REF, 1).await.unwrap().unwrap(), vec![0xBB; 16]);
+        assert_eq!(store.chunk_count(REF).await.unwrap(), 1);
+        store.delete_chunk(REF, 0).await.unwrap(); // idempotent
+        store.put_chunk(REF, 0, vec![0xAA; 16]).await.unwrap(); // restore for teardown check
 
         // Teardown removes the whole stream; idempotent on a second call.
         store.delete_stream(REF).await.unwrap();
