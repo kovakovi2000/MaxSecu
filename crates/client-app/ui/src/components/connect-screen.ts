@@ -3,7 +3,7 @@ import { call } from "../core/rpc.ts";
 export class ConnectScreen extends HTMLElement {
   connectedCallback() {
     this.innerHTML = `
-      <main id="main"><h1>Connect to a MaxSecu server</h1>
+      <main id="main" tabindex="-1"><h1>Connect to a MaxSecu server</h1>
       <form id="f">
         <label>Server <input name="server" required autocomplete="off"></label>
         <label>Username <input name="username" required autocomplete="username"></label>
