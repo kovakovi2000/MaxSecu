@@ -3,14 +3,22 @@
 //!
 //! The blob never leaves the device and is **ciphertext only** at rest. Its
 //! layout is a fixed, self-describing header (authenticated as AEAD AAD) plus
-//! an AES-256-GCM sealing of the 96-byte private material:
+//! an AES-256-GCM sealing of the private material. Two versions coexist:
 //!
 //! ```text
 //! magic "MXKB" (4) | version u8 | argon m_kib u32 | t u32 | p u32
 //!   | salt[16] | nonce[12]            <-- 45-byte header, also the AEAD AAD
-//! ciphertext = AES-256-GCM(pw_key, nonce, aad=header,
-//!                          enc_sk[32] ‖ enc_pk[32] ‖ sig_seed[32])  (112 bytes)
+//! v1 ciphertext = AES-256-GCM(pw_key, nonce, aad=header,
+//!     enc_sk[32] ‖ enc_pk[32] ‖ sig_seed[32])                  (96 + 16 tag)
+//! v2 ciphertext = AES-256-GCM(pw_key, nonce, aad=header,
+//!     enc_sk[32] ‖ enc_pk[32] ‖ sig_seed[32] ‖ mlkem_seed[64]) (160 + 16 tag)
 //! ```
+//!
+//! `version 2` (Phase 7) adds the 64-byte ML-KEM-768 decapsulation-key seed of a
+//! PQ-enrolled identity; the public key is re-derived from the seed on unlock.
+//! `seal` writes v2 for a PQ identity (every freshly-generated identity is PQ)
+//! and v1 for a legacy non-PQ identity (e.g. a resealed v1 blob). `unlock`
+//! accepts **both** versions; a v1 blob yields an identity with no ML-KEM key.
 //!
 //! `pw_key = Argon2id(password, salt, params)`. The full `(m,t,p,salt)` is
 //! stored with the blob (M3) so a re-tuned/older blob still opens; params below
@@ -24,16 +32,24 @@ use maxsecu_crypto::{self as crypto, random_array, Argon2Params};
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 4] = b"MXKB";
-const VERSION: u8 = 1;
+const VERSION_V1: u8 = 1;
+const VERSION_V2: u8 = 2;
 const HEADER_LEN: usize = 4 + 1 + 4 + 4 + 4 + 16 + 12; // 45
-const PLAINTEXT_LEN: usize = 32 + 32 + 32; // enc_sk ‖ enc_pk ‖ sig_seed = 96
+const PLAINTEXT_V1_LEN: usize = 32 + 32 + 32; // enc_sk ‖ enc_pk ‖ sig_seed = 96
+const PLAINTEXT_V2_LEN: usize = PLAINTEXT_V1_LEN + 64; // + mlkem_seed = 160
 const TAG_LEN: usize = 16;
-const BLOB_LEN: usize = HEADER_LEN + PLAINTEXT_LEN + TAG_LEN; // 157
+const BLOB_V1_LEN: usize = HEADER_LEN + PLAINTEXT_V1_LEN + TAG_LEN; // 157
+const BLOB_V2_LEN: usize = HEADER_LEN + PLAINTEXT_V2_LEN + TAG_LEN; // 221
 
-fn build_header(params: Argon2Params, salt: &[u8; 16], nonce: &[u8; 12]) -> [u8; HEADER_LEN] {
+fn build_header(
+    version: u8,
+    params: Argon2Params,
+    salt: &[u8; 16],
+    nonce: &[u8; 12],
+) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
     h[0..4].copy_from_slice(MAGIC);
-    h[4] = VERSION;
+    h[4] = version;
     h[5..9].copy_from_slice(&params.m_kib.to_be_bytes());
     h[9..13].copy_from_slice(&params.t.to_be_bytes());
     h[13..17].copy_from_slice(&params.p.to_be_bytes());
@@ -43,40 +59,64 @@ fn build_header(params: Argon2Params, salt: &[u8; 16], nonce: &[u8; 12]) -> [u8;
 }
 
 /// Seal `id` under `password` with `params`, producing the at-rest blob bytes.
+/// A PQ identity (with an ML-KEM key) seals as v2; a legacy non-PQ identity as
+/// v1.
 pub fn seal(password: &str, id: &Identity, params: Argon2Params) -> Result<Vec<u8>, ClientError> {
     let salt: [u8; 16] = random_array();
     let nonce: [u8; 12] = random_array();
     let pw_key = crypto::derive_key(password.as_bytes(), &salt, params)
         .map_err(|_| ClientError::BelowArgonFloor)?;
 
-    let (enc_sk, enc_pk, sig_seed) = id.secret_bytes();
-    // Transient combined plaintext, wiped on drop (DESIGN §8.1).
-    let mut plaintext = Zeroizing::new([0u8; PLAINTEXT_LEN]);
-    plaintext[0..32].copy_from_slice(&enc_sk);
-    plaintext[32..64].copy_from_slice(&enc_pk);
-    plaintext[64..96].copy_from_slice(&sig_seed);
+    let (enc_sk, enc_pk, sig_seed, mlkem_seed) = id.secret_bytes();
+    // Transient combined plaintext, wiped on drop (DESIGN §8.1). Sized to the
+    // version we are writing (v2 when the identity carries an ML-KEM seed).
+    let (version, plaintext) = match mlkem_seed {
+        Some(seed) => {
+            let mut pt = Zeroizing::new(vec![0u8; PLAINTEXT_V2_LEN]);
+            pt[0..32].copy_from_slice(&enc_sk);
+            pt[32..64].copy_from_slice(&enc_pk);
+            pt[64..96].copy_from_slice(&sig_seed);
+            pt[96..160].copy_from_slice(&seed);
+            (VERSION_V2, pt)
+        }
+        None => {
+            let mut pt = Zeroizing::new(vec![0u8; PLAINTEXT_V1_LEN]);
+            pt[0..32].copy_from_slice(&enc_sk);
+            pt[32..64].copy_from_slice(&enc_pk);
+            pt[64..96].copy_from_slice(&sig_seed);
+            (VERSION_V1, pt)
+        }
+    };
 
-    let header = build_header(params, &salt, &nonce);
+    let header = build_header(version, params, &salt, &nonce);
     let ct = crypto::seal(&pw_key, &nonce, &header, &plaintext[..]);
 
-    let mut out = Vec::with_capacity(BLOB_LEN);
+    let mut out = Vec::with_capacity(header.len() + ct.len());
     out.extend_from_slice(&header);
     out.extend_from_slice(&ct);
     Ok(out)
 }
 
 /// Unlock the blob with `password`, returning the in-memory [`Identity`].
-/// Wrong password, tamper, or below-floor params all fail closed.
+/// Accepts both v1 (no ML-KEM) and v2 (PQ) blobs. Wrong password, tamper, or
+/// below-floor params all fail closed.
 pub fn unlock(password: &str, blob: &[u8]) -> Result<Identity, ClientError> {
-    if blob.len() != BLOB_LEN {
+    // Need at least the header to read magic + version; full length is checked
+    // per-version once the version is known.
+    if blob.len() < HEADER_LEN {
         return Err(ClientError::CorruptBlob);
     }
     if &blob[0..4] != MAGIC {
         return Err(ClientError::CorruptBlob);
     }
     let version = blob[4];
-    if version != VERSION {
-        return Err(ClientError::UnsupportedBlobVersion(version));
+    let (blob_len, plaintext_len) = match version {
+        VERSION_V1 => (BLOB_V1_LEN, PLAINTEXT_V1_LEN),
+        VERSION_V2 => (BLOB_V2_LEN, PLAINTEXT_V2_LEN),
+        other => return Err(ClientError::UnsupportedBlobVersion(other)),
+    };
+    if blob.len() != blob_len {
+        return Err(ClientError::CorruptBlob);
     }
     let m_kib = u32::from_be_bytes(blob[5..9].try_into().unwrap());
     let t = u32::from_be_bytes(blob[9..13].try_into().unwrap());
@@ -97,7 +137,7 @@ pub fn unlock(password: &str, blob: &[u8]) -> Result<Identity, ClientError> {
     let plaintext = Zeroizing::new(
         crypto::open(&pw_key, &nonce, header, ct).map_err(|_| ClientError::WrongPassword)?,
     );
-    if plaintext.len() != PLAINTEXT_LEN {
+    if plaintext.len() != plaintext_len {
         return Err(ClientError::CorruptBlob);
     }
     let mut enc_sk = [0u8; 32];
@@ -106,7 +146,14 @@ pub fn unlock(password: &str, blob: &[u8]) -> Result<Identity, ClientError> {
     enc_sk.copy_from_slice(&plaintext[0..32]);
     enc_pk.copy_from_slice(&plaintext[32..64]);
     sig_seed.copy_from_slice(&plaintext[64..96]);
-    Ok(Identity::from_secret_bytes(enc_sk, enc_pk, sig_seed))
+    let mlkem_seed = if version == VERSION_V2 {
+        let mut seed = [0u8; 64];
+        seed.copy_from_slice(&plaintext[96..160]);
+        Some(seed)
+    } else {
+        None
+    };
+    Ok(Identity::from_secret_bytes(enc_sk, enc_pk, sig_seed, mlkem_seed))
 }
 
 /// Password change (DESIGN §9.5): unlock with the old password, re-seal under
@@ -136,11 +183,75 @@ mod tests {
         let id = Identity::generate();
         let pw = "correct horse battery staple!";
         let blob = seal(pw, &id, params()).unwrap();
-        assert_eq!(blob.len(), BLOB_LEN);
+        // A fresh (PQ) identity seals as v2.
+        assert_eq!(blob.len(), BLOB_V2_LEN);
+        assert_eq!(blob[4], VERSION_V2);
         let back = unlock(pw, &blob).unwrap();
         assert_eq!(back.enc_pub_bytes(), id.enc_pub_bytes());
         assert_eq!(back.sig_pub_bytes(), id.sig_pub_bytes());
         assert_eq!(back.fingerprint(), id.fingerprint());
+    }
+
+    #[test]
+    fn keyblob_v2_roundtrips_with_mlkem() {
+        // A fresh PQ identity seals as v2 and unlocks to a working ML-KEM half:
+        // the recovered seed re-derives the same public key, and a hybrid wrap to
+        // {enc_pub, mlkem_pub} unwraps with the recovered identity's secret parts.
+        use maxsecu_crypto::{
+            unwrap_dek_hybrid, wrap_dek_hybrid, Dek, HybridEncPublicKey, HybridEncSecretKey,
+        };
+        use maxsecu_encoding::structs::WrapContext;
+        use maxsecu_encoding::types::Id;
+
+        let id = Identity::generate();
+        let pw = "pq-keyblob-roundtrip-passphrase";
+        let blob = seal(pw, &id, params()).unwrap();
+        assert_eq!(blob.len(), BLOB_V2_LEN);
+
+        let back = unlock(pw, &blob).unwrap();
+        assert!(back.mlkem_pub_bytes().is_some());
+        assert_eq!(back.mlkem_pub_bytes(), id.mlkem_pub_bytes());
+
+        // Prove the recovered seed is correct: build a hybrid recipient from the
+        // recovered identity and round-trip a DEK.
+        let pk = HybridEncPublicKey {
+            x25519: back.enc_pub_bytes(),
+            mlkem: back.mlkem_pub_bytes().unwrap(),
+        };
+        let sk = HybridEncSecretKey::from_components(
+            back.enc_secret().expose_bytes(),
+            back.mlkem_seed().unwrap(),
+        );
+        let dek = Dek::from_bytes([0x77; 32]);
+        let ctx = WrapContext {
+            file_id: Id([3; 16]),
+            version: 7,
+            recipient_id: Id([4; 16]),
+        };
+        let w = wrap_dek_hybrid(&pk, &dek, &ctx).unwrap();
+        assert_eq!(
+            unwrap_dek_hybrid(&sk, &w, &ctx).unwrap().expose(),
+            dek.expose()
+        );
+    }
+
+    #[test]
+    fn keyblob_v1_still_loads() {
+        // A legacy (non-PQ) identity — reconstructed with no ML-KEM seed — seals
+        // as a v1 blob and unlocks to an identity with no ML-KEM key.
+        let pq = Identity::generate();
+        let (esk, epk, seed, _) = pq.secret_bytes();
+        let v1_id = Identity::from_secret_bytes(esk, epk, seed, None);
+        assert!(v1_id.mlkem_pub_bytes().is_none());
+
+        let pw = "legacy-v1-blob-passphrase";
+        let blob = seal(pw, &v1_id, params()).unwrap();
+        assert_eq!(blob.len(), BLOB_V1_LEN);
+        assert_eq!(blob[4], VERSION_V1);
+
+        let back = unlock(pw, &blob).unwrap();
+        assert!(back.mlkem_pub_bytes().is_none());
+        assert_eq!(back.fingerprint(), v1_id.fingerprint());
     }
 
     #[test]

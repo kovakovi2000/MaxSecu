@@ -4,6 +4,7 @@ use crate::CeremonyError;
 use maxsecu_crypto::{fingerprint, CryptoError, SigningKey, VerifyingKey};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::DirBinding;
+use maxsecu_encoding::types::MlKemPub;
 
 /// The offline **directory-signing key** (D5). It signs username→keys identity
 /// bindings and nothing else; its public half is the pinned trust root compiled
@@ -28,13 +29,24 @@ impl DirectorySigner {
         self.0.verifying_key().to_bytes()
     }
 
-    /// Sign a binding into the directory (`"MaxSecu-dirbinding-v1"`, §7.1). The
-    /// caller is responsible for the fingerprint confirmation; prefer
-    /// [`DirectorySigner::sign_enrollment`], which enforces it.
-    pub fn sign_binding(&self, binding: &DirBinding) -> SignedBinding {
+    /// Sign a binding into the directory (`"MaxSecu-dirbinding-v1"`, §7.1),
+    /// carrying an optional ML-KEM-768 encapsulation key for a PQ-enrolled
+    /// identity (Phase 7, P7.4). `mlkem_pub` is written into the binding before
+    /// signing, so the existing D5 Ed25519 signature over `canonical(binding)`
+    /// authenticates the PQ field for free — no new signature semantics. Pass
+    /// `None` for a classical (v1) binding. The caller is responsible for the
+    /// fingerprint confirmation; prefer [`DirectorySigner::sign_enrollment`],
+    /// which enforces it.
+    pub fn sign_binding(
+        &self,
+        binding: &DirBinding,
+        mlkem_pub: Option<MlKemPub>,
+    ) -> SignedBinding {
+        let mut binding = binding.clone();
+        binding.mlkem_pub = mlkem_pub;
         SignedBinding {
-            signature: self.0.sign_canonical(labels::DIRBINDING, binding),
-            binding: binding.clone(),
+            signature: self.0.sign_canonical(labels::DIRBINDING, &binding),
+            binding,
         }
     }
 
@@ -49,7 +61,9 @@ impl DirectorySigner {
         if &fingerprint(&binding.enc_pub.0, &binding.sig_pub.0) != confirmed_fingerprint {
             return Err(CeremonyError::FingerprintMismatch);
         }
-        Ok(self.sign_binding(binding))
+        // Preserve any PQ key already present on the binding (the fingerprint
+        // covers only enc_pub ‖ sig_pub, so the ML-KEM key is orthogonal to it).
+        Ok(self.sign_binding(binding, binding.mlkem_pub))
     }
 }
 

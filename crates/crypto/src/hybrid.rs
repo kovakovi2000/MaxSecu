@@ -114,6 +114,29 @@ impl HybridEncSecretKey {
     }
 }
 
+/// Generate a fresh **ML-KEM-768 only** keypair from the OS CSPRNG, returning
+/// the 64-byte decapsulation-key seed and the 1184-byte encapsulation (public)
+/// key. Used by the on-device identity (P7.4), which reuses its single X25519
+/// `enc` key as the hybrid classical leg, so only the PQ half is generated here
+/// (no second, throwaway X25519 key). The seed is secret — seal it into the
+/// `local_key_blob` and never send it anywhere.
+pub fn generate_mlkem_keypair() -> ([u8; MLKEM_SEED_LEN], [u8; MLKEM_PUB_LEN]) {
+    let (dk, ek) = MlKem768::generate_keypair();
+    (dk_to_seed(&dk), ek_to_bytes(&ek))
+}
+
+/// Recover the 1184-byte ML-KEM-768 encapsulation (public) key from its 64-byte
+/// decapsulation-key seed. The seed deterministically derives the whole keypair
+/// (FIPS 203), so a keyblob that stored only the seed (P7.4) can reconstruct the
+/// matching public key on unlock. Fails closed on a malformed seed.
+pub fn mlkem_public_from_seed(
+    seed: &[u8; MLKEM_SEED_LEN],
+) -> Result<[u8; MLKEM_PUB_LEN], CryptoError> {
+    let dk = <DecapsulationKey<MlKem768> as KeyInit>::new_from_slice(&seed[..])
+        .map_err(|_| CryptoError::BadPublicKey)?;
+    Ok(ek_to_bytes(dk.encapsulation_key()))
+}
+
 /// Generate a fresh hybrid keypair (X25519 + ML-KEM-768) from the OS CSPRNG.
 pub fn generate_hybrid_keypair() -> (HybridEncSecretKey, HybridEncPublicKey) {
     // Classical X25519 half (static recipient key).
@@ -456,6 +479,27 @@ mod tests {
             deserialize_hybrid_wrap(&[]).map(|_| ()),
             Err(CryptoError::BadLength)
         );
+    }
+
+    #[test]
+    fn mlkem_keypair_seed_reconstructs_public_and_unwraps() {
+        // The ML-KEM-only keygen (identity path) yields a seed + public that pair
+        // up: a wrap to that public unwraps with a hybrid secret rebuilt from the
+        // X25519 leg + the seed, and the seed re-derives the same public key.
+        let (mlkem_seed, mlkem_pub) = generate_mlkem_keypair();
+        assert_eq!(mlkem_public_from_seed(&mlkem_seed).unwrap(), mlkem_pub);
+
+        let x_sec = StaticSecret::random_from_rng(OsRng);
+        let x_pub = PublicKey::from(&x_sec).to_bytes();
+        let pk = HybridEncPublicKey {
+            x25519: x_pub,
+            mlkem: mlkem_pub,
+        };
+        let sk = HybridEncSecretKey::from_components(x_sec.to_bytes(), mlkem_seed);
+        let dek = Dek::from_bytes([9; 32]);
+        let c = ctx(0x55, 1);
+        let w = wrap_dek_hybrid(&pk, &dek, &c).unwrap();
+        assert_eq!(unwrap_dek_hybrid(&sk, &w, &c).unwrap().expose(), dek.expose());
     }
 
     #[test]

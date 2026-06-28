@@ -147,7 +147,7 @@ async fn phase2_exit_gates_over_real_tls() {
 
     // victim: a genuine binding, but account-wide revoked below.
     let victim = binding("victim", 0x0F, 0xE2, 0x52, 1);
-    let victim_signed = d5.sign_binding(&victim);
+    let victim_signed = d5.sign_binding(&victim, None);
 
     // mallory: the server tries to substitute an ATTACKER-signed binding.
     let attacker = SigningKey::generate();

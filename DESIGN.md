@@ -229,9 +229,13 @@ Offline trust root
                                               ▼
  Per-user keys (generated on device, never exported)
   ├── X25519 (unwrap DEKs)        ── stored on server: PUBLIC half only, directory-signed
+  │                                  also the CLASSICAL leg of the Suite::V2 hybrid wrap (§5)
+  ├── ML-KEM-768 (PQ unwrap leg)  ── stored on server: PUBLIC half only, directory-signed (Phase 7)
   └── Ed25519 (auth + sign)       ── stored on server: PUBLIC half only, directory-signed
         encrypted private halves  ── stored ONLY on the user's device, under Argon2id(password)
 ```
+
+> **Per-user PQ key (Phase 7).** A PQ-enrolled identity adds an on-device **ML-KEM-768** keypair alongside its X25519 `enc` and Ed25519 `sig` keys. The single X25519 `enc` key doubles as the classical leg of the hybrid wrap, so the only new key material is the ML-KEM half. At rest, the ML-KEM **decapsulation-key seed** (64 bytes) is sealed into the device `local_key_blob` next to the X25519/Ed25519 secrets (blob **v2**; the public key is re-derived from the seed on unlock); a legacy **v1** blob predates PQ and unlocks to a non-PQ identity (§9.1).
 
 > **Custody (M-5).** D5 and D6 are **breakglass** keys kept **cold** — their risk is physical custody of the cold copy, not online/device security (D6 is touched only for last-resort recovery, §12.7; D5 only at ceremonies). They may share one cold device or live on two — but with the status signer removed (§7.6) there is no longer a separate key gating forgery, so **co-locating D5+D6 means one cold-vault theft unlocks both** *decrypt-everything* (D6) **and** *forge-future* (D5); keeping them on **separate** cold devices preserves that separation (§3.1 M-5). Sealed, dual-custody storage and the planned Shamir split protect the cold copy (§16.3, §19).
 
@@ -264,13 +268,16 @@ binding = {
   key_version  : integer,          // increments on rotation / re-enrollment
   roles        : set,              // {user} or {user, admin} — offline-signed capability (§10.1)
   not_before   : timestamp,
-  not_after    : timestamp         // long validity (e.g. 1 year) — identity, not freshness
+  not_after    : timestamp,        // long validity (e.g. 1 year) — identity, not freshness
+  mlkem_pub    : option<ML-KEM-768 pub>   // PQ leg of the hybrid wrap (Phase 7) — present for a PQ-enrolled identity, absent (None) otherwise
 }
 fingerprint = SHA-256( canonical(enc_pub ‖ sig_pub) )   // the human-checkable identity (§12.1)
 directory_signature = Ed25519_sign( directory_signing_key, "MaxSecu-dirbinding-v1" ‖ canonical(binding) )
 ```
 
 **No separate status signer.** Earlier drafts split a short-lived *status attestation* (a second, online signing key, D13) from this identity binding to provide a 12 h freshness/revocation epoch. That apparatus is **removed** — it was a fleet-wide availability fuse and a second key to custody, for a job tombstones already do (see the D13 entry in §2 and §7.6). The server stores and serves `binding + directory_signature` and can forge neither; *whether* a bound user is currently authorized is answered by the **sink-anchored tombstone set** (§7.6), not by any status signature.
+
+**Optional PQ key (Phase 7).** A PQ-enrolled identity carries an additional **ML-KEM-768 encapsulation key** (`mlkem_pub`) as the post-quantum leg of the Suite::V2 hybrid wrap (§5); the X25519 `enc_pub` doubles as the classical leg, so the binding adds *only* the ML-KEM key (there is no second classical key). The field is an `option` — absent on a classical (v1) binding, present on a PQ one — and is authenticated **for free** by the existing D5 signature, which covers `canonical(binding)` including the trailing field. It is deliberately **not** part of the `fingerprint` (which stays `SHA-256(enc_pub ‖ sig_pub)`), so PQ enrollment does not change the human-checkable identity or the in-person confirmation flow (§12.1).
 
 The **`fingerprint`** is the value a human confirms in person at enrollment (§12.1). Because it is a hash of the *actual public keys*, confirming it binds the real person to the real key — unlike the `user_id`, which is just a handle the (untrusted) server assigned. Clients render the **full 256-bit** fingerprint as **base64** (≈43 characters) and/or a QR code; the entire value is compared, never a truncated prefix. Because base64 is case-sensitive, visual side-by-side or QR comparison is preferred over reading it aloud (D9).
 

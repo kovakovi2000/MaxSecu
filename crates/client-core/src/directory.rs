@@ -64,6 +64,11 @@ pub struct VerifiedBinding {
     pub key_version: u64,
     pub roles: Vec<Role>,
     pub fingerprint: [u8; 32],
+    /// The recipient's ML-KEM-768 encapsulation key for a PQ-enrolled identity
+    /// (Phase 7), or `None` for a classical binding. Carried verbatim from the
+    /// D5-signed binding so a wrapper can build a hybrid recipient (P7.5). Not
+    /// part of the fingerprint (§7.1).
+    pub mlkem_pub: Option<[u8; 1184]>,
 }
 
 /// Why a binding was not accepted. Every variant means "treat as absent" (fail
@@ -107,6 +112,9 @@ pub struct AuthorizedRecipient {
     pub key_version: u64,
     pub effective_roles: Vec<Role>,
     pub fingerprint: [u8; 32],
+    /// The recipient's ML-KEM-768 encapsulation key (PQ, Phase 7), or `None` for
+    /// a classical binding — the PQ leg of a hybrid wrap target (P7.5).
+    pub mlkem_pub: Option<[u8; 1184]>,
 }
 
 /// Verifies directory bindings against the **pinned** directory-signing public
@@ -199,6 +207,7 @@ impl DirectoryVerifier {
             sig_pub: v.sig_pub,
             key_version: v.key_version,
             fingerprint: v.fingerprint,
+            mlkem_pub: v.mlkem_pub,
         })
     }
 
@@ -254,6 +263,7 @@ impl DirectoryVerifier {
             key_version: binding.key_version,
             roles: binding.roles.roles().to_vec(),
             fingerprint: fp,
+            mlkem_pub: binding.mlkem_pub.map(|m| m.0),
         }
     }
 }
@@ -422,6 +432,45 @@ mod tests {
             v.verify_binding(&b, &sig, NOW + 2 * YEAR_MS, &mut MemoryTrustStore::new()),
             Err(VerifyError::Expired)
         );
+    }
+
+    #[test]
+    fn verified_binding_exposes_mlkem() {
+        use maxsecu_admin_core::DirectorySigner;
+        let d5 = DirectorySigner::generate();
+        let v = DirectoryVerifier::new(d5.public_key());
+
+        // A PQ binding (D5-signed with an ML-KEM key) exposes mlkem_pub verbatim.
+        let mlkem = maxsecu_encoding::types::MlKemPub([0x9C; 1184]);
+        let pq = d5.sign_binding(&binding(1, 0xE1, 0x51, 1), Some(mlkem));
+        let verified = v
+            .verify_binding(&pq.binding, &pq.signature, NOW, &mut MemoryTrustStore::new())
+            .unwrap();
+        assert_eq!(verified.mlkem_pub, Some([0x9C; 1184]));
+        // …and the PQ key carries through to the authorized recipient too.
+        let none = TombstoneSet::verify(&[], GENESIS_HEAD.0).unwrap();
+        let r = v
+            .authorize_recipient(
+                &pq.binding,
+                &pq.signature,
+                NOW,
+                &mut MemoryTrustStore::new(),
+                &none,
+            )
+            .unwrap();
+        assert_eq!(r.mlkem_pub, Some([0x9C; 1184]));
+
+        // A classical (non-PQ) binding yields None.
+        let classical = d5.sign_binding(&binding(2, 0xE2, 0x52, 1), None);
+        let verified = v
+            .verify_binding(
+                &classical.binding,
+                &classical.signature,
+                NOW,
+                &mut MemoryTrustStore::new(),
+            )
+            .unwrap();
+        assert_eq!(verified.mlkem_pub, None);
     }
 
     // ---- the full §7.2 recipient rule (binding + §7.6 revocation) ----

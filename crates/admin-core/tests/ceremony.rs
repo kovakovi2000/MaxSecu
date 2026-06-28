@@ -33,7 +33,7 @@ fn binding(username: &str, uid: u8, enc: u8, sig: u8, key_version: u64) -> DirBi
 fn signed_binding_verifies_under_the_pinned_root_only() {
     let d5 = DirectorySigner::generate();
     let other = DirectorySigner::generate();
-    let signed = d5.sign_binding(&binding("alice", 1, 0xE1, 0x51, 1));
+    let signed = d5.sign_binding(&binding("alice", 1, 0xE1, 0x51, 1), None);
 
     // Verifies under the directory-signing public key clients pin (§7.2 step 2).
     assert!(signed.verify(&d5.public_key()).is_ok());
@@ -44,7 +44,7 @@ fn signed_binding_verifies_under_the_pinned_root_only() {
 #[test]
 fn tampered_binding_fails_verification() {
     let d5 = DirectorySigner::generate();
-    let mut signed = d5.sign_binding(&binding("alice", 1, 0xE1, 0x51, 1));
+    let mut signed = d5.sign_binding(&binding("alice", 1, 0xE1, 0x51, 1), None);
     // Flip the bound key — the offline signature no longer covers it.
     signed.binding.key_version = 2;
     assert!(signed.verify(&d5.public_key()).is_err());
@@ -54,8 +54,28 @@ fn tampered_binding_fails_verification() {
 fn fingerprint_is_sha256_of_the_canonical_key_pair() {
     let d5 = DirectorySigner::generate();
     let b = binding("alice", 1, 0xE1, 0x51, 1);
-    let signed = d5.sign_binding(&b);
+    let signed = d5.sign_binding(&b, None);
     assert_eq!(signed.fingerprint(), fingerprint(&[0xE1; 32], &[0x51; 32]));
+}
+
+#[test]
+fn sign_binding_includes_mlkem() {
+    // A PQ binding: sign with an ML-KEM-768 key. The resulting binding verifies
+    // under the pinned root (the D5 signature covers the trailing PQ field) and
+    // carries the exact key — the fingerprint is unchanged (enc_pub ‖ sig_pub).
+    let d5 = DirectorySigner::generate();
+    let mlkem = maxsecu_encoding::types::MlKemPub([0x7A; 1184]);
+    let b = binding("alice", 1, 0xE1, 0x51, 1);
+    let signed = d5.sign_binding(&b, Some(mlkem));
+
+    assert!(signed.verify(&d5.public_key()).is_ok());
+    assert_eq!(signed.binding.mlkem_pub, Some(mlkem));
+    assert_eq!(signed.fingerprint(), fingerprint(&[0xE1; 32], &[0x51; 32]));
+
+    // Tampering with the PQ key breaks the signature (it is authenticated).
+    let mut tampered = signed.clone();
+    tampered.binding.mlkem_pub = Some(maxsecu_encoding::types::MlKemPub([0x00; 1184]));
+    assert!(tampered.verify(&d5.public_key()).is_err());
 }
 
 // ---- fingerprint-confirmed enrollment ceremony (§12.1 / D9) ----
