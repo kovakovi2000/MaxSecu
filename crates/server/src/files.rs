@@ -173,6 +173,48 @@ impl From<StoreError> for FinalizeError {
     }
 }
 
+/// Why a read re-share (`POST /v1/files/{id}/wraps`, api.md §10.1) was rejected.
+/// Coarse-only — the wrap bytes are inert and the client re-verifies the grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddWrapError {
+    /// The file is absent, not yet finalized, or the caller holds no wrap for the
+    /// current version — all indistinguishable (no access oracle, → 404).
+    NoAccess,
+    /// The posted wrap is not a valid re-share: `granted_by` is not the caller
+    /// (the re-sharer signs as themselves), or the recipient is the recovery
+    /// sentinel / not a user (→ 400). Re-share never targets recovery (§12.9).
+    BadRequest,
+    /// A backend fault (→ 500, logged).
+    Store(StoreError),
+}
+
+impl From<StoreError> for AddWrapError {
+    fn from(e: StoreError) -> Self {
+        AddWrapError::Store(e)
+    }
+}
+
+/// Why a soft-revoke (`DELETE /v1/files/{id}/wraps/{recipient}`, api.md §10.2)
+/// was rejected. Soft-revoke is a server-side denial, not a cryptographic
+/// boundary (§12.8) — for a guarantee against a malicious server, tombstone +
+/// rotate (§12.9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteWrapError {
+    /// No such file, finalized version, or wrap row for that recipient (→ 404).
+    NotFound,
+    /// The caller is neither the file owner nor the wrap's `granted_by` — the
+    /// coarse owner-or-granter gate (→ 403).
+    NotAuthorized,
+    /// A backend fault (→ 500, logged).
+    Store(StoreError),
+}
+
+impl From<StoreError> for DeleteWrapError {
+    fn from(e: StoreError) -> Self {
+        DeleteWrapError::Store(e)
+    }
+}
+
 /// Which version of a file `GET /v1/files/{id}` should return (api.md §8.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionSelector {

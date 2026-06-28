@@ -11,8 +11,8 @@
 use crate::auth::AuthService;
 use crate::error::{AuthError, ChallengeError, ControlAppendError, ProveError};
 use crate::files::{
-    parse_stage, FinalizeError, GenesisInput, ListFilter, StageError, StageInput, VersionSelector,
-    WrapInput,
+    parse_stage, AddWrapError, DeleteWrapError, FinalizeError, GenesisInput, ListFilter, StageError,
+    StageInput, VersionSelector, WrapInput,
 };
 use crate::blob::BlobStore;
 use crate::store::{FileView, Store};
@@ -23,7 +23,7 @@ use axum::extract::{FromRequestParts, Json, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Router};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -71,6 +71,14 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         .route("/v1/key-compromise", post(post_control::<S>))
         .route("/v1/files", get(list_files::<S>).post(create_file::<S>))
         .route("/v1/files/{file_id}", get(get_file::<S>))
+        .route(
+            "/v1/files/{file_id}/wraps",
+            post(add_wrap::<S>),
+        )
+        .route(
+            "/v1/files/{file_id}/wraps/{recipient_id}",
+            delete(delete_wrap::<S>),
+        )
         .route("/v1/files/{file_id}/versions", post(stage_version::<S>))
         .route(
             "/v1/files/{file_id}/versions/{v}/finalize",
@@ -850,7 +858,7 @@ struct WrapOut {
     wrapped_dek_b64: String,
     grant_b64: String,
     grant_sig_b64: String,
-    ancestor_grants: Vec<serde_json::Value>, // empty in Phase 3 (no re-share chain)
+    ancestor_grants: Vec<serde_json::Value>, // re-share chain to author (api.md §8.5)
 }
 
 #[derive(Serialize)]
@@ -883,7 +891,17 @@ fn file_view_to_res(v: FileView) -> FileRes {
             wrapped_dek_b64: b64encode(&v.my_wrap.wrapped_dek),
             grant_b64: b64encode(&v.my_wrap.grant_bytes),
             grant_sig_b64: b64encode(&v.my_wrap.grant_sig),
-            ancestor_grants: Vec::new(),
+            ancestor_grants: v
+                .my_wrap
+                .ancestor_grants
+                .iter()
+                .map(|(b, s)| {
+                    serde_json::json!({
+                        "grant_b64": b64encode(b),
+                        "grant_sig_b64": b64encode(s),
+                    })
+                })
+                .collect(),
         },
         recovery_grant: v.recovery_grant.map(|(b, s)| RecoveryGrantOut {
             grant_b64: b64encode(&b),
@@ -929,6 +947,63 @@ async fn get_file<S: Store + 'static>(
         Ok(Some(view)) => Json(file_view_to_res(view)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => internal_error(e),
+    }
+}
+
+/// `POST /v1/files/{file_id}/wraps` — online read re-share (api.md §10.1). The
+/// body is one wrap row (`granted_by` = the caller, the current wrap holder).
+/// `201` on success; `400` malformed/inconsistent; `404` no such file or the
+/// caller holds no wrap (no oracle); `500` backend fault. The wrap bytes are
+/// inert — the recipient re-verifies the grant chain (§12.5/P4.1).
+async fn add_wrap<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Path(file_id_hex): Path<String>,
+    Json(req): Json<WrapReq>,
+) -> Response {
+    let Some(file_id) = hex_fixed::<16>(&file_id_hex) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(wrap) = build_wraps(std::slice::from_ref(&req)).and_then(|mut v| v.pop()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st
+        .auth
+        .store()
+        .add_wrap(file_id, wrap, session.user_id, now_ms())
+        .await
+    {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(AddWrapError::BadRequest) => StatusCode::BAD_REQUEST.into_response(),
+        Err(AddWrapError::NoAccess) => StatusCode::NOT_FOUND.into_response(),
+        Err(AddWrapError::Store(e)) => internal_error(e),
+    }
+}
+
+/// `DELETE /v1/files/{file_id}/wraps/{recipient_id}` — soft revoke (api.md
+/// §10.2). Server-side denial only (§12.8). `204` on success; `403` if the
+/// caller is neither owner nor the wrap's granter; `404` if absent; `500` fault.
+async fn delete_wrap<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Path((file_id_hex, recipient_hex)): Path<(String, String)>,
+) -> Response {
+    let Some(file_id) = hex_fixed::<16>(&file_id_hex) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(recipient) = hex_fixed::<16>(&recipient_hex) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st
+        .auth
+        .store()
+        .delete_wrap(file_id, recipient, session.user_id)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(DeleteWrapError::NotAuthorized) => StatusCode::FORBIDDEN.into_response(),
+        Err(DeleteWrapError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(DeleteWrapError::Store(e)) => internal_error(e),
     }
 }
 
@@ -1857,6 +1932,87 @@ mod tests {
         assert_eq!(files[0]["file_type"], "blog");
         assert!(files[0]["streams"]["metadata"]["size"].as_u64().is_some());
         assert!(files[0]["streams"].get("content").is_none());
+    }
+
+    async fn delete_auth(router: &Router, uri: &str, token: &str) -> StatusCode {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .header(AUTHORIZATION, format!("MaxSecu-Session {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn reshare_body(recipient: [u8; 16], granted_by: [u8; 16]) -> serde_json::Value {
+        serde_json::json!({
+            "recipient_id": hex_encode(&recipient), "recipient_type": "user",
+            "wrapped_dek_b64": b64encode(&[0xD1u8; 48]), "wrap_alg": 1,
+            "granted_by": hex_encode(&granted_by), "grant_b64": b64encode(&[0xD2u8; 8]),
+            "grant_sig_b64": b64encode(&[0xD3u8; 64]),
+        })
+    }
+
+    /// Create + chunk + finalize a v1 blog owned by `owner` (admin's token).
+    async fn create_finalize_v1(router: &Router, file: [u8; 16], owner: [u8; 16], token: &str) {
+        let (st, _) = post_json_auth(router, "/v1/files", create_file_body(file, owner), token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        upload_declared_chunks(router, file, 1, token).await;
+        let (st, _) = post_json_auth(
+            router,
+            &format!("/v1/files/{}/versions/1/finalize", hex_encode(&file)),
+            serde_json::json!({}),
+            token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reshare_then_soft_revoke_over_http() {
+        let (router, admin_sk, bob_sk) = admin_app();
+        let owner = [0xADu8; 16];
+        let bob_id = [0xB0u8; 16];
+        let token = login(&router, "admin", &admin_sk).await;
+        let file = [0xF7u8; 16];
+        create_finalize_v1(&router, file, owner, &token).await;
+
+        let bob = login(&router, "bob", &bob_sk).await;
+        let wraps_uri = format!("/v1/files/{}/wraps", hex_encode(&file));
+
+        // Bob holds no wrap → cannot re-share; indistinguishable from missing (404).
+        let (st, _) = post_json_auth(&router, &wraps_uri, reshare_body([0x44; 16], bob_id), &bob).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // An inconsistent `granted_by` (not the caller) → 400.
+        let (st, _) =
+            post_json_auth(&router, &wraps_uri, reshare_body([0x55; 16], [0x99; 16]), &token).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // Owner re-shares read to bob → 201; bob can now GET (ancestor chain empty,
+        // the grant is author-rooted).
+        let (st, _) = post_json_auth(&router, &wraps_uri, reshare_body(bob_id, owner), &token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (st, body) =
+            get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &bob).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(body["my_wrap"]["wrapped_dek_b64"].as_str().is_some());
+        assert_eq!(body["my_wrap"]["ancestor_grants"].as_array().unwrap().len(), 0);
+
+        // Soft-revoke: bob (neither owner nor the granter) cannot revoke his own
+        // wrap → 403; the owner can → 204, and bob is then 404.
+        let revoke_uri = format!("/v1/files/{}/wraps/{}", hex_encode(&file), hex_encode(&bob_id));
+        assert_eq!(delete_auth(&router, &revoke_uri, &bob).await, StatusCode::FORBIDDEN);
+        assert_eq!(delete_auth(&router, &revoke_uri, &token).await, StatusCode::NO_CONTENT);
+        let (st, _) =
+            get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &bob).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

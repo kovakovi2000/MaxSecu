@@ -11,7 +11,8 @@
 use crate::control::decode_control;
 use crate::error::{ControlAppendError, StoreError};
 use crate::files::{
-    FinalizeError, ListFilter, ParsedStage, StageError, StreamRow, VersionSelector, WrapInput,
+    AddWrapError, DeleteWrapError, FinalizeError, ListFilter, ParsedStage, StageError, StreamRow,
+    VersionSelector, WrapInput,
 };
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
@@ -72,6 +73,11 @@ pub struct WrapView {
     pub wrapped_dek: Vec<u8>,
     pub grant_bytes: Vec<u8>,
     pub grant_sig: [u8; 64],
+    /// The re-share ancestor grants chaining this wrap's leaf grant to the
+    /// version author (api.md §8.5 `my_wrap.ancestor_grants`), nearest-first.
+    /// Empty for an author-rooted wrap. Advisory: assembled by walking the
+    /// server's own `granted_by` edges — the client re-verifies it (P4.1).
+    pub ancestor_grants: Vec<(Vec<u8>, [u8; 64])>,
 }
 
 /// One stream's framing as served (api.md §8.5 `streams[]`): enough for the
@@ -281,6 +287,59 @@ pub trait Store: Send + Sync {
         file_id: [u8; 16],
         version: u64,
     ) -> Result<Option<VersionMeta>, StoreError>;
+
+    /// Add a read re-share wrap to the file's current finalized version
+    /// (`POST /v1/files/{id}/wraps`, api.md §10.1). Coarse-gated: the posted
+    /// `granted_by` must be `caller_id`, the recipient must be a user (not
+    /// recovery), and the caller must already hold a wrap for that version
+    /// (§12.4b). Idempotent by recipient (a re-share replaces an existing row).
+    /// The wrap bytes are inert; the client re-verifies the grant.
+    async fn add_wrap(
+        &self,
+        file_id: [u8; 16],
+        wrap: WrapInput,
+        caller_id: [u8; 16],
+        now_ms: u64,
+    ) -> Result<(), AddWrapError>;
+
+    /// Soft-revoke a recipient (`DELETE /v1/files/{id}/wraps/{recipient}`, api.md
+    /// §10.2): delete their wrap from the current finalized version so the server
+    /// stops serving them. Coarse-gated: the caller must be the file **owner** or
+    /// the wrap's **`granted_by`**. A server-side denial only, **not** a
+    /// cryptographic boundary (§12.8).
+    async fn delete_wrap(
+        &self,
+        file_id: [u8; 16],
+        recipient_id: [u8; 16],
+        caller_id: [u8; 16],
+    ) -> Result<(), DeleteWrapError>;
+}
+
+/// Defensive cap on the server-assembled re-share ancestor chain (mirrors the
+/// client's `MAX_GRANT_CHAIN_DEPTH`, parameters §1.5): malformed stored
+/// `granted_by` edges cannot drive an unbounded walk.
+const MAX_ANCESTOR_CHAIN: usize = 32;
+
+/// Walk `granted_by` from `leaf` up to `author`, collecting each ancestor wrap's
+/// grant (bytes + sig), nearest-first (api.md §8.5). Stops at the author, a
+/// missing edge, a repeated granter (cycle), or the depth cap — all fail-safe;
+/// the client re-verifies the chain it returns (P4.1).
+pub(crate) fn ancestor_chain(
+    wraps: &[WrapInput],
+    leaf: &WrapInput,
+    author: [u8; 16],
+) -> Vec<(Vec<u8>, [u8; 64])> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut granted_by = leaf.granted_by;
+    while granted_by != author && out.len() < MAX_ANCESTOR_CHAIN && seen.insert(granted_by) {
+        let Some(anc) = wraps.iter().find(|w| w.recipient_id == granted_by) else {
+            break;
+        };
+        out.push((anc.grant_bytes.clone(), anc.grant_sig));
+        granted_by = anc.granted_by;
+    }
+    out
 }
 
 #[derive(Default)]
@@ -666,6 +725,11 @@ impl Store for MemoryStore {
         let Some(my) = ver.wraps.iter().find(|w| w.recipient_id == caller_id) else {
             return Ok(None);
         };
+        // Walk the server's own `granted_by` edges to assemble the re-share
+        // ancestor chain up to the author (owner-only write, §11.7) — advisory;
+        // the client re-verifies it (P4.1). Defensively depth-capped + cycle-
+        // guarded so malformed stored edges cannot loop (parameters §1.5).
+        let ancestor_grants = ancestor_chain(&ver.wraps, my, entry.owner_id);
         let recovery_grant = ver
             .wraps
             .iter()
@@ -691,6 +755,7 @@ impl Store for MemoryStore {
                 wrapped_dek: my.wrapped_dek.clone(),
                 grant_bytes: my.grant_bytes.clone(),
                 grant_sig: my.grant_sig,
+                ancestor_grants,
             },
             recovery_grant,
             streams,
@@ -758,6 +823,75 @@ impl Store for MemoryStore {
             finalized: ver.finalized,
             streams,
         }))
+    }
+
+    async fn add_wrap(
+        &self,
+        file_id: [u8; 16],
+        wrap: WrapInput,
+        caller_id: [u8; 16],
+        now_ms: u64,
+    ) -> Result<(), AddWrapError> {
+        // Body consistency: the re-sharer signs as themselves, and re-share
+        // targets a user — never the recovery recipient (§12.4b/§12.9).
+        if wrap.granted_by != caller_id
+            || wrap.recipient_type != 1
+            || wrap.recipient_id == maxsecu_encoding::RECOVERY_ID.0
+        {
+            return Err(AddWrapError::BadRequest);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.files.get_mut(&file_id) else {
+            return Err(AddWrapError::NoAccess);
+        };
+        let version = entry.current_version;
+        if version == 0 {
+            return Err(AddWrapError::NoAccess);
+        }
+        let Some(ver) = entry.versions.get_mut(&version) else {
+            return Err(AddWrapError::NoAccess);
+        };
+        if !ver.finalized {
+            return Err(AddWrapError::NoAccess);
+        }
+        // Coarse §10.1: the caller must already hold a wrap for this version.
+        if !ver.wraps.iter().any(|w| w.recipient_id == caller_id) {
+            return Err(AddWrapError::NoAccess);
+        }
+        // Idempotent by recipient — a re-share replaces any existing row.
+        ver.wraps.retain(|w| w.recipient_id != wrap.recipient_id);
+        ver.wraps.push(wrap);
+        entry.updated_at_ms = now_ms;
+        Ok(())
+    }
+
+    async fn delete_wrap(
+        &self,
+        file_id: [u8; 16],
+        recipient_id: [u8; 16],
+        caller_id: [u8; 16],
+    ) -> Result<(), DeleteWrapError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.files.get_mut(&file_id) else {
+            return Err(DeleteWrapError::NotFound);
+        };
+        let owner_id = entry.owner_id;
+        let version = entry.current_version;
+        if version == 0 {
+            return Err(DeleteWrapError::NotFound);
+        }
+        let Some(ver) = entry.versions.get_mut(&version) else {
+            return Err(DeleteWrapError::NotFound);
+        };
+        let Some(target) = ver.wraps.iter().find(|w| w.recipient_id == recipient_id) else {
+            return Err(DeleteWrapError::NotFound);
+        };
+        // Coarse owner-or-granter gate (§14.5 "cut the subtree" intuition).
+        if caller_id != owner_id && caller_id != target.granted_by {
+            return Err(DeleteWrapError::NotAuthorized);
+        }
+        ver.wraps.retain(|w| w.recipient_id != recipient_id);
+        Ok(())
     }
 }
 
@@ -893,5 +1027,24 @@ impl Store for FaultyStore {
         _version: u64,
     ) -> Result<Option<VersionMeta>, StoreError> {
         Err(Self::fault("version_meta"))
+    }
+
+    async fn add_wrap(
+        &self,
+        _file_id: [u8; 16],
+        _wrap: WrapInput,
+        _caller_id: [u8; 16],
+        _now_ms: u64,
+    ) -> Result<(), AddWrapError> {
+        Err(AddWrapError::Store(Self::fault("add_wrap")))
+    }
+
+    async fn delete_wrap(
+        &self,
+        _file_id: [u8; 16],
+        _recipient_id: [u8; 16],
+        _caller_id: [u8; 16],
+    ) -> Result<(), DeleteWrapError> {
+        Err(DeleteWrapError::Store(Self::fault("delete_wrap")))
     }
 }

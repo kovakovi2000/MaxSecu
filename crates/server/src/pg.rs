@@ -31,7 +31,10 @@ use time::OffsetDateTime;
 
 use crate::control::{decode_control, role_from_text, role_text};
 use crate::error::{ControlAppendError, StoreError};
-use crate::files::{FinalizeError, ListFilter, ParsedStage, StageError, VersionSelector};
+use crate::files::{
+    AddWrapError, DeleteWrapError, FinalizeError, ListFilter, ParsedStage, StageError,
+    VersionSelector, WrapInput,
+};
 use crate::store::{
     ChunkSlot, FileListEntry, FileView, SessionRecord, StoredBinding, StoredControlRecord, Store,
     StreamView, UserRecord, VersionMeta, WrapView,
@@ -673,18 +676,47 @@ impl Store for PgStore {
         .map_err(store_err(op))?;
         let Some(vrow) = vrow else { return Ok(None) };
 
-        // The caller's own wrap — its absence is a 404 (no access oracle).
-        let wrow = sqlx::query(
-            "SELECT wrapped_dek, grant_bytes, grant_sig FROM file_key_wraps \
-             WHERE file_id = $1 AND file_version = $2 AND recipient_id = $3",
+        // All wraps for this version — for the caller's wrap, the recovery grant
+        // (presence check), and the re-share ancestor chain. Their absence (no
+        // caller wrap) is a 404 (no access oracle, api.md §8.5).
+        let wrows = sqlx::query(
+            "SELECT recipient_id, recipient_type, wrapped_dek, granted_by, grant_bytes, grant_sig \
+             FROM file_key_wraps WHERE file_id = $1 AND file_version = $2",
         )
         .bind(&file_id[..])
         .bind(version)
-        .bind(&caller_id[..])
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(store_err(op))?;
-        let Some(wrow) = wrow else { return Ok(None) };
+        let mut wraps: Vec<WrapInput> = Vec::with_capacity(wrows.len());
+        for r in &wrows {
+            wraps.push(WrapInput {
+                recipient_id: col_fixed(r, op, "recipient_id")?,
+                recipient_type: r.get("recipient_type"),
+                wrapped_dek: r.try_get("wrapped_dek").map_err(store_err(op))?,
+                wrap_alg: 1,
+                granted_by: col_fixed(r, op, "granted_by")?,
+                grant_bytes: r.try_get("grant_bytes").map_err(store_err(op))?,
+                grant_sig: col_fixed(r, op, "grant_sig")?,
+            });
+        }
+        let Some(my) = wraps.iter().find(|w| w.recipient_id == caller_id) else {
+            return Ok(None);
+        };
+        let recovery_grant = wraps
+            .iter()
+            .find(|w| w.recipient_type == 2)
+            .map(|w| (w.grant_bytes.clone(), w.grant_sig));
+
+        // The author (owner-only write, §11.7) roots the ancestor chain.
+        let orow = sqlx::query("SELECT owner_id FROM files WHERE file_id = $1")
+            .bind(&file_id[..])
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_err(op))?;
+        let Some(orow) = orow else { return Ok(None) };
+        let owner_id: [u8; 16] = col_fixed(&orow, op, "owner_id")?;
+        let ancestor_grants = crate::store::ancestor_chain(&wraps, my, owner_id);
 
         let grow = sqlx::query(
             "SELECT genesis_bytes, genesis_sig FROM file_genesis WHERE file_id = $1",
@@ -694,23 +726,6 @@ impl Store for PgStore {
         .await
         .map_err(store_err(op))?;
         let Some(grow) = grow else { return Ok(None) };
-
-        let rrow = sqlx::query(
-            "SELECT grant_bytes, grant_sig FROM file_key_wraps \
-             WHERE file_id = $1 AND file_version = $2 AND recipient_type = 2",
-        )
-        .bind(&file_id[..])
-        .bind(version)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(store_err(op))?;
-        let recovery_grant = match rrow {
-            Some(r) => Some((
-                r.try_get::<Vec<u8>, _>("grant_bytes").map_err(store_err(op))?,
-                col_fixed(&r, op, "grant_sig")?,
-            )),
-            None => None,
-        };
 
         let srows = sqlx::query(
             "SELECT stream_type, chunk_count, chunk_size, blob_ref FROM file_streams \
@@ -738,9 +753,10 @@ impl Store for PgStore {
             genesis_bytes: grow.try_get("genesis_bytes").map_err(store_err(op))?,
             genesis_sig: col_fixed(&grow, op, "genesis_sig")?,
             my_wrap: WrapView {
-                wrapped_dek: wrow.try_get("wrapped_dek").map_err(store_err(op))?,
-                grant_bytes: wrow.try_get("grant_bytes").map_err(store_err(op))?,
-                grant_sig: col_fixed(&wrow, op, "grant_sig")?,
+                wrapped_dek: my.wrapped_dek.clone(),
+                grant_bytes: my.grant_bytes.clone(),
+                grant_sig: my.grant_sig,
+                ancestor_grants,
             },
             recovery_grant,
             streams,
@@ -831,6 +847,132 @@ impl Store for PgStore {
             finalized: frow.get("finalized"),
             streams,
         }))
+    }
+
+    async fn add_wrap(
+        &self,
+        file_id: [u8; 16],
+        wrap: WrapInput,
+        caller_id: [u8; 16],
+        now_ms: u64,
+    ) -> Result<(), AddWrapError> {
+        let op = "add_wrap";
+        // Body consistency (re-sharer signs as themselves; user recipient only).
+        if wrap.granted_by != caller_id
+            || wrap.recipient_type != 1
+            || wrap.recipient_id == maxsecu_encoding::RECOVERY_ID.0
+        {
+            return Err(AddWrapError::BadRequest);
+        }
+        // Current finalized version (files.current_version is 0 until first
+        // finalize); absent file or none-finalized ⇒ no access (no oracle).
+        let frow = sqlx::query("SELECT current_version FROM files WHERE file_id = $1")
+            .bind(&file_id[..])
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_err(op))?;
+        let version = match frow {
+            Some(r) => r.get::<i64, _>("current_version"),
+            None => return Err(AddWrapError::NoAccess),
+        };
+        if version == 0 {
+            return Err(AddWrapError::NoAccess);
+        }
+        // Coarse §10.1: the caller must already hold a wrap for this version.
+        let holds = sqlx::query(
+            "SELECT 1 FROM file_key_wraps \
+             WHERE file_id = $1 AND file_version = $2 AND recipient_id = $3",
+        )
+        .bind(&file_id[..])
+        .bind(version)
+        .bind(&caller_id[..])
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        if holds.is_none() {
+            return Err(AddWrapError::NoAccess);
+        }
+        // Idempotent by recipient — a re-share replaces an existing row.
+        sqlx::query(
+            "INSERT INTO file_key_wraps \
+               (file_id, file_version, recipient_id, recipient_type, wrapped_dek, wrap_alg, \
+                granted_by, grant_bytes, grant_sig) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (file_id, file_version, recipient_id) DO UPDATE SET \
+               recipient_type = EXCLUDED.recipient_type, wrapped_dek = EXCLUDED.wrapped_dek, \
+               wrap_alg = EXCLUDED.wrap_alg, granted_by = EXCLUDED.granted_by, \
+               grant_bytes = EXCLUDED.grant_bytes, grant_sig = EXCLUDED.grant_sig",
+        )
+        .bind(&file_id[..])
+        .bind(version)
+        .bind(&wrap.recipient_id[..])
+        .bind(wrap.recipient_type)
+        .bind(&wrap.wrapped_dek[..])
+        .bind(wrap.wrap_alg)
+        .bind(&wrap.granted_by[..])
+        .bind(&wrap.grant_bytes[..])
+        .bind(&wrap.grant_sig[..])
+        .execute(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        sqlx::query("UPDATE files SET updated_at = $2 WHERE file_id = $1")
+            .bind(&file_id[..])
+            .bind(ms_to_ts(now_ms))
+            .execute(&self.pool)
+            .await
+            .map_err(store_err(op))?;
+        Ok(())
+    }
+
+    async fn delete_wrap(
+        &self,
+        file_id: [u8; 16],
+        recipient_id: [u8; 16],
+        caller_id: [u8; 16],
+    ) -> Result<(), DeleteWrapError> {
+        let op = "delete_wrap";
+        let frow = sqlx::query("SELECT owner_id, current_version FROM files WHERE file_id = $1")
+            .bind(&file_id[..])
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_err(op))?;
+        let Some(frow) = frow else {
+            return Err(DeleteWrapError::NotFound);
+        };
+        let owner_id: [u8; 16] = col_fixed(&frow, op, "owner_id")?;
+        let version: i64 = frow.get("current_version");
+        if version == 0 {
+            return Err(DeleteWrapError::NotFound);
+        }
+        let wrow = sqlx::query(
+            "SELECT granted_by FROM file_key_wraps \
+             WHERE file_id = $1 AND file_version = $2 AND recipient_id = $3",
+        )
+        .bind(&file_id[..])
+        .bind(version)
+        .bind(&recipient_id[..])
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        let Some(wrow) = wrow else {
+            return Err(DeleteWrapError::NotFound);
+        };
+        let granted_by: [u8; 16] = col_fixed(&wrow, op, "granted_by")?;
+        // Coarse owner-or-granter gate (§14.5).
+        if caller_id != owner_id && caller_id != granted_by {
+            return Err(DeleteWrapError::NotAuthorized);
+        }
+        sqlx::query(
+            "DELETE FROM file_key_wraps \
+             WHERE file_id = $1 AND file_version = $2 AND recipient_id = $3",
+        )
+        .bind(&file_id[..])
+        .bind(version)
+        .bind(&recipient_id[..])
+        .execute(&self.pool)
+        .await
+        .map_err(store_err(op))?;
+        Ok(())
     }
 }
 

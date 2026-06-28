@@ -14,8 +14,9 @@ use maxsecu_encoding::types::{
 };
 use maxsecu_encoding::{encode, RECOVERY_ID};
 use maxsecu_server::{
-    parse_stage, AuthConfig, AuthService, FinalizeError, GenesisInput, ListFilter, PgStore,
-    SessionRecord, StageError, StageInput, Store, VersionSelector, WrapInput,
+    parse_stage, AddWrapError, AuthConfig, AuthService, DeleteWrapError, FinalizeError,
+    GenesisInput, ListFilter, PgStore, SessionRecord, StageError, StageInput, Store,
+    VersionSelector, WrapInput,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -667,6 +668,69 @@ async fn listing_filters_by_type_in_postgres() {
         .unwrap();
     assert_eq!(blogs.len(), 1);
     assert_eq!(blogs[0].file_id, blog);
+
+    db.teardown().await;
+}
+
+// ---- Phase 4 P4.3: re-share + soft-revoke over Postgres ----
+
+fn wrap_row(recipient: [u8; 16], granted_by: [u8; 16], tag: u8) -> WrapInput {
+    WrapInput {
+        recipient_id: recipient,
+        recipient_type: 1,
+        wrapped_dek: vec![tag; 48],
+        wrap_alg: 1,
+        granted_by,
+        grant_bytes: vec![tag; 8],
+        grant_sig: [tag; 64],
+    }
+}
+
+#[tokio::test]
+async fn reshare_and_soft_revoke_persist_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let r = [0x22u8; 16];
+    let v = [0x33u8; 16];
+    let file = [0xF5u8; 16];
+    db.seed_user(owner, "owner5").await;
+
+    let p1 = parse_stage(pg_stage(file, 1, owner, Some(pg_genesis(file, owner)), FileType::Blog)).unwrap();
+    db.store.stage_version(p1, TS).await.unwrap();
+    db.store.finalize_version(file, 1, owner, TS + 1).await.unwrap();
+
+    // Owner re-shares to R (author-rooted), R re-shares to V (re-share edge).
+    db.store.add_wrap(file, wrap_row(r, owner, 0xB0), owner, TS + 2).await.unwrap();
+    db.store.add_wrap(file, wrap_row(v, r, 0xC0), r, TS + 3).await.unwrap();
+
+    // V's view via a fresh pool: leaf grant + the ancestor chain [R's grant].
+    let fresh = db.reopen().await;
+    let vv = fresh
+        .get_file(file, VersionSelector::Latest, v)
+        .await
+        .unwrap()
+        .expect("V holds a re-shared wrap");
+    assert_eq!(vv.my_wrap.grant_bytes, vec![0xC0; 8]);
+    assert_eq!(vv.my_wrap.ancestor_grants, vec![(vec![0xB0; 8], [0xB0; 64])]);
+
+    // A non-holder cannot re-share (no oracle → NoAccess).
+    assert_eq!(
+        db.store
+            .add_wrap(file, wrap_row([0x44; 16], [0x77; 16], 0xD0), [0x77; 16], TS + 4)
+            .await,
+        Err(AddWrapError::NoAccess)
+    );
+
+    // Soft-revoke: the granter R revokes V; an unrelated user cannot revoke R;
+    // the owner can.
+    db.store.delete_wrap(file, v, r).await.expect("granter revokes grantee");
+    assert!(db.store.get_file(file, VersionSelector::Latest, v).await.unwrap().is_none());
+    assert_eq!(
+        db.store.delete_wrap(file, r, [0x88; 16]).await,
+        Err(DeleteWrapError::NotAuthorized)
+    );
+    db.store.delete_wrap(file, r, owner).await.expect("owner revokes");
+    assert!(db.store.get_file(file, VersionSelector::Latest, r).await.unwrap().is_none());
 
     db.teardown().await;
 }

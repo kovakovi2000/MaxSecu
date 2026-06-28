@@ -30,8 +30,8 @@ pub use pg::PgStore;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use serve::{export_channel_binding, serve, CHANNEL_BINDING_LABEL, CHANNEL_BINDING_LEN};
 pub use files::{
-    parse_stage, FinalizeError, GenesisInput, ListFilter, ParsedStage, StageError, StageInput,
-    VersionSelector, WrapInput,
+    parse_stage, AddWrapError, DeleteWrapError, FinalizeError, GenesisInput, ListFilter,
+    ParsedStage, StageError, StageInput, VersionSelector, WrapInput,
 };
 pub use store::{
     ChunkSlot, FileListEntry, FileView, MemoryStore, NonceRecord, SessionRecord, StoredBinding,

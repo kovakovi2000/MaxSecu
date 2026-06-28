@@ -241,7 +241,7 @@ Brokers a **short-lived, scoped, read-only** Dropbox link for a large blob so th
 ## 10. Sharing & soft-revoke (`DESIGN.md` §12.4b/§12.8 — Phase 4/5)
 
 ### 10.1 `POST /v1/files/{file_id}/wraps` — re-share read (online, D11)
-A current recipient adds a **read** wrap for another directory-verified, non-tombstoned user. Body = one wrap row with its `granted_by` + `grant_sig` (the granter actually unwrapped+re-wrapped the DEK, so this is a *possession-entailing* grant eligible for carry-forward, §12.3a). Coarse check: caller already holds a wrap. The edge is written to the external audit sink with `granted_by` (§16.5).
+A current recipient adds a **read** wrap for another directory-verified, non-tombstoned user. Body = one wrap row with its `granted_by` + `grant_sig` (the granter actually unwrapped+re-wrapped the DEK, so this is a *possession-entailing* grant eligible for carry-forward, §12.3a). Coarse checks: `granted_by` must equal the caller and the recipient must be a `user` (re-share never targets recovery) — else `400`; the caller must already hold a wrap for the file's current version — else `404` (indistinguishable from missing, no oracle). Idempotent by recipient (a re-share replaces an existing row). The edge is written to the external audit sink with `granted_by` (§16.5). The wrap added here is served to its recipient by §8.5 with the assembled `ancestor_grants` chain up to the author.
 
 ```jsonc
 { "recipient_id":"…", "recipient_type":"user",
@@ -251,7 +251,7 @@ A current recipient adds a **read** wrap for another directory-verified, non-tom
 Re-sharing read **never** confers write (owner-only, D29) — there is no write-grant endpoint.
 
 ### 10.2 `DELETE /v1/files/{file_id}/wraps/{recipient_id}` — soft revoke
-Server-side denial only (`DESIGN.md` §12.8): stops serving that recipient. **Not** a cryptographic boundary — for a guarantee against a malicious server, issue a **tombstone** (§7.2) and rotate. `204`.
+Server-side denial only (`DESIGN.md` §12.8): stops serving that recipient. **Not** a cryptographic boundary — for a guarantee against a malicious server, issue a **tombstone** (§7.2) and rotate. Coarse gate: the caller must be the file **owner** or the wrap's **`granted_by`** (the §14.5 "cut your own subtree" intuition) — else `403`; `404` if no such file/wrap (no oracle); `204` on success.
 
 ---
 
