@@ -14,6 +14,9 @@ path = "src/main.rs"
 maxsecu-server = { path = "../server" }
 maxsecu-admin-core = { path = "../admin-core" }
 maxsecu-crypto = { path = "../crypto" }
+# Copy-pasteable URL-safe-base64 DEV bootstrap secret. Same 0.22.x already
+# resolved in-tree (sink-server), so cargo-deny sees no new external version.
+base64 = "0.22"
 # Workspace-pinned (Cargo.toml [workspace.dependencies]); tokio extends the
 # feature-less workspace pin with the runtime features the launcher needs.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

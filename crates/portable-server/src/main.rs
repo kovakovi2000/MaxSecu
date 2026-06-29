@@ -6,6 +6,7 @@
 //! production ceremony key.
 #![forbid(unsafe_code)]
 
+mod bootstrap;
 mod config;
 mod layout;
 mod pki;
