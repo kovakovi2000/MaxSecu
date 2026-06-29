@@ -725,6 +725,134 @@ impl VideoSessionDecoder for AppContainerVideoSession {
     }
 }
 
+// ===========================================================================
+// Author-side transcode launcher (Phase 7, Gate 6). The codec-free spawner side of
+// the C-confined ingest worker: spawns the `media-transcode-worker` binary
+// ONE-SHOT (one request → one response) — NOT the duplex session launcher — and
+// exchanges framed messages whose body codec lives in `client-core` (the TCB). On
+// Windows the spawn is the same AppContainer + Job Object confinement
+// (`win32::spawn_confined`) the decode path uses. This crate links NO codec
+// (`rav1e`/`ac-ffmpeg` live ONLY in the worker), so a key-holding consumer
+// depending on this launcher can never unify them in.
+// ===========================================================================
+
+use maxsecu_client_core::media::{
+    decode_transcode_result, encode_transcode_request, TranscodeRequest, TranscodeResult,
+};
+
+/// Spawn the confined `media-transcode-worker` for ONE transcode job: write a
+/// framed [`TranscodeRequest`] to its stdin, read a single framed
+/// [`TranscodeResult`] from its stdout. Real process isolation (separate address
+/// space; no key state shared). The codecs (`rav1e` encode, `ac-ffmpeg` ingest)
+/// live only in the spawned binary; this launcher is codec-free.
+pub struct TranscodeLauncher {
+    worker_path: PathBuf,
+    memory_cap_bytes: u64,
+}
+
+impl TranscodeLauncher {
+    /// `worker_path` is the absolute path to the built `media-transcode-worker`.
+    pub fn new(worker_path: impl Into<PathBuf>) -> Self {
+        TranscodeLauncher {
+            worker_path: worker_path.into(),
+            memory_cap_bytes: DEFAULT_WORKER_MEMORY_CAP_BYTES,
+        }
+    }
+
+    pub fn with_memory_cap(worker_path: impl Into<PathBuf>, cap: u64) -> Self {
+        TranscodeLauncher {
+            worker_path: worker_path.into(),
+            memory_cap_bytes: cap,
+        }
+    }
+
+    /// Run one transcode job to completion and return its [`TranscodeResult`]. The
+    /// worker output is untrusted: the response frame length is bounded
+    /// ([`framing::MAX_FRAME_BYTES`]) and the body decoded with the bounds-safe
+    /// `client-core` codec — a hostile / crashing / non-zero-exit worker yields a
+    /// [`SessionError`], never a panic.
+    pub fn transcode(&self, req: &TranscodeRequest) -> Result<TranscodeResult, SessionError> {
+        let mut stdin_data = Vec::new();
+        // Writing into a Vec is infallible; frame the lone request for the worker.
+        let _ = framing::write_frame(&mut stdin_data, &encode_transcode_request(req));
+        let stdout = self.run_worker(&stdin_data)?;
+        parse_framed_result(&stdout)
+    }
+
+    /// Spawn the worker inside the Windows AppContainer + Job Object, stream the
+    /// framed request on its stdin, and return the captured stdout.
+    #[cfg(windows)]
+    fn run_worker(&self, stdin_data: &[u8]) -> Result<Vec<u8>, SessionError> {
+        let out = win32::spawn_confined(&self.worker_path, &[], stdin_data, self.memory_cap_bytes)
+            .map_err(SessionError::Spawn)?;
+        if out.exit_code != 0 {
+            return Err(SessionError::Io(std::io::Error::other(
+                "transcode worker exited non-zero",
+            )));
+        }
+        Ok(out.stdout)
+    }
+
+    /// Cross-platform fallback (no OS confinement off Windows): a plain one-shot
+    /// child. Real process isolation still holds (separate address space). The
+    /// request is streamed on a writer thread so a large request cannot deadlock
+    /// against the worker filling its stdout pipe.
+    #[cfg(not(windows))]
+    fn run_worker(&self, stdin_data: &[u8]) -> Result<Vec<u8>, SessionError> {
+        let mut child = Command::new(&self.worker_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(SessionError::Io)?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| SessionError::Io(std::io::Error::other("worker stdin unavailable")))?;
+        let data = stdin_data.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+            // drop(stdin) closes the pipe → the worker sees EOF.
+        });
+        let mut stdout = Vec::new();
+        let read_ok = child
+            .stdout
+            .take()
+            .ok_or_else(|| SessionError::Io(std::io::Error::other("worker stdout unavailable")))?
+            .read_to_end(&mut stdout)
+            .is_ok();
+        let _ = writer.join();
+        let status = child.wait().map_err(SessionError::Io)?;
+        if !status.success() || !read_ok {
+            return Err(SessionError::Io(std::io::Error::other(
+                "transcode worker failed",
+            )));
+        }
+        Ok(stdout)
+    }
+}
+
+/// Decode the worker's framed stdout into a [`TranscodeResult`], bounding the
+/// response frame length ([`framing::MAX_FRAME_BYTES`]) and rejecting an empty,
+/// truncated, over-ceiling, trailing-garbage, or undecodable response. Shared by
+/// [`TranscodeLauncher::transcode`] and its unit tests, which exercise it against a
+/// synthesized worker stdout with no real spawn (the real spawn round-trip is
+/// Task 6.2).
+fn parse_framed_result(stdout: &[u8]) -> Result<TranscodeResult, SessionError> {
+    let mut cursor = std::io::Cursor::new(stdout);
+    let body = framing::read_frame(&mut cursor)
+        .map_err(SessionError::Io)?
+        .ok_or_else(|| SessionError::Io(std::io::Error::other("worker produced no response")))?;
+    // The single frame must be the WHOLE response (no trailing second frame / junk).
+    if (cursor.position() as usize) != stdout.len() {
+        return Err(SessionError::Io(std::io::Error::other(
+            "trailing bytes after worker response frame",
+        )));
+    }
+    decode_transcode_result(&body)
+        .map_err(|_| SessionError::Io(std::io::Error::other("undecodable worker response")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::proto::*;
@@ -782,5 +910,66 @@ mod tests {
             let wire = encode_response(&Err(e.clone()));
             assert_eq!(decode_response(&wire).unwrap(), Err(e));
         }
+    }
+
+    // ---- transcode launcher (Gate 6): the framing/parse contract, no spawn ----
+
+    use maxsecu_client_core::media::{encode_transcode_result, FragmentEntry, TranscodeResult};
+
+    fn sample_transcode_result() -> TranscodeResult {
+        TranscodeResult {
+            cmaf: vec![1, 2, 3],
+            thumbnail: vec![9],
+            preview: vec![7, 7],
+            fragments: vec![FragmentEntry {
+                seq: 0,
+                pts_ms: 0,
+                chunk_start: 0,
+                chunk_len: 1,
+            }],
+            loudness_gain_db: Some(-2.0),
+        }
+    }
+
+    #[test]
+    fn transcode_launcher_parses_a_framed_worker_result() {
+        let result = sample_transcode_result();
+        // Synthesize exactly what the worker writes: one framed result body.
+        let mut worker_stdout = Vec::new();
+        framing::write_frame(&mut worker_stdout, &encode_transcode_result(&result)).unwrap();
+        assert_eq!(super::parse_framed_result(&worker_stdout).unwrap(), result);
+    }
+
+    #[test]
+    fn transcode_launcher_rejects_empty_truncated_and_trailing() {
+        let result = sample_transcode_result();
+        let mut frame = Vec::new();
+        framing::write_frame(&mut frame, &encode_transcode_result(&result)).unwrap();
+        // Clean parse first.
+        assert_eq!(super::parse_framed_result(&frame).unwrap(), result);
+        // Empty stdout (worker crashed before any output) → error.
+        assert!(super::parse_framed_result(&[]).is_err());
+        // Truncated frame body → error.
+        assert!(super::parse_framed_result(&frame[..frame.len() - 1]).is_err());
+        // Trailing garbage after the single response frame → error.
+        let mut trailing = frame.clone();
+        trailing.push(0x00);
+        assert!(super::parse_framed_result(&trailing).is_err());
+    }
+
+    #[test]
+    fn transcode_launcher_rejects_over_ceiling_response_length() {
+        // A length prefix beyond MAX_FRAME_BYTES is rejected without a huge alloc.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&((framing::MAX_FRAME_BYTES as u32) + 1).to_le_bytes());
+        assert!(super::parse_framed_result(&bad).is_err());
+    }
+
+    #[test]
+    fn transcode_launcher_constructs_codec_free() {
+        // Construct the launcher (no spawn): proves the type compiles + is usable
+        // here without linking any codec.
+        let _l = TranscodeLauncher::new(std::path::PathBuf::from("media-transcode-worker"));
+        let _l2 = TranscodeLauncher::with_memory_cap(std::path::PathBuf::from("worker"), 256 << 20);
     }
 }

@@ -44,8 +44,11 @@ pub use download::{
 pub use budget::{plan_unlock, AuditEvent, UnlockPlan};
 pub use error::{ClientError, DownloadError, PasswordError, TranscodeError, UploadError};
 pub use media::{
-    CanonicalStreams, FfmpegVideo, MediaBounds, RustImageCodec, Transcoder, MEDIA_MAX_PIXELS,
-    PREVIEW_MAX_DIM, THUMBNAIL_MAX_DIM,
+    decode_transcode_request, decode_transcode_result, encode_transcode_request,
+    encode_transcode_result, CanonicalStreams, FfmpegVideo, FragmentEntry, MediaBounds,
+    RustImageCodec, Transcoder, TranscodeProtoError, TranscodeRequest, TranscodeResult,
+    MAX_TRANSCODE_BYTES, MAX_TRANSCODE_FRAGMENTS, MEDIA_MAX_PIXELS, PREVIEW_MAX_DIM,
+    THUMBNAIL_MAX_DIM,
 };
 pub use sandbox::{
     decode_rgba_bounded, validate_decoded, DecodeError, DecodedImage, InProcessFakeDecoder,

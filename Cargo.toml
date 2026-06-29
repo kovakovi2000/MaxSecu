@@ -14,6 +14,7 @@ members = [
     "crates/server",
     "crates/media-launcher",
     "crates/media-worker",
+    "crates/media-transcode-worker",
     "crates/sink-server",
     "crates/client-app",
     "crates/portable-server",

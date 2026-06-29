@@ -65,14 +65,15 @@ ignore = [
     "RUSTSEC-2025-0100", # unic-ucd-ident
     "RUSTSEC-2025-0098", # unic-ucd-version
     #
-    # ---- Phase 7 codec deps (later: media-worker / media-transcode-worker) ----
-    # DORMANT until Gate 3/6 re-adopt the codec crates. The codec ratification
-    # (Gate 1, docs/security-review-phase7-codec-ratification.md) DELETED the
-    # throwaway spike `crates/_spike-codecs`, so `rav1d`/`rav1e` (and `paste`) have
-    # left the dependency graph entirely; they are re-adopted into real crates in
-    # Gate 3 (rav1d/rav1e/symphonia). While out-of-graph, `cargo deny` reports this
-    # as an `advisory-not-detected` WARNING (not an error) — KEPT to preserve the
-    # audited decision and avoid churn when the codecs return.
+    # ---- Phase 7 codec deps (media-worker / media-transcode-worker) ----
+    # ACTIVE — the codec crates are now ADOPTED into real crates. The Gate-1
+    # ratification (docs/security-review-phase7-codec-ratification.md) deleted the
+    # throwaway spike `crates/_spike-codecs`, but the codecs have since returned to
+    # the graph as normal deps: `rav1d` (decode) + `symphonia` (demux) in
+    # `crates/media-worker`, and `rav1e` (AV1 encode) in `crates/media-transcode-worker`
+    # (Gate 6; also a dev-dep of media-worker for fixtures). So `paste` is back in the
+    # build graph and this advisory ignore now actually fires (no longer an
+    # `advisory-not-detected` warning) — KEPT because the decision below stands.
     #
     # `paste` (unmaintained) — author has archived the repo; "no longer maintained",
     # NOT a vulnerability and "no safe upgrade is available". It is a compile-time
@@ -81,7 +82,7 @@ ignore = [
     # ONLY those two. No runtime/attack surface (build-time macro, no I/O, no unsafe
     # FFI). Remove if rav1d/rav1e drop `paste` (e.g. move to the `pastey` fork). The
     # codec crates themselves are zero-C (asm features off).
-    "RUSTSEC-2024-0436", # paste (dormant until Gate 3 re-adopts rav1d/rav1e)
+    "RUSTSEC-2024-0436", # paste (active: in-graph via rav1d/rav1e)
 ]
 
 [bans]
@@ -100,10 +101,12 @@ allow-wildcard-paths = true
 # Phase 7 note: the codec view-path (rav1d/rav1e/symphonia) is pure Rust (zero C).
 # The sole NEW C link is `ac-ffmpeg` (+ build helpers `ac-ffmpeg-build` /
 # `ac-ffmpeg-features`), the author-side ingest carve-out — NOT a crypto stack, so
-# it is not (and need not be) listed here; it is reachable only from the optional
-# `ingest` feature of crates/_spike-codecs today and will be confined to the future
-# AppContainer `media-transcode-worker` leaf. `aws-lc-rs` stays the only sanctioned
-# crypto C; `ring`/`openssl` remain banned and absent from the lockfile.
+# it is not (and need not be) listed here. It is confined to ONE crate: reachable
+# only via the `ffmpeg` feature (OFF by default) of `crates/media-transcode-worker`,
+# the sole C carve-out leaf (`cargo tree -i ac-ffmpeg` reaches only that crate, and
+# only under the feature; it is absent from the default build graph entirely).
+# `aws-lc-rs` stays the only sanctioned crypto C; `ring`/`openssl` remain banned and
+# absent from the lockfile.
 deny = [
     { name = "openssl" },
     { name = "openssl-sys" },
@@ -145,10 +148,10 @@ allow = [
     # -e all` prints nothing on any real target — it appears only under `--target all`,
     # which is how `cargo deny` surfaces it). Admitted solely to satisfy the license
     # gate for this never-linked fuzz harness; remove if rav1e drops libfuzzer-sys.
-    # DORMANT until Gate 3 re-adopts rav1e: the Gate-1 codec ratification deleted the
-    # spike, so rav1e (and libfuzzer-sys) have left the graph; while out-of-graph
-    # `cargo deny` reports this as an unused-license WARNING (not an error) — KEPT to
-    # preserve the audited decision and avoid churn when rav1e returns in Gate 3.
+    # ACTIVE: `rav1e 0.8.1` is now an in-graph normal dep of `crates/media-transcode-worker`
+    # (Gate 6; also a media-worker dev-dep), so libfuzzer-sys/NCSA is reachable again
+    # (still only under `cfg(fuzzing)` / `--target all`, never linked into a real build).
+    # KEPT to satisfy the license gate for that never-linked harness.
     "NCSA",
 ]
 confidence-threshold = 0.9

@@ -1,0 +1,52 @@
+[package]
+name = "maxsecu-media-transcode-worker"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "MaxSecu author-side ingest/transcode worker: pure-Rust rav1e AV1 encode + hand-rolled CMAF mux, with ac-ffmpeg decode behind the off-by-default `ffmpeg` feature (the sole C carve-out)."
+
+[lib]
+name = "maxsecu_media_transcode_worker"
+path = "src/lib.rs"
+
+# The transcode worker: a secret-less, network-less process that reads a framed
+# canonical-source `TranscodeRequest` on stdin and writes a framed
+# `TranscodeResult` on stdout (one job per process — the same one-shot, confined
+# shape as the decode `media-worker`). Spawned by `media-launcher::TranscodeLauncher`.
+[[bin]]
+name = "media-transcode-worker"
+path = "src/main.rs"
+
+[dependencies]
+# The transcode TYPES + the framed, bounds-safe wire codec
+# (`TranscodeRequest`/`TranscodeResult`/`FragmentEntry`,
+# `encode/decode_transcode_*`). C-free; this is the TCB-owned contract the launcher
+# and this worker agree on byte-for-byte.
+maxsecu-client-core = { path = "../client-core" }
+
+# `rav1e` — pure-Rust AV1 *encoder*: the ALWAYS-ON canonical encoder for the
+# transcode output (Task 6.2 wires the real encode + CMAF mux). asm OFF (no nasm)
+# keeps it zero-C. Non-optional: the default (no-ffmpeg) build is the pure-Rust path.
+rav1e = { version = "0.8.1", default-features = false }
+
+# `ac-ffmpeg` — the SOLE C link in the whole workspace, the author-side ingest
+# decoder. OPTIONAL and OFF by default: the committed/tested path never links C.
+# Gated behind the `ffmpeg` feature (Task 6.2 fills in the FFI decode front-end);
+# enabling it requires a provisioned FFmpeg <= 7.x dev lib on the host. This is the
+# ONLY crate in the workspace permitted to depend on `ac-ffmpeg`.
+ac-ffmpeg = { version = "0.19.0", default-features = false, optional = true }
+
+[features]
+# DEFAULT = NO ffmpeg: the pure-Rust rav1e + CMAF path only — no unsupported-ABI C
+# in the committed/tested build.
+default = []
+# Opt-in C ingest carve-out. Pulls `ac-ffmpeg` (and its C link) into THIS crate
+# only; never reaches client-core / media-launcher / client-app / media-worker.
+ffmpeg = ["dep:ac-ffmpeg"]
+
+[lints.rust]
+# `unsafe` is DENIED crate-wide and re-allowed ONLY at the contained, audited
+# `ac-ffmpeg` FFI sites under `#[cfg(feature = "ffmpeg")]` (Task 6.2). With the
+# feature OFF (default) there is no unsafe at all — the pure-Rust path stays clean.
+unsafe_code = "deny"
