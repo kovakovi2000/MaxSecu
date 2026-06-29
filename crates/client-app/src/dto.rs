@@ -134,6 +134,29 @@ pub struct CardRequest {
     pub file_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenContentRequest {
+    pub file_id: String,
+}
+
+/// The verified, decrypted content to display. Exactly one of `image_png_b64` /
+/// `blog_text` is set per `file_type`. No key material; the content shown is the
+/// product, not a TCB leak.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OpenedContentDto {
+    pub file_id: String,
+    pub file_type: String,
+    pub version: u64,
+    pub title: String,
+    pub tags: Vec<String>,
+    /// For an image: the canonical PNG as standard base64 (UI → `data:image/png`).
+    pub image_png_b64: Option<String>,
+    /// For a blog: the sanitized UTF-8 text.
+    pub blog_text: Option<String>,
+    pub author_fp: String,
+    pub recovery_ok: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SearchHit {
     pub file_id: String,

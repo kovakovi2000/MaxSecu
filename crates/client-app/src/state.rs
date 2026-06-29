@@ -8,6 +8,30 @@ pub const EVT_CONNECTION: &str = "maxsecu://connection-state";
 pub const EVT_AUTH: &str = "maxsecu://auth-state";
 pub const EVT_ACCOUNT: &str = "maxsecu://account-state";
 
+/// The fetch/decrypt feedback channel (spec §6) — per-file progress for the
+/// viewer. Emitted over the Tauri event bus; the UI binds a progress meter +
+/// per-item badge. Non-color-only: each variant carries a stable phase code.
+pub const EVT_FETCH: &str = "maxsecu://fetch-state";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "phase")]
+pub enum FetchPhase {
+    /// Fetching ciphertext (optionally with cold-fetch progress).
+    Fetching {
+        file_id: String,
+        fetched: u64,
+        total: u64,
+    },
+    /// Running the §12.5 verify ladder.
+    Verifying { file_id: String },
+    /// Shaping the verified+decrypted content for display.
+    Decrypting { file_id: String },
+    /// Done — the content is ready to render.
+    Ready { file_id: String },
+    /// Failed with a sanitized code (no oracle).
+    Failed { file_id: String, code: String },
+}
+
 // The complete connection-state vocabulary streamed to the UI. `connect` emits
 // the connect-flow subset (Resolving/TlsHandshake/ChannelBinding/Connected/
 // Disconnected); Idle/Reconnecting/Degraded are emitted by the reconnect +
@@ -71,5 +95,20 @@ mod tests {
             serde_json::to_string(&AccountState::Pending).unwrap(),
             "{\"state\":\"pending\"}"
         );
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+
+    #[test]
+    fn fetch_phase_serializes_kebab_tagged() {
+        let v = FetchPhase::Verifying {
+            file_id: "aa".into(),
+        };
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(s.contains("\"phase\":\"verifying\""));
+        assert!(s.contains("\"file_id\":\"aa\""));
     }
 }

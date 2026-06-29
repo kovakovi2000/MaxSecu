@@ -8,3 +8,4 @@ pub mod bootstrap;
 pub mod connection;
 pub mod feed;
 pub mod search;
+pub mod viewer;

@@ -103,7 +103,9 @@ pub(crate) fn file_type_name(t: FileType) -> String {
     .to_owned()
 }
 
-fn now_ms() -> u64 {
+/// Milliseconds since the Unix epoch. `pub(crate)` so the viewer command reuses
+/// it instead of redefining the same clock read.
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -122,7 +124,8 @@ fn hex16(s: &str) -> Result<[u8; 16], UiError> {
     Ok(out)
 }
 
-fn hex(b: &[u8]) -> String {
+/// Lowercase hex of a byte slice. `pub(crate)` so the viewer command reuses it.
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
