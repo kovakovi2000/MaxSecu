@@ -2,7 +2,6 @@ import { call, on } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import type { OpenedContent, FetchMsg } from "../core/types.ts";
 import "./progress-meter.ts";
-import "./state-badge.ts";
 
 // Viewer (spec §5): renders one decrypted post. Image → data: URL <img>; blog →
 // textContent (NEVER innerHTML). Subscribes to EVT_FETCH for live status. The
@@ -19,7 +18,7 @@ export class MediaViewer extends HTMLElement {
         <a href="#/feed">← Back to feed</a>
         <h1 id="vw-h">Loading…</h1>
         <p id="vw-status" role="status" aria-live="polite"></p>
-        <progress-meter id="vw-meter"></progress-meter>
+        <progress-meter id="vw-meter" hidden></progress-meter>
         <div id="vw-body"></div>
         <dl id="vw-meta"></dl>
       </main>`;
@@ -32,14 +31,17 @@ export class MediaViewer extends HTMLElement {
       if (m.phase === "fetching") {
         meter.setAttribute("value", String(m.fetched));
         meter.setAttribute("max", String(m.total));
+        meter.hidden = false;
         status.textContent = "Fetching…";
       } else if (m.phase === "verifying") {
         status.textContent = "Verifying…";
       } else if (m.phase === "decrypting") {
         status.textContent = "Decrypting…";
       } else if (m.phase === "ready") {
+        meter.hidden = true;
         status.textContent = "Ready.";
       } else if (m.phase === "failed") {
+        meter.hidden = true;
         status.textContent = `Failed: ${m.code}`;
       }
     });
