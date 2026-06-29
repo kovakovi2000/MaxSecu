@@ -12,6 +12,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 maxsecu-client-core = { path = "../client-core", features = ["net"] }
 maxsecu-crypto = { path = "../crypto" }
+maxsecu-encoding = { path = "../encoding" }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,7 +28,6 @@ base64 = "0.22"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 maxsecu-server = { path = "../server" }
 maxsecu-ceremony-harness = { path = "../../tools/ceremony-harness" }
-maxsecu-encoding = { path = "../encoding" }
 
 [lints.rust]
 unsafe_code = "forbid"
