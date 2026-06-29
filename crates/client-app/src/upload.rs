@@ -11,17 +11,13 @@ use crate::error::UiError;
 
 /// Build the canonical metadata blob: JSON `{"title","tags"}` (UTF-8) — exactly
 /// what `commands::feed::parse_title_tags` reads back.
-pub(crate) fn build_metadata(title: &str, tags: &[String]) -> Vec<u8> {
+pub fn build_metadata(title: &str, tags: &[String]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "title": title, "tags": tags })).unwrap_or_default()
 }
 
 /// Blog: `content` is the plain UTF-8 bytes; metadata is the JSON title/tags; no
 /// thumbnail/preview.
-pub(crate) fn prepare_blog_streams(
-    content: Vec<u8>,
-    title: &str,
-    tags: &[String],
-) -> PlaintextStreams {
+pub fn prepare_blog_streams(content: Vec<u8>, title: &str, tags: &[String]) -> PlaintextStreams {
     PlaintextStreams {
         content,
         metadata: Some(build_metadata(title, tags)),
@@ -33,7 +29,7 @@ pub(crate) fn prepare_blog_streams(
 /// Image: transcode the user's chosen bytes to canonical streams (content +
 /// thumbnail + preview), then attach the metadata JSON. Fail-closed on a bad image.
 /// Returns the detected `FileType` (Image) and the prepared streams.
-pub(crate) fn prepare_image_streams(
+pub fn prepare_image_streams(
     src: &[u8],
     title: &str,
     tags: &[String],
@@ -86,7 +82,7 @@ fn file_type_str(t: FileType) -> &'static str {
 }
 
 /// Shape the §8.1 `POST /v1/files` JSON body from a built bundle.
-pub(crate) fn stage_body(b: &UploadBundle) -> serde_json::Value {
+pub fn stage_body(b: &UploadBundle) -> serde_json::Value {
     let streams: Vec<_> = b
         .streams
         .iter()
@@ -124,7 +120,7 @@ pub(crate) fn stage_body(b: &UploadBundle) -> serde_json::Value {
 }
 
 /// Total ciphertext chunks across all streams (progress denominator).
-pub(crate) fn total_chunks(b: &UploadBundle) -> u64 {
+pub fn total_chunks(b: &UploadBundle) -> u64 {
     b.streams.iter().map(|s| s.chunk_count).sum()
 }
 
@@ -164,7 +160,7 @@ async fn put_chunk_retried(
 /// Stage → PUT every chunk (resumable/idempotent, retried) → finalize.
 /// `on_progress(done, total)` after each successful chunk. Fail-closed.
 // Wired into `confirm_upload` + exercised by the Task-10 e2e.
-pub(crate) async fn run_pipeline<F: FnMut(u64, u64)>(
+pub async fn run_pipeline<F: FnMut(u64, u64)>(
     sender: &mut SendRequest<Full<Bytes>>,
     host: &str,
     token: &str,
