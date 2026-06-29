@@ -12,6 +12,8 @@ use crate::dto::{FeedEntryDto, FeedFilter, FeedSort, ListFeedRequest};
 use crate::error::UiError;
 use crate::http_client::get_json;
 
+use maxsecu_encoding::types::FileType;
+
 /// Map one `ListEntryRes` JSON object to a `FeedEntryDto`. Pure — unit-tested.
 fn entry_from_json(j: &serde_json::Value) -> Option<FeedEntryDto> {
     let streams = j.get("streams")?;
@@ -71,6 +73,195 @@ pub async fn list_feed(
     Ok(entries)
 }
 
+/// Parse the metadata plaintext into `(title, tags)`. Tolerant: JSON
+/// `{title,tags}` preferred; any other UTF-8 ⇒ that string is the title; non-UTF-8
+/// ⇒ `(untitled)`. (Phase 4 uploads write the JSON form.) `pub(crate)` so the
+/// viewer command reuses it.
+pub(crate) fn parse_title_tags(meta: &[u8]) -> (String, Vec<String>) {
+    #[derive(serde::Deserialize)]
+    struct Meta {
+        title: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+    }
+    match std::str::from_utf8(meta) {
+        Ok(s) => match serde_json::from_str::<Meta>(s) {
+            Ok(m) if m.title.is_some() => (m.title.unwrap(), m.tags),
+            _ => (s.to_owned(), Vec::new()),
+        },
+        Err(_) => ("(untitled)".to_owned(), Vec::new()),
+    }
+}
+
+/// The UI-facing file-type string. `pub(crate)` so the viewer command reuses it.
+pub(crate) fn file_type_name(t: FileType) -> String {
+    match t {
+        FileType::Image => "image",
+        FileType::Video => "video",
+        FileType::Blog => "blog",
+    }
+    .to_owned()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn hex16(s: &str) -> Result<[u8; 16], UiError> {
+    let bad = || UiError::new("fetch_failed", "Malformed file id.");
+    if s.len() != 32 {
+        return Err(bad());
+    }
+    let mut out = [0u8; 16];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+    }
+    Ok(out)
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Run the §12.5 header ladder for MY wrap with a transiently-borrowed identity.
+/// Factored out so the `&identity` borrow (the `ctx` holds `enc_secret()`) is
+/// confined to this call — the caller restores the identity into the session on
+/// every path, borrow already released.
+fn open_my_header(
+    identity: &maxsecu_client_core::Identity,
+    file_id: [u8; 16],
+    author: &crate::directory::VerifiedAuthor,
+    my_id: [u8; 16],
+    header: &maxsecu_client_core::StreamHeader,
+) -> Result<maxsecu_client_core::OpenedHeader, UiError> {
+    use maxsecu_client_core::{verify_and_open_headers, VerifyContext, NO_ADMINS, NO_GRANTERS};
+    use maxsecu_encoding::types::{Id, RecipientType};
+    let ctx = VerifyContext {
+        file_id: Id(file_id),
+        author_sig_pub: author.sig_pub,
+        owner_sig_pub: author.sig_pub,
+        recipient_id: Id(my_id),
+        recipient_type: RecipientType::User,
+        recipient_secret: identity.enc_secret(),
+        recipient_mlkem_seed: None,
+        seen_max_version: None,
+        granter_sig_pub: &NO_GRANTERS,
+        admin_sig_pub: &NO_ADMINS,
+        tombstones: None,
+        compromise: None,
+    };
+    verify_and_open_headers(&ctx, header)
+        .map_err(|_| UiError::new("verify_failed", "This item failed verification."))
+}
+
+/// `decrypt_card` — fetch + verify one item's card (title/tags/thumbnail), header-
+/// only (no content fetch). Verifies the author binding under the pinned D5, runs
+/// the §12.5 header ladder, returns render-ready metadata. Sanitized errors.
+#[tauri::command]
+pub async fn decrypt_card(
+    req: crate::dto::CardRequest,
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
+) -> Result<crate::dto::CardDto, UiError> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    use maxsecu_client_core::{DirectoryVerifier, MemoryTrustStore};
+    use maxsecu_encoding::decode;
+    use maxsecu_encoding::structs::Manifest;
+    use maxsecu_encoding::types::StreamType;
+
+    let file_id = hex16(&req.file_id)?;
+    let pinned = crate::config::load_directory_pub(&dir.0)?;
+    let verifier = DirectoryVerifier::new(pinned);
+    let mut trust = MemoryTrustStore::new();
+    let now = now_ms();
+
+    let username = {
+        let s = session.0.lock().await;
+        s.username.clone()
+    }
+    .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
+
+    let server = server_of(&dir.0)?;
+    let (mut sender, host, token) = reauth(&dir.0, &server, &session, &connect_lock).await?;
+
+    // §8.5 view (carries the manifest/genesis/wrap/streams).
+    let (status, view_json) = get_json(
+        &mut sender,
+        &format!("/v1/files/{}?version=latest", req.file_id),
+        Some(&token),
+        &host,
+    )
+    .await?;
+    if status != StatusCode::OK {
+        return Err(UiError::new("fetch_failed", "That item is not available."));
+    }
+    let view = crate::download::parse_file_view(&view_json)?;
+    let manifest: Manifest =
+        decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
+
+    // Resolve the author (Phase 3: author == owner) + my own id, under the pinned D5.
+    let author = crate::directory::resolve_and_verify_author(
+        &mut sender,
+        &host,
+        &hex(&manifest.author_id.0),
+        &verifier,
+        &mut trust,
+        now,
+    )
+    .await?;
+    let my_id = crate::directory::resolve_my_user_id(
+        &mut sender,
+        &host,
+        &username,
+        &verifier,
+        &mut trust,
+        now,
+    )
+    .await?;
+
+    // Header-only fetch (metadata/thumbnail/preview — never content).
+    let header =
+        crate::download::build_stream_header(&mut sender, &host, &token, &req.file_id, &view)
+            .await?;
+
+    // Borrow the unlocked identity transiently to unwrap MY wrap; restore always.
+    let identity = { session.0.lock().await.identity.take() }
+        .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+    let opened_res = open_my_header(&identity, file_id, &author, my_id, &header);
+    session.0.lock().await.identity = Some(identity); // restore on every path
+    let opened = opened_res?;
+
+    let (title, tags) = opened
+        .small_streams
+        .iter()
+        .find(|s| s.stream_type == StreamType::Metadata)
+        .map(|s| parse_title_tags(&s.plaintext))
+        .unwrap_or_else(|| ("(untitled)".to_owned(), Vec::new()));
+    let thumbnail_b64 = opened
+        .small_streams
+        .iter()
+        .find(|s| s.stream_type == StreamType::Thumbnail)
+        .map(|s| B64.encode(&s.plaintext));
+    let mine = my_id == author.user_id;
+
+    Ok(crate::dto::CardDto {
+        file_id: req.file_id,
+        file_type: file_type_name(manifest.file_type),
+        version: opened.version,
+        title,
+        tags,
+        thumbnail_b64,
+        mine,
+        author_fp: hex(&author.fingerprint[..8]),
+        recovery_ok: opened.recovery_grant_ok,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +302,20 @@ mod tests {
         assert_eq!(filter_param(FeedFilter::All), None);
         assert_eq!(filter_param(FeedFilter::Image), Some("image"));
         assert_eq!(filter_param(FeedFilter::Blog), Some("blog"));
+    }
+
+    #[test]
+    fn parses_metadata_json_then_falls_back() {
+        let (t, tags) = super::parse_title_tags(br#"{"title":"Sunset","tags":["beach","2026"]}"#);
+        assert_eq!(t, "Sunset");
+        assert_eq!(tags, vec!["beach".to_owned(), "2026".to_owned()]);
+        // Non-JSON ⇒ whole string is the title, no tags.
+        let (t2, tags2) = super::parse_title_tags(b"title=fox");
+        assert_eq!(t2, "title=fox");
+        assert!(tags2.is_empty());
+        // Invalid UTF-8 ⇒ a safe placeholder title.
+        let (t3, tags3) = super::parse_title_tags(&[0xff, 0xfe]);
+        assert_eq!(t3, "(untitled)");
+        assert!(tags3.is_empty());
     }
 }

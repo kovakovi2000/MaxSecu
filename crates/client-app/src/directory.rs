@@ -75,7 +75,10 @@ pub async fn resolve_and_verify_author(
     host: &str,
     user_id_hex: &str,
     verifier: &DirectoryVerifier,
-    trust: &mut dyn TrustStore,
+    // `+ Send`: the trust object is held across the `get_json` await, so the
+    // returned future (and any async command awaiting it) must be `Send` for
+    // Tauri. `MemoryTrustStore` is `Send`, so `&mut trust` still coerces here.
+    trust: &mut (dyn TrustStore + Send),
     now_ms: u64,
 ) -> Result<VerifiedAuthor, UiError> {
     let (status, json) = get_json(
@@ -102,7 +105,9 @@ pub async fn resolve_my_user_id(
     host: &str,
     username: &str,
     verifier: &DirectoryVerifier,
-    trust: &mut dyn TrustStore,
+    // `+ Send` for the same reason as `resolve_and_verify_author` (held across an
+    // await ⇒ the future must be `Send` for a Tauri command).
+    trust: &mut (dyn TrustStore + Send),
     now_ms: u64,
 ) -> Result<[u8; 16], UiError> {
     let (status, json) = get_json(sender, &format!("/v1/directory/{username}"), None, host).await?;

@@ -108,3 +108,28 @@ pub struct FeedEntryDto {
     pub updated_at: u64,
     pub has_thumbnail: bool,
 }
+
+/// A decrypted, verified feed card — render-ready, no key material.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CardDto {
+    pub file_id: String,
+    pub file_type: String,
+    pub version: u64,
+    pub title: String,
+    pub tags: Vec<String>,
+    /// A small canonical-PNG thumbnail as standard base64, or `None` if the item
+    /// has no thumbnail stream (e.g. a blog). The UI renders it via a `data:` URL.
+    pub thumbnail_b64: Option<String>,
+    /// `true` if this user authored the file (drives the "only my uploads" filter).
+    pub mine: bool,
+    /// A short fingerprint hex (first 8 bytes) of the verified author identity —
+    /// a non-secret verification tick for the UI.
+    pub author_fp: String,
+    /// Whether a valid author recovery grant was present (anomaly flag, not fatal).
+    pub recovery_ok: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CardRequest {
+    pub file_id: String,
+}
