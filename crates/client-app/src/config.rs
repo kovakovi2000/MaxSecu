@@ -72,6 +72,96 @@ impl ConnectionConfig {
     }
 }
 
+// Local preferences store (no secret material — safe in cleartext at
+// `<dir>/config/settings.json`). Per-section `#[serde(default)]` lets a partial
+// or older file still load; `normalized()` clamps untrusted (hand-edited) values.
+// Wired into get/set commands in Phase-5 Task 2.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A11ySettings {
+    pub reduced_motion: bool,
+    pub high_contrast: bool,
+    pub text_size: String,
+}
+impl Default for A11ySettings {
+    fn default() -> Self {
+        Self {
+            reduced_motion: false,
+            high_contrast: false,
+            text_size: "normal".into(),
+        }
+    }
+}
+
+#[allow(dead_code)] // wired into commands in Phase-5 Task 2.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BehaviorSettings {
+    pub confirm_destructive: bool,
+}
+
+#[allow(dead_code)] // wired into commands in Phase-5 Task 2.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PerformanceSettings {
+    pub ram_cache_cap_mb: u32,
+}
+impl Default for PerformanceSettings {
+    fn default() -> Self {
+        Self {
+            ram_cache_cap_mb: 256,
+        }
+    }
+}
+
+#[allow(dead_code)] // wired into commands in Phase-5 Task 2.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ConnectionSettings {
+    pub use_tor: bool,
+}
+
+#[allow(dead_code)] // wired into commands in Phase-5 Task 2.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SettingsConfig {
+    #[serde(default)]
+    pub a11y: A11ySettings,
+    #[serde(default)]
+    pub behavior: BehaviorSettings,
+    #[serde(default)]
+    pub performance: PerformanceSettings,
+    #[serde(default)]
+    pub connection: ConnectionSettings,
+}
+
+#[allow(dead_code)] // load/save/normalized wired into commands in Phase-5 Task 2.
+impl SettingsConfig {
+    pub fn load(dir: &Path) -> Self {
+        std::fs::read(dir.join("config").join("settings.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .map(|s: SettingsConfig| s.normalized())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        let p = dir.join("config");
+        std::fs::create_dir_all(&p)?;
+        std::fs::write(
+            p.join("settings.json"),
+            serde_json::to_vec_pretty(&self.normalized()).unwrap(),
+        )
+    }
+
+    /// Clamp/normalize untrusted values (hand-edited file or UI bug): cap the RAM
+    /// cache and constrain text_size to the known set.
+    pub fn normalized(&self) -> SettingsConfig {
+        let mut s = self.clone();
+        s.performance.ram_cache_cap_mb = s.performance.ram_cache_cap_mb.clamp(16, 4096);
+        if !matches!(s.a11y.text_size.as_str(), "normal" | "large" | "larger") {
+            s.a11y.text_size = "normal".into();
+        }
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +220,32 @@ mod tests {
         };
         cfg.save(&dir).unwrap();
         assert_eq!(ConnectionConfig::load(&dir), cfg);
+    }
+
+    #[test]
+    fn settings_roundtrip_and_defaults_and_clamp() {
+        let dir = std::env::temp_dir().join(format!("mxset-{}", n()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Missing → sane defaults.
+        let d = SettingsConfig::load(&dir);
+        assert!(!d.a11y.reduced_motion && !d.a11y.high_contrast);
+        assert_eq!(d.a11y.text_size, "normal");
+        assert_eq!(d.performance.ram_cache_cap_mb, 256);
+        // Round-trip.
+        let mut s = SettingsConfig::default();
+        s.a11y.reduced_motion = true;
+        s.a11y.text_size = "large".into();
+        s.performance.ram_cache_cap_mb = 1024;
+        s.save(&dir).unwrap();
+        assert_eq!(SettingsConfig::load(&dir), s);
+        // Clamp: out-of-range cap and bad text_size are normalized.
+        let mut bad = SettingsConfig::default();
+        bad.performance.ram_cache_cap_mb = 99_999_999;
+        bad.a11y.text_size = "huge".into();
+        let norm = bad.normalized();
+        assert!(norm.performance.ram_cache_cap_mb <= 4096);
+        assert_eq!(norm.a11y.text_size, "normal");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn n() -> u128 {
