@@ -1241,18 +1241,42 @@ mod phase2_store_tests {
     #[tokio::test]
     async fn has_any_binding_flips_after_first_publish() {
         let s = MemoryStore::new();
-        assert!(!s.has_any_binding().await.unwrap(), "window open with no bindings");
-        s.put_binding([0x0A; 16], 1, binding_bytes(0x0A), [0u8; 64]).await.unwrap();
-        assert!(s.has_any_binding().await.unwrap(), "window closes after first publish");
+        assert!(
+            !s.has_any_binding().await.unwrap(),
+            "window open with no bindings"
+        );
+        s.put_binding([0x0A; 16], 1, binding_bytes(0x0A), [0u8; 64])
+            .await
+            .unwrap();
+        assert!(
+            s.has_any_binding().await.unwrap(),
+            "window closes after first publish"
+        );
     }
 
     #[tokio::test]
     async fn list_pending_excludes_users_with_a_binding() {
         let s = MemoryStore::new();
-        s.add_user("alice", UserRecord { user_id: [0x0A; 16], enc_pub: [1; 32], sig_pub: [1; 32] });
-        s.add_user("bob",   UserRecord { user_id: [0x0B; 16], enc_pub: [2; 32], sig_pub: [2; 32] });
+        s.add_user(
+            "alice",
+            UserRecord {
+                user_id: [0x0A; 16],
+                enc_pub: [1; 32],
+                sig_pub: [1; 32],
+            },
+        );
+        s.add_user(
+            "bob",
+            UserRecord {
+                user_id: [0x0B; 16],
+                enc_pub: [2; 32],
+                sig_pub: [2; 32],
+            },
+        );
         // alice gets a binding (approved); bob stays pending.
-        s.put_binding([0x0A; 16], 1, binding_bytes(0x0A), [0u8; 64]).await.unwrap();
+        s.put_binding([0x0A; 16], 1, binding_bytes(0x0A), [0u8; 64])
+            .await
+            .unwrap();
 
         let pending = s.list_pending_users().await.unwrap();
         assert_eq!(pending.len(), 1);
@@ -1303,8 +1327,16 @@ mod phase2_store_tests {
     async fn issued_voucher_is_consumable_once() {
         let s = MemoryStore::new();
         let h = maxsecu_crypto::sha256(b"invite-code-xyz");
-        s.issue_voucher(h, [0xAD; 16], 4_102_444_800_000).await.unwrap();
-        assert!(s.consume_voucher(&h).await.unwrap(), "fresh issued voucher consumes");
-        assert!(!s.consume_voucher(&h).await.unwrap(), "second consume fails (single-use)");
+        s.issue_voucher(h, [0xAD; 16], 4_102_444_800_000)
+            .await
+            .unwrap();
+        assert!(
+            s.consume_voucher(&h).await.unwrap(),
+            "fresh issued voucher consumes"
+        );
+        assert!(
+            !s.consume_voucher(&h).await.unwrap(),
+            "second consume fails (single-use)"
+        );
     }
 }

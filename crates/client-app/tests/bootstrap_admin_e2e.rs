@@ -127,7 +127,7 @@ async fn get(
     )
 }
 
-/// Parse a 32-byte-hex `user_id` string (as returned by registration) to bytes.
+/// Parse a 16-byte user_id rendered as 32 lowercase hex chars.
 fn hex16(s: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
     for (i, b) in out.iter_mut().enumerate() {
@@ -321,7 +321,8 @@ async fn full_bootstrap_to_valid_recipient() {
             "binding_b64": B64.encode(&pb.binding_bytes),
             "directory_signature_b64": B64.encode(pb.signature),
         }),
-        Some(&admin_token),
+        // publish authority is the D5 signature, not the session (unauthenticated by design)
+        None,
     )
     .await;
     assert_eq!(st, StatusCode::CREATED);

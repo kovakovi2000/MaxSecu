@@ -42,14 +42,15 @@ use maxsecu_encoding::structs::{
     AuthProofContext, DirBinding, Genesis, Manifest, Revocation, Stream,
 };
 use maxsecu_encoding::types::{
-    Bytes32, Compression, FileScope, FileType, Id, Role, RoleSet, StreamType, Suite, Text, Timestamp,
+    Bytes32, Compression, FileScope, FileType, Id, Role, RoleSet, StreamType, Suite, Text,
+    Timestamp,
 };
 use maxsecu_server::{
     router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteWrapError,
-    FileListEntry, FileView, FinalizeError, ListFilter, MemoryBlobStore, MemoryStore, NullAuditSink,
-    ParsedStage, PendingUser, RecipientView, SessionRecord, StageError, Store, StoreError,
-    StoredBinding, StoredControlRecord, TlsExporter, UserRecord, VersionMeta, VersionSelector,
-    WrapInput,
+    FileListEntry, FileView, FinalizeError, ListFilter, MemoryBlobStore, MemoryStore,
+    NullAuditSink, ParsedStage, PendingUser, RecipientView, SessionRecord, StageError, Store,
+    StoreError, StoredBinding, StoredControlRecord, TlsExporter, UserRecord, VersionMeta,
+    VersionSelector, WrapInput,
 };
 
 const EXPORTER: [u8; 32] = [0xE7; 32];
