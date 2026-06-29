@@ -8,6 +8,7 @@
 
 mod config;
 mod layout;
+mod pki;
 
 fn main() {
     eprintln!("maxsecu-portable-server: starting…");
