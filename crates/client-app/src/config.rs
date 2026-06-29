@@ -57,13 +57,7 @@ mod tests {
 
     #[test]
     fn load_directory_pub_reads_pinned_key() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mxcfg_{}",
-            maxsecu_crypto::random_array::<8>()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        ));
+        let tmp = std::env::temp_dir().join(format!("maxsecu-cfg-{}", n()));
         std::fs::create_dir_all(tmp.join("config")).unwrap();
         // Missing → a sanitized "untrusted" error (fail closed; no admin/browse
         // without a pinned root).
