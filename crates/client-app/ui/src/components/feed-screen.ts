@@ -37,7 +37,8 @@ export class FeedScreen extends HTMLElement {
       </main>`;
     (this.querySelector("#main") as HTMLElement).focus();
     const form = this.querySelector("#controls") as HTMLFormElement;
-    form.addEventListener("change", () => {
+    form.addEventListener("change", (e) => {
+      if ((e.target as HTMLElement)?.getAttribute("name") === "q") return;
       const d = new FormData(form);
       this.filter = (d.get("type") as FeedFilter) ?? "all";
       this.sort = (d.get("sort") as FeedSort) ?? "newest-first";
@@ -92,6 +93,7 @@ export class FeedScreen extends HTMLElement {
         card.setAttribute("file-id", h.file_id);
         card.setAttribute("file-type", h.file_type);
         card.setAttribute("role", "listitem");
+        if (this.mineOnly) card.setAttribute("mine-only", "");
         grid.appendChild(card);
       }
     } catch (x) {
