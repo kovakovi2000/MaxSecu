@@ -6,6 +6,9 @@
 //! production ceremony key.
 #![forbid(unsafe_code)]
 
+mod config;
+mod layout;
+
 fn main() {
     eprintln!("maxsecu-portable-server: starting…");
     // Launcher logic is wired up across Phase-6 Tasks 2–7.
