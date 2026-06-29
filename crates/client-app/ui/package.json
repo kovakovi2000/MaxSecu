@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/main.ts --bundle --format=esm --outfile=dist/main.js && node -e \"require('fs').copyFileSync('index.html','dist/index.html')\"",
+    "build": "esbuild src/main.ts --bundle --format=esm --outfile=dist/main.js && node -e \"const fs=require('fs');fs.copyFileSync('index.html','dist/index.html');fs.copyFileSync('styles.css','dist/styles.css')\"",
     "test": "node --experimental-strip-types --test src/core/store.test.ts",
     "typecheck": "tsc --noEmit"
   },

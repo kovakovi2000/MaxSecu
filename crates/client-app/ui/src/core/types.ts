@@ -71,3 +71,12 @@ export type UploadMsg =
   | { phase: "finalizing"; job_id: string }
   | { phase: "done"; job_id: string; file_id: string }
   | { phase: "failed"; job_id: string; code: string };
+
+// --- Phase 5 (settings + a11y) DTO mirror of the Rust SettingsConfig serde shape ---
+// Section objects, snake_case fields — match server/core serde exactly.
+export interface Settings {
+  a11y: { reduced_motion: boolean; high_contrast: boolean; text_size: "normal" | "large" | "larger" };
+  behavior: { confirm_destructive: boolean };
+  performance: { ram_cache_cap_mb: number };
+  connection: { use_tor: boolean };
+}

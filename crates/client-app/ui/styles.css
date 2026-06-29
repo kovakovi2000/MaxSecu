@@ -1,0 +1,27 @@
+:root { --mx-text-scale: 1; }
+:root[data-text-size="large"]  { --mx-text-scale: 1.25; }
+:root[data-text-size="larger"] { --mx-text-scale: 1.5; }
+body { font-size: calc(1rem * var(--mx-text-scale)); }
+
+:root[data-high-contrast] { filter: contrast(1.2); }
+:root[data-high-contrast] a { text-decoration: underline; }
+
+/* Reduced motion: the explicit user setting. */
+:root[data-reduced-motion] * {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}
+/* Reduced motion: respect the OS preference too. */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Always-visible focus for keyboard users (WCAG 2.4.7). */
+:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
