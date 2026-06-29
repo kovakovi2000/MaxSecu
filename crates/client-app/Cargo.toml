@@ -13,6 +13,14 @@ tauri-build = { version = "2", features = [] }
 maxsecu-client-core = { path = "../client-core", features = ["net"] }
 maxsecu-crypto = { path = "../crypto" }
 maxsecu-encoding = { path = "../encoding" }
+# The codec-free media-decode launcher: the `VideoSessionDecoder` trait + the
+# AppContainer / subprocess SPAWN launchers. This crate links NO codecs
+# (rav1d / symphonia live only in `media-worker`), so this key-holding process
+# CANNOT have the decoder unified into it by Cargo feature resolution — the
+# decoder-free-main-process guarantee is structural, not feature-conditional. The
+# main process drives video decode by spawning the confined worker binary; the
+# codecs only ever run inside that isolated subprocess.
+maxsecu-media-launcher = { path = "../media-launcher" }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

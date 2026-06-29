@@ -1,0 +1,38 @@
+[package]
+name = "maxsecu-media-launcher"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "MaxSecu codec-free media-decode launcher (spawns the confined media-worker; no rav1d/symphonia)."
+
+[lib]
+name = "maxsecu_media_launcher"
+path = "src/lib.rs"
+
+[dependencies]
+# The decode seam/types (ClientMsg/WorkerMsg, MediaBounds, SandboxedDecoder) and
+# the bounded image decode `run_decode` rides — NO codecs. The AV1/CMAF decoders
+# (rav1d/symphonia) live ONLY in the `media-worker` crate, never here, so a
+# key-holding consumer of this launcher can never link them.
+maxsecu-client-core = { path = "../client-core" }
+
+# Win32 OS-confinement (AppContainer + Job Object) for the decode launcher
+# (6b-ii). Windows-only; FFI bindings to the OS (not a vendored C library), so
+# the no-C posture holds. unsafe is confined to the audited `win32` module.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Isolation",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+] }
+
+[lints.rust]
+# `unsafe` is DENIED crate-wide and re-allowed ONLY in the contained, audited
+# `win32` module (the Win32 AppContainer/Job-Object FFI launcher). Everything
+# else — proto, the subprocess launcher — stays unsafe-free.
+unsafe_code = "deny"

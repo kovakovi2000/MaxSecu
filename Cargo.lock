@@ -2583,6 +2583,7 @@ dependencies = [
  "maxsecu-client-core",
  "maxsecu-crypto",
  "maxsecu-encoding",
+ "maxsecu-media-launcher",
  "maxsecu-server",
  "rcgen",
  "serde",
@@ -2642,15 +2643,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxsecu-media-launcher"
+version = "0.0.0"
+dependencies = [
+ "maxsecu-client-core",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "maxsecu-media-worker"
 version = "0.0.0"
 dependencies = [
  "image",
  "maxsecu-client-core",
+ "maxsecu-media-launcher",
  "rav1d",
  "rav1e",
  "symphonia",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

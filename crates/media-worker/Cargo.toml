@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "MaxSecu sandboxed media-decode worker + launcher (DESIGN §8.1/D30, media-sandbox)."
+description = "MaxSecu sandboxed media-decode worker + in-process AV1/CMAF decoder (DESIGN §8.1/D30, media-sandbox)."
 
 [lib]
 name = "maxsecu_media_worker"
@@ -21,11 +21,17 @@ path = "src/main.rs"
 # worker runs the SAME decode, just in an isolated process.
 maxsecu-client-core = { path = "../client-core" }
 
+# The codec-free launcher (spawn / framing / proto + the Win32 AppContainer/Job
+# confinement). Re-exported from `lib.rs` so the worker bin and the integration
+# tests keep their `maxsecu_media_worker::{...}` paths. The codecs below live ONLY
+# in this crate — the launcher crate links none of them, so a key-holding consumer
+# (`client-app`) depending on the launcher can never unify them in.
+maxsecu-media-launcher = { path = "../media-launcher" }
+
 # ---- Phase 7 sandboxed-video codec set (Gate-1 ratified, asm OFF = zero-C) ----
-# These are the persistent-session video path's runtime decoders (adopted here in
-# Gate 3.1; wired into `src/session.rs` in 3.2). In 3.1 they are referenced only
-# from the test-support fixture/assertion, but they are declared as normal deps
-# (not dev-deps) because they become real `session` runtime deps next task.
+# The persistent-session video path's runtime decoders, linked by `src/session.rs`
+# (`VideoSession`). Confined to THIS crate (the decoder + the worker bin); the
+# launcher crate is codec-free by construction.
 #
 # `rav1d` — memory-safe Rust port of dav1d (THE #1 AV1-decode RCE surface). The
 # `asm` feature (needs nasm, pulls C/assembly) is OFF; only the pure-Rust
@@ -41,20 +47,6 @@ symphonia = { version = "0.6.0", default-features = false, features = [
     "aac",
 ] }
 
-# Win32 OS-confinement (AppContainer + Job Object) for the decode launcher
-# (6b-ii). Windows-only; FFI bindings to the OS (not a vendored C library), so
-# the no-C posture holds. unsafe is confined to the audited `win32` module.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Isolation",
-    "Win32_Security_Authorization",
-    "Win32_System_Threading",
-    "Win32_System_JobObjects",
-    "Win32_System_Pipes",
-] }
-
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # `rav1e` — pure-Rust AV1 *encoder*. FIXTURE-ONLY in this crate (synthesizes
@@ -65,6 +57,7 @@ rav1e = { version = "0.8.1", default-features = false }
 
 [lints.rust]
 # `unsafe` is DENIED crate-wide and re-allowed ONLY in the contained, audited
-# `win32` module (the Win32 AppContainer/Job-Object FFI launcher). Everything
-# else — proto, the worker bin, the subprocess launcher — stays unsafe-free.
+# rav1d-C-ABI helpers of `src/session.rs` (the `#[allow(unsafe_code)]` FFI sites).
+# Everything else — the worker bin, the re-exported launcher — stays unsafe-free.
+# (The Win32 AppContainer/Job-Object FFI now lives in the `media-launcher` crate.)
 unsafe_code = "deny"
