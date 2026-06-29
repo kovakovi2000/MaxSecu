@@ -14,6 +14,7 @@ fn main() {
         .manage(AppDir(app_dir))
         .manage(Session::new())
         .manage(ConnectLock::new())
+        .manage(maxsecu_client_app::jobs::UploadJobs::new())
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
             maxsecu_client_app::commands::auth::unlock_keystore,
