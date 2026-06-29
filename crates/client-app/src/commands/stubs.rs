@@ -11,14 +11,6 @@ pub fn list_feed() -> Result<(), UiError> {
     ))
 }
 
-#[tauri::command]
-pub fn register_glassbreak() -> Result<(), UiError> {
-    Err(UiError::new(
-        "not_implemented",
-        "Bootstrap arrives in a later phase.",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

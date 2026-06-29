@@ -60,17 +60,24 @@ pub async fn connect(
     }
 }
 
-async fn connect_inner(
-    req: &ConnectRequest,
-    dir: &tauri::State<'_, AppDir>,
-    session: &tauri::State<'_, Session>,
-    emit_conn: &impl Fn(ConnectionState),
-    emit_auth: &impl Fn(AuthState),
-) -> Result<ConnectResponse, UiError> {
-    emit_conn(ConnectionState::Resolving);
-
+/// Open a pinned-TLS HTTP/1.1 connection to `server` and return the request
+/// sender, the connect host (cert-SAN/SNI name), and the 32-byte RFC 5705
+/// channel-binding exporter. Reusable by both `connect` (which threads the
+/// exporter into the login proof) and the unauthenticated bootstrap commands
+/// (which discard it). It does NOT emit any `ConnectionState`; callers emit.
+pub(crate) async fn open_conn(
+    dir: &std::path::Path,
+    server: &str,
+) -> Result<
+    (
+        hyper::client::conn::http1::SendRequest<http_body_util::Full<hyper::body::Bytes>>,
+        String,
+        [u8; 32],
+    ),
+    UiError,
+> {
     // 1) Pinned server cert (Phase-1 trust source): <dir>/config/server_cert.der.
-    let cert_path = dir.0.join("config").join("server_cert.der");
+    let cert_path = dir.join("config").join("server_cert.der");
     let cert_bytes = std::fs::read(&cert_path)
         .map_err(|_| UiError::new("untrusted", "This server has not been trusted yet."))?;
     let cert = CertificateDer::from(cert_bytes);
@@ -82,27 +89,40 @@ async fn connect_inner(
     //    form, no port-less host — those are not parsed yet), and the host MUST
     //    match a SAN in the pinned cert (e.g. connecting by 127.0.0.1 against a
     //    localhost-SAN cert will not verify).
-    let host = req
-        .server
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(&req.server);
+    let host = server.rsplit_once(':').map(|(h, _)| h).unwrap_or(server);
     let server_name = ServerName::try_from(host.to_owned())
         .map_err(|_| UiError::new("tls", "Invalid server name."))?;
-    let transport = Transport::new(config, server_name, req.server.clone());
+    let transport = Transport::new(config, server_name, server.to_owned());
 
-    // 3) TLS handshake + channel binding (same connection used for login).
-    emit_conn(ConnectionState::TlsHandshake);
+    // 3) TLS handshake + channel binding (same connection used by the caller).
     let (tls, exporter) = transport.connect().await?;
-    emit_conn(ConnectionState::ChannelBinding);
 
     // 4) hyper http1 over the TLS stream; drive the connection in the background.
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
         .await
         .map_err(|_| UiError::new("tls", "Secure connection failed."))?;
     tokio::spawn(async move {
         let _ = conn.await;
     });
+
+    Ok((sender, host.to_owned(), exporter))
+}
+
+async fn connect_inner(
+    req: &ConnectRequest,
+    dir: &tauri::State<'_, AppDir>,
+    session: &tauri::State<'_, Session>,
+    emit_conn: &impl Fn(ConnectionState),
+    emit_auth: &impl Fn(AuthState),
+) -> Result<ConnectResponse, UiError> {
+    emit_conn(ConnectionState::Resolving);
+
+    // Steps 1-4 (cert pin + TLS handshake + channel binding + hyper handshake)
+    // are factored into `open_conn`. The fine-grained TlsHandshake/ChannelBinding
+    // states bracket that call so the UI still sees the full ordered sequence.
+    emit_conn(ConnectionState::TlsHandshake);
+    let (mut sender, host, exporter) = open_conn(&dir.0, &req.server).await?;
+    emit_conn(ConnectionState::ChannelBinding);
 
     // 5) Take the unlocked identity OUT of the session for the duration of the
     //    exchange (Identity is not Clone) so we never hold the mutex across the
@@ -122,7 +142,7 @@ async fn connect_inner(
     emit_auth(AuthState::Authenticating);
 
     let result =
-        session::login_exchange(&mut sender, &id, &req.username, host, &exporter, ts).await;
+        session::login_exchange(&mut sender, &id, &req.username, &host, &exporter, ts).await;
 
     // 6) Restore the identity regardless of outcome (the user stays unlocked).
     let login = match result {

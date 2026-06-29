@@ -3,5 +3,6 @@
 //! material, token bytes, or exporter ever crosses this boundary (UI-outside-TCB).
 
 pub mod auth;
+pub mod bootstrap;
 pub mod connection;
 pub mod stubs;

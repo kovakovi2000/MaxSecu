@@ -12,17 +12,29 @@ pub fn keystore_path(dir: &Path) -> PathBuf {
     dir.join("keystore").join("local_key_blob")
 }
 
-// `exists`/`create` back the onboarding flow (first-run keystore creation) the
-// UI adds in a later phase (Task 9/10); Phase-1 commands only `unlock` an
-// already-provisioned keystore, so these are not yet called by the binary.
-#[allow(dead_code)]
 pub fn exists(dir: &Path) -> bool {
     keystore_path(dir).exists()
 }
 
-/// Create a fresh identity, seal it under `password`, and write the blob.
-#[allow(dead_code)]
-pub fn create(dir: &Path, password: &str) -> Result<Identity, UiError> {
+/// Fail-fast guard run BEFORE any network/account creation: refuse if a keystore
+/// already exists (overwrite would destroy the prior identity) or the password is
+/// too weak. `seal_identity` re-checks these (defense in depth).
+pub fn precheck(dir: &Path, password: &str) -> Result<(), UiError> {
+    if exists(dir) {
+        return Err(UiError::new(
+            "keystore_exists",
+            "A keystore already exists on this device.",
+        ));
+    }
+    password::check(password)
+        .map_err(|_| UiError::new("weak_password", "Password is too weak."))?;
+    Ok(())
+}
+
+/// Seal a GIVEN identity under `password` into `dir/keystore/local_key_blob`.
+/// Fails closed if a keystore already exists (overwriting destroys the prior
+/// identity irrecoverably) and enforces the password policy.
+pub fn seal_identity(dir: &Path, password: &str, id: &Identity) -> Result<(), UiError> {
     // Fail closed before doing anything: overwriting an existing blob would
     // destroy the prior identity (and access to everything sealed to it) with
     // no recovery. `exists()` is the contract; enforce it here.
@@ -34,14 +46,20 @@ pub fn create(dir: &Path, password: &str) -> Result<Identity, UiError> {
     }
     password::check(password)
         .map_err(|_| UiError::new("weak_password", "Password is too weak."))?;
-    let id = Identity::generate();
-    let blob = keyblob::seal(password, &id, ARGON2_DESKTOP_TARGET)
+    let blob = keyblob::seal(password, id, ARGON2_DESKTOP_TARGET)
         .map_err(|_| UiError::new("keystore", "Could not create keystore."))?;
     let path = keystore_path(dir);
     std::fs::create_dir_all(path.parent().unwrap())
         .map_err(|_| UiError::new("keystore", "Could not write keystore."))?;
     std::fs::write(&path, &blob)
         .map_err(|_| UiError::new("keystore", "Could not write keystore."))?;
+    Ok(())
+}
+
+/// Create a fresh identity, seal it under `password`, and write the blob.
+pub fn create(dir: &Path, password: &str) -> Result<Identity, UiError> {
+    let id = Identity::generate();
+    seal_identity(dir, password, &id)?;
     Ok(id)
 }
 
@@ -63,6 +81,29 @@ mod tests {
         let created = create(&dir, pw).unwrap();
         let unlocked = unlock(&dir, pw).unwrap();
         assert_eq!(created.sig_pub_bytes(), unlocked.sig_pub_bytes());
+    }
+
+    #[test]
+    fn seal_identity_then_unlock_roundtrips_specific_identity() {
+        let dir = tempdir();
+        let pw = "correct horse battery staple 9!";
+        let id = Identity::generate();
+        let want = id.sig_pub_bytes();
+        seal_identity(&dir, pw, &id).unwrap();
+        let unlocked = unlock(&dir, pw).unwrap();
+        assert_eq!(unlocked.sig_pub_bytes(), want);
+    }
+
+    #[test]
+    fn seal_identity_refuses_to_overwrite_existing_keystore() {
+        let dir = tempdir();
+        let pw = "correct horse battery staple 9!";
+        seal_identity(&dir, pw, &Identity::generate()).unwrap();
+        let err = match seal_identity(&dir, pw, &Identity::generate()) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "keystore_exists");
     }
 
     #[test]
