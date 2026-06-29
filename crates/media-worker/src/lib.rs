@@ -24,6 +24,9 @@
 use maxsecu_client_core::sandbox::{DecodeError, DecodedImage};
 use maxsecu_client_core::media::MediaBounds;
 use maxsecu_client_core::sandbox::SandboxedDecoder;
+use maxsecu_client_core::video::{
+    decode_worker_msg, encode_client_msg, ClientMsg, WorkerMsg,
+};
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -42,6 +45,82 @@ pub use session::VideoSession;
 
 /// Default per-worker memory cap (decompression-bomb hard kill, media-sandbox §3).
 pub const DEFAULT_WORKER_MEMORY_CAP_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Length-prefixed duplex **framing** for the persistent video-session protocol
+/// (Task 3.3). Each frame on the pipe is a `u32` little-endian length prefix
+/// followed by exactly that many bytes = one `client-core::video` message body
+/// (`encode_client_msg` / `encode_worker_msg`). The outer length prefix is this
+/// transport's job; the message-body codec lives in `client-core`. Shared by the
+/// worker's `--video-session` loop (`src/main.rs`) and the cross-platform
+/// [`VideoSubprocessSession`] launcher — and reused by the Task-3.4 AppContainer
+/// variant, which frames the same duplex over the confined pipe.
+pub mod framing {
+    use std::io::{Read, Write};
+
+    /// Hard ceiling on a single frame body. A hostile / corrupt length prefix
+    /// beyond this is rejected rather than driving a multi-GiB allocation. Sized
+    /// well above `VideoBounds::max_fragment_bytes` (16 MiB) plus the small
+    /// per-message header — generous headroom without inviting a bomb.
+    pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+    /// Read exactly `buf.len()` bytes, looping over partial pipe reads.
+    /// `Ok(true)` = filled; `Ok(false)` = clean EOF before ANY byte was read (a
+    /// frame boundary — the peer closed its end); `Err` = truncated mid-buffer /
+    /// I/O error.
+    fn read_full(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<bool> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match r.read(&mut buf[filled..]) {
+                Ok(0) => {
+                    return if filled == 0 {
+                        Ok(false)
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "truncated frame",
+                        ))
+                    };
+                }
+                Ok(n) => filled += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Read one length-prefixed frame body. `Ok(None)` = clean EOF at a frame
+    /// boundary (the peer is done); `Err` on an over-ceiling length prefix or a
+    /// truncated body. Never attempts a `u32::MAX`-sized allocation.
+    pub fn read_frame(r: &mut impl Read) -> std::io::Result<Option<Vec<u8>>> {
+        let mut len_buf = [0u8; 4];
+        if !read_full(r, &mut len_buf)? {
+            return Ok(None);
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len > MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame length exceeds ceiling",
+            ));
+        }
+        let mut body = vec![0u8; len];
+        if !read_full(r, &mut body)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated frame body",
+            ));
+        }
+        Ok(Some(body))
+    }
+
+    /// Write one length-prefixed frame body (`u32` LE length + bytes). The caller
+    /// is responsible for flushing.
+    pub fn write_frame(w: &mut impl Write, body: &[u8]) -> std::io::Result<()> {
+        w.write_all(&(body.len() as u32).to_le_bytes())?;
+        w.write_all(body)
+    }
+}
 
 pub mod proto {
     //! One-shot length-prefixed little-endian protocol (one request → one
@@ -283,6 +362,95 @@ impl SubprocessDecoder {
             .stderr(Stdio::null());
         let out = cmd.output()?;
         Ok(out.stdout.first().copied() == Some(1))
+    }
+}
+
+/// Drive a persistent video-decode **session** by spawning the `media-worker`
+/// binary with `--video-session` and exchanging length-prefixed `ClientMsg` /
+/// `WorkerMsg` frames over its stdio pipes — **real process isolation** across a
+/// process boundary (separate address space; the worker shares none of this
+/// process's key state). Cross-platform (plain `Command`); the Task-3.4
+/// AppContainer variant layers OS confinement on this same framed duplex.
+pub struct VideoSubprocessSession {
+    worker_path: PathBuf,
+}
+
+impl VideoSubprocessSession {
+    /// `worker_path` is the absolute path to the built `media-worker` executable.
+    pub fn new(worker_path: impl Into<PathBuf>) -> Self {
+        VideoSubprocessSession {
+            worker_path: worker_path.into(),
+        }
+    }
+
+    /// Run the full framed exchange: ship every `ClientMsg` in `script` (each
+    /// length-prefixed) to the worker on a **writer thread** — so a large request
+    /// can't deadlock against the worker filling its stdout pipe — while this
+    /// thread concurrently reads framed `WorkerMsg`s until the worker closes
+    /// stdout (EOF). Returns every decoded `WorkerMsg`, in order.
+    ///
+    /// `script` should normally end with `ClientMsg::Close` so the worker tears
+    /// the session down and exits; dropping stdin afterwards also signals EOF,
+    /// which the worker treats identically. Reads apply the same defensive
+    /// length-bound ([`framing::MAX_FRAME_BYTES`]) as the worker.
+    pub fn run(&self, script: Vec<ClientMsg>) -> std::io::Result<Vec<WorkerMsg>> {
+        let mut child = Command::new(&self.worker_path)
+            .arg("--video-session")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        // Writer thread: frame + send every ClientMsg, then drop stdin (EOF). This
+        // mirrors SubprocessDecoder::decode_image's writer-thread pattern, extended
+        // to many messages so the worker's stdout can drain concurrently.
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("worker stdin unavailable"))?;
+        let writer = std::thread::spawn(move || {
+            for msg in &script {
+                let body = encode_client_msg(msg);
+                if framing::write_frame(&mut stdin, &body).is_err() {
+                    break;
+                }
+            }
+            let _ = stdin.flush();
+            // drop(stdin) closes the pipe → the worker sees EOF.
+        });
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("worker stdout unavailable"))?;
+        let mut out = Vec::new();
+        let mut read_err: Option<std::io::Error> = None;
+        loop {
+            match framing::read_frame(&mut stdout) {
+                Ok(Some(body)) => match decode_worker_msg(&body) {
+                    Ok(msg) => out.push(msg),
+                    Err(_) => {
+                        read_err = Some(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "undecodable worker message",
+                        ));
+                        break;
+                    }
+                },
+                Ok(None) => break, // worker closed stdout — exchange complete.
+                Err(e) => {
+                    read_err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        let _ = writer.join();
+        let _ = child.wait();
+        match read_err {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
     }
 }
 
