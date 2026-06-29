@@ -365,6 +365,136 @@ impl SubprocessDecoder {
     }
 }
 
+/// A video-session driver failure (Task 3.4). Carries no secrets.
+#[derive(Debug)]
+pub enum SessionError {
+    /// The framed duplex exchange failed: a pipe I/O error, a truncated /
+    /// over-ceiling frame, or an undecodable worker message body.
+    Io(std::io::Error),
+    /// The Windows AppContainer + Job Object launch itself failed (setup FFI).
+    #[cfg(windows)]
+    Spawn(SpawnError),
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::Io(e) => write!(f, "video session I/O error: {e}"),
+            #[cfg(windows)]
+            SessionError::Spawn(e) => write!(f, "video session launch failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+/// Drive a persistent video-decode **session** to completion: ship every
+/// `ClientMsg` in `script` and collect every `WorkerMsg` the worker emits, in
+/// order. Implemented by the cross-platform [`VideoSubprocessSession`] and,
+/// `#[cfg(windows)]`, by the OS-confined [`AppContainerVideoSession`] — the SAME
+/// framed-duplex driver ([`drive_framed_session`]) over either a plain child's
+/// stdio or the AppContainer's confined pipes, so the test can drive both.
+pub trait VideoSessionDecoder {
+    /// Run the full `Open → Fragment* → Close` exchange and return every decoded
+    /// `WorkerMsg`, in order.
+    fn run_session(&self, script: &[ClientMsg]) -> Result<Vec<WorkerMsg>, SessionError>;
+}
+
+/// Defense-in-depth ceiling on the **number** of `WorkerMsg`s the trusted parent
+/// will buffer for one session before giving up (Minor #4): each frame is already
+/// bounded to [`framing::MAX_FRAME_BYTES`], but without a per-session cap a hostile
+/// worker could stream frames indefinitely → parent OOM. A canonical clip emits a
+/// handful of messages per fragment; `1 << 20` is far above any legitimate session
+/// yet finite. On exceed the driver stops reading and errors; teardown then kills
+/// the worker (the confined Job is kill-on-close).
+const MAX_SESSION_MSGS: usize = 1 << 20;
+
+/// Defense-in-depth ceiling on the **total bytes** of `WorkerMsg` bodies buffered
+/// for one session before giving up (Minor #4) — the byte-sized companion to
+/// [`MAX_SESSION_MSGS`], so neither many tiny frames nor a few near-`MAX_FRAME_BYTES`
+/// frames can exhaust parent memory.
+const MAX_SESSION_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Shared **framed-duplex driver** for a persistent video session over a pair of
+/// pipe ends. Streams every framed `ClientMsg` on a **writer thread** (so a large
+/// request can't deadlock against the worker filling its stdout pipe) while
+/// reading framed `WorkerMsg`s on the caller's thread until EOF — deadlock-free,
+/// bounded buffering. A broken-pipe write (the worker exited early) ends the
+/// writer cleanly. The accumulated output is bounded by [`MAX_SESSION_MSGS`] /
+/// [`MAX_SESSION_BYTES`]: a worker that streams without end is cut off with an
+/// error rather than OOMing the trusted parent. The caller owns process spawn /
+/// wait / teardown; this only drives the I/O over the two handle ends, so it is
+/// shared verbatim by the cross-platform [`VideoSubprocessSession`] (over `Child`
+/// stdio) and the Windows [`AppContainerVideoSession`] (over the confined `File`
+/// pipe ends).
+fn drive_framed_session<W, R>(
+    writer: W,
+    mut reader: R,
+    script: &[ClientMsg],
+) -> std::io::Result<Vec<WorkerMsg>>
+where
+    W: Write + Send + 'static,
+    R: Read,
+{
+    // Own the script so it can move into the writer thread (the worker reads on
+    // its own schedule; the parent must not hold a borrow across the join).
+    let script = script.to_vec();
+    let writer = std::thread::spawn(move || {
+        let mut writer = writer;
+        for msg in &script {
+            let body = encode_client_msg(msg);
+            if framing::write_frame(&mut writer, &body).is_err() {
+                break; // worker hung up early (broken pipe) — stop cleanly.
+            }
+        }
+        let _ = writer.flush();
+        // drop(writer) closes the pipe → the worker sees EOF.
+    });
+
+    let mut out = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let mut read_err: Option<std::io::Error> = None;
+    loop {
+        match framing::read_frame(&mut reader) {
+            Ok(Some(body)) => {
+                // Per-session ceiling (Minor #4): cut a runaway worker off before it
+                // can exhaust parent memory; teardown kills it afterwards.
+                total_bytes = total_bytes.saturating_add(body.len() as u64);
+                if out.len() >= MAX_SESSION_MSGS || total_bytes > MAX_SESSION_BYTES {
+                    read_err = Some(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "session output exceeded per-session ceiling",
+                    ));
+                    break;
+                }
+                match decode_worker_msg(&body) {
+                    Ok(msg) => out.push(msg),
+                    Err(_) => {
+                        read_err = Some(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "undecodable worker message",
+                        ));
+                        break;
+                    }
+                }
+            }
+            Ok(None) => break, // worker closed stdout — exchange complete.
+            Err(e) => {
+                read_err = Some(e);
+                break;
+            }
+        }
+    }
+    // Dropping `reader` (when this fn returns) closes our read end → a still-writing
+    // worker gets a broken pipe and stops; the writer thread is joined here.
+
+    let _ = writer.join();
+    match read_err {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
+}
+
 /// Drive a persistent video-decode **session** by spawning the `media-worker`
 /// binary with `--video-session` and exchanging length-prefixed `ClientMsg` /
 /// `WorkerMsg` frames over its stdio pipes — **real process isolation** across a
@@ -394,6 +524,14 @@ impl VideoSubprocessSession {
     /// which the worker treats identically. Reads apply the same defensive
     /// length-bound ([`framing::MAX_FRAME_BYTES`]) as the worker.
     pub fn run(&self, script: Vec<ClientMsg>) -> std::io::Result<Vec<WorkerMsg>> {
+        self.run_framed(&script)
+    }
+
+    /// The framed-duplex exchange behind both [`run`](Self::run) and the
+    /// [`VideoSessionDecoder`] impl: spawn the `--video-session` worker, then drive
+    /// the shared [`drive_framed_session`] over its stdio (writer thread + reader),
+    /// and reap the child. Cross-platform; no OS confinement.
+    fn run_framed(&self, script: &[ClientMsg]) -> std::io::Result<Vec<WorkerMsg>> {
         let mut child = Command::new(&self.worker_path)
             .arg("--video-session")
             .stdin(Stdio::piped())
@@ -401,56 +539,30 @@ impl VideoSubprocessSession {
             .stderr(Stdio::null())
             .spawn()?;
 
-        // Writer thread: frame + send every ClientMsg, then drop stdin (EOF). This
-        // mirrors SubprocessDecoder::decode_image's writer-thread pattern, extended
-        // to many messages so the worker's stdout can drain concurrently.
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .ok_or_else(|| std::io::Error::other("worker stdin unavailable"))?;
-        let writer = std::thread::spawn(move || {
-            for msg in &script {
-                let body = encode_client_msg(msg);
-                if framing::write_frame(&mut stdin, &body).is_err() {
-                    break;
-                }
-            }
-            let _ = stdin.flush();
-            // drop(stdin) closes the pipe → the worker sees EOF.
-        });
-
-        let mut stdout = child
+        let stdout = child
             .stdout
             .take()
             .ok_or_else(|| std::io::Error::other("worker stdout unavailable"))?;
-        let mut out = Vec::new();
-        let mut read_err: Option<std::io::Error> = None;
-        loop {
-            match framing::read_frame(&mut stdout) {
-                Ok(Some(body)) => match decode_worker_msg(&body) {
-                    Ok(msg) => out.push(msg),
-                    Err(_) => {
-                        read_err = Some(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "undecodable worker message",
-                        ));
-                        break;
-                    }
-                },
-                Ok(None) => break, // worker closed stdout — exchange complete.
-                Err(e) => {
-                    read_err = Some(e);
-                    break;
-                }
-            }
-        }
 
-        let _ = writer.join();
-        let _ = child.wait();
-        match read_err {
-            Some(e) => Err(e),
-            None => Ok(out),
+        let result = drive_framed_session(stdin, stdout, script);
+        // On an error/cap cutoff the child may still be running (e.g. a runaway
+        // worker); kill it so `wait` can't hang and nothing is left behind. (The
+        // confined path relies on the Job's kill-on-close instead.)
+        if result.is_err() {
+            let _ = child.kill();
         }
+        let _ = child.wait();
+        result
+    }
+}
+
+impl VideoSessionDecoder for VideoSubprocessSession {
+    fn run_session(&self, script: &[ClientMsg]) -> Result<Vec<WorkerMsg>, SessionError> {
+        self.run_framed(script).map_err(SessionError::Io)
     }
 }
 
@@ -510,6 +622,108 @@ impl SandboxedDecoder for AppContainerDecoder {
             Ok(inner) => inner,
             Err(_) => Err(DecodeError::Worker),
         }
+    }
+}
+
+/// Drive a persistent video-decode **session** inside a **Windows AppContainer +
+/// Job Object** (DESIGN §8.1/D30, media-sandbox §2; Task 3.4): no network
+/// capability, a low-privilege token that cannot read the user's key blob, no
+/// child processes, and a hard memory cap. Same [`VideoSessionDecoder`] contract
+/// as the cross-platform [`VideoSubprocessSession`]; the OS confinement is the
+/// only difference. The duplex framing is the SAME [`drive_framed_session`], run
+/// over the confined pipe ends handed back by [`win32::spawn_confined_session`].
+#[cfg(windows)]
+pub struct AppContainerVideoSession {
+    worker_path: PathBuf,
+    memory_cap_bytes: u64,
+}
+
+#[cfg(windows)]
+impl AppContainerVideoSession {
+    pub fn new(worker_path: impl Into<PathBuf>) -> Self {
+        AppContainerVideoSession {
+            worker_path: worker_path.into(),
+            memory_cap_bytes: DEFAULT_WORKER_MEMORY_CAP_BYTES,
+        }
+    }
+
+    pub fn with_memory_cap(worker_path: impl Into<PathBuf>, cap: u64) -> Self {
+        AppContainerVideoSession {
+            worker_path: worker_path.into(),
+            memory_cap_bytes: cap,
+        }
+    }
+
+    /// Feed ONE framed `Fragment` body on stdin and run a confined worker
+    /// `--selftest-*` probe (`--selftest-net-late` / `--selftest-spawn-late` first
+    /// decode that fragment so the worker is genuinely mid-session; `--selftest-read`
+    /// ignores it) inside the AppContainer + Job Object, returning its verdict
+    /// (`true` = the action SUCCEEDED). The session containment differential asserts
+    /// this is `false` — the same serial `spawn_confined` path the single-image
+    /// containment suite uses, so the duplex setup is exercised by the session
+    /// decode test and the late-lifetime denial by this probe.
+    pub fn selftest_with_fragment(
+        &self,
+        args: &[&str],
+        fragment: &[u8],
+    ) -> Result<bool, SpawnError> {
+        let mut stdin_data = Vec::new();
+        // Writing into a Vec is infallible; frame the lone fragment for the worker.
+        let _ = framing::write_frame(&mut stdin_data, fragment);
+        let out = win32::spawn_confined(&self.worker_path, args, &stdin_data, self.memory_cap_bytes)?;
+        Ok(out.stdout.first().copied() == Some(1))
+    }
+
+    /// Drive a confined worker `--selftest-*` probe over the **duplex**
+    /// [`win32::spawn_confined_session`] launcher (NOT the serial `spawn_confined`),
+    /// so confinement over the new duplex path is proven directly. A writer thread
+    /// streams ONE framed `Fragment` (the `--selftest-*-late` worker decodes it so it
+    /// is genuinely mid-session) then drops the pipe (EOF); the parent thread reads
+    /// the worker's single verdict byte. Returns `true` if the probed action
+    /// SUCCEEDED; the duplex containment differential asserts it is `false`.
+    pub fn selftest_duplex(&self, args: &[&str], fragment: &[u8]) -> Result<bool, SpawnError> {
+        let frag = fragment.to_vec();
+        let (verdict, _exit_code) = win32::spawn_confined_session(
+            &self.worker_path,
+            args,
+            self.memory_cap_bytes,
+            move |mut writer, mut reader| {
+                // Stream the lone framed fragment on a writer thread (concurrent with
+                // the read below — the real duplex shape), then EOF.
+                let writer_thread = std::thread::spawn(move || {
+                    let mut framed = Vec::new();
+                    let _ = framing::write_frame(&mut framed, &frag);
+                    let _ = writer.write_all(&framed);
+                    let _ = writer.flush();
+                    // drop(writer) → the worker sees EOF after its one fragment.
+                });
+                let mut out = Vec::new();
+                let _ = reader.read_to_end(&mut out);
+                let _ = writer_thread.join();
+                out.first().copied() == Some(1)
+            },
+        )?;
+        Ok(verdict)
+    }
+}
+
+#[cfg(windows)]
+impl VideoSessionDecoder for AppContainerVideoSession {
+    fn run_session(&self, script: &[ClientMsg]) -> Result<Vec<WorkerMsg>, SessionError> {
+        // `spawn_confined_session` does the SAME AppContainer + Job + pipe setup as
+        // `spawn_confined`, then hands back the two parent pipe ends as `File`s and
+        // runs our `drive` closure over them (writer thread + reader) — the duplex
+        // framing is `drive_framed_session`, identical to the cross-platform path.
+        // The closure runs to completion before `spawn_confined_session` returns, so
+        // borrowing `script` here is sound (no clone needed at this level).
+        let (result, _exit_code) = win32::spawn_confined_session(
+            &self.worker_path,
+            &["--video-session"],
+            self.memory_cap_bytes,
+            |writer, reader| drive_framed_session(writer, reader, script),
+        )
+        .map_err(SessionError::Spawn)?;
+        result.map_err(SessionError::Io)
     }
 }
 
