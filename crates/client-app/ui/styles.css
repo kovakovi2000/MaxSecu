@@ -25,3 +25,23 @@ body { font-size: calc(1rem * var(--mx-text-scale)); }
 
 /* Always-visible focus for keyboard users (WCAG 2.4.7). */
 :focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+
+/* --- Sandboxed video player (Gate 5.3) chrome --- */
+video-player .vp-stage canvas { max-width: 100%; height: auto; background: #000; display: block; }
+video-player .vp-controls {
+  display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem;
+}
+video-player .vp-field { display: inline-flex; gap: 0.25rem; align-items: center; }
+video-player .vp-time { font-variant-numeric: tabular-nums; }
+/* "Decode worker pending" badge — text-first, never colour-only. */
+video-player .vp-badge {
+  display: inline-block; padding: 0.1rem 0.4rem; border: 1px solid currentColor;
+  border-radius: 0.25rem; font-size: 0.85em;
+}
+video-player .vp-badge[hidden] { display: none; }
+/* HW-decode waiver warning — prominent, text-led (icon + words, not colour). */
+video-player .vp-warn {
+  border: 2px solid currentColor; padding: 0.5rem 0.75rem; margin: 0.5rem 0;
+  font-weight: 700; background: rgba(255, 0, 0, 0.08); flex-basis: 100%;
+}
+video-player .vp-warn[hidden] { display: none; }

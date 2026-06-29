@@ -2,6 +2,8 @@ import { call, on } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import type { OpenedContent, FetchMsg } from "../core/types.ts";
 import "./progress-meter.ts";
+import "./video-player.ts";
+import type { VideoPlayer } from "./video-player.ts";
 
 // Viewer (spec §5): renders one decrypted post. Image → data: URL <img>; blog →
 // textContent (NEVER innerHTML). Subscribes to EVT_FETCH for live status. The
@@ -10,9 +12,11 @@ import "./progress-meter.ts";
 // cannot run those concurrently with in-flight card decrypts).
 export class MediaViewer extends HTMLElement {
   private unlisten: (() => void) | null = null;
+  private reqId = "";
 
   async connectedCallback() {
     const id = new URLSearchParams(location.hash.split("?")[1] ?? "").get("id") ?? "";
+    this.reqId = id;
     this.innerHTML = `
       <main id="main" tabindex="-1" aria-labelledby="vw-h">
         <a href="#/feed">← Back to feed</a>
@@ -63,7 +67,15 @@ export class MediaViewer extends HTMLElement {
     (this.querySelector("#vw-h") as HTMLElement).textContent = c.title || "(untitled)";
     const body = this.querySelector("#vw-body") as HTMLElement;
     body.replaceChildren();
-    if (c.image_png_b64) {
+    if (c.file_type === "video") {
+      // Video is backed by the sandboxed worker (Gate 4.x) + the <video-player>
+      // chrome (Gate 5.3): mount the player on the REQUESTED id (never the served
+      // manifest's) so it opens exactly the item the user navigated to.
+      const vp = document.createElement("video-player");
+      vp.setAttribute("file-id", this.reqId);
+      (vp as unknown as VideoPlayer).fileId = this.reqId;
+      body.appendChild(vp);
+    } else if (c.image_png_b64) {
       const img = document.createElement("img");
       img.src = `data:image/png;base64,${c.image_png_b64}`;
       img.alt = c.title || "Image";

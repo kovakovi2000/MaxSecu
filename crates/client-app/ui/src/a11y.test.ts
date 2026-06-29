@@ -68,3 +68,62 @@ test("screens use a live region for feedback", () => {
     `expected most screens to use a live region; got ${withLive.length}/${screens.length}`,
   );
 });
+
+// --- Phase 7 (sandboxed video) §5.3: <video-player> chrome -----------------
+// <video-player> is a focusable media region with fully keyboard-operable,
+// labeled transport controls and non-color-only (text + icon) state. It is an
+// embedded component (mounted by media-viewer), NOT a routed screen, so it gets
+// its own structural-lint block rather than joining the `screens` list above.
+{
+  const vpPath = "src/components/video-player.ts";
+  const vp = readFileSync(vpPath, "utf8");
+
+  test(`${vpPath}: focusable region + focus on mount + live region`, () => {
+    // A labeled region with tabindex="-1" that receives focus on mount (WCAG
+    // 2.4.3), plus an aria-live status region for the player state machine.
+    assert.match(vp, /tabindex="-1"/, "video-player needs a focusable region (tabindex=-1)");
+    assert.match(vp, /\.focus\(\)/, "video-player must move focus to its region on mount");
+    assert.match(vp, /aria-live/, "video-player needs an aria-live status region");
+  });
+
+  test(`${vpPath}: transport controls are labeled + keyboard-operable`, () => {
+    // play/pause, volume and mute are labeled (aria-label / <label>); the
+    // scrubber is a native range (keyboard-operable, exposes its value) or
+    // carries aria-valuenow, and shows a played-vs-loaded (buffered) indication.
+    assert.match(vp, /aria-label|<label/, "controls must be labeled (aria-label / <label>)");
+    for (const label of ["Play", "Pause", "Mute", "Volume"]) {
+      assert.match(vp, new RegExp(label), `missing ${label} control text/label`);
+    }
+    assert.match(
+      vp,
+      /type="range"|aria-valuenow/,
+      "scrubber must be an <input type=range> or carry aria-valuenow",
+    );
+    assert.match(vp, /loaded|buffered/i, "scrubber must show a loaded/buffered indication");
+  });
+
+  test(`${vpPath}: non-color-only state text + decode-worker-pending badge`, () => {
+    // State is conveyed by TEXT (not color alone, WCAG 1.4.1): every phase has a
+    // visible label, plus a "decode worker pending" badge.
+    for (const s of ["Buffering", "Playing", "Stalled", "Error", "Codec unavailable"]) {
+      assert.match(vp, new RegExp(s), `state text "${s}" must appear in source`);
+    }
+    assert.match(vp, /Decode worker pending/i, "a 'decode worker pending' badge text must appear");
+  });
+
+  test(`${vpPath}: HW-decode waiver default-off + prominent warning`, () => {
+    // The hardware-decode waiver defaults OFF and carries an unmistakable TEXT
+    // warning that enabling it trades sandbox containment (not recommended).
+    assert.match(vp, /hardware|hw-decode|hwDecode/i, "HW-decode waiver toggle must be present");
+    assert.match(vp, /not recommended/i, "HW-decode waiver must carry a prominent warning");
+    assert.match(vp, /sandbox/i, "warning must explain the sandbox-containment trade-off");
+  });
+
+  test(`${vpPath}: no unescaped innerHTML interpolation (XSS guard)`, () => {
+    assert.doesNotMatch(
+      vp,
+      /\.innerHTML\s*=\s*`[^`]*\$\{(?!esc\()/,
+      "video-player must not interpolate unescaped dynamic data into innerHTML",
+    );
+  });
+}
