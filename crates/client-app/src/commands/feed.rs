@@ -112,7 +112,9 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn hex16(s: &str) -> Result<[u8; 16], UiError> {
+/// Parse a 32-char hex `file_id` into 16 bytes. `pub(crate)` so the viewer
+/// command validates the REQUESTED id with the same rule.
+pub(crate) fn hex16(s: &str) -> Result<[u8; 16], UiError> {
     let bad = || UiError::new("fetch_failed", "Malformed file id.");
     if s.len() != 32 {
         return Err(bad());

@@ -100,7 +100,7 @@ use maxsecu_encoding::types::{Id, RecipientType};
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
-use crate::commands::feed::{file_type_name, hex, now_ms, parse_title_tags};
+use crate::commands::feed::{file_type_name, hex, hex16, now_ms, parse_title_tags};
 use crate::config::load_directory_pub;
 use crate::directory::resolve_and_verify_author;
 use crate::download::{build_download_bundle, parse_file_view};
@@ -138,6 +138,10 @@ async fn open_content_inner(
     connect_lock: &State<'_, ConnectLock>,
     emit: &impl Fn(FetchPhase),
 ) -> Result<OpenedContentDto, UiError> {
+    // Validate the REQUESTED id up front: this is the id the served record must
+    // bind to (see `run_open`), and it also rejects a malformed id before it is
+    // interpolated into the request URL.
+    let file_id = hex16(&req.file_id)?;
     let pinned = load_directory_pub(&dir.0)?;
     let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
@@ -204,7 +208,7 @@ async fn open_content_inner(
             .identity
             .as_ref()
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-        run_open(identity, &manifest, &author, my_id, &bundle)
+        run_open(identity, file_id, &author, my_id, &bundle)
     }?;
 
     emit(FetchPhase::Decrypting {
@@ -238,13 +242,18 @@ async fn open_content_inner(
 /// the caller holds the session lock across this so the identity borrow is safe.
 fn run_open(
     identity: &Identity,
-    manifest: &Manifest,
+    file_id: [u8; 16],
     author: &crate::directory::VerifiedAuthor,
     my_id: [u8; 16],
     bundle: &maxsecu_client_core::DownloadBundle,
 ) -> Result<maxsecu_client_core::OpenedFile, UiError> {
+    // `file_id` MUST be the REQUESTED id, NOT `manifest.file_id`: `verify_header`
+    // binds the served record to the request via `manifest.file_id != ctx.file_id
+    // => FileIdMismatch`. Sourcing it from the manifest would make that check a
+    // tautology, letting an untrusted server substitute any other validly-signed
+    // record the user can decrypt.
     let ctx = VerifyContext {
-        file_id: manifest.file_id,
+        file_id: Id(file_id),
         author_sig_pub: author.sig_pub,
         owner_sig_pub: author.sig_pub,
         recipient_id: Id(my_id),
