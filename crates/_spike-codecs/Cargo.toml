@@ -1,0 +1,14 @@
+[package]
+name = "spike-codecs"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Versions confirmed via `cargo add --dry-run` 2026-06-29 (Rust 1.96, Windows MSVC,
+# no nasm). The view-path crates are ALL pure / memory-safe Rust — the `asm`
+# features (which require nasm and pull in C/assembly) are DISABLED on purpose so
+# this stays zero-C. This is a TEMPORARY spike (deleted at end of Gate 1).
+rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+symphonia = { version = "0.6.0", default-features = false, features = ["isomp4", "aac"] }
+rav1e = { version = "0.8.1", default-features = false }

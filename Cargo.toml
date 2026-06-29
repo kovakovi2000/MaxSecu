@@ -16,6 +16,7 @@ members = [
     "crates/sink-server",
     "crates/client-app",
     "crates/portable-server",
+    "crates/_spike-codecs",
     "tools/ceremony-harness",
 ]
 
