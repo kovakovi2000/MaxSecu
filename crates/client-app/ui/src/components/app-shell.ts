@@ -11,6 +11,7 @@ import "./media-viewer.ts";
 import "./upload-screen.ts";
 import "./upload-tray.ts";
 import "./settings-screen.ts";
+import "./quick-settings.ts";
 import { loadAndApplySettings } from "../core/settings.ts";
 import type { StatusPill } from "./status-pill.ts";
 import type { ConnState } from "../core/types.ts";
@@ -23,6 +24,7 @@ export class AppShell extends HTMLElement {
           <a href="#/feed">Feed</a> &middot; <span>My Content</span> &middot; <a href="#/upload">Upload</a> &middot; <a href="#/admin">Admin</a> &middot; <a href="#/settings">Settings</a>
         </nav>
         <status-pill id="pill"></status-pill>
+        <quick-settings></quick-settings>
         <upload-tray></upload-tray>
       </header>
       <div id="outlet"></div>`;
