@@ -1,0 +1,15 @@
+[package]
+name = "maxsecu-ceremony-harness"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "TEST-ONLY scripted offline D5 ceremony over admin-core (not a prod path)."
+
+[dependencies]
+maxsecu-admin-core = { path = "../../crates/admin-core" }
+maxsecu-crypto = { path = "../../crates/crypto" }
+maxsecu-encoding = { path = "../../crates/encoding" }
+
+[lints.rust]
+unsafe_code = "forbid"

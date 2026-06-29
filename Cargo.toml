@@ -15,6 +15,7 @@ members = [
     "crates/media-worker",
     "crates/sink-server",
     "crates/client-app",
+    "tools/ceremony-harness",
 ]
 
 [workspace.package]

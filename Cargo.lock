@@ -2368,6 +2368,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxsecu-ceremony-harness"
+version = "0.0.0"
+dependencies = [
+ "maxsecu-admin-core",
+ "maxsecu-crypto",
+ "maxsecu-encoding",
+]
+
+[[package]]
 name = "maxsecu-client-app"
 version = "0.0.0"
 dependencies = [
