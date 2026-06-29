@@ -1,4 +1,5 @@
 import { call } from "../core/rpc.ts";
+import { serial } from "../core/serial.ts";
 import type { FeedEntry, FeedFilter, FeedSort, SearchHit } from "../core/types.ts";
 import "./media-card.ts";
 import "./state-badge.ts";
@@ -55,9 +56,9 @@ export class FeedScreen extends HTMLElement {
     const grid = this.querySelector("#grid") as HTMLElement;
     status.textContent = "Loading…";
     try {
-      const entries = await call<FeedEntry[]>("list_feed", {
+      const entries = await serial(() => call<FeedEntry[]>("list_feed", {
         req: { filter: this.filter, sort: this.sort },
-      });
+      }));
       grid.replaceChildren();
       if (entries.length === 0) {
         status.textContent = "No content yet.";
