@@ -1,4 +1,4 @@
-const routes = ["connect", "feed", "bootstrap", "pending"] as const;
+const routes = ["connect", "feed", "bootstrap", "pending", "admin"] as const;
 export type Route = (typeof routes)[number];
 export class Router {
   constructor(private onChange: (r: Route) => void) {
