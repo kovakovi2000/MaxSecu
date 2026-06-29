@@ -64,6 +64,16 @@ ignore = [
     "RUSTSEC-2025-0080", # unic-common
     "RUSTSEC-2025-0100", # unic-ucd-ident
     "RUSTSEC-2025-0098", # unic-ucd-version
+    #
+    # ---- Phase 7 codec deps (crates/_spike-codecs; later media-transcode-worker) ----
+    # `paste` (unmaintained) — author has archived the repo; "no longer maintained",
+    # NOT a vulnerability and "no safe upgrade is available". It is a compile-time
+    # proc-macro (token concatenation) pulled by the pure-Rust AV1 codec crates
+    # `rav1d` (decode) and `rav1e` (encode); `cargo tree -i paste -e normal` shows
+    # ONLY those two -> spike-codecs. No runtime/attack surface (build-time macro,
+    # no I/O, no unsafe FFI). Remove if rav1d/rav1e drop `paste` (e.g. move to the
+    # `pastey` fork). The codec crates themselves are zero-C (asm features off).
+    "RUSTSEC-2024-0436", # paste
 ]
 
 [bans]
@@ -79,6 +89,13 @@ allow-wildcard-paths = true
 # it is intentionally NOT listed below. `ring`/`openssl` remain banned so a
 # *second* such stack cannot slip in unnoticed (e.g. via a backend default —
 # rcgen must use its `aws_lc_rs` feature, not `ring`).
+# Phase 7 note: the codec view-path (rav1d/rav1e/symphonia) is pure Rust (zero C).
+# The sole NEW C link is `ac-ffmpeg` (+ build helpers `ac-ffmpeg-build` /
+# `ac-ffmpeg-features`), the author-side ingest carve-out — NOT a crypto stack, so
+# it is not (and need not be) listed here; it is reachable only from the optional
+# `ingest` feature of crates/_spike-codecs today and will be confined to the future
+# AppContainer `media-transcode-worker` leaf. `aws-lc-rs` stays the only sanctioned
+# crypto C; `ring`/`openssl` remain banned and absent from the lockfile.
 deny = [
     { name = "openssl" },
     { name = "openssl-sys" },
@@ -112,6 +129,15 @@ allow = [
     # them unmodified, so no source-disclosure burden on our code. Remove if the
     # client drops Tauri/dirs or these crates relicense.
     "MPL-2.0",
+    # NCSA (University of Illinois/NCSA Open Source License) — permissive, OSI-approved
+    # and FSF-free (a BSD/MIT-style notice license, no copyleft). Required by exactly
+    # one crate: `libfuzzer-sys` (license "(MIT OR Apache-2.0) AND NCSA"), a transitive
+    # dep of the AV1 encoder `rav1e`. libfuzzer-sys is gated behind `cfg(fuzzing)` in
+    # rav1e, so it is NEVER compiled into our build (`cargo tree -i libfuzzer-sys
+    # -e all` prints nothing on any real target — it appears only under `--target all`,
+    # which is how `cargo deny` surfaces it). Admitted solely to satisfy the license
+    # gate for this never-linked fuzz harness; remove if rav1e drops libfuzzer-sys.
+    "NCSA",
 ]
 confidence-threshold = 0.9
 
