@@ -76,7 +76,6 @@ impl ConnectionConfig {
 // `<dir>/config/settings.json`). Per-section `#[serde(default)]` lets a partial
 // or older file still load; `normalized()` clamps untrusted (hand-edited) values.
 // Wired into get/set commands in Phase-5 Task 2.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct A11ySettings {
     pub reduced_motion: bool,
@@ -93,13 +92,11 @@ impl Default for A11ySettings {
     }
 }
 
-#[allow(dead_code)] // wired into commands in Phase-5 Task 2.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct BehaviorSettings {
     pub confirm_destructive: bool,
 }
 
-#[allow(dead_code)] // wired into commands in Phase-5 Task 2.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PerformanceSettings {
     pub ram_cache_cap_mb: u32,
@@ -112,13 +109,11 @@ impl Default for PerformanceSettings {
     }
 }
 
-#[allow(dead_code)] // wired into commands in Phase-5 Task 2.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ConnectionSettings {
     pub use_tor: bool,
 }
 
-#[allow(dead_code)] // wired into commands in Phase-5 Task 2.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SettingsConfig {
     #[serde(default)]
@@ -131,7 +126,6 @@ pub struct SettingsConfig {
     pub connection: ConnectionSettings,
 }
 
-#[allow(dead_code)] // load/save/normalized wired into commands in Phase-5 Task 2.
 impl SettingsConfig {
     pub fn load(dir: &Path) -> Self {
         std::fs::read(dir.join("config").join("settings.json"))
