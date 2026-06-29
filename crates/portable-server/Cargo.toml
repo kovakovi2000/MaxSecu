@@ -29,5 +29,14 @@ rcgen = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# HTTP client plane for the Phase-6 boot smoke test (the same hyper/http stack the
+# client-app e2es use). tokio/tokio-rustls/base64/serde_json/maxsecu-server/
+# maxsecu-crypto are already normal deps (cargo unions their features), so only the
+# hyper trio is new here.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
 [lints.rust]
 unsafe_code = "forbid"

@@ -6,14 +6,10 @@
 //! production ceremony key.
 #![forbid(unsafe_code)]
 
-mod bootstrap;
-mod config;
-mod layout;
-mod pki;
-mod run;
+use maxsecu_portable_server::{config::LauncherConfig, run};
 
 fn main() -> std::io::Result<()> {
-    let cfg = config::LauncherConfig::from_env();
+    let cfg = LauncherConfig::from_env();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run::run(cfg))
 }
