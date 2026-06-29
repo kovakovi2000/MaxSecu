@@ -226,8 +226,39 @@ with conservative closed-deployment defaults.
 
 ---
 
+## 11. Media decode bounds — canonical video caps (`docs/media-sandbox.md` §3/§4, Phase 7 Gate 1 — settled)
+
+Pre-decode ceilings for the **canonical video format** (AV1 / AAC-LC / CMAF closed-GOP, ratified in `media-sandbox.md` §4 and `docs/security-review-phase7-codec-ratification.md`). Checked in the main process (cheap, no decoder) **and** re-checked in each worker **before any decoder allocates** a frame/audio buffer (the decompression-bomb guard, §3). Anything over a ceiling is **rejected pre-allocation**; the Job Object memory + wall-clock caps kill a pathological input rather than hang. These values are the canonical source for Gate 2's `VideoBounds::default()` — encode them verbatim.
+
+| Parameter | Value | Notes |
+|---|---|---|
+| `MAX_DURATION_MS` | **1_800_000** (30 min) | hard duration ceiling; longer clips rejected before decode |
+| `MAX_FRAMERATE` | **120** | fps ceiling; bounds frame-count × per-frame allocation |
+| `MAX_FRAGMENT_BYTES` | **16_777_216** (16 MiB) | per-CMAF-fragment byte ceiling; a single fragment over this is rejected before demux |
+| `MAX_TOTAL_BYTES` | **4_294_967_296** (4 GiB) | whole-stream byte ceiling (cross-checked against the signed manifest's `total_bytes`, §3) |
+| `MAX_FRAGMENTS` | **4096** | fragment-count ceiling; bounds the `pts→fragment→chunk` index and per-session state |
+| `MAX_AUDIO_CHANNELS` | **2** | stereo ceiling for the AAC-LC track |
+| `MAX_SAMPLE_RATE` | **48_000** | audio sample-rate ceiling (Hz) |
+
+**Existing pixel caps reused (the `Media/VideoBounds` geometry, recorded here so Gate 2 stays consistent):**
+
+| Parameter | Value | Notes |
+|---|---|---|
+| `max_width` | **7680** | 8K-class width ceiling |
+| `max_height` | **4320** | 8K-class height ceiling |
+| `max_pixels` | **33_177_600** (= 7680 × 4320, 8K) | per-frame pixel-area ceiling; the decompression-bomb guard, checked before allocating a frame buffer |
+
+> These are hard ceilings on the **canonical** format only — a viewer decodes nothing but the canonical set (§4), so no codec auto-probing of the demuxer zoo. They are independent of the framing-field anti-DoS cap (§1.2's 256 GiB addressable-file guard) and the user's RAM/disk budget (§1.6); a real input must clear **all** of them. Worker output is **also** validated against these caps post-decode (plane lengths vs `width·height`, dims-within-caps, monotonic `pts`, PCM length/format/channel/rate) before the renderer touches it (`media-sandbox.md` §6, spec §7).
+
+> **These caps bound per-allocation size, NOT aggregate decode compute (Gate-2 load-bearing).** Each value is a **per-frame / per-fragment** ceiling, not a bound on total decode work. An input *at* the ceilings — `max_pixels` 8K (33.18 Mpx) × `MAX_FRAMERATE` 120 fps × `MAX_DURATION_MS` 30 min ≈ **216k frames** — decoded on **asm-OFF pure-Rust `rav1d`** (slower than C dav1d) is a real CPU/wall-clock exhaustion vector that **no numeric cap here bounds**. That vector rests **entirely on the worker's Job Object wall-clock + committed-memory cap** (`media-sandbox.md` §2/§3), which is therefore **load-bearing and MANDATORY** for the Gate-2 decode worker — not optional. The numeric caps bound a single allocation; the Job Object bounds the aggregate run.
+
+> **`MAX_FRAGMENTS` vs `MAX_TOTAL_BYTES` (read them right):** `MAX_FRAGMENTS` (4096) × `MAX_FRAGMENT_BYTES` (16 MiB) = **64 GiB**, 16× the `MAX_TOTAL_BYTES` (4 GiB) ceiling — **not a hole**: the caps are independent ceilings and an input must clear **all** of them, so the binding constraint on byte **volume** is `MAX_TOTAL_BYTES`. `MAX_FRAGMENTS` bounds per-session **index/state** (the `pts→fragment→chunk` table + resume bookkeeping), **not** byte volume — don't treat the fragment count as a volume control.
+
+---
+
 ## Cross-references
 
 - Primitive choices & rationale: `DESIGN.md` §5; per-record bytes: `docs/encoding-spec.md`.
 - Where the sink head comes from and how clients verify it: **`docs/sink-interface.md`** — §5's cadence is the client side of that contract.
-- Build-phase mapping: Phase 1 (auth/session §2–§3), Phase 3 (AEAD/versioning §1.2/§4), Phase 5 (revocation §5, sweep §6), Phase 4b (storage §8).
+- Build-phase mapping: Phase 1 (auth/session §2–§3), Phase 3 (AEAD/versioning §1.2/§4), Phase 5 (revocation §5, sweep §6), Phase 4b (storage §8), Phase 7 media-app (canonical video decode bounds §11).
+- Canonical video format + decode-sandbox model: **`docs/media-sandbox.md`** §3/§4; codec ratification: **`docs/security-review-phase7-codec-ratification.md`**.

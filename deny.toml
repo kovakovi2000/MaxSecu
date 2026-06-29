@@ -65,15 +65,23 @@ ignore = [
     "RUSTSEC-2025-0100", # unic-ucd-ident
     "RUSTSEC-2025-0098", # unic-ucd-version
     #
-    # ---- Phase 7 codec deps (crates/_spike-codecs; later media-transcode-worker) ----
+    # ---- Phase 7 codec deps (later: media-worker / media-transcode-worker) ----
+    # DORMANT until Gate 3/6 re-adopt the codec crates. The codec ratification
+    # (Gate 1, docs/security-review-phase7-codec-ratification.md) DELETED the
+    # throwaway spike `crates/_spike-codecs`, so `rav1d`/`rav1e` (and `paste`) have
+    # left the dependency graph entirely; they are re-adopted into real crates in
+    # Gate 3 (rav1d/rav1e/symphonia). While out-of-graph, `cargo deny` reports this
+    # as an `advisory-not-detected` WARNING (not an error) — KEPT to preserve the
+    # audited decision and avoid churn when the codecs return.
+    #
     # `paste` (unmaintained) — author has archived the repo; "no longer maintained",
     # NOT a vulnerability and "no safe upgrade is available". It is a compile-time
     # proc-macro (token concatenation) pulled by the pure-Rust AV1 codec crates
     # `rav1d` (decode) and `rav1e` (encode); `cargo tree -i paste -e normal` shows
-    # ONLY those two -> spike-codecs. No runtime/attack surface (build-time macro,
-    # no I/O, no unsafe FFI). Remove if rav1d/rav1e drop `paste` (e.g. move to the
-    # `pastey` fork). The codec crates themselves are zero-C (asm features off).
-    "RUSTSEC-2024-0436", # paste
+    # ONLY those two. No runtime/attack surface (build-time macro, no I/O, no unsafe
+    # FFI). Remove if rav1d/rav1e drop `paste` (e.g. move to the `pastey` fork). The
+    # codec crates themselves are zero-C (asm features off).
+    "RUSTSEC-2024-0436", # paste (dormant until Gate 3 re-adopts rav1d/rav1e)
 ]
 
 [bans]
@@ -137,6 +145,10 @@ allow = [
     # -e all` prints nothing on any real target — it appears only under `--target all`,
     # which is how `cargo deny` surfaces it). Admitted solely to satisfy the license
     # gate for this never-linked fuzz harness; remove if rav1e drops libfuzzer-sys.
+    # DORMANT until Gate 3 re-adopts rav1e: the Gate-1 codec ratification deleted the
+    # spike, so rav1e (and libfuzzer-sys) have left the graph; while out-of-graph
+    # `cargo deny` reports this as an unused-license WARNING (not an error) — KEPT to
+    # preserve the audited decision and avoid churn when rav1e returns in Gate 3.
     "NCSA",
 ]
 confidence-threshold = 0.9
