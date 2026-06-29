@@ -28,6 +28,7 @@ base64 = "0.22"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 maxsecu-server = { path = "../server" }
 maxsecu-ceremony-harness = { path = "../../tools/ceremony-harness" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [lints.rust]
 unsafe_code = "forbid"

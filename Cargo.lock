@@ -2384,6 +2384,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "image",
  "maxsecu-ceremony-harness",
  "maxsecu-client-core",
  "maxsecu-crypto",
