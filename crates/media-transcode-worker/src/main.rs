@@ -7,8 +7,9 @@
 //! `media-launcher::TranscodeLauncher` spawns exactly this binary inside the OS
 //! confinement (AppContainer + Job Object on Windows).
 //!
-//! The transcode body itself is a skeleton placeholder for Gate 6; Task 6.2 fills
-//! in the real `rav1e` encode + CMAF mux (and the optional `ac-ffmpeg` ingest).
+//! The transcode body is the pure-Rust `rav1e` encode + hand-rolled chunk-aligned
+//! CMAF mux (Task 6.2); the optional `ac-ffmpeg` broad-format ingest stays a
+//! documented deferred stub behind the off-by-default `ffmpeg` feature.
 //!
 //! [`TranscodeRequest`]: maxsecu_client_core::media::TranscodeRequest
 //! [`TranscodeResult`]: maxsecu_client_core::media::TranscodeResult

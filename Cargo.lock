@@ -2689,8 +2689,11 @@ name = "maxsecu-media-transcode-worker"
 version = "0.0.0"
 dependencies = [
  "ac-ffmpeg",
+ "image",
  "maxsecu-client-core",
+ "rav1d",
  "rav1e",
+ "symphonia",
 ]
 
 [[package]]

@@ -37,6 +37,30 @@ rav1e = { version = "0.8.1", default-features = false }
 # ONLY crate in the workspace permitted to depend on `ac-ffmpeg`.
 ac-ffmpeg = { version = "0.19.0", default-features = false, optional = true }
 
+# ---- DEV-ONLY verification deps (Task 6.2) ----
+# These are the VIEW-path decoders + the image crate, used ONLY by the integration
+# tests to PROVE the transcode output is genuinely canonical: each chunk-aligned
+# fragment demuxes (symphonia) + decodes (rav1d) back to the source dimensions, and
+# the thumbnail/preview are valid PNGs. Dev-deps do NOT propagate, so they stay OUT of
+# the worker's normal/shipped graph (the NORMAL deps remain client-core + rav1e, plus
+# the optional ac-ffmpeg). asm OFF on rav1d (no nasm) keeps the test path zero-C.
+[dev-dependencies]
+# `rav1d` — pure-Rust dav1d port; decodes the muxed fragment's av01 sample back to
+# its geometry (the dav1d C ABI is exposed as `pub unsafe extern "C"` fns, so the
+# test's FFI decode is the ONE `#[allow(unsafe_code)]` site — scoped + justified).
+rav1d = { version = "1.1.0", default-features = false, features = [
+    "bitdepth_8",
+    "bitdepth_16",
+] }
+# `symphonia` — pure-Rust ISO-BMFF demux: reads each fragment's av01 sample + geometry
+# back out of the (padded) MP4, proving the trailing `free`-box padding is tolerated.
+symphonia = { version = "0.6.0", default-features = false, features = [
+    "isomp4",
+    "aac",
+] }
+# `image` — validates the thumbnail/preview are real, in-bounds PNGs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
 [features]
 # DEFAULT = NO ffmpeg: the pure-Rust rav1e + CMAF path only — no unsupported-ABI C
 # in the committed/tested build.
