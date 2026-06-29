@@ -2457,6 +2457,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxsecu-portable-server"
+version = "0.0.0"
+dependencies = [
+ "maxsecu-admin-core",
+ "maxsecu-crypto",
+ "maxsecu-server",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "maxsecu-server"
 version = "0.0.0"
 dependencies = [
