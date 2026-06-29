@@ -10,6 +10,7 @@ pub mod directory;
 pub mod download;
 pub mod dto;
 pub mod error;
+pub mod fragment_cache;
 pub mod http_client;
 pub mod index;
 pub mod jobs;
