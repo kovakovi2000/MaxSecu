@@ -169,4 +169,45 @@ mod tests {
             "untrusted"
         );
     }
+
+    #[test]
+    fn verify_author_binding_rejects_malformed_binding_bytes() {
+        let d5 = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+        let mut trust = MemoryTrustStore::new();
+        // Not a canonical DirBinding ⇒ decode fails ⇒ sanitized untrusted (no panic).
+        let err = verify_author_binding(&verifier, &mut trust, &[0xFFu8; 8], &[0u8; 64], NOW)
+            .unwrap_err();
+        assert_eq!(err.code, "untrusted");
+    }
+
+    #[test]
+    fn parse_binding_rejects_malformed_json() {
+        // Bad base64 ⇒ untrusted (no panic).
+        let bad_b64 = serde_json::json!({
+            "binding_b64": "!!!not-base64!!!",
+            "directory_signature_b64": "AAAA"
+        });
+        assert_eq!(
+            super::parse_binding(&bad_b64).unwrap_err().code,
+            "untrusted"
+        );
+        // Wrong signature length (valid base64, but not 64 bytes) ⇒ untrusted.
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        let short_sig = serde_json::json!({
+            "binding_b64": B64.encode([1u8; 8]),
+            "directory_signature_b64": B64.encode([2u8; 10])
+        });
+        assert_eq!(
+            super::parse_binding(&short_sig).unwrap_err().code,
+            "untrusted"
+        );
+        // Missing field ⇒ untrusted.
+        let missing = serde_json::json!({ "binding_b64": B64.encode([1u8; 8]) });
+        assert_eq!(
+            super::parse_binding(&missing).unwrap_err().code,
+            "untrusted"
+        );
+    }
 }
