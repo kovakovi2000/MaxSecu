@@ -8,8 +8,7 @@ use tauri::State;
 
 use crate::admin;
 use crate::commands::auth::{AppDir, ConnectLock, Session};
-use crate::commands::connection::reauth;
-use crate::config::ConnectionConfig;
+use crate::commands::connection::{reauth, server_of};
 use crate::dto::{ApprovalRequest, CeremonyWorkItem, IssueVoucherResponse, PendingUserDto};
 use crate::error::UiError;
 use crate::http_client::{get_json, post_json};
@@ -17,14 +16,6 @@ use crate::http_client::{get_json, post_json};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use hyper::StatusCode;
-
-fn server_of(dir: &std::path::Path) -> Result<String, UiError> {
-    let cfg = ConnectionConfig::load(dir);
-    if cfg.server.is_empty() {
-        return Err(UiError::new("no_server", "No server is configured."));
-    }
-    Ok(cfg.server)
-}
 
 /// `list_pending` — the admin approval queue (D-G). Requires an admin session
 /// (re-authed on a fresh channel).

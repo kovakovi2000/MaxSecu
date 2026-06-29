@@ -71,3 +71,40 @@ pub struct CeremonyWorkItem {
     pub roles: Vec<String>,
     pub note: String,
 }
+
+/// Feed type filter (D35). `All` omits the server `type` param.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FeedFilter {
+    All,
+    Image,
+    Video,
+    Blog,
+}
+
+/// Client-side sort over the listing.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FeedSort {
+    NewestFirst,
+    OldestFirst,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListFeedRequest {
+    pub filter: FeedFilter,
+    pub sort: FeedSort,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// One feed entry — listing metadata only (no decrypted values). The card is
+/// decrypted separately by `decrypt_card`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FeedEntryDto {
+    pub file_id: String,
+    pub file_type: String,
+    pub version: u64,
+    pub updated_at: u64,
+    pub has_thumbnail: bool,
+}

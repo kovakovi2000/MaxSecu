@@ -7,6 +7,7 @@
 use hyper_util::rt::TokioIo;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 
+use crate::config::ConnectionConfig;
 use crate::dto::{ConnectRequest, ConnectResponse};
 use crate::error::UiError;
 use crate::session;
@@ -212,6 +213,17 @@ pub(crate) async fn reauth(
     session.0.lock().await.identity = Some(id); // restore regardless of outcome
     let login = result?;
     Ok((sender, host, login.token))
+}
+
+/// Load the configured connect ADDRESS (`host:port`) that `reauth`/`connect`
+/// dial — i.e. `ConnectionConfig::load(dir).server`, NOT the server's logical
+/// id. Shared by the authenticated commands (admin, feed).
+pub(crate) fn server_of(dir: &std::path::Path) -> Result<String, UiError> {
+    let cfg = ConnectionConfig::load(dir);
+    if cfg.server.is_empty() {
+        return Err(UiError::new("no_server", "No server is configured."));
+    }
+    Ok(cfg.server)
 }
 
 fn now_ms() -> u64 {

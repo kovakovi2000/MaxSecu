@@ -6,4 +6,4 @@ pub mod admin;
 pub mod auth;
 pub mod bootstrap;
 pub mod connection;
-pub mod stubs;
+pub mod feed;
