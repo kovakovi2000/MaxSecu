@@ -398,6 +398,31 @@ pub trait VideoSessionDecoder {
     /// Run the full `Open → Fragment* → Close` exchange and return every decoded
     /// `WorkerMsg`, in order.
     fn run_session(&self, script: &[ClientMsg]) -> Result<Vec<WorkerMsg>, SessionError>;
+
+    /// Resilient (respawn-on-abort) variant of [`run_session`](Self::run_session): on
+    /// a worker-PROCESS abort mid-window, skip the one culprit fragment and respawn a
+    /// FRESH confined worker over the rest, so a single hostile/corrupt fragment drops
+    /// a few frames instead of killing the whole window. `budget` caps the respawns
+    /// (callers pass [`MAX_RESPAWNS_PER_WINDOW`]).
+    ///
+    /// The **provided default** does a single non-resilient attempt — it simply wraps
+    /// [`run_session`](Self::run_session) and reports `Completed` with no skips/respawns.
+    /// Decoders that cannot abort mid-window (e.g. in-process test doubles) get this
+    /// for free; the real OS-confined sessions ([`VideoSubprocessSession`] /
+    /// `AppContainerVideoSession`) OVERRIDE it with the genuine respawn driver.
+    fn run_session_resilient(
+        &self,
+        script: &[ClientMsg],
+        budget: u32,
+    ) -> Result<ResilientOutcome, SessionError> {
+        let _ = budget; // a single attempt never respawns; budget is unused here.
+        Ok(ResilientOutcome {
+            msgs: self.run_session(script)?,
+            skipped: Vec::new(),
+            respawns: 0,
+            terminal: TerminalReason::Completed,
+        })
+    }
 }
 
 /// Defense-in-depth ceiling on the **number** of `WorkerMsg`s the trusted parent
@@ -937,25 +962,6 @@ impl VideoSubprocessSession {
         };
         Ok((msgs, drive_end))
     }
-
-    /// Resilient (respawn-on-abort) variant of [`run_session`](VideoSessionDecoder::run_session):
-    /// a worker-process abort mid-window **skips the one culprit fragment** and
-    /// respawns a FRESH `--video-session` worker over the remaining fragments, so one
-    /// hostile/corrupt fragment drops a few frames instead of killing playback. Every
-    /// respawn spawns a brand-new isolated worker (the skip never relaxes isolation);
-    /// the respawn count is capped at `budget` (pass [`MAX_RESPAWNS_PER_WINDOW`]). The
-    /// existing `run_session` stays the default for callers that don't opt in.
-    ///
-    /// Returns `Err` only if the FIRST worker could not be launched at all (nothing to
-    /// salvage); a worker that started and died is the resilient path → `Ok` with the
-    /// salvaged frames + the `skipped` culprits.
-    pub fn run_session_resilient(
-        &self,
-        script: &[ClientMsg],
-        budget: u32,
-    ) -> Result<ResilientOutcome, SessionError> {
-        run_resilient_over(|s| self.run_attempt(s), script, budget)
-    }
 }
 
 /// Shared adapter from a fallible per-attempt spawner to [`resilient_session`]: a
@@ -1001,6 +1007,24 @@ where
 impl VideoSessionDecoder for VideoSubprocessSession {
     fn run_session(&self, script: &[ClientMsg]) -> Result<Vec<WorkerMsg>, SessionError> {
         self.run_framed(script).map_err(SessionError::Io)
+    }
+
+    /// Resilient (respawn-on-abort) override: a worker-process abort mid-window
+    /// **skips the one culprit fragment** and respawns a FRESH `--video-session`
+    /// worker over the remaining fragments, so one hostile/corrupt fragment drops a
+    /// few frames instead of killing playback. Every respawn spawns a brand-new
+    /// isolated worker (the skip never relaxes isolation); the respawn count is capped
+    /// at `budget` (pass [`MAX_RESPAWNS_PER_WINDOW`]).
+    ///
+    /// Returns `Err` only if the FIRST worker could not be launched at all (nothing to
+    /// salvage); a worker that started and died is the resilient path → `Ok` with the
+    /// salvaged frames + the `skipped` culprits.
+    fn run_session_resilient(
+        &self,
+        script: &[ClientMsg],
+        budget: u32,
+    ) -> Result<ResilientOutcome, SessionError> {
+        run_resilient_over(|s| self.run_attempt(s), script, budget)
     }
 }
 
@@ -1175,24 +1199,6 @@ impl AppContainerVideoSession {
         };
         Ok((msgs, drive_end))
     }
-
-    /// Resilient (respawn-on-abort) variant of [`run_session`](VideoSessionDecoder::run_session)
-    /// inside the AppContainer + Job Object: a confined-worker abort mid-window (the
-    /// F1 rav1d `abort` / the F2 stsz-OOM Job-memory kill) **skips the one culprit
-    /// fragment** and respawns a FRESH **confined** worker over the remaining
-    /// fragments — one hostile/corrupt fragment drops a few frames instead of killing
-    /// playback, and every respawn stays freshly confined (no keys, no net). The
-    /// respawn count is capped at `budget` (pass [`MAX_RESPAWNS_PER_WINDOW`]). The
-    /// existing `run_session` stays the default for callers that don't opt in.
-    ///
-    /// Returns `Err` only if the FIRST confined worker could not be launched at all.
-    pub fn run_session_resilient(
-        &self,
-        script: &[ClientMsg],
-        budget: u32,
-    ) -> Result<ResilientOutcome, SessionError> {
-        run_resilient_over(|s| self.run_attempt(s), script, budget)
-    }
 }
 
 #[cfg(windows)]
@@ -1212,6 +1218,23 @@ impl VideoSessionDecoder for AppContainerVideoSession {
         )
         .map_err(SessionError::Spawn)?;
         result.map_err(SessionError::Io)
+    }
+
+    /// Resilient (respawn-on-abort) override inside the AppContainer + Job Object: a
+    /// confined-worker abort mid-window (the F1 rav1d `abort` / the F2 stsz-OOM
+    /// Job-memory kill) **skips the one culprit fragment** and respawns a FRESH
+    /// **confined** worker over the remaining fragments — one hostile/corrupt fragment
+    /// drops a few frames instead of killing playback, and every respawn stays freshly
+    /// confined (no keys, no net, the same memory cap). The respawn count is capped at
+    /// `budget` (pass [`MAX_RESPAWNS_PER_WINDOW`]).
+    ///
+    /// Returns `Err` only if the FIRST confined worker could not be launched at all.
+    fn run_session_resilient(
+        &self,
+        script: &[ClientMsg],
+        budget: u32,
+    ) -> Result<ResilientOutcome, SessionError> {
+        run_resilient_over(|s| self.run_attempt(s), script, budget)
     }
 }
 

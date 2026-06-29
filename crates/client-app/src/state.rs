@@ -84,6 +84,12 @@ pub enum PlayerPhase {
     Buffering,
     /// Frames are flowing (the window decoded + re-validated).
     Playing,
+    /// A BENIGN, non-terminal notice that the per-fragment resilient decode dropped
+    /// `skipped` fragment(s) whose confined worker aborted (the F1 rav1d panic / F2
+    /// stsz-OOM Job-kill): the rest of the window still decoded, so playback is a
+    /// brief gap (the surviving frames pace by their `pts_ms`), not a failure. Carries
+    /// only the COUNT — no decode oracle / per-fragment detail.
+    Gap { skipped: u32 },
     /// Awaiting the next window / data underrun (non-terminal).
     Stalled,
     /// Failed with a sanitized code (no oracle). Also the benign terminal for a

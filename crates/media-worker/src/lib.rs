@@ -17,8 +17,9 @@ pub use session::VideoSession;
 // types live in `maxsecu-media-launcher`; re-homing them keeps the bin's and the
 // integration tests' `maxsecu_media_worker::{...}` paths unchanged.
 pub use maxsecu_media_launcher::{
-    framing, proto, run_decode, SessionError, SubprocessDecoder, VideoSessionDecoder,
-    VideoSubprocessSession, DEFAULT_WORKER_MEMORY_CAP_BYTES,
+    framing, proto, run_decode, ResilientOutcome, SessionError, SubprocessDecoder, TerminalReason,
+    VideoSessionDecoder, VideoSubprocessSession, DEFAULT_WORKER_MEMORY_CAP_BYTES,
+    MAX_RESPAWNS_PER_WINDOW,
 };
 
 #[cfg(windows)]

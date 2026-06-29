@@ -302,10 +302,15 @@ where
 /// and the `Send + 'static` `decoder` MOVE into [`tokio::task::spawn_blocking`] so
 /// the blocking subprocess spawn + pipe I/O never runs on a tokio worker thread;
 /// the `ScriptGuard` is dropped inside the blocking task, zeroizing the plaintext
-/// on every path. Each returned `WorkerMsg::Video`/`Audio` is re-validated
-/// (`validate_i420`/`validate_pcm`) BEFORE its DTO is emitted (spec §7); a
-/// `WorkerMsg::Error` (or any validation failure) fails closed. Emits `Playing`
-/// once the window's frames have flowed.
+/// on every path. The confined decode uses the RESILIENT driver
+/// ([`VideoSessionDecoder::run_session_resilient`]): a worker-process abort
+/// mid-window skips just the culprit fragment and respawns a fresh confined worker
+/// for the rest (a hostile/corrupt fragment is a brief gap, not a window failure);
+/// the skip is surfaced minimally as a benign [`PlayerPhase::Gap`]. Each returned
+/// `WorkerMsg::Video`/`Audio` is re-validated (`validate_i420`/`validate_pcm`)
+/// BEFORE its DTO is emitted (spec §7); a `WorkerMsg::Error` (a SOFT decode error —
+/// distinct from a hard abort) or any validation failure still fails closed. Emits
+/// `Playing` once the window's frames have flowed.
 async fn decode_and_emit<D, E, OnF, OnA>(
     script: ScriptGuard,
     decoder: D,
@@ -320,20 +325,40 @@ where
     OnA: Fn(PcmDto),
 {
     // Hand ONLY the already-decrypted canonical bytes to the confined worker, on a
-    // blocking thread. `script` is dropped (zeroized) when this closure returns —
-    // regardless of whether `run_session` succeeded.
-    let decoded = tokio::task::spawn_blocking(move || {
-        let result = decoder.run_session(&script.0).map_err(|_| player_err());
+    // blocking thread. The RESILIENT path: a worker-PROCESS abort mid-window (the F1
+    // rav1d panic→abort, the F2 stsz-OOM Job-kill) skips the one culprit fragment and
+    // respawns a FRESH confined worker for the rest — so one hostile/corrupt fragment
+    // drops a few frames instead of failing the whole window. `Err` only if the worker
+    // could not be launched at all (a started-then-died worker is the resilient path).
+    // `script` is dropped (zeroized) when this closure returns — on every path.
+    let outcome = tokio::task::spawn_blocking(move || {
+        let result = decoder
+            .run_session_resilient(&script.0, maxsecu_media_launcher::MAX_RESPAWNS_PER_WINDOW)
+            .map_err(|_| player_err());
         drop(script);
         result
     })
     .await
     .map_err(|_| player_err())??;
 
+    // Surface a dropped fragment MINIMALLY (a hostile/corrupt segment was skipped + a
+    // fresh confined worker took over): reuse the existing player channel with a
+    // BENIGN, non-terminal `Gap` carrying only the skip COUNT (no decode oracle). The
+    // surviving frames still pace by their `pts_ms`, so the UI just notes a brief gap
+    // — no player-core change needed.
+    if outcome.respawns > 0 || !outcome.skipped.is_empty() {
+        emit(PlayerPhase::Gap {
+            skipped: outcome.skipped.len() as u32,
+        });
+    }
+
     // Re-validate EVERY untrusted worker output in the main process before any DTO
-    // crosses the seam (spec §7).
+    // crosses the seam (spec §7). NOTE: `WorkerMsg::Error(_)` still fails closed —
+    // resilience is for hard worker ABORTS only, NOT for soft decode errors (which
+    // remain a fail-closed contract; a worker that survives to report one is trusted
+    // to mean it).
     let bounds = VideoBounds::default();
-    for msg in decoded {
+    for msg in outcome.msgs {
         match msg {
             WorkerMsg::Video(frame) => {
                 validate_i420(&frame, &bounds).map_err(|_| player_err())?;

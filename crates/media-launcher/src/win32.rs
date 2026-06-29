@@ -356,7 +356,24 @@ fn setup_confined_child(
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     si.StartupInfo.hStdInput = child_stdin;
     si.StartupInfo.hStdOutput = child_stdout;
-    si.StartupInfo.hStdError = child_stdout;
+    // stderr is DELIBERATELY NOT the stdout pipe: stdout carries the length-prefixed
+    // FRAME protocol (one-shot proto response / duplex `WorkerMsg` stream), and a
+    // dying worker's diagnostics (a Rust panic message, the alloc-error handler's
+    // "memory allocation of N bytes failed" before `abort`) must NEVER be merged onto
+    // it. Merging them previously corrupted the frame stream on abort: the diagnostic
+    // text's leading bytes parsed as an over-ceiling frame length, so the launcher
+    // read a worker DEATH as a parent-side `Protective` cutoff (over-ceiling frame) and
+    // the resilient driver refused to respawn — a confined-worker abort (F1 rav1d panic
+    // / F2 stsz-OOM Job-kill) lost the rest of the window instead of skipping just the
+    // culprit fragment. With stderr routed to NULL (the worker has STARTF_USESTDHANDLES
+    // set, so this is a real "no stderr device", not console inheritance), an abort now
+    // surfaces on the FRAME pipe as a clean truncation/EOF which — combined with the
+    // non-zero/killed process exit code — classifies as `WorkerGone` (resumable), so
+    // the per-fragment skip+respawn works. This does NOT weaken any confinement (the
+    // worker simply has nowhere to write diagnostics) and does NOT touch the
+    // over-ceiling→`Protective` defense against a LIVE worker streaming a bomb-frame on
+    // the real frame pipe.
+    si.StartupInfo.hStdError = ptr::null_mut();
     si.lpAttributeList = attr_list;
 
     let app = wide(&worker_path.to_string_lossy());
