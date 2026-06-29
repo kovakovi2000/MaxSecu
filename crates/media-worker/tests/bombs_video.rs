@@ -40,9 +40,12 @@
 //! [`AppContainerVideoSession`] (the launcher returns bounded — does not hang —
 //! and no frame escapes the confined boundary) and a cross-platform
 //! [`VideoSubprocessSession`] garbage case over a real process boundary. (Neither
-//! confined case triggers an actual worker KILL — both inputs are rejected
-//! cleanly and the worker exits 0; the in-decode over-allocation Job-memory-cap
-//! kill path is the launcher's concern, exercised by the Task-3.6 fuzz corpus.)
+//! confined case here triggers an actual worker KILL — both inputs are rejected
+//! cleanly and the worker exits 0. The in-decode over-allocation Job-memory-cap
+//! KILL path is the launcher's concern: the Task-3.6 fuzz corpus / `fuzz_replay`
+//! run IN-PROCESS (no Job Object), so they only SURFACE the over-allocation (as a
+//! raw OOM); the actual confined memory-cap kill of the F2 repro is exercised by
+//! `tests/oom_kill_windows.rs::f2_oom_overalloc_killed_confined_no_frame_escapes`.)
 
 #[path = "support/mod.rs"]
 mod support;
@@ -406,8 +409,10 @@ fn bomb_fragment_before_open_fails_closed() {
 // ===========================================================================
 // Confined / cross-process bombs — prove the OS-isolated launcher rejects a bomb
 // BOUNDED (does not hang) and that NO frame escapes the process boundary. (Both
-// inputs here are rejected cleanly; the worker exits 0, it is not killed — the
-// in-decode memory-cap kill path is the launcher's concern, fuzzed in Task 3.6.)
+// inputs here are rejected cleanly; the worker exits 0, it is not killed. The
+// in-decode over-allocation memory-cap KILL is a separate path — the in-process
+// Task-3.6 fuzz/replay only SURFACE it (no Job Object); the confined kill of the
+// F2 repro is proven in `tests/oom_kill_windows.rs`.)
 // ===========================================================================
 
 /// Absolute path to the built worker binary (cargo provides it for the bin target).
@@ -458,9 +463,12 @@ fn bomb_garbage_over_subprocess_session_bounded() {
 /// NOTE — what this case does NOT exercise: the genuine in-decode over-allocation
 /// KILL path (Job Object memory cap, and the 120s timeout → TerminateProcess
 /// backstop; ratification M-2) is the launcher's responsibility for inputs that
-/// would over-allocate DURING decode. That kill is verified by the win32 launcher
-/// code review and exercised by the fuzz corpus (Task 3.6) — not by this case,
-/// which only crosses the process boundary and hits the post-decode cap.
+/// would over-allocate DURING decode. That kill is NOT exercised by the Task-3.6
+/// fuzz corpus / `fuzz_replay` either — those run IN-PROCESS (no Job Object) and
+/// only SURFACE the over-allocation as a raw OOM. The actual confined memory-cap
+/// kill of the F2 repro (`fuzz/crash-repros/oom_stsz_overalloc.bin`) is exercised
+/// by `tests/oom_kill_windows.rs::f2_oom_overalloc_killed_confined_no_frame_escapes`,
+/// not by this case (which only crosses the boundary and hits the post-decode cap).
 #[cfg(windows)]
 #[test]
 fn bomb_oversize_dimension_confined_appcontainer_bounded() {

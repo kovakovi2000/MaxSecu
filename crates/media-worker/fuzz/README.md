@@ -51,15 +51,28 @@ On this host the fuzzer **found genuine decoder DoS inputs** within seconds:
 
 **Both are contained in production by the OS sandbox, by design:** the decode runs
 in the AppContainer + Job-Object worker (512 MiB memory cap + process isolation);
-a panic aborts the worker and an over-allocation trips the memory cap, in both
+a panic aborts the worker and an over-allocation trips the memory cap (or the
+over-cap commit fails and Rust's alloc-error handler aborts the worker), in both
 cases killing the worker so the launcher returns a bounded error and no frame
-escapes (media-sandbox §3; the exact "in-decode over-allocation Job-memory-cap
-kill path … exercised by the Task-3.6 fuzz corpus" called out in
-`tests/bombs_video.rs`). Neither is memory-unsafety/RCE — AddressSanitizer
-reported no memory error; rav1d is pure-Rust. The OOM has **no** clean in-process
-fix (the Job memory cap is the architectural backstop). See `crash-repros/README.md`
-and the Task 3.6 sign-off for the full triage; a `catch_unwind`/upstream-rav1d
-hardening is a recommended follow-up for the decoder/launcher team.
+escapes (media-sandbox §3). Neither is memory-unsafety/RCE — AddressSanitizer
+reported no memory error; rav1d is pure-Rust.
+
+**What this in-process fuzz/replay does and does NOT prove:** run with **no Job
+Object**, it only **surfaces** the over-allocation (as a raw OOM) — it does NOT
+exercise the confined memory-cap kill. The actual confined Job-memory-cap kill of
+the F2 repro is exercised by the Windows regression test
+`tests/oom_kill_windows.rs::f2_oom_overalloc_killed_confined_no_frame_escapes`
+(256 MiB-capped `AppContainerVideoSession` → worker bounded, zero frames escape).
+
+For F1 (the rav1d panic), note that a session-level `catch_unwind` is
+**ineffective**: the panic unwinds out of a plain `extern "C"` frame, which trips
+`panic_cannot_unwind` and aborts the process below any caller `catch_unwind`.
+Per-fragment resilience would need launcher-level worker **respawn** (a Gate-4
+concern). The OOM (F2) has **no** clean in-process fix — the Job memory cap is the
+architectural backstop. Recommended upstream follow-ups: a rav1d issue for the
+`decode.rs:4997` `unwrap`, and a symphonia issue for the missing length bound in
+`read_raw_boxed_slice_exact`. See `crash-repros/README.md` and the Task 3.6
+sign-off for the full triage.
 
 ## Runnable local proof on every host
 
