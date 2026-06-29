@@ -1,10 +1,6 @@
 //! Launcher configuration (Phase-6 Task 2). Resolves the runtime profile and
 //! paths/ports from the environment. `from_parts` is pure (takes an env lookup
 //! closure) so it is testable without touching the real process environment.
-// Wired into the launcher in Task 5; until then these items are exercised only
-// by the unit tests, so the non-test bin build sees them as dead.
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 /// Runtime profile. `Dev` runs with no external deps (MemoryStore + FsBlobStore);

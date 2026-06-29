@@ -5,10 +5,6 @@
 //!   public key is STABLE across restarts. In PRODUCTION the D5 private key is
 //!   offline (the air-gapped ceremony) and only its PUBLIC key is pinned — this
 //!   dev key is a convenience, never a production ceremony key.
-// Wired into the launcher in Task 5; until then these items are exercised only
-// by the unit tests, so the non-test bin build sees them as dead.
-#![allow(dead_code)]
-
 use maxsecu_admin_core::DirectorySigner;
 
 use crate::layout::Layout;

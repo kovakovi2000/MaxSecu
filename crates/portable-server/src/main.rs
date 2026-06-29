@@ -10,8 +10,10 @@ mod bootstrap;
 mod config;
 mod layout;
 mod pki;
+mod run;
 
-fn main() {
-    eprintln!("maxsecu-portable-server: starting…");
-    // Launcher logic is wired up across Phase-6 Tasks 2–7.
+fn main() -> std::io::Result<()> {
+    let cfg = config::LauncherConfig::from_env();
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run::run(cfg))
 }

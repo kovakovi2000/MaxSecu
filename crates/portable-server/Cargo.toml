@@ -21,6 +21,10 @@ base64 = "0.22"
 # feature-less workspace pin with the runtime features the launcher needs.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 tokio-rustls = { workspace = true }
+# Names the `axum::Router` type returned by `maxsecu_server::router` and stored in
+# `Prepared`. Same 0.8 already resolved in-tree (the server's HTTP plane), so
+# cargo-deny sees no new external version.
+axum = "0.8"
 rcgen = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

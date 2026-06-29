@@ -1,10 +1,6 @@
 //! Portable folder layout (Phase-6 Task 2). All server-side artifacts (TLS cert,
 //! blobs, D5 key material, bootstrap marker, logs) live under a single portable
 //! `data_dir` root. [`Layout::ensure`] creates the sub-directories idempotently.
-// Wired into the launcher in Task 5; until then these items are exercised only
-// by the unit tests, so the non-test bin build sees them as dead.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 /// Portable folder layout rooted at a `data_dir`.

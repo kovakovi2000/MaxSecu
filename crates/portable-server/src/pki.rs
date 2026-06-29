@@ -2,11 +2,6 @@
 //! `localhost` cert on first run, persists it (reused on restart), builds the
 //! rustls ServerConfig (aws_lc_rs, TLS 1.3), and exports the DER cert to where a
 //! client pins it. PROD injects a real cert (not this).
-// Wired into the launcher in Task 5; until then `load_server_config` /
-// `export_client_pin` are exercised only by the unit test, so the non-test bin
-// build sees them as dead.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
