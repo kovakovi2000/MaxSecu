@@ -55,6 +55,27 @@ pub struct RecoveryRecipient {
     pub mlkem_pub: Option<[u8; 1184]>,
 }
 
+/// Verify an already-fetched recovery-recipient `(binding_bytes, signature)` under
+/// the pinned D5 and extract its wrap-target keys. Factored out so it is unit-
+/// testable without TLS (mirrors `verify_author_binding`).
+pub fn verify_recovery_binding(
+    verifier: &DirectoryVerifier,
+    trust: &mut dyn TrustStore,
+    binding_bytes: &[u8],
+    signature: &[u8; 64],
+    now_ms: u64,
+) -> Result<RecoveryRecipient, UiError> {
+    let binding: DirBinding = decode(binding_bytes)
+        .map_err(|_| UiError::new("untrusted", "Malformed directory record."))?;
+    let v = verifier
+        .verify_binding(&binding, signature, now_ms, trust)
+        .map_err(|_| UiError::new("untrusted", "The recovery recipient could not be verified."))?;
+    Ok(RecoveryRecipient {
+        enc_pub: v.enc_pub,
+        mlkem_pub: v.mlkem_pub,
+    })
+}
+
 /// Resolve + D5-verify the configured recovery recipient by username
 /// (`GET /v1/directory/{username}`). Fail-closed `untrusted` if unpublished/forged.
 pub async fn resolve_recovery_recipient(
@@ -75,15 +96,7 @@ pub async fn resolve_recovery_recipient(
         ));
     }
     let (bytes, sig) = parse_binding(&json)?;
-    let binding: DirBinding =
-        decode(&bytes).map_err(|_| UiError::new("untrusted", "Malformed directory record."))?;
-    let v = verifier
-        .verify_binding(&binding, &sig, now_ms, trust)
-        .map_err(|_| UiError::new("untrusted", "The recovery recipient could not be verified."))?;
-    Ok(RecoveryRecipient {
-        enc_pub: v.enc_pub,
-        mlkem_pub: v.mlkem_pub,
-    })
+    verify_recovery_binding(verifier, trust, &bytes, &sig, now_ms)
 }
 
 /// Decode a §6.1 `BindingRes` JSON body into `(binding_bytes, signature)`.
@@ -190,17 +203,26 @@ mod tests {
         let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
         let mut trust = MemoryTrustStore::new();
         let (bytes, sig) = signed_binding(&d5); // enc_pub [0xE1;32], sig_pub [0x51;32]
-        let binding: maxsecu_encoding::structs::DirBinding =
-            maxsecu_encoding::decode(&bytes).unwrap();
-        let v = verifier
-            .verify_binding(&binding, &sig, NOW, &mut trust)
-            .unwrap();
-        let rr = super::RecoveryRecipient {
-            enc_pub: v.enc_pub,
-            mlkem_pub: v.mlkem_pub,
-        };
+        let rr = verify_recovery_binding(&verifier, &mut trust, &bytes, &sig, NOW).unwrap();
         assert_eq!(rr.enc_pub, [0xE1; 32]);
         assert_eq!(rr.mlkem_pub, None);
+    }
+
+    #[test]
+    fn recovery_recipient_rejects_wrong_key() {
+        let d5 = SigningKey::generate();
+        let attacker = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+        let mut trust = MemoryTrustStore::new();
+        let (bytes, _) = signed_binding(&d5);
+        let forged =
+            attacker.sign_canonical(labels::DIRBINDING, &decode::<DirBinding>(&bytes).unwrap());
+        assert_eq!(
+            verify_recovery_binding(&verifier, &mut trust, &bytes, &forged, NOW)
+                .unwrap_err()
+                .code,
+            "untrusted"
+        );
     }
 
     #[test]
