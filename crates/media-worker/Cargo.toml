@@ -21,6 +21,26 @@ path = "src/main.rs"
 # worker runs the SAME decode, just in an isolated process.
 maxsecu-client-core = { path = "../client-core" }
 
+# ---- Phase 7 sandboxed-video codec set (Gate-1 ratified, asm OFF = zero-C) ----
+# These are the persistent-session video path's runtime decoders (adopted here in
+# Gate 3.1; wired into `src/session.rs` in 3.2). In 3.1 they are referenced only
+# from the test-support fixture/assertion, but they are declared as normal deps
+# (not dev-deps) because they become real `session` runtime deps next task.
+#
+# `rav1d` — memory-safe Rust port of dav1d (THE #1 AV1-decode RCE surface). The
+# `asm` feature (needs nasm, pulls C/assembly) is OFF; only the pure-Rust
+# `bitdepth_8`/`bitdepth_16` paths are built.
+rav1d = { version = "1.1.0", default-features = false, features = [
+    "bitdepth_8",
+    "bitdepth_16",
+] }
+# `symphonia` — pure-Rust CMAF/ISO-BMFF demux (`isomp4`) + AAC-LC decode (`aac`).
+# No `default-features` (no MP3/other parsers); zero-C.
+symphonia = { version = "0.6.0", default-features = false, features = [
+    "isomp4",
+    "aac",
+] }
+
 # Win32 OS-confinement (AppContainer + Job Object) for the decode launcher
 # (6b-ii). Windows-only; FFI bindings to the OS (not a vendored C library), so
 # the no-C posture holds. unsafe is confined to the audited `win32` module.
@@ -37,6 +57,11 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# `rav1e` — pure-Rust AV1 *encoder*. FIXTURE-ONLY in this crate (synthesizes
+# known-good AV1 bitstreams for the test-support canonical-clip generator); NOT in
+# the production view path (real encode rides the C-confined ingest worker). asm
+# OFF (no nasm) keeps it zero-C.
+rav1e = { version = "0.8.1", default-features = false }
 
 [lints.rust]
 # `unsafe` is DENIED crate-wide and re-allowed ONLY in the contained, audited
