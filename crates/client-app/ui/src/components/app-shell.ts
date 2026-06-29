@@ -10,6 +10,8 @@ import "./feed-screen.ts";
 import "./media-viewer.ts";
 import "./upload-screen.ts";
 import "./upload-tray.ts";
+import "./settings-screen.ts";
+import { loadAndApplySettings } from "../core/settings.ts";
 import type { StatusPill } from "./status-pill.ts";
 import type { ConnState } from "../core/types.ts";
 
@@ -18,12 +20,14 @@ export class AppShell extends HTMLElement {
     this.innerHTML = `
       <header role="banner">
         <nav role="navigation" aria-label="Primary">
-          <a href="#/feed">Feed</a> &middot; <span>My Content</span> &middot; <a href="#/upload">Upload</a> &middot; <a href="#/admin">Admin</a> &middot; <span>Settings</span>
+          <a href="#/feed">Feed</a> &middot; <span>My Content</span> &middot; <a href="#/upload">Upload</a> &middot; <a href="#/admin">Admin</a> &middot; <a href="#/settings">Settings</a>
         </nav>
         <status-pill id="pill"></status-pill>
         <upload-tray></upload-tray>
       </header>
       <div id="outlet"></div>`;
+    // Apply persisted a11y prefs at startup, regardless of the current route.
+    void loadAndApplySettings();
     const outlet = this.querySelector("#outlet")!;
     const pill = this.querySelector("#pill") as StatusPill;
     new Router((r) => {
@@ -40,6 +44,8 @@ export class AppShell extends HTMLElement {
           ? "<media-viewer></media-viewer>"
           : r === "upload"
           ? "<upload-screen></upload-screen>"
+          : r === "settings"
+          ? "<settings-screen></settings-screen>"
           : r === "admin"
           ? "<admin-screen></admin-screen>"
           : r === "bootstrap"
