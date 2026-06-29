@@ -34,6 +34,44 @@ pub async fn get_json(
     send(sender, "GET", uri, None, bearer, host).await
 }
 
+/// GET a raw `application/octet-stream` body (a ciphertext chunk); return
+/// `(status, bytes)`. `bearer` adds the channel-bound `Authorization` header.
+/// `host` is the connect host threaded into the `Host` header (see [`post_json`]).
+pub async fn get_bytes(
+    sender: &mut SendRequest<Full<Bytes>>,
+    uri: &str,
+    bearer: Option<&str>,
+    host: &str,
+) -> Result<(StatusCode, Vec<u8>), UiError> {
+    sender
+        .ready()
+        .await
+        .map_err(|_| UiError::new("offline", "Lost connection to the server."))?;
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("host", host);
+    if let Some(tok) = bearer {
+        builder = builder.header("authorization", format!("MaxSecu-Session {tok}"));
+    }
+    let req = builder
+        .body(Full::new(Bytes::new()))
+        .map_err(|_| UiError::new("internal", "Could not build the request."))?;
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|_| UiError::new("offline", "The server did not respond."))?;
+    let status = resp.status();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|_| UiError::new("offline", "The response was interrupted."))?
+        .to_bytes()
+        .to_vec();
+    Ok((status, bytes))
+}
+
 async fn send(
     sender: &mut SendRequest<Full<Bytes>>,
     method: &str,
@@ -84,6 +122,24 @@ mod tests {
     #[test]
     fn module_compiles() {
         // Behavior is exercised by the e2e (live TLS); this guards the surface.
+        assert_eq!(2 + 2, 4);
+    }
+
+    #[test]
+    fn get_bytes_is_exposed() {
+        // Compile-time guard that the raw-bytes accessor exists with the expected
+        // signature (mirrors get_json: sender, uri, bearer, host -> (status,
+        // bytes)); behavior is exercised over live TLS by the Phase-3 e2e.
+        // Returning (not binding) the future avoids clippy::let_underscore_future.
+        fn _assert_sig(
+            s: &mut hyper::client::conn::http1::SendRequest<
+                http_body_util::Full<hyper::body::Bytes>,
+            >,
+        ) -> impl std::future::Future<
+            Output = Result<(hyper::StatusCode, Vec<u8>), crate::error::UiError>,
+        > + '_ {
+            super::get_bytes(s, "/x", None, "localhost")
+        }
         assert_eq!(2 + 2, 4);
     }
 }
