@@ -42,3 +42,8 @@ pub struct RegisterUserRequest {
     pub password: String,
     pub voucher: String,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountStatusRequest {
+    pub username: String,
+}

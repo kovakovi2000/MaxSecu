@@ -6,6 +6,7 @@ use serde::Serialize;
 
 pub const EVT_CONNECTION: &str = "maxsecu://connection-state";
 pub const EVT_AUTH: &str = "maxsecu://auth-state";
+pub const EVT_ACCOUNT: &str = "maxsecu://account-state";
 
 // The complete connection-state vocabulary streamed to the UI. `connect` emits
 // the connect-flow subset (Resolving/TlsHandshake/ChannelBinding/Connected/
@@ -40,6 +41,18 @@ pub enum AuthState {
     Reauthenticating,
 }
 
+/// Approval status for the signed-in account (D-G). `Pending` shows the
+/// status-only screen; `Active` unlocks the app. `Unknown` is the pre-poll
+/// default.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "state")]
+pub enum AccountState {
+    Unknown,
+    Pending,
+    Active,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +63,13 @@ mod tests {
         assert_eq!(j, "{\"state\":\"tls-handshake\"}");
         let j = serde_json::to_string(&AuthState::UnlockingKeystore).unwrap();
         assert_eq!(j, "{\"state\":\"unlocking-keystore\"}");
+    }
+
+    #[test]
+    fn account_state_serializes_kebab_tagged() {
+        assert_eq!(
+            serde_json::to_string(&AccountState::Pending).unwrap(),
+            "{\"state\":\"pending\"}"
+        );
     }
 }

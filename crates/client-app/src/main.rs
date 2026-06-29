@@ -22,6 +22,7 @@ fn main() {
             maxsecu_client_app::commands::bootstrap::register_glassbreak,
             maxsecu_client_app::commands::bootstrap::create_first_admin,
             maxsecu_client_app::commands::bootstrap::register_user,
+            maxsecu_client_app::commands::bootstrap::account_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MaxSecu client");

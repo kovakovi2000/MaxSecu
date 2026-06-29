@@ -11,9 +11,13 @@ use tauri::State;
 use crate::commands::auth::AppDir;
 use crate::commands::connection::open_conn;
 use crate::config::ConnectionConfig;
-use crate::dto::{BootstrapRequest, FirstAdminRequest, GlassbreakResponse, RegisterUserRequest};
+use crate::dto::{
+    AccountStatusRequest, BootstrapRequest, FirstAdminRequest, GlassbreakResponse,
+    RegisterUserRequest,
+};
 use crate::error::UiError;
-use crate::http_client::post_json;
+use crate::http_client::{get_json, post_json};
+use crate::state::AccountState;
 use crate::{bootstrap, keystore};
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -126,6 +130,38 @@ pub async fn register_user(
             "That invite code is invalid or used.",
         )),
         _ => Err(UiError::new("register_failed", "Registration failed.")),
+    }
+}
+
+/// `account_status` — poll whether the signed-in account has been approved (its
+/// binding published). `404` → Pending; `200` → Active. Status only — the
+/// directory body is opaque here (the client TCB re-verifies it elsewhere).
+///
+/// SECURITY: the served directory body is intentionally ignored (`_json`). This
+/// is a coarse status poll only; the full client-side D5/TOFU re-verification of
+/// a served binding lives in the TCB / trust-store flow, NOT in this check — so
+/// we never treat an unverified served binding as trusted here.
+#[tauri::command]
+pub async fn account_status(
+    req: AccountStatusRequest,
+    dir: State<'_, AppDir>,
+) -> Result<AccountState, UiError> {
+    let server = server_of(&dir.0)?;
+    let (mut sender, host, _exp) = open_conn(&dir.0, &server).await?;
+    let (status, _json) = get_json(
+        &mut sender,
+        &format!("/v1/directory/{}", req.username),
+        None,
+        &host,
+    )
+    .await?;
+    match status {
+        StatusCode::OK => Ok(AccountState::Active),
+        StatusCode::NOT_FOUND => Ok(AccountState::Pending),
+        _ => Err(UiError::new(
+            "status_failed",
+            "Could not check account status.",
+        )),
     }
 }
 
