@@ -10,7 +10,7 @@ import type { Settings } from "../core/types.ts";
 // fieldsets, role=status live regions for save + account feedback.
 const DEFAULTS: Settings = {
   a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
-  behavior: { confirm_destructive: true },
+  behavior: { confirm_destructive: false },
   performance: { ram_cache_cap_mb: 256 },
   connection: { use_tor: false },
 };
