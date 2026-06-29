@@ -1060,6 +1060,43 @@ mod tests {
     }
 
     #[test]
+    fn open_headers_rejects_a_tampered_small_stream() {
+        let built = build();
+        let db = self_bundle(&built.bundle);
+        // Tamper the metadata (a non-content small) stream's first chunk.
+        let mut small: Vec<StreamChunks> = db
+            .streams
+            .iter()
+            .filter(|s| s.stream_type != StreamType::Content)
+            .map(|s| StreamChunks { stream_type: s.stream_type, chunks: s.chunks.clone() })
+            .collect();
+        let meta = small
+            .iter_mut()
+            .find(|s| s.stream_type == StreamType::Metadata)
+            .expect("metadata small stream present");
+        meta.chunks[0][0] ^= 0x01;
+        let header = StreamHeader {
+            manifest_bytes: db.manifest_bytes.clone(),
+            manifest_sig: db.manifest_sig,
+            genesis_bytes: db.genesis_bytes.clone(),
+            genesis_sig: db.genesis_sig,
+            wrapped_dek: db.wrapped_dek.clone(),
+            grant_bytes: db.grant_bytes.clone(),
+            grant_sig: db.grant_sig,
+            ancestor_grants: vec![],
+            recovery_grant_bytes: db.recovery_grant_bytes.clone(),
+            recovery_grant_sig: db.recovery_grant_sig,
+            small_streams: small,
+        };
+        // A flipped byte is caught either by the whole-stream digest or the AEAD open.
+        assert!(matches!(
+            verify_and_open_headers(&ctx(&built), &header),
+            Err(DownloadError::StreamDigestMismatch(StreamType::Metadata))
+                | Err(DownloadError::StreamFraming(StreamType::Metadata))
+        ));
+    }
+
+    #[test]
     fn round_trips_self_recipient() {
         let built = build();
         let db = self_bundle(&built.bundle);
