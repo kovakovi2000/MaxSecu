@@ -8,6 +8,7 @@ import "./pending-screen.ts";
 import "./admin-screen.ts";
 import "./feed-screen.ts";
 import "./media-viewer.ts";
+import "./upload-screen.ts";
 import type { StatusPill } from "./status-pill.ts";
 import type { ConnState } from "../core/types.ts";
 
@@ -16,7 +17,7 @@ export class AppShell extends HTMLElement {
     this.innerHTML = `
       <header role="banner">
         <nav role="navigation" aria-label="Primary">
-          <a href="#/feed">Feed</a> &middot; <span>My Content</span> &middot; <span>Upload</span> &middot; <a href="#/admin">Admin</a> &middot; <span>Settings</span>
+          <a href="#/feed">Feed</a> &middot; <span>My Content</span> &middot; <a href="#/upload">Upload</a> &middot; <a href="#/admin">Admin</a> &middot; <span>Settings</span>
         </nav>
         <status-pill id="pill"></status-pill>
       </header>
@@ -35,6 +36,8 @@ export class AppShell extends HTMLElement {
           ? "<feed-screen></feed-screen>"
           : r === "viewer"
           ? "<media-viewer></media-viewer>"
+          : r === "upload"
+          ? "<upload-screen></upload-screen>"
           : r === "admin"
           ? "<admin-screen></admin-screen>"
           : r === "bootstrap"

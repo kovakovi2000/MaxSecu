@@ -50,3 +50,24 @@ export type FetchMsg =
   | { phase: "decrypting"; file_id: string }
   | { phase: "ready"; file_id: string }
   | { phase: "failed"; file_id: string; code: string };
+
+// --- Phase 4 (upload) DTO mirrors of the Rust serde shapes ---
+export type UploadKind = "image" | "blog";
+
+export interface UploadPreview {
+  job_id: string;
+  file_type: string;
+  title: string;
+  tags: string[];
+  byte_size: number;
+  total_chunks: number;
+  thumbnail_b64: string | null;
+}
+
+export type UploadMsg =
+  | { phase: "encrypting"; job_id: string }
+  | { phase: "staging"; job_id: string }
+  | { phase: "uploading"; job_id: string; done: number; total: number }
+  | { phase: "finalizing"; job_id: string }
+  | { phase: "done"; job_id: string; file_id: string }
+  | { phase: "failed"; job_id: string; code: string };
