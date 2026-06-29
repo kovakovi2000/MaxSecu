@@ -76,7 +76,6 @@ pub fn unlock(dir: &Path, password: &str) -> Result<Identity, UiError> {
 /// failure the original blob is left intact (atomic temp-then-rename).
 ///
 /// Wired into a Tauri command in Phase-5 Task 4.
-#[allow(dead_code)]
 pub fn change_password(dir: &Path, old: &str, new: &str) -> Result<(), UiError> {
     // Fail closed on a weak new password before doing anything to the blob.
     password::check(new).map_err(|_| UiError::new("weak_password", "Password is too weak."))?;
@@ -105,7 +104,6 @@ pub fn change_password(dir: &Path, old: &str, new: &str) -> Result<(), UiError> 
 /// backup. NEVER decrypts; writes ciphertext only.
 ///
 /// Wired into a Tauri command in Phase-5 Task 4.
-#[allow(dead_code)]
 pub fn export_keystore(dir: &Path, dest: &str) -> Result<(), UiError> {
     let blob = std::fs::read(keystore_path(dir))
         .map_err(|_| UiError::new("no_keystore", "No keystore on this device."))?;

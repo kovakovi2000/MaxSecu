@@ -16,6 +16,17 @@ pub struct ConnectResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub old_password: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExportKeystoreRequest {
+    pub dest_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct BootstrapRequest {
     pub bootstrap_secret: String,
     /// Optional directory to ALSO write the encrypted glass-break keystore into.
