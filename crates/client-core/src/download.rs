@@ -705,6 +705,81 @@ where
     })
 }
 
+/// Run the §12.5 header ladder, then decrypt **only the non-content (small)
+/// streams** — never fetching or releasing the `content` stream. Same fail-closed
+/// header proof as [`verify_and_open`] / [`verify_and_stream_content`] (it calls the
+/// shared [`verify_header`]); it just does strictly less work, for callers (a feed
+/// card) that need a verified `metadata`/`thumbnail` without the (possibly large)
+/// content (DESIGN §12.5 / §8.6). `content_chunk_count` is reported from the
+/// verified manifest so the caller can later stream the content with the same proof.
+pub fn verify_and_open_headers(
+    ctx: &VerifyContext,
+    header: &StreamHeader,
+) -> Result<OpenedHeader, DownloadError> {
+    use DownloadError::*;
+
+    let (manifest, dek, recovery_grant_ok) = verify_header(
+        ctx,
+        &header.manifest_bytes,
+        &header.manifest_sig,
+        &header.genesis_bytes,
+        &header.genesis_sig,
+        &header.grant_bytes,
+        &header.grant_sig,
+        &header.ancestor_grants,
+        &header.recovery_grant_bytes,
+        &header.recovery_grant_sig,
+        &header.wrapped_dek,
+    )?;
+
+    let mut small = Vec::new();
+    let mut content_ms: Option<&maxsecu_encoding::structs::Stream> = None;
+    for ms in &manifest.streams {
+        if ms.compression != Compression::None {
+            return Err(CompressionUnsupported);
+        }
+        if ms.stream_type == StreamType::Content {
+            content_ms = Some(ms);
+            continue;
+        }
+        let provided = header
+            .small_streams
+            .iter()
+            .find(|s| s.stream_type == ms.stream_type)
+            .ok_or(StreamMissing(ms.stream_type))?;
+        if provided.chunks.len() as u64 != ms.chunk_count {
+            return Err(FramingBoundsExceeded("chunk_count mismatch"));
+        }
+        if stream_digest(&provided.chunks) != ms.digest.0 {
+            return Err(StreamDigestMismatch(ms.stream_type));
+        }
+        let ck = dek.stream_subkey(ms.stream_type);
+        let plaintext = open_stream(&ck, ctx.file_id, manifest.version, ms.stream_type, &provided.chunks)
+            .map_err(|_| StreamFraming(ms.stream_type))?;
+        small.push(OpenedStream {
+            stream_type: ms.stream_type,
+            plaintext,
+        });
+    }
+
+    // The content stream must be declared in the manifest (DESIGN §12.3), even
+    // though we do not fetch it here — its framing count is reported back.
+    let content_ms = content_ms.ok_or(StreamMissing(StreamType::Content))?;
+    match content_ms.chunk_count.checked_mul(manifest.chunk_size as u64) {
+        Some(b) if b <= MAX_ADDRESSABLE_BYTES => {}
+        _ => return Err(FramingBoundsExceeded("addressable size")),
+    }
+
+    Ok(OpenedHeader {
+        version: manifest.version,
+        file_type: manifest.file_type,
+        content_digest: content_ms.digest.0,
+        recovery_grant_ok,
+        content_chunk_count: content_ms.chunk_count,
+        small_streams: small,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,6 +994,69 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, DownloadError::StreamMissing(StreamType::Content));
+    }
+
+    #[test]
+    fn open_headers_decodes_small_streams_without_content() {
+        let built = build();
+        let db = self_bundle(&built.bundle);
+        // A header-only bundle: the same records + wrap, but ONLY the non-content
+        // streams supplied (content chunks deliberately withheld).
+        let small: Vec<StreamChunks> = db
+            .streams
+            .iter()
+            .filter(|s| s.stream_type != StreamType::Content)
+            .map(|s| StreamChunks { stream_type: s.stream_type, chunks: s.chunks.clone() })
+            .collect();
+        let header = StreamHeader {
+            manifest_bytes: db.manifest_bytes.clone(),
+            manifest_sig: db.manifest_sig,
+            genesis_bytes: db.genesis_bytes.clone(),
+            genesis_sig: db.genesis_sig,
+            wrapped_dek: db.wrapped_dek.clone(),
+            grant_bytes: db.grant_bytes.clone(),
+            grant_sig: db.grant_sig,
+            ancestor_grants: vec![],
+            recovery_grant_bytes: db.recovery_grant_bytes.clone(),
+            recovery_grant_sig: db.recovery_grant_sig,
+            small_streams: small,
+        };
+        let opened = verify_and_open_headers(&ctx(&built), &header).expect("header opens");
+        assert_eq!(opened.version, 1);
+        assert!(opened.recovery_grant_ok);
+        // The metadata small-stream decrypts; content is NOT among the returned streams.
+        let meta = opened
+            .small_streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Metadata)
+            .unwrap();
+        assert_eq!(meta.plaintext, b"title=fox");
+        assert!(opened.small_streams.iter().all(|s| s.stream_type != StreamType::Content));
+        // The content framing count is still reported from the verified manifest.
+        assert!(opened.content_chunk_count >= 1);
+    }
+
+    #[test]
+    fn open_headers_rejects_a_forged_manifest() {
+        let built = build();
+        let db = self_bundle(&built.bundle);
+        let header = StreamHeader {
+            manifest_bytes: db.manifest_bytes.clone(),
+            manifest_sig: { let mut s = db.manifest_sig; s[0] ^= 0x01; s },
+            genesis_bytes: db.genesis_bytes.clone(),
+            genesis_sig: db.genesis_sig,
+            wrapped_dek: db.wrapped_dek.clone(),
+            grant_bytes: db.grant_bytes.clone(),
+            grant_sig: db.grant_sig,
+            ancestor_grants: vec![],
+            recovery_grant_bytes: db.recovery_grant_bytes.clone(),
+            recovery_grant_sig: db.recovery_grant_sig,
+            small_streams: vec![],
+        };
+        assert_eq!(
+            verify_and_open_headers(&ctx(&built), &header),
+            Err(DownloadError::ManifestSignature)
+        );
     }
 
     #[test]
