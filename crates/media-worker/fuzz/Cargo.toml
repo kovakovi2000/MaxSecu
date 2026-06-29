@@ -1,0 +1,38 @@
+# cargo-fuzz crate for the persistent video decode session (MaxSecu Media App
+# Phase 7, Task 3.6; media-sandbox §3, spec §7).
+#
+# This crate is INTENTIONALLY its own workspace root (the empty `[workspace]`
+# table below) so it is EXCLUDED from the main MaxSecu cargo workspace. It pulls
+# `libfuzzer-sys` and must be built with `cfg(fuzzing)` + a sanitizer (nightly),
+# neither of which the main-workspace gates (`cargo build/test/clippy
+# --workspace`, `cargo deny check`, `cargo audit`) should ever see. The runnable
+# local proof on stable/MSVC is `crates/media-worker/tests/fuzz_replay.rs`, which
+# replays this same corpus through `VideoSession::feed` WITHOUT libFuzzer.
+#
+# To run the fuzzer (Linux + nightly, or any host where libFuzzer/ASan is
+# available) see `fuzz/README.md`.
+[package]
+name = "maxsecu-media-worker-fuzz"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.96"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+maxsecu-media-worker = { path = ".." }
+maxsecu-client-core = { path = "../../client-core" }
+
+[[bin]]
+name = "decode_session"
+path = "fuzz_targets/decode_session.rs"
+test = false
+doc = false
+bench = false
+
+# Own workspace root → excluded from the parent MaxSecu workspace. The main gates
+# never compile `libfuzzer-sys` or this `cfg(fuzzing)` target.
+[workspace]

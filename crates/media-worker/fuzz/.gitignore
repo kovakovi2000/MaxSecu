@@ -1,0 +1,5 @@
+# cargo-fuzz build output + libFuzzer-discovered crash artifacts are NOT committed.
+/target
+/artifacts
+# The curated seed corpus (corpus/) and the documented regression reproducers
+# (crash-repros/) ARE committed — do NOT ignore them.
