@@ -2462,6 +2462,9 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "maxsecu-admin-core",
  "maxsecu-crypto",
  "maxsecu-server",
