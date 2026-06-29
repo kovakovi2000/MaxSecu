@@ -48,6 +48,44 @@ pub fn verify_author_binding(
     })
 }
 
+/// A directory-verified recovery recipient: the wrap-target keys only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryRecipient {
+    pub enc_pub: [u8; 32],
+    pub mlkem_pub: Option<[u8; 1184]>,
+}
+
+/// Resolve + D5-verify the configured recovery recipient by username
+/// (`GET /v1/directory/{username}`). Fail-closed `untrusted` if unpublished/forged.
+pub async fn resolve_recovery_recipient(
+    sender: &mut SendRequest<Full<Bytes>>,
+    host: &str,
+    username: &str,
+    verifier: &DirectoryVerifier,
+    // `+ Send` for the same reason as `resolve_and_verify_author` (the trust
+    // object is held across the `get_json` await ⇒ the future must be `Send`).
+    trust: &mut (dyn TrustStore + Send),
+    now_ms: u64,
+) -> Result<RecoveryRecipient, UiError> {
+    let (status, json) = get_json(sender, &format!("/v1/directory/{username}"), None, host).await?;
+    if status != hyper::StatusCode::OK {
+        return Err(UiError::new(
+            "untrusted",
+            "The recovery recipient is not published.",
+        ));
+    }
+    let (bytes, sig) = parse_binding(&json)?;
+    let binding: DirBinding =
+        decode(&bytes).map_err(|_| UiError::new("untrusted", "Malformed directory record."))?;
+    let v = verifier
+        .verify_binding(&binding, &sig, now_ms, trust)
+        .map_err(|_| UiError::new("untrusted", "The recovery recipient could not be verified."))?;
+    Ok(RecoveryRecipient {
+        enc_pub: v.enc_pub,
+        mlkem_pub: v.mlkem_pub,
+    })
+}
+
 /// Decode a §6.1 `BindingRes` JSON body into `(binding_bytes, signature)`.
 fn parse_binding(json: &serde_json::Value) -> Result<(Vec<u8>, [u8; 64]), UiError> {
     use base64::engine::general_purpose::STANDARD as B64;
@@ -144,6 +182,25 @@ mod tests {
         };
         let sig = d5.sign_canonical(labels::DIRBINDING, &b);
         (encode(&b), sig)
+    }
+
+    #[test]
+    fn recovery_recipient_extracts_enc_pub() {
+        let d5 = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+        let mut trust = MemoryTrustStore::new();
+        let (bytes, sig) = signed_binding(&d5); // enc_pub [0xE1;32], sig_pub [0x51;32]
+        let binding: maxsecu_encoding::structs::DirBinding =
+            maxsecu_encoding::decode(&bytes).unwrap();
+        let v = verifier
+            .verify_binding(&binding, &sig, NOW, &mut trust)
+            .unwrap();
+        let rr = super::RecoveryRecipient {
+            enc_pub: v.enc_pub,
+            mlkem_pub: v.mlkem_pub,
+        };
+        assert_eq!(rr.enc_pub, [0xE1; 32]);
+        assert_eq!(rr.mlkem_pub, None);
     }
 
     #[test]

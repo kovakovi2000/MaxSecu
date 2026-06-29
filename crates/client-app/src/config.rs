@@ -21,6 +21,27 @@ pub fn load_directory_pub(dir: &Path) -> Result<[u8; 32], UiError> {
         .map_err(|_| UiError::new("untrusted", "The pinned directory key is malformed."))
 }
 
+/// The configured standing **recovery recipient** username (`<dir>/config/
+/// recovery_recipient.txt`, one line, trimmed). The upload resolves its
+/// directory-verified `enc_pub` as the mandatory recovery wrap target (DESIGN §6.3).
+pub fn recovery_recipient_username(dir: &Path) -> Result<String, UiError> {
+    let path = dir.join("config").join("recovery_recipient.txt");
+    let raw = std::fs::read_to_string(&path).map_err(|_| {
+        UiError::new(
+            "no_recovery_recipient",
+            "No recovery recipient is configured.",
+        )
+    })?;
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(UiError::new(
+            "no_recovery_recipient",
+            "No recovery recipient is configured.",
+        ));
+    }
+    Ok(name.to_owned())
+}
+
 // Loaded by the UI in a later phase (Task 10) to prefill the connect form /
 // drive auto-connect; Phase-1 `connect` takes its parameters straight from the
 // ConnectRequest, so this type is not yet read by the binary.
@@ -69,6 +90,23 @@ mod tests {
         // Wrong length → fail closed.
         std::fs::write(tmp.join("config").join("directory_pub.der"), [0u8; 31]).unwrap();
         assert_eq!(load_directory_pub(&tmp).unwrap_err().code, "untrusted");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn recovery_recipient_username_reads_config() {
+        let tmp = std::env::temp_dir().join(format!("mxcfg-rr-{}", n()));
+        std::fs::create_dir_all(tmp.join("config")).unwrap();
+        assert_eq!(
+            recovery_recipient_username(&tmp).unwrap_err().code,
+            "no_recovery_recipient"
+        );
+        std::fs::write(
+            tmp.join("config").join("recovery_recipient.txt"),
+            "  recovery-1\n",
+        )
+        .unwrap();
+        assert_eq!(recovery_recipient_username(&tmp).unwrap(), "recovery-1");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
