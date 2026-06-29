@@ -133,3 +133,15 @@ pub struct CardDto {
 pub struct CardRequest {
     pub file_id: String,
 }
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SearchHit {
+    pub file_id: String,
+    pub title: String,
+    pub file_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchRequest {
+    pub query: String,
+}

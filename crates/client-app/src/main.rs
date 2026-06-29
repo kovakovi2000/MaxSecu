@@ -20,6 +20,7 @@ fn main() {
             maxsecu_client_app::commands::auth::logout,
             maxsecu_client_app::commands::feed::list_feed,
             maxsecu_client_app::commands::feed::decrypt_card,
+            maxsecu_client_app::commands::search::search_local,
             maxsecu_client_app::commands::bootstrap::register_glassbreak,
             maxsecu_client_app::commands::bootstrap::create_first_admin,
             maxsecu_client_app::commands::bootstrap::register_user,

@@ -255,7 +255,7 @@ pub async fn decrypt_card(
         .map(|s| B64.encode(&s.plaintext));
     let mine = my_id == author.user_id;
 
-    Ok(crate::dto::CardDto {
+    let card = crate::dto::CardDto {
         file_id: req.file_id,
         file_type: file_type_name(manifest.file_type),
         version: opened.version,
@@ -265,7 +265,25 @@ pub async fn decrypt_card(
         mine,
         author_fp: hex(&author.fingerprint[..8]),
         recovery_ok: opened.recovery_grant_ok,
-    })
+    };
+
+    // Best-effort: index the decoded card for local search (D-F). An index failure
+    // must never fail the browse — swallow it.
+    {
+        let guard = session.0.lock().await;
+        if let Some(identity) = guard.identity.as_ref() {
+            if let Ok(mut idx) = crate::index::load(&dir.0, identity) {
+                idx.upsert(crate::index::IndexEntry {
+                    file_id: card.file_id.clone(),
+                    file_type: card.file_type.clone(),
+                    title: card.title.clone(),
+                    tags: card.tags.clone(),
+                });
+                let _ = crate::index::save(&dir.0, identity, &idx);
+            }
+        }
+    }
+    Ok(card)
 }
 
 #[cfg(test)]

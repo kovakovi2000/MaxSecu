@@ -11,6 +11,7 @@ pub mod download;
 pub mod dto;
 pub mod error;
 pub mod http_client;
+pub mod index;
 pub mod keystore;
 pub mod session;
 pub mod state;

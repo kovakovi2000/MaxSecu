@@ -7,3 +7,4 @@ pub mod auth;
 pub mod bootstrap;
 pub mod connection;
 pub mod feed;
+pub mod search;
