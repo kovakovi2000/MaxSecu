@@ -165,6 +165,18 @@ fn make_decoder(app_dir: &Path) -> SessionDecoder {
     SessionDecoder::new(worker_path(app_dir))
 }
 
+/// The confined `media-transcode-worker` binary lives beside the portable exe
+/// (`AppDir`), like the decode `media-worker`. Resolved here so the upload command
+/// (`stage_upload`, video kind) can drive the confined author-side transcode.
+pub(crate) fn transcode_worker_path(app_dir: &Path) -> PathBuf {
+    let name = if cfg!(windows) {
+        "media-transcode-worker.exe"
+    } else {
+        "media-transcode-worker"
+    };
+    app_dir.join(name)
+}
+
 /// SYNCHRONOUS TCB step: from the unlocked `identity` + a D5-VERIFIED `author`,
 /// run the §12.5 header ladder to (a) parse the authenticated fragment index out
 /// of the `metadata` plaintext and (b) derive the seek/decrypt-while-play
@@ -771,6 +783,106 @@ pub async fn cancel_video(
     Ok(())
 }
 
+// ===========================================================================
+// Preview-before-upload (Phase 7, Gate 6 / Task 6.4). The author transcodes their
+// source in the CONFINED worker (`stage_upload`, video kind) and the canonical
+// AV1/CMAF plaintext + authenticated fragment index are held in the `UploadJobs`
+// registry. `preview_video` drives the SAME confined decode session over that
+// STAGED plaintext — sliced straight out of `cmaf` by the fragment ranges, NO server
+// fetch + NO decrypt (the canonical bytes are already plaintext) — re-validates the
+// untrusted worker output in the main process, and emits the same frame/PCM DTOs +
+// PlayerPhase the server-fetch player (`open_video`) does. So the author sees the
+// transcoded result rendered in `<video-player>` BEFORE confirming the upload.
+// ===========================================================================
+
+/// Slice the STAGED canonical `cmaf` plaintext into a confined-decode `script`:
+/// `Open → Fragment{seq,bytes}* → Close`, where each fragment's bytes are
+/// `cmaf[chunk_start*CS .. (chunk_start+chunk_len)*CS]` (CS = [`crate::upload::VIDEO_CHUNK_SIZE`]),
+/// exactly as the server-fetch player addresses content chunks. The plaintext copies
+/// live ONLY inside the returned [`ScriptGuard`] (zeroized on drop). Fail-closed on an
+/// empty/out-of-range index (the index was AEAD-authenticated upstream at upload time;
+/// the bound check is defense in depth against an arithmetic mismatch).
+fn build_preview_script(cmaf: &[u8], index: &[FragmentEntry]) -> Result<ScriptGuard, UiError> {
+    if index.is_empty() {
+        return Err(player_err());
+    }
+    let cs = crate::upload::VIDEO_CHUNK_SIZE as usize;
+    let mut script = ScriptGuard(Vec::with_capacity(index.len() + 2));
+    script.0.push(ClientMsg::Open {
+        bounds: VideoBounds::default(),
+    });
+    for e in index {
+        let start = (e.chunk_start as usize)
+            .checked_mul(cs)
+            .ok_or_else(player_err)?;
+        let len = (e.chunk_len as usize).checked_mul(cs).ok_or_else(player_err)?;
+        let end = start.checked_add(len).ok_or_else(player_err)?;
+        let slice = cmaf.get(start..end).ok_or_else(player_err)?;
+        script.0.push(ClientMsg::Fragment {
+            seq: e.seq,
+            bytes: slice.to_vec(),
+        });
+    }
+    script.0.push(ClientMsg::Close);
+    Ok(script)
+}
+
+/// `preview_video` — locally decode the STAGED canonical video for the author's
+/// WYSIWYG preview (no server, no decrypt). Drives the confined decode session over
+/// the held plaintext, re-validates every frame/PCM chunk in the main process, and
+/// emits the same DTOs + [`PlayerPhase`] as `open_video`. Sanitized errors.
+#[tauri::command]
+pub async fn preview_video(
+    job_id: String,
+    app: tauri::AppHandle,
+    dir: State<'_, AppDir>,
+    jobs: State<'_, crate::jobs::UploadJobs>,
+) -> Result<(), UiError> {
+    let emit = |p: PlayerPhase| {
+        let _ = app.emit(EVT_PLAYER, p);
+    };
+    let on_frame = |f: I420FrameDto| {
+        let _ = app.emit(EVT_VIDEO_FRAME, f);
+    };
+    let on_audio = |a: PcmDto| {
+        let _ = app.emit(EVT_VIDEO_AUDIO, a);
+    };
+    let out = preview_video_inner(&job_id, &dir, &jobs, &emit, &on_frame, &on_audio).await;
+    if let Err(e) = &out {
+        emit(PlayerPhase::Error {
+            code: e.code.clone(),
+        });
+    }
+    out
+}
+
+async fn preview_video_inner<E, OnF, OnA>(
+    job_id: &str,
+    dir: &State<'_, AppDir>,
+    jobs: &State<'_, crate::jobs::UploadJobs>,
+    emit: &E,
+    on_frame: &OnF,
+    on_audio: &OnA,
+) -> Result<(), UiError>
+where
+    E: Fn(PlayerPhase),
+    OnF: Fn(I420FrameDto),
+    OnA: Fn(PcmDto),
+{
+    emit(PlayerPhase::Buffering);
+    // Build the decode script from the staged canonical plaintext under the jobs
+    // lock (sync slice copy), then DROP the guard before the off-runtime decode.
+    let script = {
+        let guard = jobs.0.lock().await;
+        let staged = guard.get(job_id).ok_or_else(player_err)?;
+        let preview = staged.preview.as_ref().ok_or_else(player_err)?;
+        build_preview_script(&preview.cmaf, &preview.index)?
+    };
+    // Confined decode OFF the runtime + re-validate every worker output + emit DTOs.
+    let decoder = make_decoder(&dir.0);
+    decode_and_emit(script, decoder, emit, on_frame, on_audio).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1306,6 +1418,119 @@ mod tests {
             j.gain = 99.0f32.clamp(0.0, MAX_GAIN);
             assert_eq!(j.gain, MAX_GAIN);
         }
+    }
+
+    // ---- preview-before-upload: slice STAGED cmaf → confined decode → DTOs ----
+
+    #[test]
+    fn preview_script_slices_each_fragment_range_out_of_staged_cmaf() {
+        let cs = crate::upload::VIDEO_CHUNK_SIZE as usize;
+        // 3 chunks of canonical plaintext, marked at each chunk boundary.
+        let mut cmaf = vec![0u8; cs * 3];
+        cmaf[0] = 0xAA;
+        cmaf[cs] = 0xBB;
+        cmaf[2 * cs] = 0xCC;
+        let index = vec![
+            FragmentEntry {
+                seq: 0,
+                pts_ms: 0,
+                chunk_start: 0,
+                chunk_len: 1,
+            },
+            FragmentEntry {
+                seq: 1,
+                pts_ms: 10,
+                chunk_start: 1,
+                chunk_len: 2,
+            },
+        ];
+        let script = build_preview_script(&cmaf, &index).expect("script");
+        // Open, two Fragments, Close.
+        assert!(matches!(script.0[0], ClientMsg::Open { .. }));
+        assert!(matches!(script.0[3], ClientMsg::Close));
+        match &script.0[1] {
+            ClientMsg::Fragment { seq, bytes } => {
+                assert_eq!(*seq, 0);
+                assert_eq!(bytes.len(), cs);
+                assert_eq!(bytes[0], 0xAA);
+            }
+            other => panic!("expected Fragment, got {other:?}"),
+        }
+        match &script.0[2] {
+            ClientMsg::Fragment { seq, bytes } => {
+                assert_eq!(*seq, 1);
+                assert_eq!(bytes.len(), 2 * cs);
+                assert_eq!(bytes[0], 0xBB);
+                assert_eq!(bytes[cs], 0xCC);
+            }
+            other => panic!("expected Fragment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preview_script_fails_closed_on_out_of_range_index() {
+        let cs = crate::upload::VIDEO_CHUNK_SIZE as usize;
+        let cmaf = vec![0u8; cs]; // only one chunk present
+        let index = vec![FragmentEntry {
+            seq: 0,
+            pts_ms: 0,
+            chunk_start: 0,
+            chunk_len: 5, // claims five chunks
+        }];
+        // `ScriptGuard` is intentionally not `Debug` (it holds plaintext), so the
+        // `Ok` arm can't go through `unwrap_err`; match the error directly.
+        let err = match build_preview_script(&cmaf, &index) {
+            Ok(_) => panic!("an out-of-range index must fail closed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "video_failed");
+        // Empty index also fails closed.
+        let err = match build_preview_script(&cmaf, &[]) {
+            Ok(_) => panic!("an empty index must fail closed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "video_failed");
+    }
+
+    #[tokio::test]
+    async fn preview_decodes_staged_cmaf_into_revalidated_frames() {
+        let cs = crate::upload::VIDEO_CHUNK_SIZE as usize;
+        // 5 chunks of staged canonical plaintext; two fragments [0,2) + [2,5).
+        let cmaf = vec![7u8; cs * 5];
+        let index = vec![
+            FragmentEntry {
+                seq: 0,
+                pts_ms: 0,
+                chunk_start: 0,
+                chunk_len: 2,
+            },
+            FragmentEntry {
+                seq: 1,
+                pts_ms: 1000,
+                chunk_start: 2,
+                chunk_len: 3,
+            },
+        ];
+        let script = build_preview_script(&cmaf, &index).expect("script");
+        let phases: RefCell<Vec<PlayerPhase>> = RefCell::new(Vec::new());
+        let frames: RefCell<Vec<I420FrameDto>> = RefCell::new(Vec::new());
+        // The FrameDecoder fake emits one validated frame per Fragment — exactly the
+        // re-validation seam the real confined worker output goes through.
+        decode_and_emit(
+            script,
+            FrameDecoder,
+            &|p| phases.borrow_mut().push(p),
+            &|f| frames.borrow_mut().push(f),
+            &|_a| {},
+        )
+        .await
+        .expect("decodes");
+        assert_eq!(frames.borrow().len(), 2, "one re-validated frame per fragment");
+        assert_eq!(
+            phases.borrow().last(),
+            Some(&PlayerPhase::Playing),
+            "Playing emitted last"
+        );
     }
 
     #[test]

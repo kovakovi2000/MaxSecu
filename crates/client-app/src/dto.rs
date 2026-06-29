@@ -186,17 +186,25 @@ pub struct SearchRequest {
 pub enum UploadKind {
     Image,
     Blog,
+    Video,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StageUploadRequest {
     pub kind: UploadKind,
-    /// For an image: a filesystem path to the chosen file. Ignored for blogs.
+    /// For an image: a filesystem path to the chosen file. For a video: an optional
+    /// path to a `MXRAWV01` raw-frame source file (alternative to `source_b64`).
+    /// Ignored for blogs.
     #[serde(default)]
     pub path: Option<String>,
-    /// For a blog: the post body text. Ignored for images.
+    /// For a blog: the post body text. Ignored for images/videos.
     #[serde(default)]
     pub content: Option<String>,
+    /// For a video: the `MXRAWV01` raw-frame source bytes, standard-base64 encoded
+    /// (the UI provides already-decoded raw frames for now — the real arbitrary-media
+    /// ingest is the deferred ffmpeg op). Ignored for other kinds.
+    #[serde(default)]
+    pub source_b64: Option<String>,
     pub title: String,
     #[serde(default)]
     pub tags: Vec<String>,

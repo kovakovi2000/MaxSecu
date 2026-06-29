@@ -40,6 +40,7 @@ fn main() {
             maxsecu_client_app::commands::upload::confirm_upload,
             maxsecu_client_app::commands::upload::cancel_upload,
             maxsecu_client_app::commands::upload::upload_jobs,
+            maxsecu_client_app::commands::video::preview_video,
             maxsecu_client_app::commands::settings::get_settings,
             maxsecu_client_app::commands::settings::set_settings,
             maxsecu_client_app::commands::settings::change_password,

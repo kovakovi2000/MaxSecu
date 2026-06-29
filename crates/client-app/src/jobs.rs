@@ -7,17 +7,35 @@
 use std::collections::HashMap;
 
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use maxsecu_client_core::UploadBundle;
 
+/// The canonical (already-plaintext) video held for the **preview-before-upload**
+/// local decode (Phase 7, Gate 6). `cmaf` is the transcoded AV1/CMAF content stream
+/// the bundle ALSO carries in encrypted form; the author's own plaintext is bounded
+/// here only so `preview_video` can drive the confined decode session over it
+/// without a server fetch or a decrypt. It is dropped when the job leaves the
+/// registry (confirm/cancel) — and, being `Zeroizing`, the full-file plaintext is
+/// WIPED on that drop (matching the per-window `ScriptGuard` discipline). `index` is
+/// the authenticated fragment seek-map (in VIDEO_CHUNK_SIZE units), used to slice
+/// `cmaf` into per-fragment decode inputs.
+pub struct StagedVideoPreview {
+    pub cmaf: Zeroizing<Vec<u8>>,
+    pub index: Vec<crate::video::FragmentEntry>,
+}
+
 /// One staged upload held pending the user's confirm. `bundle` carries the signed,
-/// encrypted records + ciphertext chunks (never sent to the UI).
+/// encrypted records + ciphertext chunks (never sent to the UI). For a video,
+/// `preview` additionally holds the canonical plaintext + fragment index so the
+/// author can WYSIWYG-preview the transcoded result before confirming.
 pub struct StagedUpload {
     pub bundle: UploadBundle,
     pub file_type: String,
     pub title: String,
     pub total_chunks: u64,
     pub byte_size: u64,
+    pub preview: Option<StagedVideoPreview>,
 }
 
 /// Managed state: `job_id -> StagedUpload`. Async mutex (commands are async).
@@ -103,6 +121,7 @@ mod tests {
             title: "T".into(),
             total_chunks: 1,
             byte_size: 2,
+            preview: None,
         }
     }
 

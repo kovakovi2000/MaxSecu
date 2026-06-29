@@ -52,7 +52,7 @@ export type FetchMsg =
   | { phase: "failed"; file_id: string; code: string };
 
 // --- Phase 4 (upload) DTO mirrors of the Rust serde shapes ---
-export type UploadKind = "image" | "blog";
+export type UploadKind = "image" | "blog" | "video";
 
 export interface UploadPreview {
   job_id: string;

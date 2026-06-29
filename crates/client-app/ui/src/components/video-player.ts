@@ -70,6 +70,11 @@ export class VideoPlayer extends HTMLElement {
   private hwWaiver = false;
   private lastVol = 1; // volume to restore from mute
 
+  // PREVIEW MODE (Gate 6): when set, the player drives the local preview_video
+  // path (decode of the author's STAGED canonical content — no server fetch, no
+  // decrypt) instead of open_video. Set by the upload screen's preview surface.
+  private _previewJob = "";
+
   // file-id may be supplied as a property (media-viewer sets it) or attribute.
   set fileId(v: string) {
     this._fileId = v;
@@ -77,6 +82,15 @@ export class VideoPlayer extends HTMLElement {
   }
   get fileId(): string {
     return this._fileId || this.getAttribute("file-id") || "";
+  }
+
+  // preview-job may be supplied as a property (upload screen) or attribute.
+  set previewJob(v: string) {
+    this._previewJob = v;
+    this.setAttribute("preview-job", v);
+  }
+  get previewJob(): string {
+    return this._previewJob || this.getAttribute("preview-job") || "";
   }
 
   connectedCallback() {
@@ -222,7 +236,9 @@ export class VideoPlayer extends HTMLElement {
     this.renderer?.dispose();
     this.renderer = null;
     // Drop the backend session (zeroizes the content subkey) — fire and forget.
-    if (this.opened && this.reqId) {
+    // The preview path registers no backend VideoJob (it decodes the staged
+    // plaintext one-shot), so there is nothing to cancel there.
+    if (this.opened && this.reqId && !this.previewJob) {
       void serial(() => call<void>("cancel_video", { fileId: this.reqId })).catch(() => {});
     }
     const audio = this.audio;
@@ -235,7 +251,13 @@ export class VideoPlayer extends HTMLElement {
   private async open() {
     try {
       this.opened = true;
-      await serial(() => call<void>("open_video", { fileId: this.reqId }));
+      if (this.previewJob) {
+        // Local preview-before-upload decode of the author's STAGED canonical
+        // content (no server, no decrypt). Same frame/phase events as open_video.
+        await serial(() => call<void>("preview_video", { jobId: this.previewJob }));
+      } else {
+        await serial(() => call<void>("open_video", { fileId: this.reqId }));
+      }
     } catch (x) {
       this.setPhase({ phase: "error", code: phaseCode(x) });
     }
@@ -301,7 +323,11 @@ export class VideoPlayer extends HTMLElement {
       this.dragging = false;
       const pts = Math.max(0, Math.round(Number(scrub.value)));
       this.player?.seek(pts);
-      void serial(() => call<void>("video_seek", { fileId: this.reqId, ptsMs: pts })).catch(() => {});
+      // In preview mode there is no backend session to re-window — the whole
+      // staged clip is already decoded locally, so scrub stays local.
+      if (!this.previewJob) {
+        void serial(() => call<void>("video_seek", { fileId: this.reqId, ptsMs: pts })).catch(() => {});
+      }
     });
 
     const vol = this.querySelector("#vp-vol") as HTMLInputElement;
@@ -349,7 +375,10 @@ export class VideoPlayer extends HTMLElement {
   private applyVolume(gain: number) {
     const g = Number.isFinite(gain) ? Math.min(1, Math.max(0, gain)) : 0;
     this.player?.setVolume(g);
-    void serial(() => call<void>("video_set_volume", { fileId: this.reqId, gain: g })).catch(() => {});
+    // The preview path holds no backend session/gain to persist; volume is local.
+    if (!this.previewJob) {
+      void serial(() => call<void>("video_set_volume", { fileId: this.reqId, gain: g })).catch(() => {});
+    }
   }
 
   private setPlayGlyph(playing: boolean) {

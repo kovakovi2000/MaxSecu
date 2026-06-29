@@ -4,15 +4,126 @@
 //! bundle via client-core, then stages + resumably uploads + finalizes. Only
 //! preview/progress DTOs cross the Tauri seam — never keys/wraps/plaintext.
 
+use maxsecu_client_core::media::{
+    FragmentEntry as TranscodeFragment, TranscodeRequest, TranscodeResult,
+};
+use maxsecu_client_core::video::VideoBounds;
 use maxsecu_client_core::{MediaBounds, PlaintextStreams, RustImageCodec, Transcoder};
 use maxsecu_encoding::types::FileType;
+use maxsecu_media_launcher::TranscodeLauncher;
 
 use crate::error::UiError;
+
+/// The upload `chunk_size` for video content. It **MUST** equal the transcode
+/// worker's `TRANSCODE_CHUNK_SIZE` (4096): the fragment index's `chunk_start` /
+/// `chunk_len` are expressed in whole units of this size, so the upload's content
+/// chunks line up one-for-one with the fragment ranges. A mismatch would silently
+/// break seek (`chunks_for_fragment` would resolve a fragment to the wrong byte
+/// range), so [`prepare_video_streams`] enforces the alignment against this value.
+/// (The worker's `TRANSCODE_CHUNK_SIZE` lives in a crate this codec-free process
+/// does not depend on, so the constant is duplicated here and checked at runtime.)
+pub const VIDEO_CHUNK_SIZE: u32 = 4096;
 
 /// Build the canonical metadata blob: JSON `{"title","tags"}` (UTF-8) — exactly
 /// what `commands::feed::parse_title_tags` reads back.
 pub fn build_metadata(title: &str, tags: &[String]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "title": title, "tags": tags })).unwrap_or_default()
+}
+
+/// Build the canonical **video** metadata blob: JSON `{"title","tags","fragments"}`
+/// where each fragment is `{seq,pts_ms,chunk_start,chunk_len}` — the EXACT shape the
+/// viewer's [`crate::video::parse_fragment_index`] reads back (the author→view seek
+/// contract). The field names are the verbatim wire/JSON names from the transcode
+/// worker, so the index round-trips unchanged through the authenticated metadata
+/// stream.
+pub fn build_metadata_with_fragments(
+    title: &str,
+    tags: &[String],
+    fragments: &[TranscodeFragment],
+) -> Vec<u8> {
+    let frags: Vec<serde_json::Value> = fragments
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "seq": f.seq,
+                "pts_ms": f.pts_ms,
+                "chunk_start": f.chunk_start,
+                "chunk_len": f.chunk_len,
+            })
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({
+        "title": title, "tags": tags, "fragments": frags,
+    }))
+    .unwrap_or_default()
+}
+
+/// Sanitized video-prep error (no internal detail / decode oracle crosses the seam).
+fn video_prep_err() -> UiError {
+    UiError::new("video_failed", "That video could not be processed.")
+}
+
+/// Transcode the author's source media to canonical AV1/CMAF streams **in the
+/// confined transcode worker** (`media-launcher::TranscodeLauncher`, an
+/// AppContainer-isolated one-shot spawn on Windows). The author's source is
+/// untrusted, so the codec runs OUT of this key-holding process; only the worker's
+/// (untrusted) [`TranscodeResult`] crosses back, and it is bounds-checked by the
+/// launcher's framed codec. This does **NO network** — it is the preview-before-
+/// upload transcode.
+///
+/// Maps `TranscodeResult.cmaf` → `content`, `thumbnail`/`preview` straight through,
+/// and `build_metadata_with_fragments(title, tags, &fragments)` → `metadata`.
+///
+/// **Chunk-size invariant.** The fragment index is expressed in
+/// [`VIDEO_CHUNK_SIZE`] (4096)-byte units. This re-validates the worker's index
+/// against the canonical content: it must parse + validate as a contiguous index
+/// (`parse_fragment_index`) AND cover the `cmaf` exactly in whole 4096-byte chunks
+/// (so the upload's content chunks map one-for-one onto the fragment ranges). A
+/// worker that returns a misaligned stream/index fails closed here rather than
+/// silently breaking seek after upload.
+pub fn prepare_video_streams(
+    source: &[u8],
+    transcode_worker_path: &std::path::Path,
+    bounds: &VideoBounds,
+    title: &str,
+    tags: &[String],
+) -> Result<(PlaintextStreams, Vec<TranscodeFragment>), UiError> {
+    let launcher = TranscodeLauncher::new(transcode_worker_path);
+    let result: TranscodeResult = launcher
+        .transcode(&TranscodeRequest {
+            source: source.to_vec(),
+            bounds: *bounds,
+        })
+        .map_err(|_| video_prep_err())?;
+
+    let metadata = build_metadata_with_fragments(title, tags, &result.fragments);
+
+    // Enforce the chunk-size mapping (seek correctness). The metadata fragment
+    // index must validate (contiguity/ordering/coverage) AND tile the canonical
+    // content exactly in whole VIDEO_CHUNK_SIZE chunks.
+    let chunk = VIDEO_CHUNK_SIZE as usize;
+    if result.cmaf.is_empty() || !result.cmaf.len().is_multiple_of(chunk) {
+        return Err(video_prep_err());
+    }
+    let meta_json: serde_json::Value =
+        serde_json::from_slice(&metadata).map_err(|_| video_prep_err())?;
+    let index = crate::video::parse_fragment_index(&meta_json)?;
+    let last = index.last().ok_or_else(video_prep_err)?;
+    let covered_chunks = last
+        .chunk_start
+        .checked_add(last.chunk_len)
+        .ok_or_else(video_prep_err)?;
+    if covered_chunks != (result.cmaf.len() / chunk) as u64 {
+        return Err(video_prep_err());
+    }
+
+    let streams = PlaintextStreams {
+        content: result.cmaf,
+        metadata: Some(metadata),
+        thumbnail: Some(result.thumbnail),
+        preview: Some(result.preview),
+    };
+    Ok((streams, result.fragments))
 }
 
 /// Blog: `content` is the plain UTF-8 bytes; metadata is the JSON title/tags; no
@@ -208,6 +319,51 @@ mod tests {
         let (t, tags) = crate::commands::feed::parse_title_tags(&meta);
         assert_eq!(t, "Sunset");
         assert_eq!(tags, vec!["beach".to_owned(), "2026".to_owned()]);
+    }
+
+    #[test]
+    fn video_metadata_with_fragments_roundtrips_through_parse_fragment_index() {
+        let frags = vec![
+            TranscodeFragment {
+                seq: 0,
+                pts_ms: 0,
+                chunk_start: 0,
+                chunk_len: 2,
+            },
+            TranscodeFragment {
+                seq: 1,
+                pts_ms: 1000,
+                chunk_start: 2,
+                chunk_len: 3,
+            },
+        ];
+        let meta = build_metadata_with_fragments("Clip", &["holiday".to_owned()], &frags);
+        // Title/tags still parse via the shared title/tag reader.
+        let (t, tags) = crate::commands::feed::parse_title_tags(&meta);
+        assert_eq!(t, "Clip");
+        assert_eq!(tags, vec!["holiday".to_owned()]);
+        // And the fragment index round-trips byte-for-field through the viewer's
+        // authenticated-metadata reader (the author→view seek contract).
+        let json: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+        let parsed = crate::video::parse_fragment_index(&json).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[1],
+            crate::video::FragmentEntry {
+                seq: 1,
+                pts_ms: 1000,
+                chunk_start: 2,
+                chunk_len: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn video_chunk_size_matches_the_upload_chunk_size() {
+        // The fragment index is in VIDEO_CHUNK_SIZE units; the upload stages video
+        // content at exactly this chunk size so the ranges map one-for-one. This is
+        // the same 4096 the transcode worker's TRANSCODE_CHUNK_SIZE pads to.
+        assert_eq!(VIDEO_CHUNK_SIZE, 4096);
     }
 
     #[test]
