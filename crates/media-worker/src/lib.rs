@@ -34,6 +34,12 @@ mod win32;
 #[cfg(windows)]
 pub use win32::{ConfinedOutput, SpawnError};
 
+/// Persistent video-decode session (Phase 7, Task 3.2): the in-process AV1/CMAF
+/// decode state machine over the `client-core` `ClientMsg`/`WorkerMsg` seam. Drive
+/// it on a 64 MiB-stack thread (CF-2 — see [`session`] docs).
+mod session;
+pub use session::VideoSession;
+
 /// Default per-worker memory cap (decompression-bomb hard kill, media-sandbox §3).
 pub const DEFAULT_WORKER_MEMORY_CAP_BYTES: u64 = 512 * 1024 * 1024;
 
