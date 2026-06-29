@@ -7,6 +7,7 @@ pub mod bootstrap;
 pub mod commands;
 pub mod config;
 pub mod directory;
+pub mod download;
 pub mod dto;
 pub mod error;
 pub mod http_client;
