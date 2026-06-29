@@ -17,6 +17,11 @@ path = "src/lib.rs"
 # key-holding consumer of this launcher can never link them.
 maxsecu-client-core = { path = "../client-core" }
 
+# Wipe the transient canonical PLAINTEXT (already-decrypted fragment bytes) copied
+# into each attempt's writer thread — defense in depth, multiplied by respawns. Not
+# a codec; pure-Rust secret-hygiene crate already in the workspace lock.
+zeroize = "1"
+
 # Win32 OS-confinement (AppContainer + Job Object) for the decode launcher
 # (6b-ii). Windows-only; FFI bindings to the OS (not a vendored C library), so
 # the no-C posture holds. unsafe is confined to the audited `win32` module.
