@@ -72,6 +72,35 @@ pub async fn get_bytes(
     Ok((status, bytes))
 }
 
+/// PUT a raw `application/octet-stream` body (a ciphertext chunk); return the
+/// status. `host` threaded into the Host header; `bearer` for the channel-bound
+/// session. (Idempotent by index server-side → safe to retry / resume.)
+pub async fn put_bytes(
+    sender: &mut SendRequest<Full<Bytes>>,
+    uri: &str,
+    body: Vec<u8>,
+    bearer: &str,
+    host: &str,
+) -> Result<StatusCode, UiError> {
+    sender
+        .ready()
+        .await
+        .map_err(|_| UiError::new("offline", "Lost connection to the server."))?;
+    let req = Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("host", host)
+        .header("content-type", "application/octet-stream")
+        .header("authorization", format!("MaxSecu-Session {bearer}"))
+        .body(Full::new(Bytes::from(body)))
+        .map_err(|_| UiError::new("internal", "Could not build the request."))?;
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|_| UiError::new("offline", "The server did not respond."))?;
+    Ok(resp.status())
+}
+
 async fn send(
     sender: &mut SendRequest<Full<Bytes>>,
     method: &str,
