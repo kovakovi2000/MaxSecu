@@ -214,3 +214,12 @@ pub struct ConfirmUploadRequest {
 pub struct CancelUploadRequest {
     pub job_id: String,
 }
+
+/// One staged/retained upload job, for the active-uploads tray. No bundle, no keys.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UploadJobView {
+    pub job_id: String,
+    pub title: String,
+    pub file_type: String,
+    pub total_chunks: u64,
+}

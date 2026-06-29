@@ -130,9 +130,7 @@ pub(crate) fn total_chunks(b: &UploadBundle) -> u64 {
 
 /// PUT one chunk, retrying up to MAX_CHUNK_RETRY on a transport error or non-200
 /// (idempotent by index → safe). Fail-closed `upload_chunk_failed` after retries.
-// Wired into `confirm_upload` in Task 7 + exercised by the Task-10 e2e; the body
-// is live (calls `put_bytes`), only the entry point is not yet called.
-#[allow(dead_code)]
+// Wired into `confirm_upload` + exercised by the Task-10 e2e.
 async fn put_chunk_retried(
     sender: &mut SendRequest<Full<Bytes>>,
     host: &str,
@@ -165,8 +163,7 @@ async fn put_chunk_retried(
 
 /// Stage → PUT every chunk (resumable/idempotent, retried) → finalize.
 /// `on_progress(done, total)` after each successful chunk. Fail-closed.
-// Wired into `confirm_upload` in Task 7 + exercised by the Task-10 e2e.
-#[allow(dead_code)]
+// Wired into `confirm_upload` + exercised by the Task-10 e2e.
 pub(crate) async fn run_pipeline<F: FnMut(u64, u64)>(
     sender: &mut SendRequest<Full<Bytes>>,
     host: &str,

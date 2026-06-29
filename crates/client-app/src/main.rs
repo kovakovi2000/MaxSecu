@@ -31,6 +31,9 @@ fn main() {
             maxsecu_client_app::commands::admin::issue_voucher,
             maxsecu_client_app::commands::admin::request_approval,
             maxsecu_client_app::commands::upload::stage_upload,
+            maxsecu_client_app::commands::upload::confirm_upload,
+            maxsecu_client_app::commands::upload::cancel_upload,
+            maxsecu_client_app::commands::upload::upload_jobs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MaxSecu client");
