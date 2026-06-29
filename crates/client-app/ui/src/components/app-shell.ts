@@ -2,6 +2,7 @@ import { Router } from "../core/router.ts";
 import { on } from "../core/rpc.ts";
 import "./status-pill.ts";
 import "./connect-screen.ts";
+import "./bootstrap-screen.ts";
 import "./feed-empty.ts";
 import type { StatusPill } from "./status-pill.ts";
 import type { ConnState } from "../core/types.ts";
@@ -21,6 +22,8 @@ export class AppShell extends HTMLElement {
     new Router((r) => {
       outlet.innerHTML = r === "feed"
         ? "<feed-empty></feed-empty>"
+        : r === "bootstrap"
+        ? "<bootstrap-screen></bootstrap-screen>"
         : "<connect-screen></connect-screen>";
       // WCAG 2.4.3: the old content (incl. the focused control) was just
       // removed; move focus to the new screen's main landmark so focus order
