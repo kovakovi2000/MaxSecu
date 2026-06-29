@@ -15,8 +15,8 @@
 //! evaluation against the sink-anchored head is Phase 5.
 
 use maxsecu_crypto::{
-    open_stream, open_stream_streaming, stream_digest, unwrap_dek, unwrap_dek_hybrid, Dek,
-    EncSecretKey, HybridEncSecretKey, VerifyingKey, WrappedDek,
+    open_chunk, open_stream, open_stream_streaming, stream_digest, unwrap_dek, unwrap_dek_hybrid,
+    Dek, EncSecretKey, HybridEncSecretKey, VerifyingKey, WrappedDek,
 };
 use maxsecu_encoding::structs::{Genesis, Grant, Manifest, WrapContext};
 use maxsecu_encoding::types::{Compression, FileType, Id, RecipientType, StreamType, Suite};
@@ -777,6 +777,186 @@ pub fn verify_and_open_headers(
         recovery_grant_ok,
         content_chunk_count: content_ms.chunk_count,
         small_streams: small,
+    })
+}
+
+/// A **verified content decryptor** for random-access fragment-range decrypt
+/// (Phase 7 sandboxed video, Gate 4). Produced by [`open_content_decryptor`]
+/// after the §12.5 header ladder has run **once**, it holds the `content`
+/// stream subkey (`HKDF(DEK, content)`) as a `Zeroizing` secret together with
+/// the manifest-bound `file_id`, `version`, and the **signed**
+/// `content_chunk_count`. It lets the player decrypt ONE canonical CMAF
+/// fragment — a contiguous range of `content` chunks — on demand (arbitrary
+/// seek, bounded decrypt-while-play) WITHOUT re-running the signature ladder per
+/// fragment and WITHOUT materializing the whole content plaintext.
+///
+/// It is **non-`Clone`**, deliberately does NOT implement `Debug`/`Display`
+/// (its key never reaches a log line), and is held inside the TCB — it never
+/// crosses the Tauri seam (the 4.2b caller decodes the fragment behind the
+/// boundary). The `content_subkey` is `Zeroizing`, so it is wiped on drop.
+pub struct ContentDecryptor {
+    content_subkey: zeroize::Zeroizing<[u8; 32]>,
+    file_id: Id,
+    version: u64,
+    content_chunk_count: u64,
+}
+
+impl ContentDecryptor {
+    /// The verified file `version` (matches the opened header).
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// The **signed** number of `content` chunks — the inclusive upper bound for
+    /// `chunk_start + chunks_ciphertext.len()` in [`open_range`](Self::open_range).
+    pub fn content_chunk_count(&self) -> u64 {
+        self.content_chunk_count
+    }
+
+    /// Decrypt ONE contiguous fragment — the `content` ciphertext chunks for
+    /// absolute indices `chunk_start .. chunk_start + chunks_ciphertext.len()` —
+    /// returning the concatenated plaintext (the canonical CMAF fragment bytes)
+    /// in a `Zeroizing` buffer. Bounded RAM: only this fragment's plaintext is
+    /// held; the caller discards it after decode. Fail-closed: a tampered,
+    /// substituted, or mis-positioned chunk → AEAD failure → `Err`.
+    ///
+    /// SECURITY — why random-access range decrypt is sound (and equivalent to
+    /// the streaming model already shipped):
+    ///   (a) Each `content` chunk's AEAD binds `(file_id, version, stream_type,
+    ///       chunk_index, is_last)` in its AAD and uses the chunk index as the
+    ///       96-bit nonce (`maxsecu_crypto::aead`, D33/§12.10). So a chunk
+    ///       CANNOT be replayed to another position, file, version, or stream:
+    ///       opening ciphertext `c` at absolute index `i` only succeeds if `c`
+    ///       was sealed at exactly `(file_id, version, Content, i, is_last_i)`.
+    ///       This is precisely the per-chunk `open` that the whole-stream
+    ///       [`open_stream`] and the streaming [`open_stream_streaming`] use; we
+    ///       call the SAME primitive ([`open_chunk`]) with the absolute index,
+    ///       so no AEAD is reimplemented.
+    ///   (b) The signed manifest `content_chunk_count` (carried in
+    ///       [`ContentDecryptor`], proven by [`verify_header`]) bounds the valid
+    ///       index range. A request past it is rejected up front
+    ///       ([`DownloadError::FramingBoundsExceeded`]) with no overflow, and
+    ///       `is_last` for each index is derived from that signed count — so a
+    ///       chunk that was NOT the sealed last cannot masquerade as it (and
+    ///       vice-versa), exactly as the streaming path enforces truncation.
+    ///   (c) The fragment → chunk-range map comes from the AEAD-decrypted,
+    ///       manifest-bound `metadata` stream (verified by 4.2b BEFORE any range
+    ///       is requested), so the *which range is fragment N* decision is itself
+    ///       authenticated — a malicious server cannot steer the player to an
+    ///       attacker-chosen range.
+    ///   (d) This is the SAME integrity model [`verify_and_stream_content`]
+    ///       already relies on for `content`: per-chunk index-bound AEAD + the
+    ///       signed `chunk_count`/`is_last`, NOT the whole-stream digest (which
+    ///       cannot be checked before release).
+    /// What it does NOT provide vs the whole-stream [`verify_and_open`]: there is
+    /// no whole-stream `content` digest check and no is_last truncation check at
+    /// the *fragment* granularity (a legitimate mid-stream fragment has no
+    /// is_last chunk). That is acceptable and inherent to random access: every
+    /// individual chunk is still index-bound (a), the total is still bounded (b),
+    /// and the per-chunk AAD still binds the file's true last index via the
+    /// signed count — a fragment cannot smuggle a chunk from another position.
+    pub fn open_range(
+        &self,
+        chunk_start: u64,
+        chunks_ciphertext: &[Vec<u8>],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, DownloadError> {
+        use DownloadError::*;
+
+        // Bounds-check with no overflow: chunk_start + len <= content_chunk_count.
+        let len = chunks_ciphertext.len() as u64;
+        match chunk_start.checked_add(len) {
+            Some(end) if end <= self.content_chunk_count => {}
+            _ => return Err(FramingBoundsExceeded("content fragment range")),
+        }
+
+        // `content_chunk_count >= 1` is guaranteed by the `chunk_count == 0` guard
+        // in `open_content_decryptor`, so this subtraction cannot underflow.
+        let last_index = self.content_chunk_count - 1;
+        let mut out: zeroize::Zeroizing<Vec<u8>> = zeroize::Zeroizing::new(Vec::new());
+        for (j, ct) in chunks_ciphertext.iter().enumerate() {
+            let i = chunk_start + j as u64;
+            // SAME per-chunk AEAD the streaming path uses, with the ABSOLUTE index
+            // and the is_last derived from the signed count — a substituted or
+            // mis-positioned chunk fails the AAD check and we fail closed.
+            let aad = maxsecu_encoding::structs::ChunkAad {
+                file_id: self.file_id,
+                version: self.version,
+                stream_type: StreamType::Content,
+                chunk_index: i,
+                is_last: i == last_index,
+            };
+            let pt = open_chunk(&self.content_subkey, &aad, ct)
+                .map_err(|_| StreamFraming(StreamType::Content))?;
+            out.extend_from_slice(&pt);
+        }
+        Ok(out)
+    }
+}
+
+/// Run the §12.5 header ladder **once** and return a [`ContentDecryptor`] bound
+/// to the verified `content` subkey, `file_id`, `version`, and signed
+/// `content_chunk_count` — the seek/decrypt-while-play handle for the sandboxed
+/// video player (Phase 7 Gate 4). Same fail-closed header proof as
+/// [`verify_and_open`] / [`verify_and_stream_content`] / [`verify_and_open_headers`]
+/// (it calls the shared [`verify_header`]); it just stops after deriving the
+/// content subkey, fetching NO content chunks. The caller then issues random
+/// [`ContentDecryptor::open_range`] requests as the user seeks — see that
+/// method's `SECURITY` note for why per-fragment decrypt is sound.
+pub fn open_content_decryptor(
+    ctx: &VerifyContext,
+    header: &StreamHeader,
+) -> Result<ContentDecryptor, DownloadError> {
+    use DownloadError::*;
+
+    let (manifest, dek, _recovery_grant_ok) = verify_header(
+        ctx,
+        &header.manifest_bytes,
+        &header.manifest_sig,
+        &header.genesis_bytes,
+        &header.genesis_sig,
+        &header.grant_bytes,
+        &header.grant_sig,
+        &header.ancestor_grants,
+        &header.recovery_grant_bytes,
+        &header.recovery_grant_sig,
+        &header.wrapped_dek,
+    )?;
+
+    // The content stream must be declared in the manifest (DESIGN §12.3) and its
+    // addressable size bounded — identical guards to the streaming/header paths.
+    // INTENTIONAL: we inspect `compression` only for the Content stream (the only
+    // stream this decryptor ever opens); unlike `verify_and_stream_content` we do
+    // NOT decode the other streams here, so their compression is irrelevant — this
+    // narrower check is deliberate, not an omission.
+    let mut content_ms: Option<&maxsecu_encoding::structs::Stream> = None;
+    for ms in &manifest.streams {
+        if ms.stream_type == StreamType::Content {
+            if ms.compression != Compression::None {
+                return Err(CompressionUnsupported);
+            }
+            content_ms = Some(ms);
+            break;
+        }
+    }
+    let content_ms = content_ms.ok_or(StreamMissing(StreamType::Content))?;
+    // Parity with `open_stream_streaming` (crypto::aead), which fail-closes on an
+    // empty stream: reject a content `chunk_count == 0` here too. Nothing upstream
+    // enforces `>= 1` (the framing field is a raw u64 and the addressable-size
+    // guard below passes for 0), so THIS guard is what makes `content_chunk_count
+    // >= 1` — and thus the `- 1` in `open_range` — sound.
+    if content_ms.chunk_count == 0 {
+        return Err(StreamFraming(StreamType::Content));
+    }
+    match content_ms.chunk_count.checked_mul(manifest.chunk_size as u64) {
+        Some(b) if b <= MAX_ADDRESSABLE_BYTES => {}
+        _ => return Err(FramingBoundsExceeded("addressable size")),
+    }
+
+    Ok(ContentDecryptor {
+        content_subkey: dek.stream_subkey(StreamType::Content),
+        file_id: ctx.file_id,
+        version: manifest.version,
+        content_chunk_count: content_ms.chunk_count,
     })
 }
 
@@ -2048,6 +2228,149 @@ mod tests {
             Err(DownloadError::FirstContactCeiling {
                 served: FIRST_CONTACT_VERSION_CEILING + 1
             })
+        );
+    }
+
+    // ---- Random-access content fragment-range decrypt (Gate 4) ----
+
+    /// The whole content plaintext for the multi-chunk `build_large` fixture,
+    /// recovered via the already-trusted streaming opener (an independent oracle).
+    fn whole_content(built: &Built, header: &StreamHeader, chunks: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        verify_and_stream_content(
+            &ctx(built),
+            header,
+            |i| Ok(chunks[i as usize].clone()),
+            |frame| {
+                out.extend_from_slice(frame);
+                Ok(())
+            },
+        )
+        .expect("streams");
+        out
+    }
+
+    #[test]
+    fn decryptor_open_range_round_trips_per_fragment() {
+        let (built, content) = build_large();
+        let (header, chunks) = stream_header(&built.bundle);
+        assert!(chunks.len() >= 4, "content spans multiple chunks");
+        let dec = open_content_decryptor(&ctx(&built), &header).expect("decryptor");
+        assert_eq!(dec.version(), 1);
+        assert_eq!(dec.content_chunk_count(), chunks.len() as u64);
+        let oracle = whole_content(&built, &header, &chunks);
+        assert_eq!(oracle, content);
+
+        // Non-overlapping fragments [0,2) and [2,N) reconstruct the whole content.
+        let f0 = dec.open_range(0, &chunks[0..2]).expect("frag 0");
+        let f1 = dec
+            .open_range(2, &chunks[2..chunks.len()])
+            .expect("frag 1");
+        let mut joined = Vec::new();
+        joined.extend_from_slice(&f0);
+        joined.extend_from_slice(&f1);
+        assert_eq!(joined, content, "fragments reconstruct the whole content");
+
+        // A single mid-stream fragment equals the matching plaintext slice
+        // (chunk_size = 4096; fragment [1,3) -> plaintext bytes 4096..min(3*4096,len)).
+        let cs = 4096usize;
+        let mid = dec.open_range(1, &chunks[1..3]).expect("mid frag");
+        let lo = cs;
+        let hi = (3 * cs).min(content.len());
+        assert_eq!(&mid[..], &content[lo..hi]);
+
+        // A back-range re-decrypts correctly (idempotent — handle is reusable).
+        let again = dec.open_range(1, &chunks[1..3]).expect("re-decrypt");
+        assert_eq!(&again[..], &mid[..]);
+    }
+
+    #[test]
+    fn decryptor_rejects_a_substituted_chunk() {
+        // Feed chunk j's ciphertext at position i (i != j): the per-chunk AEAD
+        // binds chunk_index, so opening it at the wrong absolute index fails —
+        // proving random-access positions cannot be swapped.
+        let (built, _content) = build_large();
+        let (header, chunks) = stream_header(&built.bundle);
+        let dec = open_content_decryptor(&ctx(&built), &header).expect("decryptor");
+        // Range starts at index 1 but we hand it chunk 2's ciphertext first.
+        let substituted = vec![chunks[2].clone(), chunks[2].clone()];
+        assert_eq!(
+            dec.open_range(1, &substituted),
+            Err(DownloadError::StreamFraming(StreamType::Content))
+        );
+    }
+
+    #[test]
+    fn decryptor_rejects_out_of_range_without_panic() {
+        let (built, _content) = build_large();
+        let (header, _chunks) = stream_header(&built.bundle);
+        let dec = open_content_decryptor(&ctx(&built), &header).expect("decryptor");
+        let n = dec.content_chunk_count();
+        // start + len exceeds the signed chunk_count -> FramingBoundsExceeded.
+        let pad: Vec<Vec<u8>> = vec![vec![0u8; 8]; 2];
+        assert!(matches!(
+            dec.open_range(n - 1, &pad),
+            Err(DownloadError::FramingBoundsExceeded(_))
+        ));
+        // A huge start that would overflow on add is rejected, not panicked.
+        assert!(matches!(
+            dec.open_range(u64::MAX, &pad),
+            Err(DownloadError::FramingBoundsExceeded(_))
+        ));
+        // An empty range exactly at the end is in-bounds (returns empty).
+        let empty = dec.open_range(n, &[]).expect("empty in-bounds");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn decryptor_rejects_tampered_ciphertext() {
+        let (built, _content) = build_large();
+        let (header, mut chunks) = stream_header(&built.bundle);
+        chunks[2][0] ^= 0x01; // flip a byte in chunk 2's ciphertext
+        let dec = open_content_decryptor(&ctx(&built), &header).expect("decryptor");
+        assert_eq!(
+            dec.open_range(2, &chunks[2..3]),
+            Err(DownloadError::StreamFraming(StreamType::Content))
+        );
+    }
+
+    #[test]
+    fn open_content_decryptor_rejects_a_forged_header() {
+        let (built, _content) = build_large();
+        let (mut header, _chunks) = stream_header(&built.bundle);
+        header.manifest_sig[0] ^= 0x01; // forge the manifest signature
+        assert_eq!(
+            open_content_decryptor(&ctx(&built), &header).map(|_| ()),
+            Err(DownloadError::ManifestSignature)
+        );
+    }
+
+    #[test]
+    fn open_content_decryptor_rejects_zero_content_chunk_count() {
+        // A (validly author-signed) manifest declaring content chunk_count == 0
+        // must fail closed — parity with open_stream_streaming, and the guard that
+        // keeps the `- 1` in open_range from underflowing. We forge such a manifest
+        // by editing the decoded content stream's chunk_count to 0 and RE-SIGNING
+        // under the owner's key, so verify_header passes and the count==0 guard
+        // (not a panic, not a silent accept) is what rejects it.
+        let (built, _content) = build_large();
+        let (mut header, _chunks) = stream_header(&built.bundle);
+        let mut manifest: Manifest = decode(&header.manifest_bytes).unwrap();
+        let cms = manifest
+            .streams
+            .iter_mut()
+            .find(|s| s.stream_type == StreamType::Content)
+            .expect("content stream");
+        cms.chunk_count = 0;
+        header.manifest_bytes = encode(&manifest);
+        header.manifest_sig = built
+            .owner
+            .signing_key()
+            .sign_canonical(labels::MANIFEST, &manifest);
+        // No panic (the empty-range path `0u64 - 1` is never reached) — a clean Err.
+        assert_eq!(
+            open_content_decryptor(&ctx(&built), &header).map(|_| ()),
+            Err(DownloadError::StreamFraming(StreamType::Content))
         );
     }
 }
