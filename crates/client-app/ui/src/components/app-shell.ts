@@ -9,6 +9,7 @@ import "./admin-screen.ts";
 import "./feed-screen.ts";
 import "./media-viewer.ts";
 import "./upload-screen.ts";
+import "./upload-tray.ts";
 import type { StatusPill } from "./status-pill.ts";
 import type { ConnState } from "../core/types.ts";
 
@@ -20,6 +21,7 @@ export class AppShell extends HTMLElement {
           <a href="#/feed">Feed</a> &middot; <span>My Content</span> &middot; <a href="#/upload">Upload</a> &middot; <a href="#/admin">Admin</a> &middot; <span>Settings</span>
         </nav>
         <status-pill id="pill"></status-pill>
+        <upload-tray></upload-tray>
       </header>
       <div id="outlet"></div>`;
     const outlet = this.querySelector("#outlet")!;

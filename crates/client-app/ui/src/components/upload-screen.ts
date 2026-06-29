@@ -1,7 +1,6 @@
 import { call } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import type { UploadKind, UploadPreview } from "../core/types.ts";
-import "./state-badge.ts";
 
 // Upload (spec §5): choose Image (file path) or Blog (body text) + title/tags →
 // Preview (stage_upload — encrypts locally, NO network write) → Confirm
