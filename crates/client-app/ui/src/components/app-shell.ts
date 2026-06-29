@@ -7,6 +7,7 @@ import "./bootstrap-screen.ts";
 import "./pending-screen.ts";
 import "./admin-screen.ts";
 import "./feed-screen.ts";
+import "./media-viewer.ts";
 import type { StatusPill } from "./status-pill.ts";
 import type { ConnState } from "../core/types.ts";
 
@@ -32,6 +33,8 @@ export class AppShell extends HTMLElement {
       } else {
         outlet.innerHTML = r === "feed"
           ? "<feed-screen></feed-screen>"
+          : r === "viewer"
+          ? "<media-viewer></media-viewer>"
           : r === "admin"
           ? "<admin-screen></admin-screen>"
           : r === "bootstrap"

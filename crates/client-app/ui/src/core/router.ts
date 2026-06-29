@@ -1,4 +1,4 @@
-const routes = ["connect", "feed", "bootstrap", "pending", "admin"] as const;
+const routes = ["connect", "feed", "bootstrap", "pending", "admin", "viewer"] as const;
 export type Route = (typeof routes)[number];
 export class Router {
   constructor(private onChange: (r: Route) => void) {
@@ -6,7 +6,9 @@ export class Router {
     this.emit();
   }
   private emit() {
-    const raw = location.hash.replace(/^#\//, "");
+    // Strip any `?query` (e.g. `#/viewer?id=x`) before matching: the route is
+    // the path segment only; the component reads its own query from the hash.
+    const raw = location.hash.replace(/^#\//, "").split("?")[0];
     const r: Route = (routes as readonly string[]).includes(raw) ? (raw as Route) : "connect";
     this.onChange(r);
   }
