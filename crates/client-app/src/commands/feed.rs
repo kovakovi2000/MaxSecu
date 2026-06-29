@@ -229,12 +229,18 @@ pub async fn decrypt_card(
         crate::download::build_stream_header(&mut sender, &host, &token, &req.file_id, &view)
             .await?;
 
-    // Borrow the unlocked identity transiently to unwrap MY wrap; restore always.
-    let identity = { session.0.lock().await.identity.take() }
-        .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-    let opened_res = open_my_header(&identity, file_id, &author, my_id, &header);
-    session.0.lock().await.identity = Some(identity); // restore on every path
-    let opened = opened_res?;
+    // Borrow the unlocked identity UNDER the lock to unwrap MY wrap. The guard is
+    // held only across `open_my_header`, which is SYNCHRONOUS (no await), so this
+    // never takes the identity out (no transient `None` window for a concurrent
+    // command to observe) and is panic-safe (nothing to restore).
+    let opened = {
+        let guard = session.0.lock().await;
+        let identity = guard
+            .identity
+            .as_ref()
+            .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+        open_my_header(identity, file_id, &author, my_id, &header)
+    }?;
 
     let (title, tags) = opened
         .small_streams
