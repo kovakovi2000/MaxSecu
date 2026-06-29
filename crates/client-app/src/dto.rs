@@ -168,3 +168,49 @@ pub struct SearchHit {
 pub struct SearchRequest {
     pub query: String,
 }
+
+/// What kind of content the user is staging for upload.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum UploadKind {
+    Image,
+    Blog,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StageUploadRequest {
+    pub kind: UploadKind,
+    /// For an image: a filesystem path to the chosen file. Ignored for blogs.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// For a blog: the post body text. Ignored for images.
+    #[serde(default)]
+    pub content: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// A preview of a staged-but-not-uploaded post. No key material, no bundle —
+/// only what the UI renders before the user confirms.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UploadPreview {
+    pub job_id: String,
+    pub file_type: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub byte_size: u64,
+    pub total_chunks: u64,
+    /// A small canonical-PNG thumbnail (base64) for an image preview, else None.
+    pub thumbnail_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfirmUploadRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CancelUploadRequest {
+    pub job_id: String,
+}

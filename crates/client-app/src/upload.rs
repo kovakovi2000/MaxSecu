@@ -11,16 +11,12 @@ use crate::error::UiError;
 
 /// Build the canonical metadata blob: JSON `{"title","tags"}` (UTF-8) — exactly
 /// what `commands::feed::parse_title_tags` reads back.
-// Wired into the upload command in the next Phase-4 task; exercised by tests now.
-#[allow(dead_code)]
 pub(crate) fn build_metadata(title: &str, tags: &[String]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "title": title, "tags": tags })).unwrap_or_default()
 }
 
 /// Blog: `content` is the plain UTF-8 bytes; metadata is the JSON title/tags; no
 /// thumbnail/preview.
-// Wired into the upload command in the next Phase-4 task; exercised by tests now.
-#[allow(dead_code)]
 pub(crate) fn prepare_blog_streams(
     content: Vec<u8>,
     title: &str,
@@ -37,8 +33,6 @@ pub(crate) fn prepare_blog_streams(
 /// Image: transcode the user's chosen bytes to canonical streams (content +
 /// thumbnail + preview), then attach the metadata JSON. Fail-closed on a bad image.
 /// Returns the detected `FileType` (Image) and the prepared streams.
-// Wired into the upload command in the next Phase-4 task; exercised by tests now.
-#[allow(dead_code)]
 pub(crate) fn prepare_image_streams(
     src: &[u8],
     title: &str,

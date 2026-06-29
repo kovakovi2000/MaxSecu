@@ -23,6 +23,10 @@ pub struct VerifiedAuthor {
     pub sig_pub: [u8; 32],
     pub enc_pub: [u8; 32],
     pub fingerprint: [u8; 32],
+    /// The verified binding's `key_version` (non-secret). The upload sets the
+    /// owner's `owner_key_version` from this so `genesis_sig` verifies against the
+    /// right binding.
+    pub key_version: u64,
 }
 
 /// Verify an already-fetched `(binding_bytes, signature)` under the pinned D5 and
@@ -45,6 +49,7 @@ pub fn verify_author_binding(
         sig_pub: v.sig_pub,
         enc_pub: v.enc_pub,
         fingerprint: v.fingerprint,
+        key_version: v.key_version,
     })
 }
 
@@ -169,6 +174,25 @@ pub async fn resolve_my_user_id(
     Ok(verify_author_binding(verifier, trust, &bytes, &sig, now_ms)?.user_id)
 }
 
+/// Resolve + D5-verify MY OWN binding by username (`GET /v1/directory/{username}`),
+/// returning the full verified author (user_id + key_version + keys). Used by the
+/// upload to set `owner_id`/`owner_key_version`. Fail-closed `pending` if unpublished.
+pub async fn resolve_my_binding(
+    sender: &mut SendRequest<Full<Bytes>>,
+    host: &str,
+    username: &str,
+    verifier: &DirectoryVerifier,
+    trust: &mut (dyn TrustStore + Send),
+    now_ms: u64,
+) -> Result<VerifiedAuthor, UiError> {
+    let (status, json) = get_json(sender, &format!("/v1/directory/{username}"), None, host).await?;
+    if status != hyper::StatusCode::OK {
+        return Err(UiError::new("pending", "Your account is not yet approved."));
+    }
+    let (bytes, sig) = parse_binding(&json)?;
+    verify_author_binding(verifier, trust, &bytes, &sig, now_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +259,7 @@ mod tests {
         assert_eq!(a.user_id, [0x0A; 16]);
         assert_eq!(a.sig_pub, [0x51; 32]);
         assert_eq!(a.enc_pub, [0xE1; 32]);
+        assert_eq!(a.key_version, 1);
     }
 
     #[test]
