@@ -32,6 +32,32 @@ pub enum FetchPhase {
     Failed { file_id: String, code: String },
 }
 
+/// The upload feedback channel (spec §6) — per-job progress for the active-uploads
+/// tray. Emitted over the Tauri event bus; the UI binds a progress meter + badge.
+/// Non-color-only: each variant carries a stable `phase` code.
+pub const EVT_UPLOAD: &str = "maxsecu://upload-state";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "phase")]
+pub enum UploadPhase {
+    /// Transcoding/encrypting locally (before any network write).
+    Encrypting { job_id: String },
+    /// Staging the version (POST /v1/files).
+    Staging { job_id: String },
+    /// Uploading ciphertext chunks (resumable).
+    Uploading {
+        job_id: String,
+        done: u64,
+        total: u64,
+    },
+    /// Finalizing the version.
+    Finalizing { job_id: String },
+    /// Done — the file is committed.
+    Done { job_id: String, file_id: String },
+    /// Failed with a sanitized code (no oracle).
+    Failed { job_id: String, code: String },
+}
+
 // The complete connection-state vocabulary streamed to the UI. `connect` emits
 // the connect-flow subset (Resolving/TlsHandshake/ChannelBinding/Connected/
 // Disconnected); Idle/Reconnecting/Degraded are emitted by the reconnect +
@@ -110,5 +136,28 @@ mod fetch_tests {
         let s = serde_json::to_string(&v).unwrap();
         assert!(s.contains("\"phase\":\"verifying\""));
         assert!(s.contains("\"file_id\":\"aa\""));
+    }
+}
+
+#[cfg(test)]
+mod upload_phase_tests {
+    use super::*;
+
+    #[test]
+    fn upload_phase_serializes_kebab_tagged() {
+        let s = serde_json::to_string(&UploadPhase::Uploading {
+            job_id: "j".into(),
+            done: 2,
+            total: 5,
+        })
+        .unwrap();
+        assert!(s.contains("\"phase\":\"uploading\""), "got {s}");
+        assert!(s.contains("\"done\":2") && s.contains("\"total\":5"));
+        let d = serde_json::to_string(&UploadPhase::Done {
+            job_id: "j".into(),
+            file_id: "ab".into(),
+        })
+        .unwrap();
+        assert!(d.contains("\"phase\":\"done\"") && d.contains("\"file_id\":\"ab\""));
     }
 }
