@@ -6,7 +6,7 @@ import "./connect-screen.ts";
 import "./bootstrap-screen.ts";
 import "./pending-screen.ts";
 import "./admin-screen.ts";
-import "./feed-empty.ts";
+import "./feed-screen.ts";
 import type { StatusPill } from "./status-pill.ts";
 import type { ConnState } from "../core/types.ts";
 
@@ -31,7 +31,7 @@ export class AppShell extends HTMLElement {
         outlet.replaceChildren(el);
       } else {
         outlet.innerHTML = r === "feed"
-          ? "<feed-empty></feed-empty>"
+          ? "<feed-screen></feed-screen>"
           : r === "admin"
           ? "<admin-screen></admin-screen>"
           : r === "bootstrap"
