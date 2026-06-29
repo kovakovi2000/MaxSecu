@@ -12,3 +12,30 @@ publish = false
 rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 symphonia = { version = "0.6.0", default-features = false, features = ["isomp4", "aac"] }
 rav1e = { version = "0.8.1", default-features = false }
+
+# --- Author-side INGEST path (Task 1.2) — OPTIONAL, OFF by default ----------
+# The ONE sanctioned C carve-out: libav (ffmpeg) used ONLY to decode the
+# author's own arbitrary source media into raw frames/PCM (later -> rav1e AV1).
+# This is NOT zero-C, so it is gated behind the `ingest` feature and is absent
+# from the default (view-path) build, which MUST stay pure Rust. In production
+# this C lives ONLY inside the future AppContainer-confined `media-transcode-
+# worker` leaf crate — never the view path.
+#
+# CHOSEN binding: `ac-ffmpeg` 0.19.0 (the narrower option). It is BINDGEN-FREE
+# (hand-written FFI + a tiny `cc`-compiled C shim), so it needs only a C compiler
+# (MSVC `cl.exe`) and the FFmpeg dev libraries — NOT libclang. On this headless
+# host it BUILDS, LINKS and DECODES a real H.264 clip against the installed
+# FFmpeg 8.0 / libavcodec 62 libraries (see `ingest_probe` -> "INGEST DECODE OK:
+# 48x32"). `default-features = false` keeps `filters`/avfilter off (fewer linked
+# libs). The evaluated-but-rejected alternative `ffmpeg-next`/`ffmpeg-sys-next`
+# 8.1.0 is API-matched to FFmpeg 8.0 too, but its build runs `bindgen`, which
+# needs libclang — ABSENT here (headless blocker). Full recipe + the ffmpeg-next
+# blocker are in SPIKE_NOTES.md ("Ingest (ffmpeg) provisioning").
+ac-ffmpeg = { version = "0.19.0", default-features = false, optional = true }
+
+[features]
+# `cargo run -p spike-codecs --features ingest` enables the ffmpeg ingest probe
+# (requires FFMPEG_INCLUDE_DIR / FFMPEG_LIB_DIR + the FFmpeg DLLs on PATH — see
+# SPIKE_NOTES.md). The default (no-feature) build pulls NO C and reproduces the
+# Task 1.1 zero-C round-trip.
+ingest = ["dep:ac-ffmpeg"]

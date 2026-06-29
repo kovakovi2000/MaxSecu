@@ -49,6 +49,13 @@ const W: usize = 64;
 const H: usize = 64;
 
 fn main() {
+    // ---- Task 1.2: author-side INGEST probe (optional, OFF by default) ----
+    // When built `--features ingest`, decode a tiny known H.264 clip through the
+    // C ffmpeg binding and print the decoded source dims. This is the ONE
+    // sanctioned C carve-out and is absent from the default build below.
+    #[cfg(feature = "ingest")]
+    ingest_probe();
+
     // rav1d's single-threaded decode path uses large/deep stack frames that
     // overflow Windows' default 1 MiB main-thread stack. Run the whole spike on
     // a worker thread with a generous stack. (Production will run the decoder in
@@ -59,6 +66,66 @@ fn main() {
         .expect("spawn worker thread")
         .join()
         .expect("worker thread panicked");
+}
+
+/// Author-side ingest probe (Task 1.2). Decodes the first frame of a tiny known
+/// H.264 clip (`testdata/tiny.mp4`, 48x32, libx264) through the C ffmpeg binding
+/// and prints the decoded source dimensions, proving the sanctioned C ingest
+/// carve-out builds and decodes. This is the production transcode worker's input
+/// stage (arbitrary author media -> raw frames -> later rav1e AV1). The code is
+/// the real `ac-ffmpeg` 0.19.0 API (demux -> first video stream -> `VideoDecoder`
+/// push/take); it only runs under `--features ingest` and links the system
+/// FFmpeg libraries (see SPIKE_NOTES.md "Ingest (ffmpeg) provisioning").
+#[cfg(feature = "ingest")]
+fn ingest_probe() {
+    use ac_ffmpeg::codec::video::VideoDecoder;
+    use ac_ffmpeg::codec::Decoder;
+    use ac_ffmpeg::format::demuxer::Demuxer;
+    use ac_ffmpeg::format::io::IO;
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/tiny.mp4");
+    let file = std::fs::File::open(path).expect("ffmpeg: open input clip");
+    let io = IO::from_seekable_read_stream(file);
+    let mut demuxer = Demuxer::builder()
+        .build(io)
+        .expect("ffmpeg: build demuxer")
+        .find_stream_info(None)
+        .map_err(|(_, e)| e)
+        .expect("ffmpeg: find stream info");
+
+    // Pick the first video stream and build its decoder. The immutable borrow of
+    // `demuxer` is scoped so the packet-pump loop below can borrow it mutably.
+    let stream_index;
+    let mut decoder = {
+        let (idx, stream) = demuxer
+            .streams()
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.codec_parameters().is_video_codec())
+            .expect("ffmpeg: no video stream");
+        stream_index = idx;
+        VideoDecoder::from_stream(stream)
+            .expect("ffmpeg: video decoder from stream")
+            .build()
+            .expect("ffmpeg: build video decoder")
+    };
+
+    while let Some(packet) = demuxer.take().expect("ffmpeg: demux take") {
+        if packet.stream_index() != stream_index {
+            continue;
+        }
+        decoder.push(packet).expect("ffmpeg: decoder push");
+        if let Some(frame) = decoder.take().expect("ffmpeg: decoder take") {
+            println!("INGEST DECODE OK: {}x{}", frame.width(), frame.height());
+            return;
+        }
+    }
+    decoder.flush().expect("ffmpeg: decoder flush");
+    if let Some(frame) = decoder.take().expect("ffmpeg: decoder take (flush)") {
+        println!("INGEST DECODE OK: {}x{}", frame.width(), frame.height());
+        return;
+    }
+    panic!("ffmpeg: produced no decoded frame");
 }
 
 fn run() {

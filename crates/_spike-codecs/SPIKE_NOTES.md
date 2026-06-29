@@ -161,10 +161,112 @@ offset). No `av1C` box is emitted (symphonia tolerates its absence; geometry com
 from the `av01` visual sample entry's width/height fields). This is throwaway:
 production ingest will mux real CMAF on the C-confined side, not in the view path.
 
+## Ingest (ffmpeg) provisioning — Task 1.2
+
+The VIEW path above is zero-C. The **author-side INGEST** path is the ONE
+sanctioned C carve-out: libav (ffmpeg) decoding the author's *own* arbitrary
+source media into raw frames (later -> rav1e AV1 -> AAC/CMAF). In production it
+lives ONLY in the future AppContainer-confined `media-transcode-worker`. This
+task only verifies the binding builds + decodes. It is gated behind the
+`ingest` cargo feature (optional dep + `ingest = ["dep:ac-ffmpeg"]`); the default
+build pulls NO C and reproduces the Task 1.1 round-trip.
+
+### Host provisioning inventory (probed 2026-06-29)
+
+- NO `pkg-config`, NO `vcpkg`, NO preset `FFMPEG_DIR`, NO `nasm`, **NO
+  `libclang.dll` anywhere on the system** (searched VS, LLVM, miniconda, user).
+- VS 2022 Community present: MSVC `cl.exe` 14.44.35207 (found via the VS
+  registry by the `cc` crate even though it is not on `PATH`).
+- A **full FFmpeg 8.0 dev build** is installed at `C:\FFmpeg` (`bin/` already on
+  `PATH`): `ffmpeg version N-121256-g0fdb5829e3-20250929`, **libavcodec 62 /
+  libavutil 60 / libavformat 62**. It ships `include/` (libav* headers), `lib/`
+  (MSVC import libs `avcodec.lib`+`avcodec-62.def`, … and mingw `*.dll.a`), and
+  `bin/` shared DLLs (`avcodec-62.dll`, `avformat-62.dll`, `avutil-60.dll`, …).
+
+### CHOSEN binding: `ac-ffmpeg` 0.19.0 — REAL DECODE ACHIEVED
+
+`ac-ffmpeg` is the narrower option and is **bindgen-free**: a hand-written FFI
+plus a small C shim (`ffwrapper`) compiled by the `cc` crate. It therefore needs
+only a C compiler + the FFmpeg dev libs — **NOT libclang**. Wired as
+`ac-ffmpeg = { version = "0.19.0", default-features = false, optional = true }`
+(`default-features = false` keeps `filters`/avfilter off → fewer linked libs).
+
+Working provisioning recipe on this host:
+```
+export PATH="$HOME/.cargo/bin:$PATH"
+export FFMPEG_INCLUDE_DIR="C:\\FFmpeg\\include"   # ac-ffmpeg-build reads these
+export FFMPEG_LIB_DIR="C:\\FFmpeg\\lib"           # (Windows: env vars, else vcpkg)
+# C:\FFmpeg\bin is already on PATH so the avcodec-62.dll etc. resolve at runtime
+cargo run -p spike-codecs --features ingest
+```
+Result (one run, exit 0): `INGEST DECODE OK: 48x32` then `ROUND-TRIP OK: 64x64`.
+The clip `testdata/tiny.mp4` (48x32, 1-frame libx264, 1546 B) was generated with
+the bundled `ffmpeg.exe` (`-f lavfi -i color=…:s=48x32 -frames:v 1 -c:v libx264`).
+
+Real API used (`ac-ffmpeg` 0.19.0, in `ingest_probe`):
+- `format::io::IO::from_seekable_read_stream(std::fs::File)`
+- `format::demuxer::Demuxer::builder().build(io)?.find_stream_info(None)` (the
+  error variant is `(Demuxer, Error)`; map with `.map_err(|(_, e)| e)`).
+- `demuxer.streams().iter().enumerate()` → first
+  `stream.codec_parameters().is_video_codec()` (the immutable borrow MUST be
+  scoped so the packet pump can borrow `demuxer` mutably).
+- `codec::video::VideoDecoder::from_stream(&stream)?.build()?`
+- pump: `demuxer.take()? -> Option<Packet>`; skip `packet.stream_index() != idx`;
+  `decoder.push(packet)?`; drain `decoder.take()? -> Option<VideoFrame>`;
+  `decoder.flush()?` then final drain. `frame.width()/height() -> usize`.
+- Link mode is `dylib` by default (`FFMPEG_STATIC` unset) → links the import
+  libs; the matching DLLs must be on `PATH` at runtime.
+
+CAVEAT for Gate 6: `ac-ffmpeg` 0.19.0's README lists only FFmpeg **4.x–7.x**, yet
+its C shim compiled, linked and decoded cleanly against the installed **8.0**
+libs here. Do not rely on this undocumented 8.0 compatibility — Gate 6 should pin
+a vendored, supported FFmpeg in the confined worker and re-verify.
+
+### Evaluated alternative: `ffmpeg-next` / `ffmpeg-sys-next` 8.1.0 — libclang BLOCKER
+
+The named primary candidate. `ffmpeg-sys-next` 8.1.0 is API-matched to FFmpeg 8.0
+(its `build.rs`, given `FFMPEG_DIR=C:\FFmpeg`, found the headers/libs and detected
+`ffmpeg_8_0=true`, probing `ffmpeg_8_1` which this install lacks). Library
+discovery and the `cl`-compiled C version-probe BOTH succeeded. The build then
+fails at FFI generation — `ffmpeg-sys-next` runs **bindgen unconditionally**, and
+bindgen needs libclang, which is absent:
+```
+thread 'main' panicked at bindgen-0.72.1\lib.rs:616:27:
+Unable to find libclang: "couldn't find any valid shared libraries matching:
+['clang.dll', 'libclang.dll'], set the `LIBCLANG_PATH` environment variable …"
+```
+This is a headless toolchain blocker, NOT a fundamental one. To use `ffmpeg-next`
+in production, Gate 6 must provision LLVM/`libclang.dll` (set `LIBCLANG_PATH`) at
+build time, or vendor prebuilt `ffmpeg-sys-next` bindings. The `ingest` feature in
+this spike does NOT use `ffmpeg-next`, so the default + ingest builds both stay
+green without libclang; this is recorded only so Gate 1 can compare bindings.
+
+### Why `ac-ffmpeg` for the confined ingest worker
+
+- Narrower surface (the task's stated "narrower" option) — fewer linked libs with
+  `default-features = false`; aligns with the minimize-the-C-carve-out posture.
+- **Bindgen-free** → no libclang build dependency, simpler to provision inside the
+  future AppContainer build. It is the only candidate that actually built AND
+  decoded headlessly on this host.
+
 ## Gate results
 
+### Task 1.1 (default, zero-C view path)
+
 - `cargo build -p spike-codecs` — OK
-- `cargo run -p spike-codecs` — `ROUND-TRIP OK: 64x64`, exit 0
+- `cargo run -p spike-codecs` — `ROUND-TRIP OK: 64x64`, exit 0 (no `INGEST` line)
 - `cargo clippy -p spike-codecs --all-targets -- -D warnings` — clean
 - `cargo tree -p spike-codecs -i {ring,openssl,openssl-sys}` — all empty
 - `cargo metadata` — workspace resolves with `crates/_spike-codecs` added to `members`
+
+### Task 1.2 (`--features ingest`, C ffmpeg carve-out)
+
+Provisioned with `FFMPEG_INCLUDE_DIR=C:\FFmpeg\include`,
+`FFMPEG_LIB_DIR=C:\FFmpeg\lib`, `C:\FFmpeg\bin` on `PATH`:
+- `cargo run -p spike-codecs --features ingest` — `INGEST DECODE OK: 48x32`
+  (real C ffmpeg H.264 decode) then `ROUND-TRIP OK: 64x64`, exit 0
+- `cargo clippy -p spike-codecs --all-targets --features ingest -- -D warnings` — clean
+- `cargo tree -p spike-codecs --features ingest -i {ring,openssl,openssl-sys}` — all empty
+  (the C ffmpeg build uses schannel, not openssl; no new Rust TLS crate enters)
+- `ffmpeg-next`/`ffmpeg-sys-next` 8.1.0 (alternative) — discovery OK via
+  `FFMPEG_DIR=C:\FFmpeg`, blocked at `bindgen` (no libclang); see above.
