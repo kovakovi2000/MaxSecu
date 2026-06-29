@@ -6,6 +6,7 @@ pub mod commands;
 pub mod config;
 pub mod dto;
 pub mod error;
+pub mod http_client;
 pub mod keystore;
 pub mod session;
 pub mod state;
