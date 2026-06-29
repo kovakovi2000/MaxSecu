@@ -45,6 +45,13 @@ ac-ffmpeg = { version = "0.19.0", default-features = false, optional = true }
 # the worker's normal/shipped graph (the NORMAL deps remain client-core + rav1e, plus
 # the optional ac-ffmpeg). asm OFF on rav1d (no nasm) keeps the test path zero-C.
 [dev-dependencies]
+# `maxsecu-media-launcher` — the CODEC-FREE confined spawner (Gate 6). DEV-ONLY: the
+# containment test drives the real `TranscodeLauncher` (AppContainer + Job Object on
+# Windows) for the confined functional + differential-containment proofs. It links NO
+# codec (rav1e/ac-ffmpeg live only here), depends only on client-core + windows-sys,
+# and does NOT depend on this worker crate — so this is a pure leaf dev-edge, no cycle,
+# and (being a dev-dep) never enters the worker's NORMAL/shipped graph.
+maxsecu-media-launcher = { path = "../media-launcher" }
 # `rav1d` — pure-Rust dav1d port; decodes the muxed fragment's av01 sample back to
 # its geometry (the dav1d C ABI is exposed as `pub unsafe extern "C"` fns, so the
 # test's FFI decode is the ONE `#[allow(unsafe_code)]` site — scoped + justified).

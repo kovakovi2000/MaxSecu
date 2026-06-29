@@ -2691,6 +2691,7 @@ dependencies = [
  "ac-ffmpeg",
  "image",
  "maxsecu-client-core",
+ "maxsecu-media-launcher",
  "rav1d",
  "rav1e",
  "symphonia",

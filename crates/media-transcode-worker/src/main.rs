@@ -11,6 +11,14 @@
 //! CMAF mux (Task 6.2); the optional `ac-ffmpeg` broad-format ingest stays a
 //! documented deferred stub behind the off-by-default `ffmpeg` feature.
 //!
+//! In `--selftest-*` mode (Phase 7 Gate 6) it performs ONE containment probe —
+//! attempt a network connect / spawn a child / read a sensitive path — and writes a
+//! single verdict byte (`1` = the action SUCCEEDED, `0` = it was DENIED), so the
+//! containment tests can assert the AppContainer + Job Object confinement denies each
+//! from inside the sandbox (the same probes the decode `media-worker` uses). This
+//! bounds the blast radius of the future, deferred ffmpeg C decode: even a libav 0-day
+//! in the confined worker cannot reach the network, shell out, or read the user's keys.
+//!
 //! [`TranscodeRequest`]: maxsecu_client_core::media::TranscodeRequest
 //! [`TranscodeResult`]: maxsecu_client_core::media::TranscodeResult
 
@@ -29,6 +37,20 @@ use maxsecu_media_transcode_worker::transcode;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 fn main() -> ExitCode {
+    // Gate-6 containment probe mode: ONE net/spawn/read attempt, then a single verdict
+    // byte (`1` = succeeded, `0` = denied) on stdout. Added ALONGSIDE the normal
+    // one-shot transcode mode (below), which is untouched. The probe reads no stdin.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(mode) = args.get(1) {
+        if mode.starts_with("--selftest") {
+            let verdict = run_selftest(mode, args.get(2).map(String::as_str));
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&[verdict as u8]);
+            let _ = out.flush();
+            return ExitCode::SUCCESS;
+        }
+    }
+
     // Read exactly one framed request from stdin. Any framing/decoding failure is
     // fail-closed: write nothing and exit non-zero so the launcher surfaces an error.
     let stdin = std::io::stdin();
@@ -110,4 +132,50 @@ fn read_frame(r: &mut impl Read) -> std::io::Result<Option<Vec<u8>>> {
 fn write_frame(w: &mut impl Write, body: &[u8]) -> std::io::Result<()> {
     w.write_all(&(body.len() as u32).to_le_bytes())?;
     w.write_all(body)
+}
+
+/// One containment probe (Phase 7 Gate 6) from inside the (possibly confined) worker.
+/// Returns whether the action **succeeded** — the containment tests assert it does NOT
+/// when the worker is confined (AppContainer + Job Object), yet DOES when unconfined.
+/// Mirrors the decode `media-worker`'s `run_selftest` so both workers prove the same
+/// net/spawn/read denials. The transcode worker holds NO keys and opens NO sockets in
+/// normal operation; these probes are the ONLY such attempts, and they are denied.
+fn run_selftest(mode: &str, arg: Option<&str>) -> bool {
+    use std::process::{Command, Stdio};
+    match mode {
+        // Attempt a loopback TCP connect. An AppContainer with no network capability
+        // cannot reach the network (loopback included) → false. Unconfined → true.
+        "--selftest-net" => match arg.and_then(|p| p.parse::<u16>().ok()) {
+            Some(port) => {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
+                    .is_ok()
+            }
+            None => false,
+        },
+        // Attempt to read a user file (a key-blob stand-in). An AppContainer's
+        // low-privilege token cannot read the user's files → false.
+        "--selftest-read" => arg.map(|p| std::fs::read(p).is_ok()).unwrap_or(false),
+        // Attempt to spawn a child process. A Job Object with active-process = 1 (and
+        // breakaway denied) cannot create a child → false.
+        "--selftest-spawn" => std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                Command::new(exe)
+                    .arg("--selftest-noop")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .ok()
+            })
+            .map(|mut child| {
+                let _ = child.wait();
+                true
+            })
+            .unwrap_or(false),
+        // The child spawned by --selftest-spawn; exists only to be spawnable.
+        "--selftest-noop" => true,
+        _ => false,
+    }
 }

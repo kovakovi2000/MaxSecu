@@ -779,6 +779,22 @@ impl TranscodeLauncher {
         parse_framed_result(&stdout)
     }
 
+    /// Run a transcode-worker `--selftest-*` probe **inside** the AppContainer + Job
+    /// Object and return its verdict (`true` = the probed action SUCCEEDED). The
+    /// Gate-6 containment differential asserts this is `false` (network / child-spawn /
+    /// key-blob-read denied) while the SAME worker run unconfined is allowed — proving
+    /// the confinement is what bounds a (future, deferred) ffmpeg C-decode 0-day. The
+    /// probe needs no stdin, so none is written; the lone verdict byte is read off the
+    /// confined stdout.
+    #[cfg(windows)]
+    pub fn selftest(&self, args: &[&str]) -> Result<bool, SpawnError> {
+        let out = win32::spawn_confined(&self.worker_path, args, &[], self.memory_cap_bytes)?;
+        // Read ONLY the single verdict byte (not the worker exit code): a confined
+        // spawn that produced no stdout byte reads as `false` (DENIED) — the SAFE
+        // direction (a probe can never silently read as ALLOWED).
+        Ok(out.stdout.first().copied() == Some(1))
+    }
+
     /// Spawn the worker inside the Windows AppContainer + Job Object, stream the
     /// framed request on its stdin, and return the captured stdout.
     #[cfg(windows)]
