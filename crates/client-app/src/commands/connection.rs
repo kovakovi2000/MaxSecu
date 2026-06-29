@@ -151,6 +151,7 @@ async fn connect_inner(
             s.identity = Some(id);
             s.server_id = login.server_id.clone();
             s.token = Some(login.token.clone());
+            s.username = Some(req.username.clone());
             login
         }
         Err(e) => {
@@ -165,6 +166,52 @@ async fn connect_inner(
     Ok(ConnectResponse {
         server_id: login.server_id,
     })
+}
+
+/// Re-authenticate on a FRESH channel and return that live authenticated channel
+/// plus a token bound to it. Channel-bound sessions can't be reused across
+/// connections, so each authenticated command mints its own. Serialized with
+/// `connect` via the ConnectLock; the unlocked identity is borrowed transiently
+/// and ALWAYS restored before returning.
+pub(crate) async fn reauth(
+    dir: &std::path::Path,
+    server: &str,
+    session: &Session,
+    connect_lock: &ConnectLock,
+) -> Result<
+    (
+        hyper::client::conn::http1::SendRequest<http_body_util::Full<hyper::body::Bytes>>,
+        String,
+        String,
+    ),
+    UiError,
+> {
+    let _guard = connect_lock
+        .0
+        .try_lock()
+        .map_err(|_| UiError::new("busy", "A connection attempt is already in progress."))?;
+    let username = {
+        let s = session.0.lock().await;
+        s.username
+            .clone()
+            .ok_or_else(|| UiError::new("locked", "Sign in first."))?
+    };
+    let (mut sender, host, exporter) = open_conn(dir, server).await?;
+    // Bind ts before the take so a clock panic can't strike between take and
+    // restore (mirrors connect_inner).
+    let ts = now_ms();
+    // Borrow the identity transiently (Identity isn't Clone); restore on every path.
+    let id = {
+        let mut s = session.0.lock().await;
+        s.identity
+            .take()
+            .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?
+    };
+    let result =
+        crate::session::login_exchange(&mut sender, &id, &username, &host, &exporter, ts).await;
+    session.0.lock().await.identity = Some(id); // restore regardless of outcome
+    let login = result?;
+    Ok((sender, host, login.token))
 }
 
 fn now_ms() -> u64 {

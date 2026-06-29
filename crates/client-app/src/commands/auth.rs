@@ -24,6 +24,10 @@ pub struct SessionInner {
     pub identity: Option<Identity>,
     pub server_id: String,
     pub token: Option<String>,
+    /// The username this session authenticated as. Stored so channel-bound admin
+    /// commands can RE-AUTHENTICATE on a fresh connection (the connect-minted
+    /// token is bound to a closed channel and unusable elsewhere).
+    pub username: Option<String>,
 }
 
 /// Async-aware managed wrapper (commands are `async`, so the guard must be a
@@ -83,5 +87,6 @@ pub async fn logout(session: tauri::State<'_, Session>) -> Result<(), UiError> {
     s.token = None;
     s.identity = None; // forget the unlocked key on logout
     s.server_id.clear();
+    s.username = None;
     Ok(())
 }

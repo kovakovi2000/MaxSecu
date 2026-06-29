@@ -47,3 +47,27 @@ pub struct RegisterUserRequest {
 pub struct AccountStatusRequest {
     pub username: String,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingUserDto {
+    pub user_id: String,
+    pub username: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IssueVoucherResponse {
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalRequest {
+    pub user_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CeremonyWorkItem {
+    pub user_id: String,
+    pub roles: Vec<String>,
+    pub note: String,
+}
