@@ -61,8 +61,11 @@ impl SearchIndex {
 
 /// Derive the 32-byte index-sealing key from the unlocked identity (a stable TCB
 /// secret), domain-separated so it is unrelated to any wrap key.
-fn index_key(identity: &Identity) -> [u8; 32] {
-    maxsecu_crypto::hkdf_sha256_32(&identity.enc_secret().expose_bytes(), INDEX_LABEL)
+fn index_key(identity: &Identity) -> zeroize::Zeroizing<[u8; 32]> {
+    zeroize::Zeroizing::new(maxsecu_crypto::hkdf_sha256_32(
+        &identity.enc_secret().expose_bytes(),
+        INDEX_LABEL,
+    ))
 }
 
 /// Load + decrypt the index from `<dir>/index/search.idx`, or an empty index if
@@ -71,7 +74,13 @@ pub fn load(dir: &Path, identity: &Identity) -> Result<SearchIndex, UiError> {
     let path = dir.join("index").join("search.idx");
     let sealed = match std::fs::read(&path) {
         Ok(b) => b,
-        Err(_) => return Ok(SearchIndex::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SearchIndex::default()),
+        Err(_) => {
+            return Err(UiError::new(
+                "index_failed",
+                "The search index could not be read.",
+            ))
+        }
     };
     if sealed.len() < 12 {
         return Err(UiError::new("index_failed", "The search index is corrupt."));
@@ -92,11 +101,13 @@ pub fn save(dir: &Path, identity: &Identity, index: &SearchIndex) -> Result<(), 
     let idx_dir = dir.join("index");
     std::fs::create_dir_all(&idx_dir)
         .map_err(|_| UiError::new("index_failed", "Could not write the index."))?;
-    let plain = serde_json::to_vec(index)
-        .map_err(|_| UiError::new("index_failed", "Could not encode the index."))?;
+    let plain = zeroize::Zeroizing::new(
+        serde_json::to_vec(index)
+            .map_err(|_| UiError::new("index_failed", "Could not encode the index."))?,
+    );
     let key = index_key(identity);
     let nonce = maxsecu_crypto::random_array::<12>();
-    let ct = maxsecu_crypto::seal(&key, &nonce, INDEX_LABEL, &plain);
+    let ct = maxsecu_crypto::seal(&key, &nonce, INDEX_LABEL, &plain[..]);
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ct);
