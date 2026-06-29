@@ -58,6 +58,41 @@ pub enum UploadPhase {
     Failed { job_id: String, code: String },
 }
 
+/// The sandboxed-video player feedback channel (Phase 7, Gate 4) — per-file
+/// playback state for the `<media-viewer>` video surface. Emitted over the Tauri
+/// event bus alongside the decoded frame/PCM DTOs (`EVT_VIDEO_FRAME`/
+/// `EVT_VIDEO_AUDIO`). Non-color-only: each variant carries a stable `phase` code.
+pub const EVT_PLAYER: &str = "maxsecu://player-state";
+
+/// Decoded-frame channel: one [`crate::commands::video::I420FrameDto`] per
+/// re-validated frame the confined worker produced (the UI uploads its planes to
+/// a WebGL texture in Gate 5). Carries NO key material — only RAM-only pixels.
+pub const EVT_VIDEO_FRAME: &str = "maxsecu://video-frame";
+
+/// Decoded-audio channel: one [`crate::commands::video::PcmDto`] per re-validated
+/// PCM chunk (the UI feeds it to WebAudio in Gate 5).
+pub const EVT_VIDEO_AUDIO: &str = "maxsecu://video-audio";
+
+/// The video player's state machine (spec §6/§7). Emitted over [`EVT_PLAYER`];
+/// the UI binds a buffering spinner / play state / error banner. `Error` carries a
+/// sanitized code (no decode oracle); `CodecUnavailable` is the honest
+/// player-gated terminal when the confined worker is not present.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "phase")]
+pub enum PlayerPhase {
+    /// Decrypting + decoding the current bounded window before frames flow.
+    Buffering,
+    /// Frames are flowing (the window decoded + re-validated).
+    Playing,
+    /// Awaiting the next window / data underrun (non-terminal).
+    Stalled,
+    /// Failed with a sanitized code (no oracle). Also the benign terminal for a
+    /// user cancel (`code = "cancelled"`).
+    Error { code: String },
+    /// The confined video worker is unavailable (player gated, D-B).
+    CodecUnavailable,
+}
+
 // The complete connection-state vocabulary streamed to the UI. `connect` emits
 // the connect-flow subset (Resolving/TlsHandshake/ChannelBinding/Connected/
 // Disconnected); Idle/Reconnecting/Degraded are emitted by the reconnect +
@@ -136,6 +171,32 @@ mod fetch_tests {
         let s = serde_json::to_string(&v).unwrap();
         assert!(s.contains("\"phase\":\"verifying\""));
         assert!(s.contains("\"file_id\":\"aa\""));
+    }
+}
+
+#[cfg(test)]
+mod player_phase_tests {
+    use super::*;
+
+    #[test]
+    fn player_phase_serializes_kebab_tagged() {
+        assert_eq!(
+            serde_json::to_string(&PlayerPhase::Buffering).unwrap(),
+            "{\"phase\":\"buffering\"}"
+        );
+        assert_eq!(
+            serde_json::to_string(&PlayerPhase::Playing).unwrap(),
+            "{\"phase\":\"playing\"}"
+        );
+        assert_eq!(
+            serde_json::to_string(&PlayerPhase::CodecUnavailable).unwrap(),
+            "{\"phase\":\"codec-unavailable\"}"
+        );
+        let e = serde_json::to_string(&PlayerPhase::Error {
+            code: "cancelled".into(),
+        })
+        .unwrap();
+        assert!(e.contains("\"phase\":\"error\"") && e.contains("\"code\":\"cancelled\""));
     }
 }
 

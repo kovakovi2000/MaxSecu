@@ -10,4 +10,5 @@ pub mod feed;
 pub mod search;
 pub mod settings;
 pub mod upload;
+pub mod video;
 pub mod viewer;

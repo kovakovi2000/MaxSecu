@@ -35,6 +35,39 @@ impl Default for UploadJobs {
     }
 }
 
+/// One live video-player session (Phase 7, Gate 4). Holds the in-TCB
+/// [`ContentDecryptor`] (the content subkey — NEVER crosses the Tauri seam), the
+/// authenticated fragment index (seek map), and the bounded on-disk **ciphertext**
+/// [`FragmentCache`]. Dropping the job (on `cancel_video`) drops the decryptor,
+/// which zeroizes the subkey. Non-`Clone` by construction (the decryptor is).
+pub struct VideoJob {
+    pub decryptor: maxsecu_client_core::ContentDecryptor,
+    pub index: Vec<crate::video::FragmentEntry>,
+    pub cache: crate::fragment_cache::FragmentCache,
+    pub file_id_hex: String,
+    pub version: u64,
+    /// UI playback gain preference (0.0..=4.0). Has NO decode effect — the UI
+    /// applies it via WebAudio (Gate 5); stored here so it survives across windows.
+    pub gain: f32,
+}
+
+/// Managed state: `file_id_hex -> VideoJob`. Async mutex (commands are async).
+/// Keyed by the canonical lowercase `hex16(file_id)` so seek/volume/cancel find
+/// the session `open_video` created.
+pub struct VideoJobs(pub Mutex<HashMap<String, VideoJob>>);
+
+impl VideoJobs {
+    pub fn new() -> Self {
+        VideoJobs(Mutex::new(HashMap::new()))
+    }
+}
+
+impl Default for VideoJobs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

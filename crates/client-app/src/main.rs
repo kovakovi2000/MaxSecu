@@ -20,6 +20,7 @@ fn main() {
         .manage(Session::new())
         .manage(ConnectLock::new())
         .manage(maxsecu_client_app::jobs::UploadJobs::new())
+        .manage(maxsecu_client_app::jobs::VideoJobs::new())
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
             maxsecu_client_app::commands::auth::unlock_keystore,
@@ -43,6 +44,10 @@ fn main() {
             maxsecu_client_app::commands::settings::set_settings,
             maxsecu_client_app::commands::settings::change_password,
             maxsecu_client_app::commands::settings::export_keystore,
+            maxsecu_client_app::commands::video::open_video,
+            maxsecu_client_app::commands::video::video_seek,
+            maxsecu_client_app::commands::video::video_set_volume,
+            maxsecu_client_app::commands::video::cancel_video,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MaxSecu client");
