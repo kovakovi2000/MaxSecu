@@ -14,6 +14,7 @@ pub mod http_client;
 pub mod index;
 pub mod jobs;
 pub mod keystore;
+pub mod layout;
 pub mod session;
 pub mod state;
 pub mod transport;

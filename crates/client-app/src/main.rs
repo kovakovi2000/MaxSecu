@@ -10,6 +10,11 @@ fn main() {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
+    // Ensure the portable sub-dirs exist beside the exe (spec §8.1). Best-effort:
+    // the individual writers also create their own parents, so a failure here must
+    // not crash startup.
+    let _ = maxsecu_client_app::layout::ensure_portable_layout(&app_dir);
+
     tauri::Builder::default()
         .manage(AppDir(app_dir))
         .manage(Session::new())
