@@ -20,3 +20,4 @@ pub mod session;
 pub mod state;
 pub mod transport;
 pub mod upload;
+pub mod video;
