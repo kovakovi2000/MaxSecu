@@ -1,4 +1,6 @@
 import { call } from "../core/rpc.ts";
+import { setUsername } from "../core/session.ts";
+import type { AccountStateMsg } from "../core/types.ts";
 
 export class ConnectScreen extends HTMLElement {
   connectedCallback() {
@@ -17,16 +19,30 @@ export class ConnectScreen extends HTMLElement {
       e.preventDefault();
       const d = new FormData(f);
       const err = this.querySelector("#err")!;
+      const uname = String(d.get("username"));
       try {
         await call("unlock_keystore", { password: String(d.get("password")) });
         await call("connect", {
           req: {
             server: String(d.get("server")),
-            username: String(d.get("username")),
+            username: uname,
             use_tor: !!d.get("tor"),
           },
         });
-        location.hash = "#/feed";
+        // Stash the username so the pending screen can poll account_status for
+        // the right user; UI-only convenience state, not a security boundary.
+        setUsername(uname);
+        // Route a not-yet-approved account to the status-only pending screen; an
+        // active account goes straight to the app. account_status is a
+        // request/response command (no event), so the connect handler decides.
+        try {
+          const acct = await call<AccountStateMsg>("account_status", { req: { username: uname } });
+          location.hash = acct.state === "active" ? "#/feed" : "#/pending";
+        } catch {
+          // If the status check fails, fall back to the feed (which handles its
+          // own errors); the connect itself already succeeded.
+          location.hash = "#/feed";
+        }
       } catch (x) {
         err.textContent =
           (x && typeof x === "object" && "message" in x

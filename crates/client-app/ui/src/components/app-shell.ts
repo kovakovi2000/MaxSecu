@@ -1,8 +1,10 @@
 import { Router } from "../core/router.ts";
 import { on } from "../core/rpc.ts";
+import { getUsername } from "../core/session.ts";
 import "./status-pill.ts";
 import "./connect-screen.ts";
 import "./bootstrap-screen.ts";
+import "./pending-screen.ts";
 import "./feed-empty.ts";
 import type { StatusPill } from "./status-pill.ts";
 import type { ConnState } from "../core/types.ts";
@@ -20,11 +22,19 @@ export class AppShell extends HTMLElement {
     const outlet = this.querySelector("#outlet")!;
     const pill = this.querySelector("#pill") as StatusPill;
     new Router((r) => {
-      outlet.innerHTML = r === "feed"
-        ? "<feed-empty></feed-empty>"
-        : r === "bootstrap"
-        ? "<bootstrap-screen></bootstrap-screen>"
-        : "<connect-screen></connect-screen>";
+      if (r === "pending") {
+        // Build via the DOM (not innerHTML) so the username goes into an
+        // attribute, never parsed as markup.
+        const el = document.createElement("pending-screen");
+        el.setAttribute("username", getUsername());
+        outlet.replaceChildren(el);
+      } else {
+        outlet.innerHTML = r === "feed"
+          ? "<feed-empty></feed-empty>"
+          : r === "bootstrap"
+          ? "<bootstrap-screen></bootstrap-screen>"
+          : "<connect-screen></connect-screen>";
+      }
       // WCAG 2.4.3: the old content (incl. the focused control) was just
       // removed; move focus to the new screen's main landmark so focus order
       // is preserved and screen readers land on the new view.
