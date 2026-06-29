@@ -5,14 +5,19 @@
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use http_body_util::Full;
+use hyper::body::Bytes;
+use hyper::client::conn::http1::SendRequest;
 
+use maxsecu_client_core::{DownloadBundle, StreamChunks, StreamHeader};
 use maxsecu_crypto::WrappedDek;
 use maxsecu_encoding::types::StreamType;
 
 use crate::error::UiError;
+use crate::http_client::get_bytes;
 
 /// One stream's wire descriptor from a §8.5 file view (no values).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StreamSpec {
     pub stream_type: StreamType,
     pub chunk_count: u64,
@@ -110,14 +115,6 @@ pub fn parse_file_view(json: &serde_json::Value) -> Result<ParsedView, UiError> 
     })
 }
 
-use http_body_util::Full;
-use hyper::body::Bytes;
-use hyper::client::conn::http1::SendRequest;
-
-use maxsecu_client_core::{DownloadBundle, StreamChunks, StreamHeader};
-
-use crate::http_client::get_bytes;
-
 fn stream_name(st: StreamType) -> &'static str {
     match st {
         StreamType::Content => "content",
@@ -137,7 +134,11 @@ pub async fn fetch_stream_chunks(
     version: u64,
     spec: &StreamSpec,
 ) -> Result<StreamChunks, UiError> {
-    let mut chunks = Vec::with_capacity(spec.chunk_count as usize);
+    // No eager capacity hint: `chunk_count` is the UNSIGNED §8.5 listing value
+    // (attacker-controlled, read before verification) — a huge value would panic
+    // (capacity overflow) or OOM. The loop self-bounds: the first out-of-range
+    // chunk GET returns non-OK and errors out.
+    let mut chunks = Vec::new();
     for i in 0..spec.chunk_count {
         let uri = format!(
             "/v1/files/{file_id_hex}/versions/{version}/streams/{}/chunks/{i}",
