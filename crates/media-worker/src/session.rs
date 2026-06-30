@@ -38,10 +38,15 @@ use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 use maxsecu_client_core::sandbox::{DecodeError, OutputReject};
-use maxsecu_client_core::video::{validate_i420, ClientMsg, I420Frame, VideoBounds, WorkerMsg};
+use maxsecu_client_core::video::{
+    validate_i420, validate_pcm, ClientMsg, I420Frame, PcmChunk, VideoBounds, WorkerMsg,
+};
 
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::CodecParameters;
 use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::default::codecs::AacDecoder;
 use symphonia::default::formats::IsoMp4Reader;
 
 use rav1d::include::dav1d::data::Dav1dData;
@@ -62,6 +67,17 @@ const DAV1D_ERR_AGAIN: i32 = -11;
 /// stuck stream terminates instead of spinning forever. A canonical fragment is one
 /// keyframe still, so a handful of iterations suffice; the bound is generous.
 const MAX_DRAIN_ITERS: usize = 4096;
+
+/// Decode-expansion ceiling (decode-bomb defense) for the per-fragment AUDIO path:
+/// the maximum number of seconds of PCM a single fragment may decode to. The total
+/// emitted i16 sample budget per fragment is then
+/// `max_sample_rate * max_audio_channels * MAX_FRAGMENT_AUDIO_SECONDS` — at the
+/// default bounds (48 kHz × 2ch) that is 11.52 M samples (~23 MiB) per fragment,
+/// far above any real closed-GOP fragment (seconds of audio) yet a hard ceiling so
+/// a small hostile fragment within `max_fragment_bytes` cannot expand into
+/// unbounded PCM. `validate_pcm` deliberately does NOT magnitude-cap `samples`, so
+/// this session-layer bound is the magnitude defense. Over it ⇒ fail-closed.
+const MAX_FRAGMENT_AUDIO_SECONDS: u64 = 120;
 
 /// A persistent video-decode session over the launcher↔worker seam. Holds the live
 /// rav1d context + active bounds across many `feed` calls. Drive on a 64 MiB-stack
@@ -96,8 +112,9 @@ impl VideoSession {
     /// Feed one launcher → worker message; returns the (possibly empty) sequence of
     /// worker → launcher messages it produces. The state machine:
     /// * `Open{bounds}` — store bounds, (re)initialize the rav1d context → `[Ready]`.
-    /// * `Fragment{seq,bytes}` — byte-cap check, demux, decode each video sample to a
-    ///   validated I420 frame (`[Video..]`), then `[EndOfFragment{seq}]`.
+    /// * `Fragment{seq,bytes}` — byte-cap check, then decode each video sample to a
+    ///   validated I420 frame (`[Video..]`), then AAC-decode the audio track to
+    ///   validated PCM (`[Audio..]`), then `[EndOfFragment{seq}]` LAST.
     /// * `Seek{..}` — flush (tear down + recreate the context) → `[]`.
     /// * `Close` — tear down the context → `[]`.
     pub fn feed(&mut self, msg: ClientMsg) -> Vec<WorkerMsg> {
@@ -161,8 +178,145 @@ impl VideoSession {
             // No reader / no video packet → a malformed/empty fragment.
             _ => out.push(WorkerMsg::Error(DecodeError::DecodeFailed)),
         }
-        // (3) Fragment boundary marker, regardless of per-sample outcome.
+        // (2b) AUDIO (R1): demux + AAC-decode the audio track to validated PCM,
+        // emitted AFTER all of this fragment's video frames (the audio track is
+        // independent of the video outcome above — a video-only fragment, or a
+        // fragment whose video failed, simply contributes whatever audio decodes).
+        // The player buffers + A/V-syncs by pts, so emit order (all-video then
+        // all-audio) is fine. A fragment with no audio track contributes nothing.
+        out.extend(self.decode_audio_samples(&bytes));
+        // (3) Fragment boundary marker LAST, regardless of per-sample outcome.
         out.push(WorkerMsg::EndOfFragment { seq });
+        out
+    }
+
+    /// Demux + AAC-LC-decode the fragment's AUDIO track (if any) to validated,
+    /// interleaved-i16 [`PcmChunk`]s, in packet order. Mirrors the video path's
+    /// fail-closed posture: any decode/validation failure — or a per-fragment
+    /// PCM-expansion overrun — yields a single `WorkerMsg::Error` and stops; a
+    /// fragment with NO audio track yields an empty `Vec` (video-only is fine).
+    ///
+    /// Trust boundary: these are attacker-authored audio bytes (a NEW decode
+    /// surface). symphonia's `aac` decoder is pure-Rust (no `unsafe` added here);
+    /// the per-fragment **byte cap** is already enforced upstream in
+    /// [`Self::on_fragment`], and the **decode-expansion ceiling**
+    /// ([`MAX_FRAGMENT_AUDIO_SECONDS`]) bounds total emitted PCM so a small hostile
+    /// fragment cannot expand into unbounded RAM. Never panics / OOBs on hostile
+    /// input — symphonia errors map to a fail-closed `WorkerMsg::Error`.
+    ///
+    /// A fresh `AacDecoder` is built per fragment: each canonical fragment is
+    /// self-contained with its own `esds`/AudioSpecificConfig, so no cross-fragment
+    /// decoder state leaks (matching the video ctx flush on `Seek`). The decoder is
+    /// a plain owned value dropped at end of scope — nothing to unref.
+    fn decode_audio_samples(&self, mp4: &[u8]) -> Vec<WorkerMsg> {
+        // Open the demuxer. A malformed container yields no audio (the video path
+        // already reported the malformed fragment). Never panics on hostile bytes.
+        let mss = MediaSourceStream::new(
+            Box::new(Cursor::new(mp4.to_vec())),
+            MediaSourceStreamOptions::default(),
+        );
+        let mut reader = match IsoMp4Reader::try_new(mss, FormatOptions::default()) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        // No audio track ⇒ video-only fragment; emit nothing.
+        let Some(track) = reader.first_track(TrackType::Audio) else {
+            return Vec::new();
+        };
+        let track_id = track.id;
+        let time_base = track.time_base;
+        let params = match track.codec_params.as_ref() {
+            Some(CodecParameters::Audio(a)) => a.clone(),
+            // An audio track present but not interpretable as audio params is a
+            // malformed/hostile trak → fail closed.
+            _ => return vec![WorkerMsg::Error(DecodeError::DecodeFailed)],
+        };
+        // Fresh per-fragment decoder; construction failure ⇒ fail closed.
+        let mut decoder = match AacDecoder::try_new(&params, &AudioDecoderOptions::default()) {
+            Ok(d) => d,
+            Err(_) => return vec![WorkerMsg::Error(DecodeError::DecodeFailed)],
+        };
+
+        // Per-fragment PCM-expansion ceiling (decode-bomb defense). Saturating so a
+        // pathological bounds set can never wrap.
+        let ceiling: u64 = (self.bounds.max_sample_rate as u64)
+            .saturating_mul(self.bounds.max_audio_channels as u64)
+            .saturating_mul(MAX_FRAGMENT_AUDIO_SECONDS);
+
+        let mut out: Vec<WorkerMsg> = Vec::new();
+        let mut total_samples: u64 = 0;
+        // Fallback running pts (per-channel frames) when the track has no time_base.
+        let mut running_frames: u64 = 0;
+
+        loop {
+            let pkt = match reader.next_packet() {
+                Ok(Some(p)) => p,
+                Ok(None) => break,  // clean end of stream.
+                Err(_) => break,    // truncated/EOF → stop with what we have.
+            };
+            if pkt.track_id != track_id {
+                continue; // a non-audio packet — skip.
+            }
+            // Decode one AAC packet. A hostile/malformed packet → fail closed.
+            let buf = match decoder.decode(&pkt) {
+                Ok(b) => b,
+                Err(_) => {
+                    out.push(WorkerMsg::Error(DecodeError::DecodeFailed));
+                    break;
+                }
+            };
+            let rate = buf.spec().rate();
+            let ch_count = buf.spec().channels().count();
+            let frames = buf.frames() as u64;
+
+            // Real-time-ish pts: prefer the packet pts via the track time_base
+            // (≈ 1/sample_rate for audio), else a per-fragment running pts derived
+            // from cumulative decoded frames. Negative pts (encoder delay) → 0.
+            let pts_ms = time_base
+                .and_then(|tb| tb.calc_time(pkt.pts))
+                .map(|t| (t.as_secs_f64() * 1000.0).max(0.0) as u64)
+                .unwrap_or_else(|| {
+                    if rate > 0 {
+                        running_frames.saturating_mul(1000) / rate as u64
+                    } else {
+                        0
+                    }
+                });
+            running_frames = running_frames.saturating_add(frames);
+
+            // Convert to interleaved i16 (one AAC frame is bounded: ≤1024 frames ×
+            // channels, so this single allocation is small regardless of input).
+            let mut samples: Vec<i16> = Vec::new();
+            buf.copy_to_vec_interleaved(&mut samples);
+            if samples.is_empty() {
+                continue; // a frame that produced no audio (e.g. priming) — skip.
+            }
+
+            // Decode-expansion bound BEFORE accepting this chunk into the stream.
+            total_samples = total_samples.saturating_add(samples.len() as u64);
+            if total_samples > ceiling {
+                out.push(WorkerMsg::Error(DecodeError::OutputRejected {
+                    reason: OutputReject::OverCap,
+                }));
+                break;
+            }
+
+            // An absurd channel count truncates to 0 → validate_pcm rejects it.
+            let channels = u8::try_from(ch_count).unwrap_or(0);
+            let chunk = PcmChunk {
+                channels,
+                sample_rate: rate,
+                pts_ms,
+                samples,
+            };
+            match validate_pcm(&chunk, &self.bounds) {
+                Ok(()) => out.push(WorkerMsg::Audio(chunk)),
+                Err(e) => {
+                    out.push(WorkerMsg::Error(e));
+                    break;
+                }
+            }
+        }
         out
     }
 

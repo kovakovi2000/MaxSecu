@@ -49,6 +49,13 @@ symphonia = { version = "0.6.0", default-features = false, features = [
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# `maxsecu-media-transcode-worker` — DEV-ONLY fixture builder for the A+V audio
+# test (`tests/audio_session.rs`): it re-muxes a vendored-ffmpeg AV1+AAC mp4 into
+# the canonical per-fragment CMAF layout so the new AAC->PCM path is exercised on a
+# REAL AAC track (verbatim ffmpeg `mp4a`/`esds`). This is a dev-dep CYCLE — that
+# crate already dev-deps THIS one to drive `VideoSession` — which cargo permits
+# because BOTH edges are dev-deps. It never enters either crate's shipped graph.
+maxsecu-media-transcode-worker = { path = "../media-transcode-worker" }
 # `rav1e` — pure-Rust AV1 *encoder*. FIXTURE-ONLY in this crate (synthesizes
 # known-good AV1 bitstreams for the test-support canonical-clip generator); NOT in
 # the production view path (real encode rides the C-confined ingest worker). asm

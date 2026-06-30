@@ -2690,6 +2690,7 @@ dependencies = [
  "image",
  "maxsecu-client-core",
  "maxsecu-media-launcher",
+ "maxsecu-media-transcode-worker",
  "rav1d",
  "rav1e",
  "symphonia",
