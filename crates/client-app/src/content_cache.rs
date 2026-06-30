@@ -55,8 +55,10 @@ struct Entry {
 
 impl Entry {
     fn recompute_bytes(&mut self) {
-        self.bytes =
-            self.meta.approx_bytes() + self.content.as_ref().map_or(0, |c| c.len());
+        const ENTRY_OVERHEAD: usize = 128; // fixed accounting floor per entry (key+headers+bucket)
+        self.bytes = ENTRY_OVERHEAD
+            + self.meta.approx_bytes()
+            + self.content.as_ref().map_or(0, |c| c.len());
     }
 }
 
@@ -80,6 +82,12 @@ impl ContentCache {
         }))
     }
 
+    /// Poison-safe lock: a panic while holding the guard must not brick the cache
+    /// (it stores no key material), so recover the inner state instead of `unwrap`.
+    fn guard(&self) -> std::sync::MutexGuard<'_, CacheInner> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn tick(inner: &mut CacheInner) -> u64 {
         inner.clock += 1;
         inner.clock
@@ -87,7 +95,7 @@ impl ContentCache {
 
     /// Reconstruct a `CardDto` from a cached entry's meta (header-only data).
     pub fn get_card(&self, key: CacheKey, file_id_hex: &str) -> Option<CardDto> {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.guard();
         let t = Self::tick(&mut inner);
         let e = inner.map.get_mut(&key)?;
         e.last_used = t;
@@ -107,8 +115,12 @@ impl ContentCache {
 
     /// Reconstruct an `OpenedContentDto` — only a hit if the content payload is
     /// resident (a card-only entry returns `None` so the caller fetches content).
+    /// The stored bytes are DISPLAY-FINAL (see `put_content`): an image is
+    /// re-encoded back to base64 into `image_png_b64`; a blog's already-sanitized
+    /// UTF-8 bytes are returned verbatim via `from_utf8_lossy`. So a cache hit is
+    /// byte-identical to a fresh decrypt+shape — the cache applies no shaping itself.
     pub fn get_content(&self, key: CacheKey, file_id_hex: &str) -> Option<OpenedContentDto> {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.guard();
         let t = Self::tick(&mut inner);
         let e = inner.map.get_mut(&key)?;
         let content = e.content.as_ref()?;
@@ -133,15 +145,22 @@ impl ContentCache {
 
     /// Insert/update the header-only meta for a card (no content).
     pub fn put_card(&self, key: CacheKey, meta: CachedMeta) {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.guard();
         let t = Self::tick(&mut inner);
         Self::upsert(&mut inner, key, meta, None, t);
         Self::evict_to_fit(&mut inner);
     }
 
     /// Insert/update with the decrypted content payload resident.
+    ///
+    /// Stores the caller's FINAL display bytes for this content: for an IMAGE the
+    /// raw canonical-PNG content bytes (read back base64-encoded into
+    /// `image_png_b64`); for a BLOG the already-sanitized UTF-8 text bytes (read
+    /// back verbatim). The caller is responsible for passing display-final bytes so
+    /// a cache hit is byte-identical to a fresh decrypt+shape.
     pub fn put_content(&self, key: CacheKey, meta: CachedMeta, content: Vec<u8>) {
-        let mut inner = self.0.lock().unwrap();
+        let content = Zeroizing::new(content); // wiped on every exit, incl. oversize return
+        let mut inner = self.guard();
         // Oversize-vs-cap: serve through, never store (and never evict everything
         // for one giant item).
         let projected = meta.approx_bytes() + content.len();
@@ -150,10 +169,10 @@ impl ContentCache {
             if let Some(old) = inner.map.remove(&key) {
                 inner.total -= old.bytes;
             }
-            return;
+            return; // content drops here → zeroized
         }
         let t = Self::tick(&mut inner);
-        Self::upsert(&mut inner, key, meta, Some(Zeroizing::new(content)), t);
+        Self::upsert(&mut inner, key, meta, Some(content), t);
         Self::evict_to_fit(&mut inner);
     }
 
@@ -196,7 +215,7 @@ impl ContentCache {
 
     /// Drop a specific entry (e.g. a newer version supersedes it).
     pub fn invalidate(&self, key: CacheKey) {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.guard();
         if let Some(e) = inner.map.remove(&key) {
             inner.total -= e.bytes;
         }
@@ -204,7 +223,7 @@ impl ContentCache {
 
     /// Live cap change (Settings RAM control). Shrinks → evicts to fit immediately.
     pub fn set_cap(&self, cap_bytes: usize) {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.guard();
         inner.cap = cap_bytes;
         Self::evict_to_fit(&mut inner);
     }
@@ -212,18 +231,18 @@ impl ContentCache {
     /// Wipe everything (app close). Every content payload is `Zeroizing`, so the
     /// plaintext is zeroed as each entry drops.
     pub fn clear_and_zeroize(&self) {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.guard();
         inner.map.clear(); // each Entry drops → Zeroizing<Vec<u8>> wiped.
         inner.total = 0;
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.0.lock().unwrap().map.len()
+        self.guard().map.len()
     }
     #[cfg(test)]
     fn total(&self) -> usize {
-        self.0.lock().unwrap().total
+        self.guard().total
     }
 }
 
@@ -260,8 +279,9 @@ mod tests {
 
     #[test]
     fn lru_evicts_least_recently_used_by_bytes() {
-        // cap fits ~2 small entries; a 3rd evicts the oldest-touched.
-        let c = ContentCache::new(60);
+        // Each entry ≈ 128 overhead + 7 meta ("blog"+1-char title+"ab") + 20 content
+        // = 155B. Cap 360 fits 2 (310) but not 3 (465), so the 3rd evicts the LRU.
+        let c = ContentCache::new(360);
         c.put_content(key(1, 1), meta("a"), vec![0u8; 20]);
         c.put_content(key(2, 1), meta("b"), vec![0u8; 20]);
         // Touch #1 so #2 is now the LRU.
@@ -304,5 +324,27 @@ mod tests {
         c.put_card(key(1, 1), meta("card"));
         assert!(c.get_card(key(1, 1), "x").is_some());
         assert!(c.get_content(key(1, 1), "x").is_none());
+    }
+
+    #[test]
+    fn image_content_round_trips_as_base64() {
+        let c = ContentCache::new(1024);
+        let mut m = meta("pic");
+        m.file_type = "image".into();
+        let png = vec![0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
+        c.put_content(key(7, 2), m, png.clone());
+        let got = c.get_content(key(7, 2), "07".repeat(16).as_str()).unwrap();
+        assert_eq!(got.image_png_b64.unwrap(), B64.encode(&png));
+        assert!(got.blog_text.is_none());
+    }
+
+    #[test]
+    fn invalidate_drops_entry_and_byte_accounting() {
+        let c = ContentCache::new(1000);
+        c.put_content(key(1, 1), meta("a"), vec![0u8; 200]);
+        assert!(c.get_content(key(1, 1), "x").is_some());
+        c.invalidate(key(1, 1));
+        assert!(c.get_content(key(1, 1), "x").is_none());
+        assert_eq!(c.total(), 0);
     }
 }
