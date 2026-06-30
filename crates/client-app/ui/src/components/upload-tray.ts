@@ -1,5 +1,6 @@
 import { call, on } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
+import { toast } from "../core/toast.ts";
 import type { UploadMsg } from "../core/types.ts";
 import "./progress-meter.ts";
 import "./state-badge.ts";
@@ -13,7 +14,8 @@ export class UploadTray extends HTMLElement {
 
   async connectedCallback() {
     this.innerHTML = `
-      <section aria-label="Active uploads">
+      <section class="upload-tray" aria-label="Active uploads">
+        <h2 class="ut-title">Uploads</h2>
         <ul id="ut-list" aria-live="polite"></ul>
       </section>`;
     this.unlisten = await on<UploadMsg>("maxsecu://upload-state", (m) => this.onMsg(m));
@@ -59,6 +61,7 @@ export class UploadTray extends HTMLElement {
     } else if (m.phase === "done") {
       meter.hidden = true;
       this.starts.delete(m.job_id);
+      toast("success", "Upload complete.");
       this.clearRowLater(m.job_id);
     } else if (m.phase === "failed") {
       meter.hidden = true;
