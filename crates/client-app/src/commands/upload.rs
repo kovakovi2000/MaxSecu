@@ -24,6 +24,7 @@ use crate::dto::{
     UploadPreview,
 };
 use crate::error::UiError;
+use crate::ffmpeg_bin::ensure_ffmpeg;
 use crate::jobs::{StagedUpload, StagedVideoPreview, UploadJobs};
 use crate::state::{UploadPhase, EVT_UPLOAD};
 use crate::upload::{
@@ -52,35 +53,6 @@ fn rand_job_id() -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-/// Read the `MXRAWV01` raw-frame source for a video stage from the request: either
-/// `source_b64` (base64 bytes the UI provides) or `path` (a raw-frame file). Bounded
-/// by [`MAX_UPLOAD_BYTES`] (the worker re-enforces every `VideoBounds` cap in its own
-/// confined address space). Fail-closed on a missing/oversized/undecodable source.
-fn read_video_source(req: &StageUploadRequest) -> Result<Vec<u8>, UiError> {
-    if let Some(b64) = req.source_b64.as_ref() {
-        if b64.len() as u64 > MAX_UPLOAD_BYTES * 2 {
-            return Err(UiError::new("too_large", "That video is too large."));
-        }
-        let bytes = B64
-            .decode(b64)
-            .map_err(|_| UiError::new("bad_request", "That video source was malformed."))?;
-        if bytes.len() as u64 > MAX_UPLOAD_BYTES {
-            return Err(UiError::new("too_large", "That video is too large."));
-        }
-        return Ok(bytes);
-    }
-    let path = req
-        .path
-        .clone()
-        .ok_or_else(|| UiError::new("bad_request", "No video source was provided."))?;
-    let meta = std::fs::metadata(&path)
-        .map_err(|_| UiError::new("bad_request", "That file could not be read."))?;
-    if meta.len() > MAX_UPLOAD_BYTES {
-        return Err(UiError::new("too_large", "That video is too large."));
-    }
-    std::fs::read(&path).map_err(|_| UiError::new("bad_request", "That file could not be read."))
 }
 
 /// `stage_upload` — prepare + encrypt a post and hold it for preview. No network write.
@@ -122,17 +94,32 @@ pub async fn stage_upload(
             (ft, s, None)
         }
         UploadKind::Video => {
-            let source = read_video_source(&req)?;
-            // Confined transcode OFF the async runtime (the worker spawn + pipe I/O
-            // must not run on a tokio worker thread). NO network here — this is the
-            // preview-before-upload transcode.
+            // The video source is now an ARBITRARY file (a path from the Browse
+            // picker), decoded by the confined ffmpeg — no in-memory source, no seam
+            // size limit on it.
+            let path = req
+                .path
+                .clone()
+                .ok_or_else(|| UiError::new("bad_request", "No video was chosen."))?;
+            let input_path = std::path::PathBuf::from(path);
+            // Materialize + verify the embedded confined ffmpeg; resolve the confined
+            // re-mux worker beside the exe. Map any ffmpeg-availability error to the
+            // sanitized video error (no internal detail crosses).
+            let ffmpeg_path = ensure_ffmpeg(&dir.0)
+                .map_err(|_| UiError::new("video_failed", "That video could not be processed."))?;
             let tw_path = crate::commands::video::transcode_worker_path(&dir.0);
+            let options = req.options.clone().unwrap_or_default();
+            // Confined ingest OFF the async runtime (two confined subprocess spawns +
+            // file/pipe I/O must not run on a tokio worker thread). NO network here —
+            // this is the preview-before-upload transcode.
             let title = req.title.clone();
             let tags = req.tags.clone();
             let (s, frags) = tokio::task::spawn_blocking(move || {
                 prepare_video_streams(
-                    &source,
+                    &input_path,
+                    &ffmpeg_path,
                     &tw_path,
+                    &options,
                     &maxsecu_client_core::video::VideoBounds::default(),
                     &title,
                     &tags,

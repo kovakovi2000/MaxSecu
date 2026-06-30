@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use maxsecu_media_launcher::TranscodeOptions;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConnectRequest {
     pub server: String, // host:port or domain
@@ -198,19 +200,21 @@ pub enum UploadKind {
 #[derive(Debug, Clone, Deserialize)]
 pub struct StageUploadRequest {
     pub kind: UploadKind,
-    /// For an image: a filesystem path to the chosen file. For a video: an optional
-    /// path to a `MXRAWV01` raw-frame source file (alternative to `source_b64`).
-    /// Ignored for blogs.
+    /// For an image OR a video: a filesystem path to the chosen source file (the
+    /// Browse picker returns it via `commands::dialog::pick_file`). The video source
+    /// is now an ARBITRARY file decoded by the confined ffmpeg, so it is carried as a
+    /// path (no in-memory bytes, no 64 MiB seam limit on the source). Ignored for
+    /// blogs.
     #[serde(default)]
     pub path: Option<String>,
     /// For a blog: the post body text. Ignored for images/videos.
     #[serde(default)]
     pub content: Option<String>,
-    /// For a video: the `MXRAWV01` raw-frame source bytes, standard-base64 encoded
-    /// (the UI provides already-decoded raw frames for now — the real arbitrary-media
-    /// ingest is the deferred ffmpeg op). Ignored for other kinds.
+    /// For a video: the author's transcode shaping (resolution + bitrate) that feeds
+    /// the confined ffmpeg argv. Absent → [`TranscodeOptions::default`] (preserve the
+    /// source). Ignored for other kinds.
     #[serde(default)]
-    pub source_b64: Option<String>,
+    pub options: Option<TranscodeOptions>,
     pub title: String,
     #[serde(default)]
     pub tags: Vec<String>,

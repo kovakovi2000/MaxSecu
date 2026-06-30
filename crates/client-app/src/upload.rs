@@ -4,13 +4,15 @@
 //! bundle via client-core, then stages + resumably uploads + finalizes. Only
 //! preview/progress DTOs cross the Tauri seam — never keys/wraps/plaintext.
 
+use std::path::Path;
+
 use maxsecu_client_core::media::{
     FragmentEntry as TranscodeFragment, TranscodeRequest, TranscodeResult,
 };
 use maxsecu_client_core::video::VideoBounds;
 use maxsecu_client_core::{MediaBounds, PlaintextStreams, RustImageCodec, Transcoder};
 use maxsecu_encoding::types::FileType;
-use maxsecu_media_launcher::TranscodeLauncher;
+use maxsecu_media_launcher::{build_ffmpeg_args, FfmpegLauncher, TranscodeLauncher, TranscodeOptions};
 
 use crate::error::UiError;
 
@@ -63,16 +65,62 @@ fn video_prep_err() -> UiError {
     UiError::new("video_failed", "That video could not be processed.")
 }
 
-/// Transcode the author's source media to canonical AV1/CMAF streams **in the
-/// confined transcode worker** (`media-launcher::TranscodeLauncher`, an
-/// AppContainer-isolated one-shot spawn on Windows). The author's source is
-/// untrusted, so the codec runs OUT of this key-holding process; only the worker's
-/// (untrusted) [`TranscodeResult`] crosses back, and it is bounds-checked by the
-/// launcher's framed codec. This does **NO network** — it is the preview-before-
-/// upload transcode.
+/// RAII guard that recursively deletes a per-job temp dir on **every** exit path
+/// (success and error). This is the [`FfmpegLauncher::run`] CLEANUP OBLIGATION, not
+/// mere hygiene: the confined ffmpeg writes output files inside the granted dir that
+/// inherit the container-SID allow ACE + a Low integrity label at creation, and
+/// revoking the dir grant cannot retroactively strip those from the child files —
+/// only wholesale deletion of the WHOLE per-job dir removes the
+/// container-accessible, Low-IL artifacts. Because the wipe is in `Drop`, it runs
+/// even on an early `?`/`return` mid-flow.
+struct JobDirGuard {
+    dir: std::path::PathBuf,
+}
+
+impl Drop for JobDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A fresh, unique per-job dir path under the system temp dir. The pid + 8 random
+/// bytes make it collision-free across concurrent ingests; the caller `create_dir`s
+/// it so it is guaranteed freshly created (not pre-existing).
+fn unique_job_dir() -> std::path::PathBuf {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        hex(&maxsecu_crypto::random_array::<8>())
+    );
+    std::env::temp_dir().join(format!("maxsecu-vjob-{unique}"))
+}
+
+/// Transcode the author's **arbitrary** source video to canonical AV1/CMAF streams
+/// via TWO confined spawns, keeping this key-holding process CODEC-FREE (it links
+/// only the codec-free `media-launcher` + the pure-Rust `RustImageCodec`; rav1d /
+/// symphonia never enter it).
 ///
-/// Maps `TranscodeResult.cmaf` → `content`, `thumbnail`/`preview` straight through,
-/// and `build_metadata_with_fragments(title, tags, &fragments)` → `metadata`.
+/// Flow (topology A — two confined spawns):
+/// 1. A fresh, unique, freshly-created per-job dir is made; a [`JobDirGuard`]
+///    recursively deletes the WHOLE dir on every return path (the
+///    [`FfmpegLauncher::run`] cleanup obligation).
+/// 2. The source is COPIED into the granted dir (the confined ffmpeg reads it under
+///    the single ReadWrite grant), preserving the extension so ffmpeg can sniff it.
+/// 3. **Confined ffmpeg** ([`FfmpegLauncher`], no net/keys/children, mem cap,
+///    bounded timeout) runs the pinned [`build_ffmpeg_args`] argv — ONE invocation
+///    producing both `out.mp4` (AV1 + AAC) and `thumb.png` (first frame). A nonzero
+///    exit fails closed; the bounded stderr tail is diagnostic only and never
+///    surfaced to the UI (no decode oracle).
+/// 4. **Confined re-mux worker** ([`TranscodeLauncher`]) takes `out.mp4`'s BYTES and
+///    returns the canonical [`TranscodeResult`] (CMAF fragments; its
+///    `thumbnail`/`preview` are empty — derived below instead).
+/// 5. The real thumbnail + preview are derived from `thumb.png` via the pure-Rust
+///    [`RustImageCodec`] (the same path image uploads use).
+///
+/// Maps `TranscodeResult.cmaf` → `content`, the derived image streams →
+/// `thumbnail`/`preview`, and `build_metadata_with_fragments(title, tags,
+/// &fragments)` → `metadata`. This does **NO network** — it is the
+/// preview-before-upload transcode.
 ///
 /// **Chunk-size invariant.** The fragment index is expressed in
 /// [`VIDEO_CHUNK_SIZE`] (4096)-byte units. This re-validates the worker's index
@@ -82,25 +130,75 @@ fn video_prep_err() -> UiError {
 /// worker that returns a misaligned stream/index fails closed here rather than
 /// silently breaking seek after upload.
 pub fn prepare_video_streams(
-    source: &[u8],
-    transcode_worker_path: &std::path::Path,
+    input_path: &Path,
+    ffmpeg_path: &Path,
+    transcode_worker_path: &Path,
+    options: &TranscodeOptions,
     bounds: &VideoBounds,
     title: &str,
     tags: &[String],
 ) -> Result<(PlaintextStreams, Vec<TranscodeFragment>), UiError> {
-    let launcher = TranscodeLauncher::new(transcode_worker_path);
-    let result: TranscodeResult = launcher
+    // 1) Fresh, unique, freshly-created per-job dir. The guard recursively deletes
+    //    the WHOLE dir on every return path (security cleanup, see JobDirGuard).
+    let dir = unique_job_dir();
+    std::fs::create_dir(&dir).map_err(|_| video_prep_err())?;
+    let _guard = JobDirGuard { dir: dir.clone() };
+
+    // 2) Copy the source INTO the granted dir so the confined ffmpeg can read it
+    //    under the single ReadWrite grant. Preserve the original extension (ffmpeg
+    //    sniffs by content too, so a missing ext falls back to `input.bin`).
+    let input_copy = match input_path.extension() {
+        Some(ext) => {
+            let mut name = std::ffi::OsString::from("input.");
+            name.push(ext);
+            dir.join(name)
+        }
+        None => dir.join("input.bin"),
+    };
+    std::fs::copy(input_path, &input_copy).map_err(|_| video_prep_err())?;
+
+    // 3) The pinned argv: ONE confined ffmpeg run → out.mp4 (AV1+AAC) + thumb.png.
+    let out_mp4 = dir.join("out.mp4");
+    let thumb_png = dir.join("thumb.png");
+    let args = build_ffmpeg_args(&input_copy, &out_mp4, &thumb_png, options, bounds);
+
+    // 4) Decode the untrusted source in the CONFINED ffmpeg (no net / keys /
+    //    children, mem cap, bounded timeout). A nonzero exit fails closed; the
+    //    bounded stderr is diagnostic only and never reaches the UI.
+    let outcome = FfmpegLauncher::new(ffmpeg_path)
+        .run(&args, &dir)
+        .map_err(|_| video_prep_err())?;
+    if outcome.exit_code != 0 {
+        return Err(video_prep_err());
+    }
+
+    // 5) Read ffmpeg's outputs from the granted dir; both must exist + be non-empty.
+    let out_mp4_bytes = std::fs::read(&out_mp4).map_err(|_| video_prep_err())?;
+    let thumb_png_bytes = std::fs::read(&thumb_png).map_err(|_| video_prep_err())?;
+    if out_mp4_bytes.is_empty() || thumb_png_bytes.is_empty() {
+        return Err(video_prep_err());
+    }
+
+    // 6) Re-mux out.mp4's bytes → canonical AV1/CMAF in the SECOND confined spawn.
+    //    The worker's thumbnail/preview come back empty (derived below).
+    let result: TranscodeResult = TranscodeLauncher::new(transcode_worker_path)
         .transcode(&TranscodeRequest {
-            source: source.to_vec(),
+            source: out_mp4_bytes,
             bounds: *bounds,
         })
         .map_err(|_| video_prep_err())?;
 
+    // 7) Derive the real thumbnail + preview from ffmpeg's first-frame PNG via the
+    //    pure-Rust image codec — NO C codec enters this key-holding process.
+    let derived = RustImageCodec
+        .transcode(&thumb_png_bytes, &MediaBounds::default())
+        .map_err(|_| video_prep_err())?;
+
     let metadata = build_metadata_with_fragments(title, tags, &result.fragments);
 
-    // Enforce the chunk-size mapping (seek correctness). The metadata fragment
-    // index must validate (contiguity/ordering/coverage) AND tile the canonical
-    // content exactly in whole VIDEO_CHUNK_SIZE chunks.
+    // 8) Enforce the chunk-size mapping (seek correctness). The metadata fragment
+    //    index must validate (contiguity/ordering/coverage) AND tile the canonical
+    //    content exactly in whole VIDEO_CHUNK_SIZE chunks.
     let chunk = VIDEO_CHUNK_SIZE as usize;
     if result.cmaf.is_empty() || !result.cmaf.len().is_multiple_of(chunk) {
         return Err(video_prep_err());
@@ -117,12 +215,14 @@ pub fn prepare_video_streams(
         return Err(video_prep_err());
     }
 
+    // 9) Assemble — canonical content + metadata, derived thumbnail + preview.
     let streams = PlaintextStreams {
         content: result.cmaf,
         metadata: Some(metadata),
-        thumbnail: Some(result.thumbnail),
-        preview: Some(result.preview),
+        thumbnail: Some(derived.thumbnail),
+        preview: Some(derived.preview),
     };
+    // 10) `_guard` drops here → the per-job dir is recursively deleted.
     Ok((streams, result.fragments))
 }
 

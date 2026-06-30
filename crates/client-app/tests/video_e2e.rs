@@ -16,11 +16,12 @@
 //!
 //! Five gates:
 //!
-//! 1. **Author transcode + upload** — the confined `media-transcode-worker` turns a
-//!    small `MXRAWV01` source into canonical AV1/CMAF + a fragment index, then the
-//!    real Phase-4 pipeline (`build_upload(Video,4096)` + `run_pipeline`) stages it
-//!    over TLS. The video is now on the server (content + authenticated metadata +
-//!    the recovery wrap).
+//! 1. **Author transcode + upload** — the two confined spawns (the embedded ffmpeg
+//!    decodes a small real `.y4m` source to AV1/AAC `out.mp4`, then the
+//!    `media-transcode-worker` re-muxes it to canonical AV1/CMAF + a fragment index),
+//!    then the real Phase-4 pipeline (`build_upload(Video,4096)` + `run_pipeline`)
+//!    stages it over TLS. The video is now on the server (content + authenticated
+//!    metadata + the recovery wrap).
 //! 2. **Browse** — the D35 listing (`GET /v1/files?type=video`) returns the staged
 //!    file with `file_type=video`, so the viewer can resolve it.
 //! 3. **View (the headline)** — the open_video path on the REQUESTED `file_id`:
@@ -82,7 +83,7 @@ use maxsecu_crypto::{sha256, EncPublicKey};
 use maxsecu_encoding::structs::{DirBinding, Manifest};
 use maxsecu_encoding::types::{FileType, Id, RecipientType, Role, StreamType, Timestamp};
 use maxsecu_encoding::{decode, labels};
-use maxsecu_media_launcher::VideoSessionDecoder;
+use maxsecu_media_launcher::{TranscodeOptions, VideoSessionDecoder};
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuthConfig, AuthService, FsBlobStore, MemoryStore,
 };
@@ -123,23 +124,64 @@ fn find_worker(name: &str) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-// ---- MXRAWV01 raw-frame source (the transcode worker's default-path container) --
+// ---- real source video synthesis (Y4M; ffmpeg always reads it, no codec dep) ----
 
-fn make_raw_source(w: u32, h: u32, frames: u32, fps: u32) -> Vec<u8> {
+/// The vendored static ffmpeg the universal-video-ingest path drives. Discovered
+/// relative to this crate (`crates/client-app/../../vendor/ffmpeg/ffmpeg.exe`).
+/// `None` ⇒ the spawn gates SKIP (it is gitignored, fetched by `fetch-ffmpeg.ps1`).
+fn vendored_ffmpeg() -> Option<PathBuf> {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("vendor")
+        .join("ffmpeg")
+        .join("ffmpeg.exe");
+    p.is_file().then_some(p)
+}
+
+/// A fresh, unique temp dir for a test's source file.
+fn temp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "mxviding-{tag}-{}-{}",
+        std::process::id(),
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Build a real, decodable raw video as YUV4MPEG2 (`.y4m`) bytes — the confined
+/// ffmpeg under test reads this with its built-in demuxer (no external codec), then
+/// transcodes it to canonical AV1. `w`/`h` must be even (4:2:0). No audio track (the
+/// re-mux worker handles an audio-absent source).
+fn make_y4m(w: u32, h: u32, frames: u32, fps: u32) -> Vec<u8> {
     let mut v = Vec::new();
-    v.extend_from_slice(b"MXRAWV01");
-    v.extend_from_slice(&w.to_le_bytes());
-    v.extend_from_slice(&h.to_le_bytes());
-    v.extend_from_slice(&frames.to_le_bytes());
-    v.extend_from_slice(&fps.to_le_bytes());
+    v.extend_from_slice(format!("YUV4MPEG2 W{w} H{h} F{fps}:1 Ip A1:1 C420jpeg\n").as_bytes());
+    let (cw, ch) = (w / 2, h / 2);
     for f in 0..frames {
-        for i in 0..(w * h) {
-            v.push(((i + f) & 0xff) as u8); // R
-            v.push(((i / w) & 0xff) as u8); // G
-            v.push((f.wrapping_mul(40) & 0xff) as u8); // B
+        v.extend_from_slice(b"FRAME\n");
+        for y in 0..h {
+            for x in 0..w {
+                v.push(((x + y + f) & 0xff) as u8); // Y: a moving gradient
+            }
+        }
+        for _ in 0..(cw * ch) {
+            v.push(((f.wrapping_mul(3)) & 0xff) as u8); // U
+        }
+        for _ in 0..(cw * ch) {
+            v.push(((f.wrapping_mul(7)) & 0xff) as u8); // V
         }
     }
     v
+}
+
+/// Write a `.y4m` source into a fresh temp dir and return `(dir, path)`.
+fn write_source_y4m(tag: &str, w: u32, h: u32, frames: u32, fps: u32) -> (PathBuf, PathBuf) {
+    let dir = temp_dir(tag);
+    let path = dir.join("source.y4m");
+    std::fs::write(&path, make_y4m(w, h, frames, fps)).unwrap();
+    (dir, path)
 }
 
 // ---- TLS harness (copied from upload_e2e.rs / video_upload_e2e.rs) ----------
@@ -486,24 +528,37 @@ async fn phase7_video_author_to_view_over_real_tls() {
         );
         return;
     };
+    let Some(ffmpeg) = vendored_ffmpeg() else {
+        eprintln!(
+            "SKIP phase7_video_author_to_view_over_real_tls: vendored ffmpeg \
+             (vendor/ffmpeg/ffmpeg.exe) not present; run scripts/fetch-ffmpeg.ps1 to exercise the \
+             confined ffmpeg ingest."
+        );
+        return;
+    };
 
-    // A 16x16 clip with several frames so seek + back-seek are meaningful.
-    let (w, h, frames, fps) = (16u32, 16u32, 5u32, 10u32);
-    let source = make_raw_source(w, h, frames, fps);
+    // A 64x64 clip spanning SEVERAL GOPs so seek + back-seek are meaningful: a
+    // canonical fragment is one closed GOP (DEFAULT_GOP=48 frames), so ~200 frames
+    // yields >=5 fragments (keyframes at 0,48,96,144,192).
+    let (w, h, frames, fps) = (64u32, 64u32, 200u32, 24u32);
+    let (src_dir, source_path) = write_source_y4m("view", w, h, frames, fps);
 
-    // ---- GATE 1 (a): confined transcode (NO network yet) ----
+    // ---- GATE 1 (a): confined ffmpeg ingest + re-mux (NO network yet) ----
     let (streams, fragments) = prepare_video_streams(
-        &source,
+        &source_path,
+        &ffmpeg,
         &transcode_worker,
+        &TranscodeOptions::default(),
         &VideoBounds::default(),
         "Holiday clip",
         &["beach".to_owned()],
     )
-    .expect("GATE 1: the confined transcode produced canonical streams");
-    assert_eq!(
-        fragments.len(),
-        frames as usize,
-        "one fragment per source frame"
+    .expect("GATE 1: the confined ffmpeg + re-mux produced canonical streams");
+    let _ = std::fs::remove_dir_all(&src_dir);
+    assert!(
+        fragments.len() >= 5,
+        "GATE 1: the source spans several GOPs → multiple canonical fragments (got {})",
+        fragments.len()
     );
     let canonical = streams.content.clone();
     assert!(
@@ -678,8 +733,8 @@ async fn phase7_video_author_to_view_over_real_tls() {
     let index = parse_fragment_index(&meta_json).expect("GATE 3: authenticated fragment index");
     assert_eq!(
         index.len(),
-        frames as usize,
-        "GATE 3: fragment index covers every source frame"
+        fragments.len(),
+        "GATE 3: the authenticated fragment index matches the transcode output"
     );
     let decryptor = open_content_decryptor(&ctx, &header).expect("GATE 3: content decryptor");
     let version = decryptor.version();
@@ -709,12 +764,14 @@ async fn phase7_video_author_to_view_over_real_tls() {
     )
     .await
     .expect("GATE 3: the confined decode session plays the initial window");
-    let window0_len = PLAY_WINDOW.min(frames) as usize;
-    assert_eq!(
-        window0_frames.len(),
-        window0_len,
-        "GATE 3: every fragment in the window decoded to a frame"
+    // A canonical fragment is a whole GOP, so the window decodes to MANY frames (the
+    // sum of the GOPs' frame counts), not one-per-fragment. Assert it decoded to at
+    // least one frame and every frame is the source dims.
+    assert!(
+        !window0_frames.is_empty(),
+        "GATE 3: the initial window decoded to frames"
     );
+    let window0_count = window0_frames.len();
     for f in &window0_frames {
         assert_eq!(
             (f.width, f.height),
@@ -735,7 +792,7 @@ async fn phase7_video_author_to_view_over_real_tls() {
     let seek_seq = fragment_for_time(&index, last.pts_ms).expect("GATE 4: pts maps to a fragment");
     assert_eq!(
         seek_seq,
-        frames - 1,
+        index.len() as u32 - 1,
         "GATE 4: the last fragment's pts maps to the last fragment"
     );
     // The last fragment is NOT in the initial window (window covered 0..4, last == 4),
@@ -759,12 +816,15 @@ async fn phase7_video_author_to_view_over_real_tls() {
     )
     .await
     .expect("GATE 4: the seeked window plays");
-    assert_eq!(
-        seek_frames.len(),
-        1,
-        "GATE 4: exactly the mapped (last) fragment decoded"
+    // Only the mapped (last) fragment is in this window; it decodes to >=1 frame (its
+    // GOP), all at the source dims.
+    assert!(
+        !seek_frames.is_empty(),
+        "GATE 4: the mapped (last) fragment decoded to frames"
     );
-    assert_eq!((seek_frames[0].width, seek_frames[0].height), (w, h));
+    for f in &seek_frames {
+        assert_eq!((f.width, f.height), (w, h));
+    }
     assert!(
         fetch_count > after_window0,
         "GATE 4: the forward seek fetched the mapped fragment's ciphertext"
@@ -793,8 +853,8 @@ async fn phase7_video_author_to_view_over_real_tls() {
     .expect("GATE 5: the back-seek window plays from cache");
     assert_eq!(
         back_frames.len(),
-        window0_len,
-        "GATE 5: the back-seek re-decoded the cached window"
+        window0_count,
+        "GATE 5: the back-seek re-decoded the cached window to the same frames"
     );
     assert_eq!(
         fetch_count, after_seek,
