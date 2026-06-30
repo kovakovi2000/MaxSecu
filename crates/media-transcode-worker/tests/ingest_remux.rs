@@ -340,6 +340,86 @@ fn odd_dimension_source_round_trips_at_even_decode_dims() {
     eprintln!("PASS odd {ow}x{oh} → even {ew}x{eh}: {frames} frame(s), {n_frags} fragment(s)");
 }
 
+/// D-7 review (Minor 1): a genuinely ANAMORPHIC (SAR≠1) source must render at the right
+/// DISPLAY shape. The production SAR-aware Original filter resamples the source to SQUARE
+/// pixels at its display width, so the canonical fragment's coded dims ARE the correct
+/// display dims. Here a 320x240 source with SAR 4:3 has display ≈ 426x240 (16:9); we prove
+/// the canonical fragment decodes through the unmodified VideoSession at exactly 426x240
+/// square — NOT the 320x240 storage dims a SAR-unaware ingest would have produced.
+#[test]
+fn anamorphic_source_round_trips_at_square_display_dims() {
+    let (sw, sh) = (320u32, 240u32);
+    let (sar_n, sar_d) = (4u32, 3u32);
+    // Display width = trunc(sw * sar / 2) * 2 (square pixels, even); height even.
+    let ew = ((sw * sar_n / sar_d) / 2) * 2; // 426
+    let eh = sh - sh % 2; // 240
+    let Some(source) = common::make_anamorphic_ffmpeg_source(sw, sh, sar_n, sar_d, 1, 24) else {
+        eprintln!(
+            "SKIP anamorphic_source_round_trips_at_square_display_dims: vendored ffmpeg.exe \
+             not found at <crate>/../../vendor/ffmpeg/ffmpeg.exe"
+        );
+        return;
+    };
+
+    let out = transcode(&req(source)).expect("transcode re-muxes the anamorphic source");
+    assert!(!out.fragments.is_empty(), "at least one fragment");
+    assert_eq!(out.cmaf.len() % TRANSCODE_CHUNK_SIZE, 0, "cmaf chunk-aligned");
+
+    let frags = fragment_slices(&out);
+    let n_frags = frags.len();
+
+    let (frames, eofs) = on_big_stack(move || {
+        let mut session = VideoSession::new();
+        assert_eq!(
+            session.feed(ClientMsg::Open {
+                bounds: VideoBounds::default()
+            }),
+            vec![WorkerMsg::Ready],
+        );
+        let (mut frames, mut eofs) = (0usize, 0usize);
+        for (i, frag) in frags.iter().enumerate() {
+            for m in session.feed(ClientMsg::Fragment {
+                seq: i as u32,
+                bytes: frag.clone(),
+            }) {
+                match m {
+                    WorkerMsg::Video(f) => {
+                        // The decisive assertion: SQUARE display dims, not the 320x240
+                        // storage dims a SAR-unaware ingest would have left.
+                        assert_eq!(
+                            (f.width, f.height),
+                            (ew, eh),
+                            "anamorphic resampled to square display dims (not storage dims)"
+                        );
+                        assert_eq!(f.width % 2, 0, "even width");
+                        assert_eq!(f.height % 2, 0, "even height");
+                        frames += 1;
+                    }
+                    WorkerMsg::Audio(_) => {}
+                    WorkerMsg::EndOfFragment { .. } => eofs += 1,
+                    WorkerMsg::Error(e) => panic!("VideoSession decode error: {e:?}"),
+                    WorkerMsg::Ready => panic!("unexpected extra Ready"),
+                }
+            }
+        }
+        assert!(session.feed(ClientMsg::Close).is_empty());
+        (frames, eofs)
+    });
+
+    assert_eq!(eofs, n_frags, "one EndOfFragment per fragment");
+    assert!(frames >= 1, "decoded at least one frame at {ew}x{eh}");
+    // Sanity: the display aspect is ~16:9, distinctly different from the 4:3 storage shape.
+    let dar = ew as f64 / eh as f64;
+    assert!(
+        (dar - 16.0 / 9.0).abs() < 0.05,
+        "display aspect ≈ 16:9 (got {dar:.3}), proving SAR was applied"
+    );
+    eprintln!(
+        "PASS anamorphic {sw}x{sh} SAR {sar_n}:{sar_d} → square {ew}x{eh} (DAR {dar:.3}): \
+         {frames} frame(s), {n_frags} fragment(s)"
+    );
+}
+
 #[test]
 fn rejects_hostile_input_without_panic() {
     // Random garbage is not an MP4 → DecodeFailed, never a panic.

@@ -432,14 +432,16 @@ fn build_video_trak(
     // stsd > av01 (VisualSampleEntry; NO av1C — the seq-header OBU is in-band).
     //
     // D-7 even-dimension / SAR handling: `w`/`h` are the AV1 CODED dimensions demuxed
-    // from ffmpeg's output, which the ingest `scale` filter has already coerced EVEN
-    // (`scale=trunc(iw/2)*2:trunc(ih/2)*2` / `-2:<h>` / even Custom) — AV1 4:2:0 requires
-    // even dims. The VisualSampleEntry width/height ARE those even coded dims, and we
-    // deliberately write NO `pasp` (pixel-aspect) box and a UNITY tkhd matrix: an odd
-    // source's display aspect is preserved by the even-coercion itself (a <0.2% rounding,
-    // e.g. 643x363 → 642x362), so the canonical fragment is SQUARE-PIXEL at the coded
-    // dims and the viewer (WebGL YUV, square pixels) renders the display aspect directly —
-    // there is no separate SAR to carry. ffmpeg's intermediate container SAR is NOT read
+    // from ffmpeg's output. The ingest `scale` filter has already normalized the source to
+    // SQUARE PIXELS at its correct DISPLAY shape AND coerced both dims EVEN (AV1 4:2:0
+    // requires even): it is SAR-aware — `scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1`
+    // (Original), `scale='trunc(h*dar/2)*2':h,setsar=1` (Height), or even Custom + setsar=1.
+    // So a genuinely anamorphic (SAR≠1) source is RESAMPLED to square pixels at INGEST, and
+    // the even coded dims ARE the correct display dims. The VisualSampleEntry width/height
+    // are therefore those even coded dims, and we deliberately write NO `pasp` (pixel-aspect)
+    // box and a UNITY tkhd matrix: there is no residual non-square SAR to carry — the viewer
+    // (WebGL YUV, square pixels) renders the display aspect directly (to within a <0.2%
+    // even-rounding, e.g. 643x363 → 642x362). ffmpeg's intermediate container SAR is NOT read
     // or propagated (only `v.width`/`v.height` cross into the re-mux).
     let mut av01 = Vec::new();
     av01.extend_from_slice(&[0u8; 6]); // SampleEntry reserved

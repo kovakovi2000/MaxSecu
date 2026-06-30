@@ -146,16 +146,28 @@ pub fn build_ffmpeg_args(
     args
 }
 
-/// The `-vf` scale filter for the MAIN output (D-5 / ratification §7). Always
-/// yields even W/H (AV1 4:2:0 requires it); dims arrive even from `normalized`.
+/// The `-vf` scale filter for the MAIN output (D-5 / ratification §7). Always yields
+/// even W/H (AV1 4:2:0 requires it) AND **square pixels** (`setsar=1`) at the correct
+/// DISPLAY shape, so a genuinely anamorphic (SAR≠1) source renders at the right aspect
+/// (D-7 / spec §8) — not just byte-correct on square-pixel sources.
+///
+/// SAR-awareness: ffmpeg's scale expressions expose `sar` (input sample aspect ratio)
+/// and `dar` (input display aspect ratio). For a square-pixel source both collapse to
+/// the storage ratio (`sar == 1`), so every branch below is byte-identical to the prior
+/// even-only coercion — the existing e2e/round-trips are unaffected. ffmpeg evaluates
+/// `sar`/`dar` as 1 / the storage ratio when the source SAR is undefined or 0 (verified
+/// with the vendored ffmpeg), so `iw*sar` / `h*dar` never collapse to 0.
 fn main_scale_filter(res: &Resolution) -> String {
     match res {
-        // No resize; just force even (no-op on already-even sources).
-        Resolution::Original => "scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string(),
-        // Fixed height, width auto-rounded to a multiple of 2, aspect preserved.
-        Resolution::Height(h) => format!("scale=-2:{h}"),
-        // Exact dims (both already even from normalize).
-        Resolution::Custom { width, height } => format!("scale={width}:{height}"),
+        // Resample WIDTH by the input SAR so anamorphic pixels become square at the true
+        // display width, force both dims even, and stamp the output square (`setsar=1`).
+        Resolution::Original => "scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1".to_string(),
+        // Fixed display height; width = height × input DISPLAY aspect (`dar`) so an
+        // anamorphic source keeps its display shape (a naive `-2:h` would preserve the
+        // STORAGE ratio and distort). Even-rounded; output marked square.
+        Resolution::Height(h) => format!("scale='trunc({h}*dar/2)*2':{h},setsar=1"),
+        // Exact (already-even) DISPLAY dims; mark them square-pixel.
+        Resolution::Custom { width, height } => format!("scale={width}:{height},setsar=1"),
     }
 }
 
@@ -214,10 +226,21 @@ mod tests {
             "Original bitrate must not emit -b:v"
         );
 
-        // The even-guard scale filter.
+        // The SAR-aware even-guard scale filter: width resampled by the input SAR to
+        // square pixels, both dims even, output marked square (`setsar=1`). For a square
+        // source `sar == 1` so this is byte-identical to the prior even-only coercion.
         assert_eq!(
             value_after(&args, "-vf"),
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+            "scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1"
+        );
+        // The fix is present: SAR-aware width term + an explicit square-pixel stamp.
+        assert!(
+            value_after(&args, "-vf").contains("iw*sar"),
+            "Original scale must be SAR-aware"
+        );
+        assert!(
+            value_after(&args, "-vf").ends_with("setsar=1"),
+            "output must be marked square-pixel"
         );
 
         // Core pinned flags + their values.
@@ -256,7 +279,9 @@ mod tests {
         };
         let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds());
 
-        assert_eq!(value_after(&args, "-vf"), "scale=-2:720");
+        // Height: width = height × input display aspect (`dar`), even, output square.
+        // For a square source `dar` is the storage ratio, matching the prior `-2:h`.
+        assert_eq!(value_after(&args, "-vf"), "scale='trunc(720*dar/2)*2':720,setsar=1");
         assert!(contains(&args, "-b:v"), "Kbps must emit -b:v");
         assert_eq!(value_after(&args, "-b:v"), "4000k");
     }
@@ -272,8 +297,8 @@ mod tests {
             bitrate: Bitrate::Original,
         };
         let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds());
-        // normalize floors each dim to even ⇒ 1920x1080.
-        assert_eq!(value_after(&args, "-vf"), "scale=1920:1080");
+        // normalize floors each dim to even ⇒ 1920x1080; output marked square-pixel.
+        assert_eq!(value_after(&args, "-vf"), "scale=1920:1080,setsar=1");
     }
 
     #[test]
@@ -287,8 +312,8 @@ mod tests {
             bitrate: Bitrate::Kbps(10_000_000),
         };
         let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds());
-        // Per-dim clamp to the 8K caps (7680x4320 fits max_pixels exactly).
-        assert_eq!(value_after(&args, "-vf"), "scale=7680:4320");
+        // Per-dim clamp to the 8K caps (7680x4320 fits max_pixels exactly); square-pixel.
+        assert_eq!(value_after(&args, "-vf"), "scale=7680:4320,setsar=1");
         // Bitrate clamped down to the ceiling.
         assert_eq!(
             value_after(&args, "-b:v"),

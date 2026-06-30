@@ -108,6 +108,11 @@ export interface PlayerOptions {
   // memory so an extreme (4K+) clip can't accumulate unbounded I420 planes. Over the cap
   // the OLDEST pending frame is dropped (counted toward dropped) — the same catch-up
   // posture tick() already uses for stale frames.
+  // A COUNT cap (not bytes) is safe here because the upstream client-app already enforces
+  // a BYTE cap (MAX_FRAME_BUF_BYTES = 64 MiB) before frames cross the seam: at 8K only
+  // ~1 frame per fragment survives, ~5 at 4K, so `pending` only ever approaches this count
+  // at lower resolutions where each frame's absolute footprint (and thus 96 frames) is
+  // modest. The two caps compose to bound the total decoded-frame footprint end to end.
   pendingCapacity?: number;
   // Master clock in SECONDS; defaults to audio.currentTime. Injectable so tests
   // drive sync deterministically.

@@ -74,3 +74,74 @@ pub fn make_ffmpeg_source(w: u32, h: u32, dur_s: u32, gop: u32) -> Option<Vec<u8
     }
     std::fs::read(&out).ok()
 }
+
+/// Produce a real canonical `out.mp4` from a genuinely ANAMORPHIC (SAR≠1) synthetic
+/// source: a `w`x`h` `testsrc` whose input sample aspect ratio is set to
+/// `sar_num/sar_den`, run through the EXACT production SAR-aware Original scale filter
+/// (`scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1`). The output is square-pixel at
+/// the true display shape — exactly what the confined ingest emits — so the re-mux test
+/// can prove anamorphic sources render at the right aspect. `None` if ffmpeg is absent.
+pub fn make_anamorphic_ffmpeg_source(
+    w: u32,
+    h: u32,
+    sar_num: u32,
+    sar_den: u32,
+    dur_s: u32,
+    gop: u32,
+) -> Option<Vec<u8>> {
+    let ff = vendored_ffmpeg()?;
+    let dir = std::env::temp_dir().join(format!(
+        "maxsecu_ingest_ana_{}_{w}x{h}_{sar_num}_{sar_den}_{gop}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).ok()?;
+    let out = dir.join("out.mp4");
+    let _ = std::fs::remove_file(&out);
+
+    // Inject the source SAR, then apply the production SAR-aware Original filter verbatim.
+    let vf = format!(
+        "setsar={sar_num}/{sar_den},scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1"
+    );
+    let result = Command::new(&ff)
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=duration={dur_s}:size={w}x{h}:rate=24"),
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("sine=duration={dur_s}"),
+            "-shortest",
+            "-vf",
+            &vf,
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libsvtav1",
+            "-preset",
+            "12",
+            "-g",
+            &gop.to_string(),
+            "-svtav1-params",
+            &format!("keyint={gop}:pred-struct=1"),
+            "-c:a",
+            "aac",
+            "-ac",
+            "2",
+        ])
+        .arg(&out)
+        .output()
+        .ok()?;
+
+    if !result.status.success() {
+        eprintln!(
+            "vendored ffmpeg anamorphic encode failed (status {:?}):\n{}",
+            result.status.code(),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return None;
+    }
+    std::fs::read(&out).ok()
+}
