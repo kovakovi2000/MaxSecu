@@ -215,6 +215,9 @@ pub async fn decrypt_card(
     }
     let view = crate::download::parse_file_view(&view_json)?;
     if req.version.is_none() {
+        // NB: keyed on the UNVERIFIED envelope `view.version`; if it diverges from the
+        // signed manifest version this is a benign cache miss (the put keys on the
+        // verified `opened.version`).
         if let Some(card) =
             cache.get_card(CacheKey { file_id, version: view.version }, &req.file_id)
         {

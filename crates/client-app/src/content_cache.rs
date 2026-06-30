@@ -179,12 +179,22 @@ impl ContentCache {
     fn upsert(
         inner: &mut CacheInner,
         key: CacheKey,
-        meta: CachedMeta,
-        content: Option<Zeroizing<Vec<u8>>>,
+        mut meta: CachedMeta,
+        mut content: Option<Zeroizing<Vec<u8>>>,
         now: u64,
     ) {
         if let Some(old) = inner.map.remove(&key) {
             inner.total -= old.bytes;
+            // Carry forward fields the new writer didn't supply, so a card-put
+            // (thumbnail, no content) and a content-put (content, no thumbnail) for
+            // the same (file, version) ENRICH one unified entry instead of clobbering
+            // each other on the feed→view→feed flow the cache exists to accelerate.
+            if meta.thumbnail_b64.is_none() {
+                meta.thumbnail_b64 = old.meta.thumbnail_b64;
+            }
+            if content.is_none() {
+                content = old.content;
+            }
         }
         let mut e = Entry {
             meta,
@@ -336,6 +346,29 @@ mod tests {
         let got = c.get_content(key(7, 2), "07".repeat(16).as_str()).unwrap();
         assert_eq!(got.image_png_b64.unwrap(), B64.encode(&png));
         assert!(got.blog_text.is_none());
+    }
+
+    #[test]
+    fn card_and_content_puts_merge_not_clobber() {
+        let c = ContentCache::new(10_000);
+        // 1) card first: thumbnail present, no content.
+        let mut m = meta("t");
+        m.thumbnail_b64 = Some("THUMB".into());
+        c.put_card(key(1, 1), m);
+        // 2) content next: no thumbnail in this meta — must NOT drop the thumbnail.
+        c.put_content(key(1, 1), meta("t"), b"body".to_vec());
+        assert_eq!(c.get_content(key(1, 1), "x").unwrap().blog_text.unwrap(), "body");
+        assert_eq!(
+            c.get_card(key(1, 1), "x").unwrap().thumbnail_b64,
+            Some("THUMB".into()),
+            "thumbnail survives a later content-put"
+        );
+        // 3) a later card-put (feed re-mount) must NOT evict the cached content.
+        c.put_card(key(1, 1), meta("t"));
+        assert!(
+            c.get_content(key(1, 1), "x").is_some(),
+            "content survives a later card-put"
+        );
     }
 
     #[test]
