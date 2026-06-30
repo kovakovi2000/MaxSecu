@@ -75,53 +75,80 @@ pub(crate) struct ParsedTables {
     pub audio_sample_entry: Option<Vec<u8>>,
 }
 
+/// Parse exactly ONE box at byte `off` in `data`, **bounds-safely**, returning
+/// `(type, payload-range, next-offset)` or `None` when there is no well-formed box at
+/// `off` (truncation, header underflow, or a length — including a hostile 64-bit
+/// `largesize` up to `u64::MAX` — that overruns the container). Handles 32-bit sizes,
+/// the 64-bit `largesize` (`size == 1`) and the to-end form (`size == 0`).
+///
+/// All length checks compare against the **remaining bytes** (`total > remaining`)
+/// rather than via addition (`off + total > data.len()`), which would overflow/wrap on
+/// a hostile `largesize` and could push a reversed range. `remaining = data.len() - off`
+/// is computed with `checked_sub`, and the function returns early unless
+/// `remaining >= 8`; on success it guarantees `total <= remaining`, so the returned
+/// range `off+hdr..off+total` and next-offset `off+total` can neither overflow nor
+/// reverse.
+fn box_at(data: &[u8], off: usize) -> Option<([u8; 4], core::ops::Range<usize>, usize)> {
+    let remaining = data.len().checked_sub(off)?;
+    if remaining < 8 {
+        return None;
+    }
+    let size = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+    let typ = [data[off + 4], data[off + 5], data[off + 6], data[off + 7]];
+    let (hdr, total): (usize, usize) = if size == 1 {
+        // 64-bit largesize follows the type.
+        if remaining < 16 {
+            return None;
+        }
+        let large = u64::from_be_bytes([
+            data[off + 8],
+            data[off + 9],
+            data[off + 10],
+            data[off + 11],
+            data[off + 12],
+            data[off + 13],
+            data[off + 14],
+            data[off + 15],
+        ]);
+        // A largesize beyond usize is unrepresentable here ⇒ treat as an overrun.
+        (16, usize::try_from(large).unwrap_or(usize::MAX))
+    } else if size == 0 {
+        (8, remaining) // extends to end of the container.
+    } else {
+        (8, size as usize)
+    };
+    // Reject a box that underflows its own header or overruns the container. Compared
+    // against the remaining bytes — no addition, so no overflow/wrap/reversed range.
+    if total < hdr || total > remaining {
+        return None;
+    }
+    Some((typ, off + hdr..off + total, off + total))
+}
+
 /// Iterate the immediate child boxes of `data`, returning each `(type, payload-range)`
-/// **bounds-safely**. Handles 32-bit sizes, the 64-bit `largesize` (`size == 1`) and
-/// the to-end form (`size == 0`); stops at the first malformed/over-long box rather
-/// than panicking or reading out of bounds.
+/// **bounds-safely**. Stops at the first malformed/over-long box (see [`box_at`]).
 fn child_boxes(data: &[u8]) -> Vec<([u8; 4], core::ops::Range<usize>)> {
     let mut out = Vec::new();
     let mut off = 0usize;
-    while off + 8 <= data.len() {
-        let size = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-        let typ = [data[off + 4], data[off + 5], data[off + 6], data[off + 7]];
-        let (hdr, total): (usize, usize) = if size == 1 {
-            // 64-bit largesize follows the type.
-            if off + 16 > data.len() {
-                break;
-            }
-            let large = u64::from_be_bytes([
-                data[off + 8],
-                data[off + 9],
-                data[off + 10],
-                data[off + 11],
-                data[off + 12],
-                data[off + 13],
-                data[off + 14],
-                data[off + 15],
-            ]);
-            (16, large as usize)
-        } else if size == 0 {
-            (8, data.len() - off) // extends to end of the container.
-        } else {
-            (8, size as usize)
-        };
-        // Reject a box that underflows its own header or overruns the container.
-        if total < hdr || off + total > data.len() {
-            break;
-        }
-        out.push((typ, off + hdr..off + total));
-        off += total;
+    while let Some((typ, range, next)) = box_at(data, off) {
+        out.push((typ, range));
+        off = next; // strictly increases (total >= hdr >= 8), so the loop terminates.
     }
     out
 }
 
-/// First immediate child box of `data` whose type is `typ`, as a payload slice.
+/// First immediate child box of `data` whose type is `typ`, as a payload slice. Scans
+/// lazily and **short-circuits** at the first match — it never materializes the whole
+/// child list (a 64 MiB source of 8-byte boxes would otherwise build ~8M entries).
 fn find_child<'a>(data: &'a [u8], typ: &[u8; 4]) -> Option<&'a [u8]> {
-    child_boxes(data)
-        .into_iter()
-        .find(|(t, _)| t == typ)
-        .map(|(_, r)| &data[r])
+    let mut off = 0usize;
+    while let Some((t, range, next)) = box_at(data, off) {
+        if &t == typ {
+            return Some(&data[range]);
+        }
+        off = next;
+    }
+    None
 }
 
 /// The 4-byte handler type out of an `hdlr` full-box payload
@@ -157,24 +184,10 @@ fn parse_stss(stss: &[u8]) -> Vec<u32> {
 /// (with its child `esds`), lifted **verbatim** — bounds-safe, `None` on a short box.
 fn first_sample_entry(stsd: &[u8]) -> Option<Vec<u8>> {
     let entries = stsd.get(8..)?; // skip version+flags(4) + entry_count(4)
-    if entries.len() < 8 {
-        return None;
-    }
-    let size = u32::from_be_bytes([entries[0], entries[1], entries[2], entries[3]]);
-    let total: usize = if size == 1 {
-        let large = entries.get(8..16)?;
-        u64::from_be_bytes([
-            large[0], large[1], large[2], large[3], large[4], large[5], large[6], large[7],
-        ]) as usize
-    } else if size == 0 {
-        entries.len()
-    } else {
-        size as usize
-    };
-    if total < 8 || total > entries.len() {
-        return None;
-    }
-    Some(entries[..total].to_vec())
+                                  // The first SampleEntry box, parsed by the shared bounds-safe reader; `next` is its
+                                  // total length (header + payload), so `entries[..next]` is the full box verbatim.
+    let (_, _, next) = box_at(entries, 0)?;
+    Some(entries[..next].to_vec())
 }
 
 /// Walk ffmpeg's `moov` and extract, bounds-safely, the video `stss` sync samples and
@@ -570,6 +583,35 @@ mod tests {
         // Empty / sub-header buffers are fine too.
         assert!(child_boxes(&[]).is_empty());
         assert!(child_boxes(&[0, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn child_boxes_is_bounds_safe_on_hostile_largesize() {
+        // A valid 8-byte `free` box (advances off to 8, so off > 0) followed by a
+        // `size == 1` (64-bit largesize) box whose largesize is u64::MAX. The old
+        // `off + total > data.len()` check would overflow/wrap with off > 0 and push a
+        // reversed range that then slice-panics; the subtraction guard must reject it.
+        let mut data = Vec::new();
+        data.extend_from_slice(&8u32.to_be_bytes());
+        data.extend_from_slice(b"free");
+        data.extend_from_slice(&1u32.to_be_bytes()); // size == 1 → largesize follows
+        data.extend_from_slice(b"moov");
+        data.extend_from_slice(&u64::MAX.to_be_bytes()); // hostile largesize
+
+        // Returns WITHOUT panic, yielding only the well-formed first box.
+        let boxes = child_boxes(&data);
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].0, *b"free");
+
+        // The short-circuiting lookup also never panics on the hostile box.
+        assert!(find_child(&data, b"free").is_some());
+        assert!(find_child(&data, b"moov").is_none());
+
+        // And the top-level table parse over the hostile input fails soft (no moov
+        // payload is reachable), never panicking on a reversed slice range.
+        let tables = parse_tables(&data);
+        assert!(tables.video_sync.is_empty());
+        assert!(tables.audio_sample_entry.is_none());
     }
 
     #[test]
