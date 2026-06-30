@@ -21,17 +21,25 @@ function pump(): void {
   const job = queue.shift();
   if (!job) return;
   running = true;
+  // Invoke inside try/catch so a SYNCHRONOUS throw (not just a rejected promise)
+  // still releases the runner and rejects the job — the queue must never wedge.
+  let p: Promise<unknown>;
+  try {
+    p = Promise.resolve(job.task());
+  } catch (e) {
+    running = false;
+    job.reject(e);
+    pump();
+    return;
+  }
   // Run, then ALWAYS release and pump the next — success or failure.
-  job
-    .task()
-    .then(
-      (v) => job.resolve(v),
-      (e) => job.reject(e),
-    )
-    .finally(() => {
-      running = false;
-      pump();
-    });
+  p.then(
+    (v) => job.resolve(v),
+    (e) => job.reject(e),
+  ).finally(() => {
+    running = false;
+    pump();
+  });
 }
 
 function enqueue<T>(task: () => Promise<T>, priority: boolean): Promise<T> {
@@ -45,6 +53,9 @@ function enqueue<T>(task: () => Promise<T>, priority: boolean): Promise<T> {
     } else {
       queue.push(job as Job);
     }
+    // When the queue is idle this starts the task SYNCHRONOUSLY during the
+    // serial()/serialPriority() call — deliberate; the priority ordering relies
+    // on the running task not being preemptible once it has started.
     pump();
   });
 }

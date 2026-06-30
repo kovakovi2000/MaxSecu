@@ -20,6 +20,14 @@ test("a failing task does not stall the queue", async () => {
   assert.deepEqual(ran, [2]);
 });
 
+test("a synchronously-throwing task does not wedge the queue", async () => {
+  const ran: number[] = [];
+  const a = serial(() => { throw new Error("sync-boom"); }).catch(() => {});
+  const b = serial(async () => { ran.push(2); });
+  await Promise.all([a, b]);
+  assert.deepEqual(ran, [2], "the next task still runs after a sync throw");
+});
+
 test("priority task jumps ahead of queued tasks", async () => {
   const order: string[] = [];
   // Occupy the queue with a slow task, then enqueue normal + priority.
