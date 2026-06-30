@@ -22,6 +22,11 @@ maxsecu-client-core = { path = "../client-core" }
 # a codec; pure-Rust secret-hygiene crate already in the workspace lock.
 zeroize = "1"
 
+# Author-side `TranscodeOptions` (resolution/bitrate) (de)serialize across the
+# Tauri seam (UI → client-app → this codec-free crate's ffmpeg-argv builder).
+# Pure option types only — NOT a codec; serde is already in the workspace lock.
+serde = { workspace = true }
+
 # Win32 OS-confinement (AppContainer + Job Object) for the decode launcher
 # (6b-ii). Windows-only; FFI bindings to the OS (not a vendored C library), so
 # the no-C posture holds. unsafe is confined to the audited `win32` module.
@@ -36,6 +41,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Pipes",
     "Win32_Storage_FileSystem",
 ] }
+
+# serde round-trip tests for `TranscodeOptions` exercise the JSON wire shape the
+# Tauri seam uses; serde_json is test-only here (already in the workspace lock).
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints.rust]
 # `unsafe` is DENIED crate-wide and re-allowed ONLY in the contained, audited

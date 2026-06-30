@@ -2701,6 +2701,8 @@ name = "maxsecu-media-launcher"
 version = "0.0.0"
 dependencies = [
  "maxsecu-client-core",
+ "serde",
+ "serde_json",
  "windows-sys 0.61.2",
  "zeroize",
 ]

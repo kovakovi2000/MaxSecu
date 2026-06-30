@@ -38,6 +38,9 @@ use std::process::{Command, Stdio};
 
 use zeroize::Zeroize;
 
+pub mod transcode_opts;
+pub use transcode_opts::{Bitrate, Resolution, TranscodeOptions};
+
 #[cfg(windows)]
 mod win32;
 #[cfg(windows)]
