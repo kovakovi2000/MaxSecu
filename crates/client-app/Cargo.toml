@@ -6,6 +6,15 @@ rust-version.workspace = true
 publish = false
 description = "MaxSecu media client (Tauri shell over client-core TCB)."
 
+[features]
+# Bake the vendored static ffmpeg into the binary via `include_bytes!` (see
+# `src/ffmpeg_bin.rs`). Default-on so CI / release builds embed it; turn it off
+# (`--no-default-features`) to build the workspace without
+# `vendor/ffmpeg/ffmpeg.exe` present (the gitignored binary fetched by
+# `scripts/fetch-ffmpeg.ps1`), in which case `ensure_ffmpeg` fail-closes.
+default = ["embed-ffmpeg"]
+embed-ffmpeg = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

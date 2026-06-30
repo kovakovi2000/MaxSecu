@@ -11,6 +11,7 @@ pub mod directory;
 pub mod download;
 pub mod dto;
 pub mod error;
+pub mod ffmpeg_bin;
 pub mod fragment_cache;
 pub mod http_client;
 pub mod index;
