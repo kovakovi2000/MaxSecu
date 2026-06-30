@@ -1,13 +1,13 @@
 import { call } from "../core/rpc.ts";
-import { applySettings, loadAndApplySettings } from "../core/settings.ts";
-import type { Settings } from "../core/types.ts";
+import { settingsStore, updateSettings, loadAndApplySettings } from "../core/settings.ts";
+import type { Settings, RamLimits } from "../core/types.ts";
 
-// Settings (spec §5): accessibility / performance / behavior / connection / account
-// / privacy sections. Preference controls (a11y/performance/behavior) round-trip on
-// change through set_settings → applySettings, reflecting any backend clamping back
-// into the form. Account actions (change password / export keystore) are explicit
-// button clicks. Accessible: landmark focused on mount, labelled controls grouped in
-// fieldsets, role=status live regions for save + account feedback.
+// Settings (spec §5/§7): appearance / accessibility / performance / behavior /
+// connection / account / privacy. Preference controls write through the SHARED
+// settings store (so quick-settings + the shell theme stay in sync and apply
+// live); the RAM control is bounded to the live `ram_limits`. Account actions
+// are explicit submits. Accessible: focused landmark on mount, labelled controls
+// in fieldsets, role=status live regions.
 const DEFAULTS: Settings = {
   a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
   behavior: { confirm_destructive: false },
@@ -17,6 +17,9 @@ const DEFAULTS: Settings = {
 };
 
 export class SettingsScreen extends HTMLElement {
+  private limits: RamLimits = { default_mb: 256, min_mb: 64, max_mb: 4096 };
+  private unsub: (() => void) | null = null;
+
   connectedCallback() {
     this.innerHTML = `
       <main id="main" tabindex="-1" aria-labelledby="set-h">
@@ -24,6 +27,15 @@ export class SettingsScreen extends HTMLElement {
         <p id="set-status" role="status" aria-live="polite"></p>
 
         <form id="set-form">
+          <fieldset>
+            <legend>Appearance</legend>
+            <label>Theme
+              <select name="theme">
+                <option value="dark">Dark</option>
+                <option value="light">Light</option>
+              </select></label>
+          </fieldset>
+
           <fieldset>
             <legend>Accessibility</legend>
             <label><input type="checkbox" name="reduced_motion" /> Reduce motion</label>
@@ -39,7 +51,9 @@ export class SettingsScreen extends HTMLElement {
           <fieldset>
             <legend>Performance</legend>
             <label>RAM cache cap (MB)
-              <input type="number" name="ram_cache_cap_mb" min="16" max="4096" step="1" /></label>
+              <input type="range" name="ram_range" step="1" />
+              <input type="number" name="ram_cache_cap_mb" step="1" /></label>
+            <p id="ram-hint" class="hint"></p>
           </fieldset>
 
           <fieldset>
@@ -82,18 +96,31 @@ export class SettingsScreen extends HTMLElement {
     (this.querySelector("#main") as HTMLElement).focus();
 
     const prefForm = this.querySelector("#set-form") as HTMLFormElement;
-    prefForm.addEventListener("change", () => this.saveFromControls());
+    prefForm.addEventListener("change", (e) => this.onPrefChange(e));
 
-    const pwForm = this.querySelector("#pw-form") as HTMLFormElement;
-    pwForm.addEventListener("submit", (e) => { e.preventDefault(); this.onChangePassword(); });
+    (this.querySelector("#pw-form") as HTMLFormElement)
+      .addEventListener("submit", (e) => { e.preventDefault(); this.onChangePassword(); });
+    (this.querySelector("#exp-form") as HTMLFormElement)
+      .addEventListener("submit", (e) => { e.preventDefault(); this.onExportKeystore(); });
 
-    const expForm = this.querySelector("#exp-form") as HTMLFormElement;
-    expForm.addEventListener("submit", (e) => { e.preventDefault(); this.onExportKeystore(); });
+    // Keep the form mirrored to the shared store (so a quick-settings edit shows
+    // up here live, and vice-versa).
+    this.unsub = settingsStore.subscribe((s) => this.writeControls(s));
 
     this.init();
   }
+  disconnectedCallback() {
+    this.unsub?.();
+  }
 
   private async init() {
+    try { this.limits = await call<RamLimits>("ram_limits"); } catch { /* keep defaults */ }
+    const range = this.input("ram_range");
+    const num = this.input("ram_cache_cap_mb");
+    range.min = String(this.limits.min_mb); range.max = String(this.limits.max_mb);
+    num.min = String(this.limits.min_mb); num.max = String(this.limits.max_mb);
+    (this.querySelector("#ram-hint") as HTMLElement).textContent =
+      `Allowed ${this.limits.min_mb}–${this.limits.max_mb} MB (cap = total RAM − 6 GB).`;
     const loaded = await loadAndApplySettings();
     this.writeControls(loaded ?? DEFAULTS);
   }
@@ -101,46 +128,47 @@ export class SettingsScreen extends HTMLElement {
   private input(name: string): HTMLInputElement {
     return this.querySelector(`#set-form [name="${name}"]`) as HTMLInputElement;
   }
+  private sel(name: string): HTMLSelectElement {
+    return this.querySelector(`#set-form [name="${name}"]`) as HTMLSelectElement;
+  }
 
-  private readControls(): Settings {
-    const textSel = this.querySelector('#set-form [name="text_size"]') as HTMLSelectElement;
-    const text = textSel.value;
-    const text_size: Settings["a11y"]["text_size"] =
-      text === "large" || text === "larger" ? text : "normal";
+  private async onPrefChange(e: Event) {
+    const status = this.querySelector("#set-status")!;
+    const target = e.target as HTMLElement;
+    if (target?.getAttribute("name") === "ram_range") {
+      this.input("ram_cache_cap_mb").value = this.input("ram_range").value;
+    } else if (target?.getAttribute("name") === "ram_cache_cap_mb") {
+      this.input("ram_range").value = this.input("ram_cache_cap_mb").value;
+    }
     const ram = Number(this.input("ram_cache_cap_mb").value);
-    return {
+    const text = this.sel("text_size").value;
+    const patch: Partial<Settings> = {
+      appearance: { theme: this.sel("theme").value === "light" ? "light" : "dark" },
       a11y: {
         reduced_motion: this.input("reduced_motion").checked,
         high_contrast: this.input("high_contrast").checked,
-        text_size,
+        text_size: text === "large" || text === "larger" ? text : "normal",
       },
-      behavior: { confirm_destructive: this.input("confirm_destructive").checked },
       performance: { ram_cache_cap_mb: Number.isFinite(ram) ? ram : DEFAULTS.performance.ram_cache_cap_mb },
-      connection: { use_tor: this.input("use_tor").checked },
-      appearance: { theme: DEFAULTS.appearance.theme },
+      behavior: { confirm_destructive: this.input("confirm_destructive").checked },
     };
-  }
-
-  private writeControls(s: Settings): void {
-    this.input("reduced_motion").checked = s.a11y.reduced_motion;
-    this.input("high_contrast").checked = s.a11y.high_contrast;
-    (this.querySelector('#set-form [name="text_size"]') as HTMLSelectElement).value = s.a11y.text_size;
-    this.input("ram_cache_cap_mb").value = String(s.performance.ram_cache_cap_mb);
-    this.input("confirm_destructive").checked = s.behavior.confirm_destructive;
-    this.input("use_tor").checked = s.connection.use_tor;
-  }
-
-  private async saveFromControls() {
-    const status = this.querySelector("#set-status")!;
-    const next: Settings = this.readControls();
     try {
-      const norm = await call<Settings>("set_settings", { settings: next });
-      applySettings(norm);
-      this.writeControls(norm); // reflect clamping back into the form
+      await updateSettings(patch);
       status.textContent = "Saved.";
     } catch (x) {
       status.textContent = errMsg(x, "Could not save settings.");
     }
+  }
+
+  private writeControls(s: Settings): void {
+    this.sel("theme").value = s.appearance.theme;
+    this.input("reduced_motion").checked = s.a11y.reduced_motion;
+    this.input("high_contrast").checked = s.a11y.high_contrast;
+    this.sel("text_size").value = s.a11y.text_size;
+    this.input("ram_cache_cap_mb").value = String(s.performance.ram_cache_cap_mb);
+    this.input("ram_range").value = String(s.performance.ram_cache_cap_mb);
+    this.input("confirm_destructive").checked = s.behavior.confirm_destructive;
+    this.input("use_tor").checked = s.connection.use_tor;
   }
 
   private async onChangePassword() {
@@ -156,7 +184,6 @@ export class SettingsScreen extends HTMLElement {
       status.textContent = errMsg(x, "Could not change the password.");
     }
   }
-
   private async onExportKeystore() {
     const status = this.querySelector("#acct-status")!;
     const dest = (this.querySelector('input[name="dest"]') as HTMLInputElement).value;
