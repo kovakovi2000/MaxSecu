@@ -138,6 +138,7 @@ All field names are **snake_case**; all enum string values are **kebab-case**.
 | `decrypt_card` | `{ req: { file_id, version? } }` | `Card` | media-card |
 | `open_content` | `{ req: { file_id, version? } }` | `OpenedContent` | media-viewer |
 | `search_local` | `{ req: { query } }` | `SearchHit[]` | feed-screen |
+| `pick_file` | `{ extensions: string[] }` | `string \| null` (chosen path, or null if cancelled) | upload-screen |
 | `register_glassbreak` | `{ req: { bootstrap_secret, save_path? } }` | `GlassbreakResponse` | bootstrap-screen |
 | `create_first_admin` | `{ req: { username, password, bootstrap_secret } }` | `string` (user_id) | bootstrap-screen |
 | `register_user` | `{ req: { username, password, voucher } }` | `string` (user_id) | (enrollment) |

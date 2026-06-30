@@ -31,13 +31,17 @@ export class UploadScreen extends HTMLElement {
               <option value="blog">Blog</option>
               <option value="video">Video</option>
             </select></label>
-          <label id="path-row">Image file path
-            <input name="path" type="text" autocomplete="off" /></label>
+          <div id="path-row">
+            <label>Image file path
+              <input name="path" type="text" autocomplete="off" /></label>
+            <button id="pick-image" type="button" aria-label="Browse for an image file">Browse…</button>
+          </div>
           <label id="body-row" hidden>Post body
             <textarea name="content" rows="6"></textarea></label>
           <div id="video-row" hidden>
             <label>Raw-frame (MXRAWV01) source file path
               <input name="vpath" type="text" autocomplete="off" /></label>
+            <button id="pick-video" type="button" aria-label="Browse for a raw-frame source file">Browse…</button>
             <button id="up-gen" type="button">Generate a sample clip</button>
             <p id="up-gen-status" role="status" aria-live="polite"></p>
           </div>
@@ -68,6 +72,26 @@ export class UploadScreen extends HTMLElement {
       this.sampleSourceB64 = makeSampleSourceB64();
       (this.querySelector("#up-gen-status") as HTMLElement).textContent =
         "Sample clip ready — choose Preview to transcode it.";
+    });
+
+    // "Browse…" opens the native OS file dialog (pick_file) and drops the chosen
+    // path into the matching text field — no bytes cross here, only a path.
+    const pathInput = form.querySelector('input[name="path"]') as HTMLInputElement;
+    const vpathInput = form.querySelector('input[name="vpath"]') as HTMLInputElement;
+    const pickInto = async (input: HTMLInputElement, extensions: string[]) => {
+      try {
+        const p = await call<string | null>("pick_file", { extensions });
+        if (p) input.value = p;
+      } catch (x) {
+        (this.querySelector("#up-status") as HTMLElement).textContent =
+          errMsg(x, "Could not open the file dialog.");
+      }
+    };
+    this.querySelector("#pick-image")?.addEventListener("click", () => {
+      void pickInto(pathInput, ["png", "jpg", "jpeg", "webp", "gif", "bmp"]);
+    });
+    this.querySelector("#pick-video")?.addEventListener("click", () => {
+      void pickInto(vpathInput, []);
     });
 
     form.addEventListener("submit", (e) => this.onPreview(e, form));

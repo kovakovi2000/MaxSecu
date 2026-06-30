@@ -65,6 +65,7 @@ export class FeedScreen extends HTMLElement {
               <option value="oldest-first">Oldest first</option>
             </select></label>
           <label id="mine-toggle"><input type="checkbox" name="mine" /> Only my uploads</label>
+          <button id="refresh" type="button" class="feed-refresh">Refresh</button>
         </form>
         <p id="fd-status" role="status" aria-live="polite"></p>
         <div id="grid" role="list"></div>
@@ -89,6 +90,14 @@ export class FeedScreen extends HTMLElement {
     });
     const q = form.querySelector('input[name="q"]') as HTMLInputElement;
     q.addEventListener("input", () => this.runSearch(q.value));
+
+    // Manual refresh: clear any search box and force a fresh server listing,
+    // bypassing the retained (cached) view so newly-posted items appear.
+    (this.querySelector("#refresh") as HTMLButtonElement).addEventListener("click", () => {
+      q.value = "";
+      retained[this.key] = null;
+      this.load();
+    });
 
     if (r && r.entries.length) {
       this.renderEntries(r.entries);

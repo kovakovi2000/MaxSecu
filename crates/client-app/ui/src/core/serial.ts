@@ -6,6 +6,25 @@
 // behind a backlog of card decrypts); `cancelPending` rejects everything still
 // queued (used when leaving the feed) so a stalled backlog can't wedge the lock.
 
+// The rejection `cancelPending` uses. A distinct type so callers (e.g. a feed
+// card) can tell a benign queue-flush from a real backend failure and react
+// differently — a still-on-screen card retries; a torn-down one drops silently.
+// `.message` stays "cancelled" for back-compat with existing assertions/logs.
+export class CancelledError extends Error {
+  constructor() {
+    super("cancelled");
+    this.name = "CancelledError";
+  }
+}
+
+/** True if `e` is a serial-queue cancellation (vs a real error). */
+export function isCancelled(e: unknown): e is CancelledError {
+  return (
+    e instanceof CancelledError ||
+    (typeof e === "object" && e !== null && (e as { message?: unknown }).message === "cancelled")
+  );
+}
+
 type Job<T = unknown> = {
   task: () => Promise<T>;
   resolve: (v: T) => void;
@@ -75,6 +94,6 @@ export function serialPriority<T>(task: () => Promise<T>): Promise<T> {
 export function cancelPending(): void {
   while (queue.length) {
     const job = queue.shift()!;
-    job.reject(new Error("cancelled"));
+    job.reject(new CancelledError());
   }
 }

@@ -418,6 +418,9 @@ pre {
 }
 #controls label { margin: 0; }
 #mine-toggle { align-self: center; }
+/* Keep the Refresh button compact (don't stretch to a full grid column when it
+   wraps to a second row on the Feed route). */
+.feed-refresh { justify-self: start; align-self: end; white-space: nowrap; }
 #grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(238px, 1fr));

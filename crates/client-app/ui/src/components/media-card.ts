@@ -1,5 +1,6 @@
 import { call } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
+import { decideCardOutcome } from "../core/card-retry.ts";
 import type { Card } from "../core/types.ts";
 import "./state-badge.ts";
 
@@ -9,6 +10,11 @@ import "./state-badge.ts";
 // one accessible transparent overlay link to the viewer; no separate "View"
 // button or visible link chrome is needed.
 export class MediaCard extends HTMLElement {
+  // How many times this card's decrypt has been re-attempted after a benign
+  // queue-flush cancellation (see core/card-retry.ts). Bounded so a pathological
+  // flush loop can't spin.
+  private attempts = 0;
+
   connectedCallback() {
     const id = this.getAttribute("file-id") ?? "";
     const versionAttr = this.getAttribute("version");
@@ -93,6 +99,17 @@ export class MediaCard extends HTMLElement {
       article.appendChild(link);
       this.replaceChildren(article);
     } catch (x) {
+      // A "cancelled" rejection is the GLOBAL serial-queue flush (cancelPending),
+      // not a real failure. If this card is still on screen the flush wasn't meant
+      // for it — retry (bounded) so it can't get stuck on a permanent bogus
+      // "cancelled" badge. If it's been torn down, drop silently.
+      const outcome = decideCardOutcome(x, this.isConnected, this.attempts);
+      if (outcome === "drop") return;
+      if (outcome === "retry") {
+        this.attempts++;
+        void this.decrypt(id, version);
+        return;
+      }
       const article = document.createElement("article");
       article.className = "media-card-shell";
       article.setAttribute("aria-busy", "false");
