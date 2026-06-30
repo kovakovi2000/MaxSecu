@@ -127,3 +127,50 @@ test("screens use a live region for feedback", () => {
     );
   });
 }
+
+// --- UI-overhaul affordances (this plan) -----------------------------------
+{
+  const shell = readFileSync("src/components/app-shell.ts", "utf8");
+  const toastHost = readFileSync("src/components/toast-host.ts", "utf8");
+
+  test("shell exposes a real My Content link (not a dead span)", () => {
+    // The shell builds nav hrefs from a NAV table (`href="#/${n.route}"`), so the
+    // literal "#/mine" isn't in source — assert the mine route is wired into NAV.
+    assert.match(shell, /#\/mine|route:\s*"mine"/, "shell must wire the #/mine route");
+    assert.match(shell, /My Content/, "My Content label present");
+    assert.doesNotMatch(
+      shell,
+      /<span>\s*My Content\s*<\/span>/,
+      "My Content must be a link, not a span",
+    );
+  });
+
+  test("shell status strip + active-tasks live region", () => {
+    assert.match(shell, /status-strip/, "status strip present");
+    assert.match(shell, /tasks-ind/, "active-tasks indicator present");
+    assert.match(shell, /aria-live/, "status strip uses a live region");
+  });
+
+  test("toast host has assertive + polite live regions, no raw innerHTML interpolation", () => {
+    assert.match(toastHost, /aria-live="assertive"/, "errors are assertive");
+    assert.match(toastHost, /aria-live="polite"/, "non-errors are polite");
+    assert.match(toastHost, /textContent/, "toast text via textContent");
+    assert.doesNotMatch(
+      toastHost,
+      /\.innerHTML\s*=\s*`[^`]*\$\{(?!esc\()/,
+      "toast-host must not interpolate unescaped data into innerHTML",
+    );
+  });
+
+  test("quick-settings + settings expose a labelled Theme + RAM control", () => {
+    const qs = readFileSync("src/components/quick-settings.ts", "utf8");
+    const set = readFileSync("src/components/settings-screen.ts", "utf8");
+    for (const src of [qs, set]) {
+      assert.match(src, /Theme/, "Theme control present");
+      assert.match(src, /aria-label|<label|name="theme"/, "controls labelled");
+    }
+    // quick-settings builds the slider via the DOM API (`range.type = "range"`),
+    // not literal HTML — accept either form.
+    assert.match(qs, /type="range"|\.type\s*=\s*"range"/, "quick-settings RAM uses a range slider");
+  });
+}
