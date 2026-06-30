@@ -79,6 +79,15 @@ const MAX_DRAIN_ITERS: usize = 4096;
 /// this session-layer bound is the magnitude defense. Over it ⇒ fail-closed.
 const MAX_FRAGMENT_AUDIO_SECONDS: u64 = 120;
 
+/// Hard upper bound on demux iterations while draining a fragment's audio (a
+/// belt-and-suspenders companion to [`MAX_DRAIN_ITERS`] for the video path). The
+/// loop is already finite — bounded by the fragment's sample table, itself bounded
+/// by `max_fragment_bytes` — but a pathological table of a great many tiny/empty
+/// (non-sample-producing) packets could spin longer than intended; this caps it.
+/// A real closed-GOP fragment yields well under a thousand packets, so the bound is
+/// generous; hitting it ⇒ fail-closed.
+const MAX_AUDIO_PACKETS: u64 = 1 << 20;
+
 /// A persistent video-decode session over the launcher↔worker seam. Holds the live
 /// rav1d context + active bounds across many `feed` calls. Drive on a 64 MiB-stack
 /// thread (CF-2). Holds **no keys and opens no sockets**.
@@ -247,8 +256,18 @@ impl VideoSession {
         let mut total_samples: u64 = 0;
         // Fallback running pts (per-channel frames) when the track has no time_base.
         let mut running_frames: u64 = 0;
+        // Belt-and-suspenders demux-iteration cap (see MAX_AUDIO_PACKETS): a hostile
+        // sample table of a great many tiny/empty packets can't spin the loop forever.
+        let mut packets_seen: u64 = 0;
 
         loop {
+            if packets_seen >= MAX_AUDIO_PACKETS {
+                out.push(WorkerMsg::Error(DecodeError::OutputRejected {
+                    reason: OutputReject::OverCap,
+                }));
+                break;
+            }
+            packets_seen += 1;
             let pkt = match reader.next_packet() {
                 Ok(Some(p)) => p,
                 Ok(None) => break,  // clean end of stream.
