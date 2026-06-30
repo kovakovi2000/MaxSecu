@@ -97,9 +97,6 @@ pub struct VideoSession {
     /// The live rav1d context (`None` before `Open` / after `Close`). `Dav1dContext`
     /// is a `Copy` opaque handle (an internally ref-counted pointer).
     ctx: Option<Dav1dContext>,
-    /// Monotonic presentation timestamp (ms) stamped on emitted frames; reset on
-    /// `Open`. Canonical fixtures carry one frame per fragment.
-    next_pts_ms: u64,
 }
 
 impl Default for VideoSession {
@@ -114,7 +111,6 @@ impl VideoSession {
         VideoSession {
             bounds: VideoBounds::default(),
             ctx: None,
-            next_pts_ms: 0,
         }
     }
 
@@ -130,7 +126,6 @@ impl VideoSession {
         match msg {
             ClientMsg::Open { bounds } => {
                 self.bounds = bounds;
-                self.next_pts_ms = 0;
                 self.open_ctx();
                 vec![WorkerMsg::Ready]
             }
@@ -138,10 +133,9 @@ impl VideoSession {
             ClientMsg::Seek { .. } => {
                 // Flush: tear down + recreate so NO inter-fragment decoder state
                 // leaks across the seek. Each fragment is independently decodable, so
-                // the next Fragment decodes cleanly from the fresh context. Restamp
-                // pts from the seek target (same as Open) so post-seek frames are
-                // timestamped consistently rather than continuing to climb.
-                self.next_pts_ms = 0;
+                // the next Fragment decodes cleanly from the fresh context. Frame pts
+                // are read fresh per fragment (fragment-relative), so there is no
+                // running counter to reset here.
                 self.open_ctx();
                 Vec::new()
             }
@@ -175,8 +169,8 @@ impl VideoSession {
         let mut out = Vec::new();
         match demux_video_samples(&bytes) {
             Some(samples) if !samples.is_empty() => {
-                for sample in samples {
-                    let mut msgs = self.decode_sample(&sample);
+                for (sample, pts_ms) in samples {
+                    let mut msgs = self.decode_sample(&sample, pts_ms);
                     let had_err = msgs.iter().any(|m| matches!(m, WorkerMsg::Error(_)));
                     out.append(&mut msgs);
                     if had_err {
@@ -387,8 +381,15 @@ impl VideoSession {
     /// `WorkerMsg::Error` on failure. Carries the Task-3.1 FFI hardening:
     /// unconditional `dav1d_data_unref` before any early return (stuck-stream leak
     /// fix) and `-EAGAIN`(retry)-vs-fatal(fail-fast) branching on `dav1d_send_data`.
+    ///
+    /// `pts_ms` is the sample's REAL fragment-relative presentation time (ms), read
+    /// from the fragment's sample table (Task 5.2 A/V sync). Every picture produced by
+    /// THIS sample is stamped with it: the canonical fragments are low-delay
+    /// (`pred-struct=1`, `max_frame_delay=1`), so a sample yields its own picture in
+    /// presentation order — decode order equals presentation order, so the fed sample's
+    /// pts is the produced picture's pts.
     #[allow(unsafe_code)]
-    fn decode_sample(&mut self, sample: &[u8]) -> Vec<WorkerMsg> {
+    fn decode_sample(&mut self, sample: &[u8], pts_ms: u64) -> Vec<WorkerMsg> {
         let handle = match self.ctx {
             Some(h) => h,
             None => return vec![WorkerMsg::Error(DecodeError::DecodeFailed)],
@@ -433,7 +434,7 @@ impl VideoSession {
                     dav1d_get_picture(Some(handle), Some(NonNull::new(pic.as_mut_ptr()).unwrap()));
                 if r.0 == 0 {
                     let mut pic = pic.assume_init();
-                    let extracted = extract_i420(&pic, &bounds, self.next_pts_ms);
+                    let extracted = extract_i420(&pic, &bounds, pts_ms);
                     // SAFETY: `pic` is a live, dav1d-initialized picture we own;
                     // release our reference exactly once now that the planes (if any)
                     // are copied into owned Vecs.
@@ -441,7 +442,6 @@ impl VideoSession {
                     match extracted {
                         Ok(frame) => match validate_i420(&frame, &bounds) {
                             Ok(()) => {
-                                self.next_pts_ms += 1;
                                 out.push(WorkerMsg::Video(frame));
                             }
                             Err(e) => {
@@ -595,21 +595,40 @@ unsafe fn copy_plane(
     }
 }
 
-/// Demux every video sample out of a self-contained fragment MP4 with symphonia's
-/// isomp4 reader. Returns `None` on a malformed reader / missing video track (the
-/// session maps that to `DecodeError::DecodeFailed`) — never panics on hostile input.
-fn demux_video_samples(mp4: &[u8]) -> Option<Vec<Vec<u8>>> {
+/// Demux every video sample (with its REAL fragment-relative presentation time, ms)
+/// out of a self-contained fragment MP4 with symphonia's isomp4 reader. Returns `None`
+/// on a malformed reader / missing video track (the session maps that to
+/// `DecodeError::DecodeFailed`) — never panics on hostile input.
+///
+/// The pts is derived exactly like the audio path: the packet pts via the video track
+/// `time_base` (the fragment's `mdhd` timescale, 1000 ⇒ ms), clamped non-negative.
+/// When a track carries no time_base the per-sample index is used as a fail-safe
+/// fallback (canonical fragments always carry one, so the real path is the live path).
+fn demux_video_samples(mp4: &[u8]) -> Option<Vec<(Vec<u8>, u64)>> {
     let mss = MediaSourceStream::new(
         Box::new(Cursor::new(mp4.to_vec())),
         MediaSourceStreamOptions::default(),
     );
     let mut reader = IsoMp4Reader::try_new(mss, FormatOptions::default()).ok()?;
-    let track_id = reader.first_track(TrackType::Video)?.id;
+    let track = reader.first_track(TrackType::Video)?;
+    let track_id = track.id;
+    let time_base = track.time_base;
 
     let mut samples = Vec::new();
+    let mut idx: u64 = 0;
     loop {
         match reader.next_packet() {
-            Ok(Some(pkt)) if pkt.track_id == track_id => samples.push(pkt.data.into_vec()),
+            Ok(Some(pkt)) if pkt.track_id == track_id => {
+                // Real pts (ms) via the track time_base, mirroring the audio path; a
+                // negative pts (encoder delay) clamps to 0. Fail-safe to the sample
+                // index when no time_base is present (degenerate source).
+                let pts_ms = time_base
+                    .and_then(|tb| tb.calc_time(pkt.pts))
+                    .map(|t| (t.as_secs_f64() * 1000.0).max(0.0) as u64)
+                    .unwrap_or(idx);
+                samples.push((pkt.data.into_vec(), pts_ms));
+                idx = idx.saturating_add(1);
+            }
             Ok(Some(_)) => continue, // a non-video packet — skip.
             Ok(None) => break,       // clean end of stream.
             Err(_) => break,         // truncated/EOF — stop; return what we have.

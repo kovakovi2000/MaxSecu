@@ -311,9 +311,27 @@ where
 /// BEFORE its DTO is emitted (spec §7); a `WorkerMsg::Error` (a SOFT decode error —
 /// distinct from a hard abort) or any validation failure still fails closed. Emits
 /// `Playing` once the window's frames have flowed.
+/// The window-relative base offset (ms) for fragment `seq`: how far into THIS playback
+/// window the fragment begins, from the AUTHENTICATED fragment index. The decode worker
+/// emits FRAGMENT-relative pts (each fragment starts at ~0); the player needs a SINGLE
+/// window-relative timeline, so each frame/chunk's emitted pts is
+/// `(index[seq].pts_ms - window_start_pts) + worker_pts`. `window_start_pts` is the pts
+/// of the window's first fragment. Saturating so a (defensively) out-of-order index can
+/// never underflow; an unknown seq contributes 0 (fail-safe — the frame still flows).
+fn window_offset_ms(index: &[FragmentEntry], seq: u32, window_start_pts: u64) -> u64 {
+    index
+        .iter()
+        .find(|e| e.seq == seq)
+        .map(|e| e.pts_ms.saturating_sub(window_start_pts))
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn decode_and_emit<D, E, OnF, OnA>(
     script: ScriptGuard,
     decoder: D,
+    frag_index: Vec<FragmentEntry>,
+    window_start_pts: u64,
     emit: &E,
     on_frame: &OnF,
     on_audio: &OnA,
@@ -357,19 +375,43 @@ where
     // resilience is for hard worker ABORTS only, NOT for soft decode errors (which
     // remain a fail-closed contract; a worker that survives to report one is trusted
     // to mean it).
+    //
+    // A/V SYNC (Task 5.2 Part C): the worker emits FRAGMENT-relative pts; we offset
+    // each into the SINGLE window-relative timeline the player syncs on. Frames/audio
+    // for one fragment arrive GROUPED and are delimited by `EndOfFragment{seq}` (which
+    // carries the real seq, robust to the resilient driver skipping a fragment). So we
+    // buffer a fragment's validated outputs, then on its `EndOfFragment` flush them with
+    // that fragment's window offset applied (`emitted = base + worker_pts`). Any frames
+    // left unflushed at the end (a fragment aborted mid-decode with no `EndOfFragment`,
+    // i.e. a skipped culprit) are dropped — their seq, hence their offset, is unknown.
     let bounds = VideoBounds::default();
+    let mut frame_buf: Vec<I420Frame> = Vec::new();
+    let mut audio_buf: Vec<PcmChunk> = Vec::new();
     for msg in outcome.msgs {
         match msg {
             WorkerMsg::Video(frame) => {
                 validate_i420(&frame, &bounds).map_err(|_| player_err())?;
-                on_frame(frame_dto(&frame));
+                frame_buf.push(frame);
             }
             WorkerMsg::Audio(chunk) => {
                 validate_pcm(&chunk, &bounds).map_err(|_| player_err())?;
-                on_audio(pcm_dto(&chunk));
+                audio_buf.push(chunk);
             }
             WorkerMsg::Error(_) => return Err(player_err()),
-            WorkerMsg::Ready | WorkerMsg::EndOfFragment { .. } => {}
+            WorkerMsg::EndOfFragment { seq } => {
+                let base = window_offset_ms(&frag_index, seq, window_start_pts);
+                for frame in frame_buf.drain(..) {
+                    let mut dto = frame_dto(&frame);
+                    dto.pts_ms = base.saturating_add(frame.pts_ms);
+                    on_frame(dto);
+                }
+                for chunk in audio_buf.drain(..) {
+                    let mut dto = pcm_dto(&chunk);
+                    dto.pts_ms = base.saturating_add(chunk.pts_ms);
+                    on_audio(dto);
+                }
+            }
+            WorkerMsg::Ready => {}
         }
     }
 
@@ -507,22 +549,41 @@ where
     }
 
     // Phase C — decrypt the window IN THE TCB under the lock (sync), then DROP the
-    // guard. If the job was cancelled during prefetch, it is gone here ⇒ abort.
-    let script = {
+    // guard. If the job was cancelled during prefetch, it is gone here ⇒ abort. Also
+    // capture the (cloned) authenticated index + the window's first-fragment pts so the
+    // decode step can offset fragment-relative worker pts into the window timeline (A/V
+    // sync, Part C) — both read here under the lock, never across the decode.
+    let (script, frag_index, window_start_pts) = {
         let mut guard = jobs.0.lock().await;
         let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
-        decrypt_window(
+        let window_start_pts = job
+            .index
+            .get(plan.start as usize)
+            .map(|e| e.pts_ms)
+            .unwrap_or(0);
+        let frag_index = job.index.clone();
+        let script = decrypt_window(
             job,
             plan.start,
             count,
             |i| prefetched.remove(&i).ok_or_else(player_err),
             emit,
-        )?
+        )?;
+        (script, frag_index, window_start_pts)
     };
 
     // Phase D — decode OFF the runtime + re-validate + emit (no lock, no identity).
     let decoder = make_decoder(app_dir);
-    decode_and_emit(script, decoder, emit, on_frame, on_audio).await
+    decode_and_emit(
+        script,
+        decoder,
+        frag_index,
+        window_start_pts,
+        emit,
+        on_frame,
+        on_audio,
+    )
+    .await
 }
 
 /// `open_video` — open + verify a video, register its decrypt-while-play session,
@@ -896,16 +957,29 @@ where
 {
     emit(PlayerPhase::Buffering);
     // Build the decode script from the staged canonical plaintext under the jobs
-    // lock (sync slice copy), then DROP the guard before the off-runtime decode.
-    let script = {
+    // lock (sync slice copy), then DROP the guard before the off-runtime decode. The
+    // preview window covers ALL fragments, so the window start is the first fragment's
+    // pts; the cloned index drives the same fragment-relative→window pts offset (Part C).
+    let (script, frag_index, window_start_pts) = {
         let guard = jobs.0.lock().await;
         let staged = guard.get(job_id).ok_or_else(player_err)?;
         let preview = staged.preview.as_ref().ok_or_else(player_err)?;
-        build_preview_script(&preview.cmaf, &preview.index)?
+        let window_start_pts = preview.index.first().map(|e| e.pts_ms).unwrap_or(0);
+        let script = build_preview_script(&preview.cmaf, &preview.index)?;
+        (script, preview.index.clone(), window_start_pts)
     };
     // Confined decode OFF the runtime + re-validate every worker output + emit DTOs.
     let decoder = make_decoder(&dir.0);
-    decode_and_emit(script, decoder, emit, on_frame, on_audio).await
+    decode_and_emit(
+        script,
+        decoder,
+        frag_index,
+        window_start_pts,
+        emit,
+        on_frame,
+        on_audio,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -993,7 +1067,9 @@ mod tests {
         }
     }
 
-    /// Fake decoder that emits one PCM chunk per fragment.
+    /// Fake decoder that emits one PCM chunk per fragment, each closed with its
+    /// `EndOfFragment` (the real worker's contract — the per-fragment delimiter the
+    /// window-offset flush keys on).
     struct AudioDecoder;
     impl VideoSessionDecoder for AudioDecoder {
         fn run_session(&self, script: &[ClientMsg]) -> Result<Vec<WorkerMsg>, SessionError> {
@@ -1006,6 +1082,31 @@ mod tests {
                         pts_ms: *seq as u64,
                         samples: vec![1, -1, 2, -2],
                     }));
+                    out.push(WorkerMsg::EndOfFragment { seq: *seq });
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    /// Fake decoder that emits SEVERAL frames per fragment with REAL fragment-relative
+    /// pts (0, 41, 83, … ms — every fragment restarts at 0, like the real worker),
+    /// each fragment closed with its `EndOfFragment{seq}`. Used to prove Part C offsets
+    /// fragment-relative pts into the SINGLE window timeline (monotonic across fragment
+    /// boundaries, fragment k starting at its window-relative index pts).
+    struct RealPtsDecoder {
+        frames_per_fragment: u32,
+        step_ms: u64,
+    }
+    impl VideoSessionDecoder for RealPtsDecoder {
+        fn run_session(&self, script: &[ClientMsg]) -> Result<Vec<WorkerMsg>, SessionError> {
+            let mut out = vec![WorkerMsg::Ready];
+            for m in script {
+                if let ClientMsg::Fragment { seq, .. } = m {
+                    for k in 0..self.frames_per_fragment {
+                        out.push(WorkerMsg::Video(ok_frame(k as u64 * self.step_ms)));
+                    }
+                    out.push(WorkerMsg::EndOfFragment { seq: *seq });
                 }
             }
             Ok(out)
@@ -1173,6 +1274,7 @@ mod tests {
         let emit = |p| phases.borrow_mut().push(p);
 
         // Decrypt the window IN THE TCB (emits Buffering), then decode off-thread.
+        let frag_index = job.index.clone();
         let script = decrypt_window(
             &mut job,
             0,
@@ -1187,6 +1289,8 @@ mod tests {
         decode_and_emit(
             script,
             FrameDecoder,
+            frag_index,
+            0,
             &emit,
             &|f| frames.borrow_mut().push(f),
             &|a| audios.borrow_mut().push(a),
@@ -1219,6 +1323,7 @@ mod tests {
     async fn play_window_rejects_malformed_worker_frame() {
         let (mut job, chunks) = build_job("malformed");
         let frames: RefCell<Vec<I420FrameDto>> = RefCell::new(Vec::new());
+        let frag_index = job.index.clone();
         let script = decrypt_window(
             &mut job,
             0,
@@ -1230,6 +1335,8 @@ mod tests {
         let err = decode_and_emit(
             script,
             MalformedDecoder,
+            frag_index,
+            0,
             &|_p| {},
             &|f| frames.borrow_mut().push(f),
             &|_a| {},
@@ -1246,6 +1353,7 @@ mod tests {
     #[tokio::test]
     async fn play_window_fails_closed_on_worker_error() {
         let (mut job, chunks) = build_job("workererr");
+        let frag_index = job.index.clone();
         let script = decrypt_window(
             &mut job,
             0,
@@ -1254,7 +1362,7 @@ mod tests {
             &|_p| {},
         )
         .expect("decrypts");
-        let err = decode_and_emit(script, ErrorDecoder, &|_p| {}, &|_f| {}, &|_a| {})
+        let err = decode_and_emit(script, ErrorDecoder, frag_index, 0, &|_p| {}, &|_f| {}, &|_a| {})
             .await
             .unwrap_err();
         assert_eq!(err.code, "video_failed");
@@ -1264,6 +1372,7 @@ mod tests {
     async fn play_window_emits_revalidated_audio() {
         let (mut job, chunks) = build_job("audio");
         let audios: RefCell<Vec<PcmDto>> = RefCell::new(Vec::new());
+        let frag_index = job.index.clone();
         let script = decrypt_window(
             &mut job,
             0,
@@ -1272,7 +1381,7 @@ mod tests {
             &|_p| {},
         )
         .expect("decrypts");
-        decode_and_emit(script, AudioDecoder, &|_p| {}, &|_f| {}, &|a| {
+        decode_and_emit(script, AudioDecoder, frag_index, 0, &|_p| {}, &|_f| {}, &|a| {
             audios.borrow_mut().push(a)
         })
         .await
@@ -1284,6 +1393,57 @@ mod tests {
             want.extend_from_slice(&s.to_le_bytes());
         }
         assert_eq!(audios.borrow()[0].samples_b64, B64.encode(&want));
+    }
+
+    /// Part C (A/V sync): the worker emits FRAGMENT-relative pts (each fragment
+    /// restarts at 0); `decode_and_emit` must offset them into a SINGLE window-relative
+    /// timeline that stays monotonic ACROSS fragment boundaries — fragment k's first
+    /// frame lands at `index[k].pts_ms - window_start_pts`, not back at ~0. Audio is
+    /// offset by the same per-fragment base.
+    #[tokio::test]
+    async fn emitted_pts_are_window_relative_and_monotonic_across_fragments() {
+        let (mut job, chunks) = build_job("offset");
+        // The job index is two fragments at window pts 0 and 1000 ms.
+        assert_eq!(job.index[0].pts_ms, 0);
+        assert_eq!(job.index[1].pts_ms, 1000);
+        let frag_index = job.index.clone();
+        let frames: RefCell<Vec<I420FrameDto>> = RefCell::new(Vec::new());
+
+        let script = decrypt_window(
+            &mut job,
+            0,
+            PLAY_WINDOW,
+            |i| Ok(chunks[i as usize].clone()),
+            &|_p| {},
+        )
+        .expect("decrypts");
+        decode_and_emit(
+            script,
+            RealPtsDecoder {
+                frames_per_fragment: 3,
+                step_ms: 41,
+            },
+            frag_index,
+            0, // window_start_pts = first fragment's pts
+            &|_p| {},
+            &|f| frames.borrow_mut().push(f),
+            &|_a| {},
+        )
+        .await
+        .expect("decodes");
+
+        let pts: Vec<u64> = frames.borrow().iter().map(|f| f.pts_ms).collect();
+        // Fragment 0 (base 0): 0,41,82 ; Fragment 1 (base 1000): 1000,1041,1082.
+        assert_eq!(pts, vec![0, 41, 82, 1000, 1041, 1082]);
+        // Monotonic non-decreasing across the fragment boundary (NOT reset to ~0).
+        for w in pts.windows(2) {
+            assert!(w[1] >= w[0], "window-relative pts monotonic across fragments");
+        }
+        // Fragment 1's first frame ≈ index[1].pts - index[0].pts (the window offset).
+        assert_eq!(
+            pts[3], 1000,
+            "fragment 1 starts at its window-relative index offset, not back at 0"
+        );
     }
 
     /// M1: a `feed_fragment` error mid-window still returns through the
@@ -1317,6 +1477,8 @@ mod tests {
         assert_eq!(start1, 1, "pts 1000 maps to fragment 1");
         let fetch1 = Cell::new(0u32);
         let frames1: RefCell<Vec<I420FrameDto>> = RefCell::new(Vec::new());
+        let frag_index = job.index.clone();
+        let window_start1 = job.index[start1 as usize].pts_ms;
         let script1 = decrypt_window(
             &mut job,
             start1,
@@ -1331,6 +1493,8 @@ mod tests {
         decode_and_emit(
             script1,
             FrameDecoder,
+            frag_index.clone(),
+            window_start1,
             &|_p| {},
             &|f| frames1.borrow_mut().push(f),
             &|_a| {},
@@ -1354,6 +1518,8 @@ mod tests {
         decode_and_emit(
             script2,
             FrameDecoder,
+            frag_index,
+            window_start1,
             &|_p| {},
             &|f| frames2.borrow_mut().push(f),
             &|_a| {},
@@ -1544,6 +1710,8 @@ mod tests {
         decode_and_emit(
             script,
             FrameDecoder,
+            index.clone(),
+            0,
             &|p| phases.borrow_mut().push(p),
             &|f| frames.borrow_mut().push(f),
             &|_a| {},

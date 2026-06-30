@@ -126,6 +126,54 @@ fn ns_of(pts: i64, num: u32, den: u32) -> i128 {
     (pts.max(0) as i128) * (num as i128) * 1_000_000_000 / (den.max(1) as i128)
 }
 
+/// REAL per-sample presentation durations (in ms — the canonical video media
+/// timescale 1000) for one closed GOP, from its consecutive source frame pts
+/// (`gop_ns`, fragment-relative pts in nanoseconds of each sample in decode order).
+///
+/// Within the self-contained fragment the per-sample pts start at 0, so durations are
+/// derived from the *differences* of fragment-relative ms pts (telescoping ⇒ the sum
+/// equals the last sample's relative pts plus the final sample's duration, with no
+/// accumulating rounding drift). The LAST sample's duration is the previous delta (it
+/// has no successor); a single-sample GOP gets a nominal 1 ms (matching the historical
+/// one-frame-per-fragment layout).
+///
+/// Bounds-/overflow-safe on hostile pts (the input is attacker-derived): all math is in
+/// `i128`; a NON-MONOTONIC pts is clamped to its predecessor (so a delta is never
+/// negative); each delta is floored at 1 ms (no zero-duration sample) and a huge delta
+/// saturates to `u32::MAX`. Never panics. Returns one duration per input sample.
+fn frame_durations_ms(gop_ns: &[i128]) -> Vec<u32> {
+    let n = gop_ns.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let base = gop_ns[0];
+    // Fragment-relative ms pts, clamped non-negative AND monotonic non-decreasing
+    // (a hostile out-of-order pts is pinned to its predecessor rather than producing a
+    // negative duration).
+    let mut rel_ms: Vec<i128> = Vec::with_capacity(n);
+    let mut prev = 0i128;
+    for &ns in gop_ns {
+        let mut ms = (ns - base) / 1_000_000;
+        if ms < 0 {
+            ms = 0;
+        }
+        if ms < prev {
+            ms = prev;
+        }
+        rel_ms.push(ms);
+        prev = ms;
+    }
+    let mut durs: Vec<u32> = Vec::with_capacity(n);
+    for w in rel_ms.windows(2) {
+        let d = (w[1] - w[0]).max(1); // floor at 1 ms; never negative (monotonic above).
+        durs.push(u32::try_from(d).unwrap_or(u32::MAX));
+    }
+    // The last sample has no successor: reuse the previous delta, else a nominal 1 ms.
+    let last = durs.last().copied().unwrap_or(1);
+    durs.push(last);
+    durs
+}
+
 /// symphonia-demux ffmpeg's output MP4 into ordered video + audio samples, enforcing
 /// the magnitude caps that bound subsequent allocation **before** building anything.
 /// Bounds-safe and fail-closed on any malformed/hostile input (returns `Err`, never
@@ -312,6 +360,8 @@ pub fn transcode(req: &TranscodeRequest) -> Result<TranscodeResult, TranscodeErr
             .iter()
             .map(|s| s.as_slice())
             .collect();
+        // REAL per-sample durations for this GOP, from its source frame pts.
+        let video_durations = frame_durations_ms(&dem.video_ns[start..end]);
 
         // Pre-build cap: this GOP's raw sample bytes must fit the per-fragment cap
         // BEFORE we allocate and assemble its fragment buffer.
@@ -331,8 +381,13 @@ pub fn transcode(req: &TranscodeRequest) -> Result<TranscodeResult, TranscodeErr
             _ => None,
         };
 
-        let fragment =
-            remux::build_av_fragment(&video_slice, audio_frag.as_ref(), dem.width, dem.height)?;
+        let fragment = remux::build_av_fragment(
+            &video_slice,
+            &video_durations,
+            audio_frag.as_ref(),
+            dem.width,
+            dem.height,
+        )?;
 
         // Defense-in-depth: the padded fragment must not exceed the per-fragment cap.
         if fragment.len() as u64 > bounds.max_fragment_bytes {
@@ -431,6 +486,43 @@ mod tests {
             transcode(&req(src)).unwrap_err(),
             TranscodeError::DecodeFailed
         );
+    }
+
+    #[test]
+    fn frame_durations_are_real_not_uniform() {
+        // 24 fps: each frame is 1000/24 = 41.66… ms apart. Fragment-relative source
+        // pts in ns (telescoping from 0). Six frames.
+        let step_ns: i128 = 1_000_000_000 / 24; // ~41_666_666 ns
+        let gop: Vec<i128> = (0..6).map(|i| i as i128 * step_ns).collect();
+        let durs = frame_durations_ms(&gop);
+        assert_eq!(durs.len(), 6, "one duration per sample");
+        // Deltas are ~41/42 ms (NOT 1 ms): the cumulative ms pts are 0,41,83,124,166,208.
+        // diffs: 41,42,41,42,42 ; the last reuses the previous delta (42).
+        assert_eq!(durs, vec![41, 42, 41, 42, 42, 42]);
+        let total: u64 = durs.iter().map(|&d| d as u64).sum();
+        // ≈ 6/24 s = 250 ms, emphatically not 6 ms.
+        assert!(
+            (240..=260).contains(&total),
+            "total ≈ frames/fps seconds, got {total} ms"
+        );
+    }
+
+    #[test]
+    fn frame_durations_are_bounds_safe_on_hostile_pts() {
+        // Empty GOP → no durations.
+        assert!(frame_durations_ms(&[]).is_empty());
+        // Single sample → one nominal 1 ms duration (the historical layout).
+        assert_eq!(frame_durations_ms(&[5_000_000]), vec![1]);
+        // NON-MONOTONIC pts must never yield a negative/zero duration: each delta is
+        // floored at 1 ms and an out-of-order pts is pinned to its predecessor.
+        let gop = vec![0i128, 100_000_000, 10_000_000, 200_000_000];
+        let durs = frame_durations_ms(&gop);
+        assert_eq!(durs.len(), 4);
+        assert!(durs.iter().all(|&d| d >= 1), "no zero/negative durations");
+        // A HUGE pts jump saturates rather than overflowing u32.
+        let huge = vec![0i128, i128::MAX];
+        let durs = frame_durations_ms(&huge);
+        assert_eq!(durs, vec![u32::MAX, u32::MAX]);
     }
 
     #[test]

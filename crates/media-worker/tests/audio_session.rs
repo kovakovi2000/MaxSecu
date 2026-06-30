@@ -160,11 +160,11 @@ fn av_fragment_emits_video_and_aac_pcm() {
             "Close emits nothing"
         );
 
-        let mut videos: Vec<(u32, u32)> = Vec::new();
+        let mut videos: Vec<(u32, u32, u64)> = Vec::new();
         let mut audios: Vec<(u8, u32, usize, u64)> = Vec::new();
         for m in &msgs {
             match m {
-                WorkerMsg::Video(f) => videos.push((f.width, f.height)),
+                WorkerMsg::Video(f) => videos.push((f.width, f.height, f.pts_ms)),
                 WorkerMsg::Audio(p) => {
                     audios.push((p.channels, p.sample_rate, p.samples.len(), p.pts_ms))
                 }
@@ -182,8 +182,36 @@ fn av_fragment_emits_video_and_aac_pcm() {
         "fragment decodes ≥1 video frame, got {}",
         videos.len()
     );
-    for (w, h) in &videos {
+    for (w, h, _pts) in &videos {
         assert_eq!((*w, *h), (W, H), "decoded geometry");
+    }
+
+    // ---- video pts are REAL (the Task 5.2 deliverable) ----
+    // A multi-frame GOP fragment must carry REAL fragment-relative pts: starting at 0,
+    // monotonic non-decreasing, and spaced by the true frame duration (~41-42 ms at 24
+    // fps) — NOT the old synthetic 0,1,2,… ms per-frame counter.
+    let v_pts: Vec<u64> = videos.iter().map(|(_, _, p)| *p).collect();
+    assert_eq!(v_pts[0], 0, "first video frame is fragment-relative pts 0");
+    for w in v_pts.windows(2) {
+        assert!(w[1] >= w[0], "video pts monotonic non-decreasing");
+    }
+    if v_pts.len() >= 2 {
+        // The span across the GOP must be ≈ (frames-1)/fps seconds, far above the
+        // (frames-1) ms a 1-ms counter would have produced. At 24 fps even 3 frames
+        // span ~83 ms; require the mean inter-frame gap to be clearly > 1 ms.
+        let span = *v_pts.last().unwrap();
+        let gaps = (v_pts.len() - 1) as u64;
+        let mean_gap = span / gaps.max(1);
+        assert!(
+            mean_gap >= 20,
+            "real frame spacing (~41 ms at 24 fps), got mean {mean_gap} ms across {} frames \
+             (span {span} ms) — NOT a 1-ms counter",
+            v_pts.len()
+        );
+        eprintln!(
+            "PASS real video pts: {} frames, span {span} ms, mean gap {mean_gap} ms",
+            v_pts.len()
+        );
     }
 
     // ---- audio (the Task 5.1 deliverable) ----

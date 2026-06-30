@@ -249,11 +249,14 @@ pub(crate) struct AudioFragment<'a> {
 
 /// Build ONE self-contained, chunk-aligned canonical fragment MP4 for a closed GOP.
 ///
-/// `video_samples` is the GOP in decode order (sample 1 = the keyframe); `audio` are
-/// the AAC frames whose presentation time falls in the GOP's span (or `None` when the
-/// source has no audio). Returns the padded, whole-`TRANSCODE_CHUNK_SIZE` fragment.
+/// `video_samples` is the GOP in decode order (sample 1 = the keyframe); `video_durations`
+/// are the matching REAL per-sample presentation durations in the video media timescale
+/// (ms — see [`build_video_trak`]); `audio` are the AAC frames whose presentation time
+/// falls in the GOP's span (or `None` when the source has no audio). Returns the padded,
+/// whole-`TRANSCODE_CHUNK_SIZE` fragment.
 pub(crate) fn build_av_fragment(
     video_samples: &[&[u8]],
+    video_durations: &[u32],
     audio: Option<&AudioFragment<'_>>,
     width: u32,
     height: u32,
@@ -271,7 +274,7 @@ pub(crate) fn build_av_fragment(
     // Two-pass for the `stco` chunk offsets: the offset *values* don't change the
     // moov's *length* (fixed-width u32), so build once with placeholder offsets to
     // learn moov.len(), then rebuild with the real absolute mdat offsets.
-    let moov_probe = build_moov(0, 0, video_samples, audio, width, height);
+    let moov_probe = build_moov(0, 0, video_samples, video_durations, audio, width, height);
     let mdat_payload_off = ftyp.len() + moov_probe.len() + 8; // +8 = mdat box header
     let video_off = mdat_payload_off;
     let audio_off = mdat_payload_off + video_total;
@@ -279,6 +282,7 @@ pub(crate) fn build_av_fragment(
         video_off as u32,
         audio_off as u32,
         video_samples,
+        video_durations,
         audio,
         width,
         height,
@@ -324,12 +328,17 @@ fn build_moov(
     video_chunk_off: u32,
     audio_chunk_off: u32,
     video_samples: &[&[u8]],
+    video_durations: &[u32],
     audio: Option<&AudioFragment<'_>>,
     width: u32,
     height: u32,
 ) -> Vec<u8> {
-    let n_video = video_samples.len() as u32;
-    let video_dur_ms = n_video as u64; // video media timescale 1000, 1 tick/sample.
+    // Total video presentation time = the sum of the REAL per-sample durations (video
+    // media timescale 1000, i.e. ms), saturating so a degenerate duration table can
+    // never overflow the running total.
+    let video_dur_ms: u64 = video_durations
+        .iter()
+        .fold(0u64, |acc, &d| acc.saturating_add(d as u64));
 
     let audio_dur_ms = audio
         .map(|a| {
@@ -357,7 +366,14 @@ fn build_moov(
     mvhd.extend_from_slice(&next_track_id.to_be_bytes());
     let mvhd = fbox(b"mvhd", 0, 0, &mvhd);
 
-    let video_trak = build_video_trak(video_chunk_off, video_samples, width, height, video_dur_ms);
+    let video_trak = build_video_trak(
+        video_chunk_off,
+        video_samples,
+        video_durations,
+        width,
+        height,
+        video_dur_ms,
+    );
 
     let mut children: Vec<&[u8]> = vec![&mvhd, &video_trak];
     let audio_trak = audio.map(|a| build_audio_trak(audio_chunk_off, a, audio_dur_ms));
@@ -367,7 +383,14 @@ fn build_moov(
     box_(b"moov", &concat(&children))
 }
 
-fn build_video_trak(chunk_off: u32, samples: &[&[u8]], w: u32, h: u32, dur_ms: u64) -> Vec<u8> {
+fn build_video_trak(
+    chunk_off: u32,
+    samples: &[&[u8]],
+    durations: &[u32],
+    w: u32,
+    h: u32,
+    dur_ms: u64,
+) -> Vec<u8> {
     let n = samples.len() as u32;
 
     // tkhd (track 1, video; width/height in 16.16)
@@ -425,12 +448,37 @@ fn build_video_trak(chunk_off: u32, samples: &[&[u8]], w: u32, h: u32, dur_ms: u
     let av01 = box_(b"av01", &av01);
     let stsd = stsd_box(&av01);
 
-    // stts: 1 entry, sample_count=N, delta=1 (uniform; low-delay, pred-struct=1).
-    let mut stts = Vec::new();
-    stts.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-    stts.extend_from_slice(&n.to_be_bytes()); // sample_count
-    stts.extend_from_slice(&1u32.to_be_bytes()); // sample_delta
-    let stts = fbox(b"stts", 0, 0, &stts);
+    // stts: REAL per-sample durations (video media timescale 1000 ⇒ ms), run-length
+    // compressed (consecutive equal deltas coalesce into one entry), so the decoder
+    // reads true frame presentation times instead of a synthetic ~1000 fps. A 24 fps
+    // GOP, for example, alternates 41/42 ms deltas summing to ≈ N/fps seconds rather
+    // than N ms. Fail-safe: when `durations` does not match the sample count (it always
+    // should — the caller derives one per sample) fall back to the old uniform delta=1
+    // so the table stays well-formed; a 0-length GOP is impossible here (n ≥ 1).
+    let stts = if durations.len() == samples.len() && !durations.is_empty() {
+        // Coalesce consecutive equal deltas: each entry is (sample_count, sample_delta).
+        let mut entries: Vec<(u32, u32)> = Vec::new();
+        for &d in durations {
+            match entries.last_mut() {
+                Some((cnt, delta)) if *delta == d => *cnt = cnt.saturating_add(1),
+                _ => entries.push((1, d)),
+            }
+        }
+        let mut stts = Vec::with_capacity(8 + entries.len() * 8);
+        stts.extend_from_slice(&(entries.len() as u32).to_be_bytes()); // entry_count
+        for (cnt, delta) in &entries {
+            stts.extend_from_slice(&cnt.to_be_bytes()); // sample_count
+            stts.extend_from_slice(&delta.to_be_bytes()); // sample_delta
+        }
+        fbox(b"stts", 0, 0, &stts)
+    } else {
+        // Defensive fallback: a single uniform entry (sample_count=N, delta=1).
+        let mut stts = Vec::new();
+        stts.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        stts.extend_from_slice(&n.to_be_bytes()); // sample_count
+        stts.extend_from_slice(&1u32.to_be_bytes()); // sample_delta
+        fbox(b"stts", 0, 0, &stts)
+    };
 
     // stsc: 1 entry, all N samples in one chunk.
     let stsc = stsc_box(n);

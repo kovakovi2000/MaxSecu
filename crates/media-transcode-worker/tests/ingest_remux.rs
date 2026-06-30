@@ -171,8 +171,11 @@ fn ffmpeg_output_remuxes_to_canonical_av1_aac_cmaf() {
     let n_frags = frags.len();
 
     // ---- video round-trip through the REAL, unmodified VideoSession ----
+    // Also collect each fragment's per-frame video pts (fragment-relative ms) to prove
+    // the new REAL-duration stts: a multi-sample GOP now spans ≈ frames/fps seconds, NOT
+    // the old synthetic 1-ms-per-frame (~1000 fps) counter.
     let video_frags = frags.clone();
-    let (frames, eofs) = on_big_stack(move || {
+    let (frames, eofs, pts_per_fragment) = on_big_stack(move || {
         let mut session = VideoSession::new();
         assert_eq!(
             session.feed(ClientMsg::Open {
@@ -182,30 +185,37 @@ fn ffmpeg_output_remuxes_to_canonical_av1_aac_cmaf() {
             "Open yields Ready"
         );
         let (mut frames, mut eofs) = (0usize, 0usize);
+        let mut pts_per_fragment: Vec<Vec<u64>> = Vec::new();
         for (i, frag) in video_frags.iter().enumerate() {
             let msgs = session.feed(ClientMsg::Fragment {
                 seq: i as u32,
                 bytes: frag.clone(),
             });
+            let mut frag_pts: Vec<u64> = Vec::new();
             for m in msgs {
                 match m {
                     WorkerMsg::Video(f) => {
                         assert_eq!((f.width, f.height), (W, H), "decoded geometry");
                         assert_eq!(f.width % 2, 0, "even width");
                         assert_eq!(f.height % 2, 0, "even height");
+                        frag_pts.push(f.pts_ms);
                         frames += 1;
                     }
+                    // The canonical A+V fragment also AAC-decodes to PCM (Task 5.1);
+                    // the video round-trip simply ignores it here.
+                    WorkerMsg::Audio(_) => {}
                     WorkerMsg::EndOfFragment { .. } => eofs += 1,
                     WorkerMsg::Error(e) => panic!("VideoSession decode error: {e:?}"),
-                    other => panic!("unexpected worker message: {other:?}"),
+                    WorkerMsg::Ready => panic!("unexpected extra Ready"),
                 }
             }
+            pts_per_fragment.push(frag_pts);
         }
         assert!(
             session.feed(ClientMsg::Close).is_empty(),
             "Close emits nothing"
         );
-        (frames, eofs)
+        (frames, eofs, pts_per_fragment)
     });
 
     eprintln!("PASS VideoSession decoded {frames} frame(s) at {W}x{H} across {eofs} fragment(s)");
@@ -213,6 +223,32 @@ fn ffmpeg_output_remuxes_to_canonical_av1_aac_cmaf() {
     assert!(
         frames >= n_frags && frames >= 2,
         "multi-sample GOP fragments decoded all their frames ({frames} frames, {n_frags} fragments)"
+    );
+
+    // ---- REAL per-frame durations (the Task 5.2 Part A deliverable) ----
+    // A multi-frame fragment's video samples now carry REAL durations: its frames span
+    // ≈ (count-1)/fps seconds (mean inter-frame gap ~41 ms at 24 fps), NOT the old
+    // ~1 ms uniform delta. Find the first multi-frame fragment and assert it.
+    let multi = pts_per_fragment
+        .iter()
+        .find(|p| p.len() >= 2)
+        .expect("at least one multi-frame GOP fragment");
+    assert_eq!(multi[0], 0, "frame pts are fragment-relative (start at 0)");
+    for w in multi.windows(2) {
+        assert!(w[1] >= w[0], "frame pts monotonic within a fragment");
+    }
+    let span = *multi.last().unwrap();
+    let gaps = (multi.len() - 1) as u64;
+    let mean_gap = span / gaps.max(1);
+    assert!(
+        mean_gap >= 20,
+        "REAL frame durations (~41 ms at 24 fps), got mean gap {mean_gap} ms across {} frames \
+         (span {span} ms) — NOT a ~1 ms uniform delta",
+        multi.len()
+    );
+    eprintln!(
+        "PASS real video stts: a {}-frame fragment spans {span} ms (mean gap {mean_gap} ms)",
+        multi.len()
     );
 
     // ---- audio round-trip: AAC → PCM through symphonia's viewer codec stack ----

@@ -175,6 +175,110 @@ test("drops stale frames when the audio clock has jumped past them", () => {
   assert.strictEqual(player.stats().dropped, 1, "the stale frame is counted dropped");
 });
 
+test("video syncs to elapsed time from playback start, not the raw clock (no burst)", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  // Playback begins at a NONZERO wall-clock time (e.g. the app has been running 10s).
+  let clock = 10;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  player.play();
+
+  // The first audio chunk establishes the playback origin at clock=10, and still
+  // feeds the WebAudio graph.
+  bus.emit(EVT_VIDEO_AUDIO, pcmDto(0));
+  assert.ok(audio.sources.length >= 1, "audio fed into the WebAudio graph");
+  assert.ok(audio.sources[0].started, "audio source scheduled");
+
+  // Window-relative REAL video pts: a frame at 0ms and a frame at 1000ms.
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  bus.emit(EVT_VIDEO_FRAME, frameDto(1000));
+
+  // elapsed = 0: only the pts=0 frame is due. The OLD raw-clock code compared
+  // 1000/1000=1 <= clock=10 and would have BURST both frames immediately.
+  clock = 10;
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "no burst: the 1000ms frame is held");
+  assert.strictEqual(drawn[0].pts_ms, 0);
+
+  // elapsed = 0.5s: the 1000ms frame is still held.
+  clock = 10.5;
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "frame at 1000ms held until ~1s elapsed");
+
+  // elapsed = 1.0s: the 1000ms frame releases in sync with the audio clock.
+  clock = 11.0;
+  player.tick();
+  assert.strictEqual(drawn.length, 2);
+  assert.strictEqual(drawn[1].pts_ms, 1000);
+  assert.strictEqual(player.stats().dropped, 0, "frames paced (not burst), nothing dropped");
+});
+
+test("video-only: the first frame establishes the playback origin", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 5; // nonzero origin, no audio at all
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  player.play();
+
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0)); // sets playbackStart = 5
+  bus.emit(EVT_VIDEO_FRAME, frameDto(500));
+
+  clock = 5; // elapsed 0
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "only the pts=0 frame is due (no burst)");
+
+  clock = 5.5; // elapsed 0.5s
+  player.tick();
+  assert.strictEqual(drawn.length, 2, "the 500ms frame releases at ~0.5s elapsed");
+  assert.strictEqual(drawn[1].pts_ms, 500);
+});
+
+test("seek resets the playback origin for the new window", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  player.play();
+
+  // First window establishes origin at clock=0.
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  clock = 0;
+  player.tick();
+  assert.strictEqual(drawn.length, 1);
+
+  // Seek; the new window's first frame arrives at a later wall-clock time and must
+  // re-establish the origin there (so its window-relative pts=0 is due immediately,
+  // not treated as 20s in the past).
+  player.seek(9999);
+  clock = 20;
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0)); // new window, sets playbackStart = 20
+  clock = 20;
+  player.tick();
+  assert.strictEqual(drawn.length, 2, "the new window's first frame is due at its origin");
+  assert.strictEqual(player.stats().dropped, 0, "no stale drop from the stale origin");
+});
+
 // ---- volume --------------------------------------------------------------
 
 test("setVolume clamps to [0,1] and drives the GainNode + persists", () => {

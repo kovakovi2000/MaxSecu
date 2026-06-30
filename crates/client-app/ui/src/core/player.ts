@@ -213,8 +213,21 @@ export function createPlayer(opts: PlayerOptions): Player {
   let drawnCount = 0;
   let droppedCount = 0;
   let nextAudioTime = 0; // playout cursor for the audio graph (seconds)
+  // The audio-clock reading captured when playback begins (first scheduled audio
+  // chunk, or first frame when video-only). The audio is master and is scheduled
+  // gaplessly from here, so video frames sync against ELAPSED time since this origin
+  // (audioClock() - playbackStart) rather than the raw clock — otherwise window-relative
+  // pts (which start near 0) would all read as "due" against a nonzero wall clock and
+  // the whole window would burst then stall. Reset on seek (a new window). null until
+  // the first frame/audio establishes the origin.
+  let playbackStart: number | null = null;
 
   gain.gain.value = volume;
+
+  // Capture the playback-start origin exactly once, at the first audio chunk or frame.
+  function ensurePlaybackStart(): void {
+    if (playbackStart === null) playbackStart = audioClock();
+  }
 
   // rAF pacing when in a browser; under node the loop is inert and tests drive
   // tick() directly.
@@ -244,6 +257,9 @@ export function createPlayer(opts: PlayerOptions): Player {
 
   function onFrame(dto: I420FrameDto): void {
     if (disposed) return;
+    // Establish the playback origin on the first frame (covers the video-only case;
+    // for A/V the first audio chunk usually sets it first — whichever fires first wins).
+    ensurePlaybackStart();
     const frame: YuvFrame = {
       width: dto.width,
       height: dto.height,
@@ -263,6 +279,9 @@ export function createPlayer(opts: PlayerOptions): Player {
 
   function onAudio(dto: PcmDto): void {
     if (disposed || dto.channels <= 0) return;
+    // Audio is master: the first scheduled chunk establishes the playback origin the
+    // video syncs against.
+    ensurePlaybackStart();
     const samples = decodeI16Le(dto.samples_b64);
     const frames = Math.floor(samples.length / dto.channels);
     if (frames <= 0) return;
@@ -308,7 +327,11 @@ export function createPlayer(opts: PlayerOptions): Player {
   // and the earlier ones are DROPPED, so video catches up to audio.
   function tick(): void {
     if (!playing || disposed) return;
-    const now = audioClock();
+    // Sync against ELAPSED time since playback start, not the raw clock, so the
+    // window-relative pts (which start near 0) line up with the audio that began at
+    // playbackStart. If no frame/audio has set the origin yet, set it now.
+    if (playbackStart === null) playbackStart = audioClock();
+    const now = audioClock() - playbackStart;
     let toDraw: YuvFrame | null = null;
     while (pending.length > 0) {
       const head = pending[0];
@@ -343,6 +366,9 @@ export function createPlayer(opts: PlayerOptions): Player {
     pending.length = 0;
     ring.length = 0;
     nextAudioTime = 0;
+    // A new window restarts the timeline: re-establish the playback origin from the
+    // first frame/audio of the new window.
+    playbackStart = null;
     stopAllSources();
     opts.onSeek?.(pts_ms);
   }
