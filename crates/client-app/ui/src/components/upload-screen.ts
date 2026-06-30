@@ -1,25 +1,28 @@
 import { call } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import type { UploadKind, UploadPreview } from "../core/types.ts";
+import { normalizeOptions, resolutionForPreset, suggestKbps } from "../core/transcode-opts.ts";
+import type { Bitrate, Resolution } from "../core/transcode-opts.ts";
 import "./video-player.ts";
 import type { VideoPlayer } from "./video-player.ts";
 
-// Upload (spec §5): choose Image (file path), Blog (body text) or Video (a raw-
-// frame MXRAWV01 source — file path or a generated sample) + title/tags → Preview
+// Upload (spec §5): choose Image (file path), Blog (body text) or Video (a real
+// video file path + a resolution/bitrate menu) + title/tags → Preview
 // (stage_upload — transcodes/encrypts LOCALLY, NO network write) → Confirm
 // (confirm_upload — staged → resumable PUT → finalize, routed through serial()).
 //
-// For a Video the stage runs the CONFINED transcode worker; the returned job holds
-// the canonical AV1/CMAF plaintext + fragment index, which the preview surface
-// renders by driving <video-player preview-job=…> against the local preview_video
-// path (decode of the staged content — no server, no decrypt). The author sees the
-// transcoded result BEFORE confirming the upload.
+// For a Video the stage runs the CONFINED ffmpeg ingest + transcode worker against
+// the chosen real video file (only its PATH crosses the seam — no bytes); the
+// returned job holds the canonical AV1/CMAF plaintext + fragment index, which the
+// preview surface renders by driving <video-player preview-job=…> against the local
+// preview_video path (decode of the staged content — no server, no decrypt). The
+// author sees the transcoded result BEFORE confirming the upload.
+//
+// The resolution/bitrate menu builds a TranscodeOptions (see core/transcode-opts.ts)
+// whose JSON shape matches the Rust `media-launcher::TranscodeOptions` enum exactly.
 //
 // Accessible: landmark, labelled controls, role=status live region.
 export class UploadScreen extends HTMLElement {
-  // The generated/loaded MXRAWV01 raw-frame source for a video stage (base64).
-  private sampleSourceB64 = "";
-
   connectedCallback() {
     this.innerHTML = `
       <main id="main" tabindex="-1" aria-labelledby="up-h">
@@ -39,11 +42,28 @@ export class UploadScreen extends HTMLElement {
           <label id="body-row" hidden>Post body
             <textarea name="content" rows="6"></textarea></label>
           <div id="video-row" hidden>
-            <label>Raw-frame (MXRAWV01) source file path
+            <label>Video file
               <input name="vpath" type="text" autocomplete="off" /></label>
-            <button id="pick-video" type="button" aria-label="Browse for a raw-frame source file">Browse…</button>
-            <button id="up-gen" type="button">Generate a sample clip</button>
-            <p id="up-gen-status" role="status" aria-live="polite"></p>
+            <button id="pick-video" type="button" aria-label="Browse for a video file">Browse…</button>
+            <label>Resolution
+              <select name="resolution">
+                <option value="original">Original (keep source)</option>
+                <option value="2160">2160p (4K)</option>
+                <option value="1440">1440p (QHD)</option>
+                <option value="1080">1080p (Full HD)</option>
+                <option value="720">720p (HD)</option>
+                <option value="480">480p (SD)</option>
+                <option value="custom">Custom…</option>
+              </select></label>
+            <div id="custom-res" hidden>
+              <label>Custom width
+                <input name="cw" type="number" min="2" max="7680" step="2" autocomplete="off" /></label>
+              <label>Custom height
+                <input name="ch" type="number" min="2" max="4320" step="2" autocomplete="off" /></label>
+            </div>
+            <label>Bitrate (kbps)
+              <input name="kbps" type="number" min="64" max="200000" step="1" autocomplete="off" /></label>
+            <label><input name="origbitrate" type="checkbox" checked /> Original bitrate</label>
           </div>
           <label>Title <input name="title" type="text" required autocomplete="off" /></label>
           <label>Tags (comma-separated) <input name="tags" type="text" autocomplete="off" /></label>
@@ -67,12 +87,52 @@ export class UploadScreen extends HTMLElement {
     kind.addEventListener("change", syncKind);
     syncKind();
 
-    const gen = this.querySelector("#up-gen") as HTMLButtonElement;
-    gen.addEventListener("click", () => {
-      this.sampleSourceB64 = makeSampleSourceB64();
-      (this.querySelector("#up-gen-status") as HTMLElement).textContent =
-        "Sample clip ready — choose Preview to transcode it.";
-    });
+    // Resolution/bitrate menu wiring. Custom W/H are revealed only for "custom".
+    // Changing resolution AWAY from Original auto-suggests a starting bitrate
+    // (from the TARGET resolution's nominal dims at 30 fps — the source's real
+    // dims/fps are unknown until staging) and unchecks "Original bitrate" so the
+    // user can edit the kbps. Selecting Original re-checks it (keep source bitrate).
+    const resSel = form.querySelector('select[name="resolution"]') as HTMLSelectElement;
+    const customRes = this.querySelector("#custom-res") as HTMLElement;
+    const cwInput = form.querySelector('input[name="cw"]') as HTMLInputElement;
+    const chInput = form.querySelector('input[name="ch"]') as HTMLInputElement;
+    const kbpsInput = form.querySelector('input[name="kbps"]') as HTMLInputElement;
+    const origBitrate = form.querySelector('input[name="origbitrate"]') as HTMLInputElement;
+    // Nominal 16:9 dims per height preset — only a starting suggestion source.
+    const PRESET_DIMS: Record<string, { w: number; h: number }> = {
+      "2160": { w: 3840, h: 2160 },
+      "1440": { w: 2560, h: 1440 },
+      "1080": { w: 1920, h: 1080 },
+      "720": { w: 1280, h: 720 },
+      "480": { w: 854, h: 480 },
+    };
+    const targetDims = (): { w: number; h: number } => {
+      if (resSel.value === "custom") {
+        return { w: Number(cwInput.value), h: Number(chInput.value) };
+      }
+      return PRESET_DIMS[resSel.value] ?? { w: 0, h: 0 };
+    };
+    const suggestBitrate = () => {
+      const { w, h } = targetDims();
+      kbpsInput.value = String(suggestKbps(w, h, 30));
+      origBitrate.checked = false;
+    };
+    const onResolutionChange = () => {
+      customRes.hidden = resSel.value !== "custom";
+      if (resSel.value === "original") {
+        origBitrate.checked = true; // Original resolution ⇒ keep source bitrate.
+        return;
+      }
+      suggestBitrate();
+    };
+    resSel.addEventListener("change", onResolutionChange);
+    // While in Custom, re-suggest the bitrate as the user enters/edits W×H.
+    const onCustomDims = () => {
+      if (resSel.value === "custom") suggestBitrate();
+    };
+    cwInput.addEventListener("input", onCustomDims);
+    chInput.addEventListener("input", onCustomDims);
+    customRes.hidden = resSel.value !== "custom";
 
     // "Browse…" opens the native OS file dialog (pick_file) and drops the chosen
     // path into the matching text field — no bytes cross here, only a path.
@@ -91,7 +151,7 @@ export class UploadScreen extends HTMLElement {
       void pickInto(pathInput, ["png", "jpg", "jpeg", "webp", "gif", "bmp"]);
     });
     this.querySelector("#pick-video")?.addEventListener("click", () => {
-      void pickInto(vpathInput, []);
+      void pickInto(vpathInput, ["mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg", "wmv", "flv", "ts"]);
     });
 
     form.addEventListener("submit", (e) => this.onPreview(e, form));
@@ -109,12 +169,25 @@ export class UploadScreen extends HTMLElement {
       req.content = d.get("content");
     } else if (kind === "video") {
       const vpath = String(d.get("vpath") ?? "").trim();
-      if (this.sampleSourceB64) req.source_b64 = this.sampleSourceB64;
-      else if (vpath) req.path = vpath;
-      else {
-        status.textContent = "Choose a raw-frame source file or generate a sample clip.";
+      if (!vpath) {
+        status.textContent = "Choose a video file.";
         return;
       }
+      // Build the transcode shaping options from the menu. The JSON shape mirrors
+      // the Rust `TranscodeOptions` enum; normalizeOptions clamps as a UX nicety
+      // (the Rust side ALWAYS re-clamps against the authoritative VideoBounds).
+      const resVal = String(d.get("resolution") ?? "original");
+      let resolution: Resolution;
+      if (resVal === "original") {
+        resolution = "Original";
+      } else if (resVal === "custom") {
+        resolution = { Custom: { width: Number(d.get("cw")), height: Number(d.get("ch")) } };
+      } else {
+        resolution = resolutionForPreset(resVal);
+      }
+      const bitrate: Bitrate = d.get("origbitrate") != null ? "Original" : { Kbps: Number(d.get("kbps")) };
+      req.path = vpath;
+      req.options = normalizeOptions({ resolution, bitrate });
     } else {
       req.path = d.get("path");
     }
@@ -173,38 +246,11 @@ export class UploadScreen extends HTMLElement {
       await serial(() => call<string>("confirm_upload", { req: { job_id: jobId } }));
       status.textContent = "Upload complete.";
       (this.querySelector("#up-preview") as HTMLElement).replaceChildren();
-      this.sampleSourceB64 = "";
     } catch (x) {
       btn.disabled = false;
       status.textContent = errMsg(x, "Upload failed.");
     }
   }
-}
-
-// Build a tiny MXRAWV01 raw-frame source (the transcode worker's documented
-// default-path container): 24-byte header (magic + w/h/frames/fps LE) then tightly
-// packed RGB24 frames. Standard-base64 encoded for the `source_b64` request field.
-function makeSampleSourceB64(): string {
-  const w = 16, h = 16, frames = 3, fps = 10;
-  const header = 24;
-  const buf = new Uint8Array(header + w * h * 3 * frames);
-  buf.set([0x4d, 0x58, 0x52, 0x41, 0x57, 0x56, 0x30, 0x31], 0); // "MXRAWV01"
-  const dv = new DataView(buf.buffer);
-  dv.setUint32(8, w, true);
-  dv.setUint32(12, h, true);
-  dv.setUint32(16, frames, true);
-  dv.setUint32(20, fps, true);
-  let p = header;
-  for (let f = 0; f < frames; f++) {
-    for (let i = 0; i < w * h; i++) {
-      buf[p++] = (i + f) & 0xff; // R
-      buf[p++] = Math.floor(i / w) & 0xff; // G
-      buf[p++] = (f * 40) & 0xff; // B
-    }
-  }
-  let s = "";
-  for (let i = 0; i < buf.length; i++) s += String.fromCharCode(buf[i]);
-  return btoa(s);
 }
 
 function errMsg(x: unknown, fallback: string): string {
