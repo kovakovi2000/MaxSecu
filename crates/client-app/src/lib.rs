@@ -6,6 +6,7 @@ pub mod admin;
 pub mod bootstrap;
 pub mod commands;
 pub mod config;
+pub mod content_cache;
 pub mod directory;
 pub mod download;
 pub mod dto;
