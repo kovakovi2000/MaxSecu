@@ -42,12 +42,20 @@ use zeroize::Zeroize;
 mod win32;
 #[cfg(windows)]
 pub use win32::{
-    appcontainer_sid_string, grant_path_to_appcontainer, ConfinedOutput, GrantAccess, PathGrant,
-    SpawnError,
+    appcontainer_sid_string, grant_path_to_appcontainer, spawn_confined_exe, ConfinedExeOutput,
+    ConfinedOutput, GrantAccess, PathGrant, SpawnError,
 };
 
 /// Default per-worker memory cap (decompression-bomb hard kill, media-sandbox §3).
 pub const DEFAULT_WORKER_MEMORY_CAP_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Default Job-Object memory cap for the confined **ffmpeg** ingest (Task 2.2).
+/// AV1 (SVT-AV1) ENCODE is markedly hungrier than the decode worker — lookahead +
+/// reference buffers — so this is larger than [`DEFAULT_WORKER_MEMORY_CAP_BYTES`].
+/// 2 GiB is generous headroom for realistic source media while still hard-killing a
+/// runaway/bomb; callers tune it via [`FfmpegLauncher::with_memory_cap`].
+#[cfg(windows)]
+pub const DEFAULT_FFMPEG_MEMORY_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Length-prefixed duplex **framing** for the persistent video-session protocol
 /// (Task 3.3). Each frame on the pipe is a `u32` little-endian length prefix
@@ -1383,6 +1391,83 @@ fn parse_framed_result(stdout: &[u8]) -> Result<TranscodeResult, SessionError> {
     }
     decode_transcode_result(&body)
         .map_err(|_| SessionError::Io(std::io::Error::other("undecodable worker response")))
+}
+
+/// The outcome of a confined ffmpeg run: ffmpeg's process exit code and a BOUNDED
+/// tail of its stderr (diagnostics — its media goes to the granted output file).
+/// `exit_code == 0` is success; the CALLER then reads the output file from the
+/// per-job dir. `stderr_tail` is capped (head-kept) so a verbose/hostile ffmpeg
+/// can't OOM the parent.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct FfmpegOutcome {
+    pub exit_code: u32,
+    pub stderr_tail: Vec<u8>,
+}
+
+/// Spawn the pinned `ffmpeg.exe` inside the SAME AppContainer + Job Object
+/// confinement the decode worker uses (Task 2.2, D-2): NO network capability, a
+/// low-IL token that cannot read the user's keys, NO child processes
+/// (`ActiveProcessLimit = 1`), a hard memory cap, and kill-on-close +
+/// bounded-wait-then-kill (no hang). Filesystem access is scoped to exactly one
+/// caller-provided per-job directory via the Task-2.1 path-ACL grant (RAII —
+/// revoked after the spawn on every path). ffmpeg reads an input FILE and writes an
+/// output FILE in that dir (its MP4 muxer writes `moov` last and cannot stream to a
+/// pipe — Phase-0 ratification §2.1); media never crosses stdio (stdin/stdout =
+/// NUL), only a bounded stderr tail is captured. This launcher links NO codec — it
+/// only spawns the external binary.
+#[cfg(windows)]
+pub struct FfmpegLauncher {
+    ffmpeg_path: PathBuf,
+    memory_cap_bytes: u64,
+}
+
+#[cfg(windows)]
+impl FfmpegLauncher {
+    /// `ffmpeg_path` is the absolute path to the pinned `ffmpeg.exe`.
+    pub fn new(ffmpeg_path: impl Into<PathBuf>) -> Self {
+        FfmpegLauncher {
+            ffmpeg_path: ffmpeg_path.into(),
+            memory_cap_bytes: DEFAULT_FFMPEG_MEMORY_CAP_BYTES,
+        }
+    }
+
+    /// As [`new`](Self::new) with an explicit Job-Object memory cap (AV1 encode is
+    /// memory-hungry; tune per source/preset).
+    pub fn with_memory_cap(ffmpeg_path: impl Into<PathBuf>, cap: u64) -> Self {
+        FfmpegLauncher {
+            ffmpeg_path: ffmpeg_path.into(),
+            memory_cap_bytes: cap,
+        }
+    }
+
+    /// Run ffmpeg confined with `args` (the discrete argv elements — inputs/outputs
+    /// are separate elements, not a shell string), granting the AppContainer SID
+    /// `ReadWrite` access to `grant_dir` for the spawn only.
+    ///
+    /// CONTRACT: `grant_dir` MUST be a **fresh, unique, non-symlinked** directory
+    /// (the caller creates it under the system temp dir) that already contains the
+    /// source as an input file; ffmpeg writes its output file in the SAME dir. The
+    /// grant is `ReadWrite` (which also drops the dir to a Low integrity label so the
+    /// Low-IL container can write) and is REVOKED when this returns on every path.
+    /// The argv must reference only paths inside `grant_dir` — anything outside is
+    /// denied by the confinement (proven by the D-2 differential test).
+    pub fn run(
+        &self,
+        args: &[std::ffi::OsString],
+        grant_dir: &std::path::Path,
+    ) -> Result<FfmpegOutcome, SpawnError> {
+        let out = win32::spawn_confined_exe(
+            &self.ffmpeg_path,
+            args,
+            &[(grant_dir, GrantAccess::ReadWrite)],
+            self.memory_cap_bytes,
+        )?;
+        Ok(FfmpegOutcome {
+            exit_code: out.exit_code,
+            stderr_tail: out.stderr_tail,
+        })
+    }
 }
 
 #[cfg(test)]

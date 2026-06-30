@@ -17,7 +17,7 @@
 //! isolation does not make the bytes trusted.
 #![allow(unsafe_code)]
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
@@ -39,6 +39,9 @@ use windows_sys::Win32::Security::{
     FreeSid, GetSecurityDescriptorSacl, ACL, DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION,
     NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
     SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
@@ -84,6 +87,16 @@ impl std::error::Error for SpawnError {}
 pub struct ConfinedOutput {
     pub exit_code: u32,
     pub stdout: Vec<u8>,
+}
+
+/// The result of a confined **arbitrary-exe** run ([`spawn_confined_exe`], Task
+/// 2.2): the program's exit code and a BOUNDED tail of its stderr (diagnostics
+/// only — its media goes to a granted output file, never to stdio). `stderr_tail`
+/// is capped at [`FFMPEG_STDERR_CAP_BYTES`] (head-kept), so a hostile/verbose
+/// program cannot OOM the trusted parent through its error stream.
+pub struct ConfinedExeOutput {
+    pub exit_code: u32,
+    pub stderr_tail: Vec<u8>,
 }
 
 /// The AppContainer moniker (stable, app-specific). No capabilities are ever
@@ -311,6 +324,21 @@ fn free_sid(sid: PSID) {
         // SAFETY: `sid` was produced by the AppContainer SID APIs above and is
         // freed exactly once here.
         unsafe { FreeSid(sid) };
+    }
+}
+
+/// RAII owner of an [`appcontainer_sid`] SID, freeing it on `Drop`. The SID must
+/// outlive every step that references it — the `SECURITY_CAPABILITIES` consumed by
+/// `CreateProcessW` borrow it — so [`setup_confined_exe_child`] keeps this guard
+/// alive across the whole spawn and frees the SID on EVERY exit path (success or
+/// any early-error return), unlike the older [`setup_confined_child`] which leaves
+/// the SID's lifetime to the process. Declared first in that function so it drops
+/// LAST (after `caps` / the attribute list are done with it).
+struct SidGuard(PSID);
+
+impl Drop for SidGuard {
+    fn drop(&mut self) {
+        free_sid(self.0);
     }
 }
 
@@ -1002,4 +1030,365 @@ fn close_all(handles: &[HANDLE]) {
             unsafe { CloseHandle(h) };
         }
     }
+}
+
+// ===========================================================================
+// Confined arbitrary-exe spawn for the author-side ffmpeg ingest (Task 2.2, D-2).
+//
+// `ffmpeg.exe` is the #1 RCE surface on the author side: it parses arbitrary,
+// attacker-authored source media. It is run inside the SAME confinement the decode
+// worker uses — the capability-free AppContainer SID (no network capability, a
+// low-IL token that cannot read the user's keys) + a Job Object (ActiveProcessLimit
+// = 1 → no child processes, a hard memory cap, kill-on-job-close) — but with a
+// DIFFERENT stdio shape: ffmpeg's MP4 muxer writes `moov` last and so cannot stream
+// to a pipe (per the Phase-0 ratification it writes a TEMP FILE), therefore media
+// never crosses stdio. stdin and stdout are the NUL device; stderr is a BOUNDED
+// capture pipe (ffmpeg's diagnostics, useful for a sanitized failure log, capped so
+// a verbose/hostile ffmpeg can't OOM the parent). Filesystem access is scoped to
+// exactly the caller's per-job dir via the Task-2.1 RAII path grant, revoked on
+// every exit path.
+// ===========================================================================
+
+/// Hard cap on the captured ffmpeg stderr tail (head-kept): a verbose or hostile
+/// ffmpeg cannot drive an unbounded allocation in the trusted parent through its
+/// diagnostics stream. 64 KiB is ample for the final error lines that matter.
+pub const FFMPEG_STDERR_CAP_BYTES: usize = 64 * 1024;
+
+/// Encode an `OsStr` to a NUL-terminated wide buffer (for `lpApplicationName`).
+fn wide_os(s: &OsStr) -> Vec<u16> {
+    s.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Append `arg` to a command-line wide buffer, quoted per the `CommandLineToArgvW`
+/// rules (so a path with spaces, embedded quotes, or trailing backslashes round-
+/// trips to exactly one argv element). Always double-quotes the argument.
+fn append_quoted_wide(out: &mut Vec<u16>, arg: &OsStr) {
+    const QUOTE: u16 = b'"' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+    out.push(QUOTE);
+    let mut backslashes: usize = 0;
+    for c in arg.encode_wide() {
+        if c == BACKSLASH {
+            backslashes += 1;
+        } else if c == QUOTE {
+            // Escape the run of backslashes (double them) then the embedded quote.
+            for _ in 0..(backslashes * 2 + 1) {
+                out.push(BACKSLASH);
+            }
+            out.push(QUOTE);
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                out.push(BACKSLASH);
+            }
+            backslashes = 0;
+            out.push(c);
+        }
+    }
+    // Double a trailing run of backslashes so the closing quote is not escaped.
+    for _ in 0..(backslashes * 2) {
+        out.push(BACKSLASH);
+    }
+    out.push(QUOTE);
+}
+
+/// Open the **NUL** device as an inheritable handle for a confined child's stdin
+/// (`write = false`, immediate EOF on read) or stdout (`write = true`, discard).
+/// Media never crosses stdio (it goes to the granted output file), so the child's
+/// stdin/stdout are NUL — bounded by construction, no parent capture. NUL has a
+/// world-permissive DACL, so the inherited handle is usable by the low-IL
+/// AppContainer without an explicit grant.
+fn open_nul(write: bool) -> Result<HANDLE, SpawnError> {
+    let name = wide("NUL");
+    let mut sa: SECURITY_ATTRIBUTES = unsafe { core::mem::zeroed() };
+    sa.nLength = core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+    sa.lpSecurityDescriptor = ptr::null_mut();
+    sa.bInheritHandle = 1; // the child must inherit this stdio handle.
+    let access = if write { GENERIC_WRITE } else { GENERIC_READ };
+    // SAFETY: `name` is a valid NUL-terminated wide string; `sa` lives across the
+    // call; opening the existing NUL device returns an owned, inheritable handle.
+    let h = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &sa,
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(SpawnError::last("CreateFileW.NUL"));
+    }
+    Ok(h)
+}
+
+/// A live confined arbitrary-exe child after [`setup_confined_exe_child`]: the
+/// kill-on-close [`JobGuard`] (RAII-owning the Job + process/thread handles) plus
+/// the parent's read end of the stderr capture pipe. stdin/stdout are NUL (not
+/// owned here — the child inherited them and the parent closed its copies).
+struct ConfinedExeChild {
+    guard: JobGuard,
+    parent_stderr_read: HANDLE,
+}
+
+/// AppContainer + Job Object + NUL-stdio + stderr-capture setup for a confined
+/// arbitrary exe (the ffmpeg sibling of [`setup_confined_child`]): same
+/// capability-free SID + `SECURITY_CAPABILITIES` + proc-thread attribute list +
+/// no-children / memory-capped / kill-on-close Job, but stdin = NUL, stdout = NUL,
+/// stderr = an AppContainer-granted capture pipe (ffmpeg has no framed protocol to
+/// corrupt — only diagnostics — so unlike the worker its stderr IS captured). On
+/// ANY error every handle made here is closed (and a created-but-unresumed child
+/// terminated) and the SID freed before returning: no leak, no double-close.
+fn setup_confined_exe_child(
+    program: &Path,
+    args: &[OsString],
+    memory_cap_bytes: u64,
+) -> Result<ConfinedExeChild, SpawnError> {
+    // Declared FIRST so it drops LAST: the SID must outlive `caps` / the attribute
+    // list / `CreateProcessW`. Frees the SID on every exit path below.
+    let sid_guard = SidGuard(appcontainer_sid()?);
+    let sid = sid_guard.0;
+
+    // Capability-free security capabilities → no network, low-privilege token.
+    let mut caps: SECURITY_CAPABILITIES = unsafe { core::mem::zeroed() };
+    caps.AppContainerSid = sid;
+    caps.Capabilities = ptr::null_mut();
+    caps.CapabilityCount = 0;
+
+    // stderr capture pipe: the child WRITES diagnostics, the parent READS them. The
+    // pipe is granted to the container SID (same pattern as the worker pipes).
+    let pipe_sd = appcontainer_pipe_security(sid)?;
+    let pipe = make_pipe(false, pipe_sd);
+    // SAFETY: `pipe_sd` came from ConvertStringSecurityDescriptor (LocalAlloc'd);
+    // only consulted during CreatePipe, freed now.
+    unsafe { LocalFree(pipe_sd) };
+    let (child_stderr, parent_stderr_read) = pipe?;
+
+    // stdin = NUL (immediate EOF), stdout = NUL (discard). On failure close what we
+    // have so far (the stderr pipe ends + any NUL handle already opened).
+    let child_stdin = match open_nul(false) {
+        Ok(h) => h,
+        Err(e) => {
+            close_all(&[child_stderr, parent_stderr_read]);
+            return Err(e);
+        }
+    };
+    let child_stdout = match open_nul(true) {
+        Ok(h) => h,
+        Err(e) => {
+            close_all(&[child_stdin, child_stderr, parent_stderr_read]);
+            return Err(e);
+        }
+    };
+
+    // Build the proc-thread attribute list holding the security capabilities.
+    let mut attr_size: usize = 0;
+    // SAFETY: first call computes the required size (returns FALSE).
+    unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut attr_size) };
+    let mut attr_buf = vec![0u8; attr_size];
+    let attr_list = attr_buf.as_mut_ptr() as *mut core::ffi::c_void;
+    // SAFETY: buffer is sized exactly as requested above.
+    if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) } == 0 {
+        let e = SpawnError::last("InitializeProcThreadAttributeList");
+        close_all(&[child_stdin, child_stdout, child_stderr, parent_stderr_read]);
+        return Err(e);
+    }
+    // SAFETY: `caps` outlives CreateProcessW below; the attribute references it.
+    let upd = unsafe {
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+            &caps as *const _ as *const core::ffi::c_void,
+            core::mem::size_of::<SECURITY_CAPABILITIES>(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if upd == 0 {
+        let e = SpawnError::last("UpdateProcThreadAttribute");
+        unsafe { DeleteProcThreadAttributeList(attr_list) };
+        close_all(&[child_stdin, child_stdout, child_stderr, parent_stderr_read]);
+        return Err(e);
+    }
+
+    let mut si: STARTUPINFOEXW = unsafe { core::mem::zeroed() };
+    si.StartupInfo.cb = core::mem::size_of::<STARTUPINFOEXW>() as u32;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    // Media never crosses stdio (it goes to the granted output file): stdin/stdout
+    // are NUL, and ONLY stderr is captured (bounded). There is no framed protocol on
+    // any stream for ffmpeg's diagnostics to corrupt.
+    si.StartupInfo.hStdInput = child_stdin;
+    si.StartupInfo.hStdOutput = child_stdout;
+    si.StartupInfo.hStdError = child_stderr;
+    si.lpAttributeList = attr_list;
+
+    // Build the command line: quoted program + each quoted argv element (paths may
+    // contain spaces / unicode — `OsStr`-faithful wide quoting, no lossy String).
+    let app = wide_os(program.as_os_str());
+    let mut cmdline: Vec<u16> = Vec::new();
+    append_quoted_wide(&mut cmdline, program.as_os_str());
+    for a in args {
+        cmdline.push(b' ' as u16);
+        append_quoted_wide(&mut cmdline, a);
+    }
+    cmdline.push(0); // NUL-terminate the (mutable) command line.
+
+    let mut pi: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
+    // SAFETY: all buffers (app, cmdline, si, attr_buf, caps, sid) live across the
+    // call; the std handles are valid; flags request an extended, suspended start.
+    let created = unsafe {
+        CreateProcessW(
+            app.as_ptr(),
+            cmdline.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            1, // inherit handles (the child NUL stdio + the child stderr write end)
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+            ptr::null(),
+            ptr::null(),
+            &si as *const STARTUPINFOEXW as *const STARTUPINFOW,
+            &mut pi,
+        )
+    };
+    unsafe { DeleteProcThreadAttributeList(attr_list) };
+    // The child has inherited its stdio + stderr-write ends; the parent's copies are
+    // no longer needed (closing the parent's stderr-write copy is what lets the
+    // capture reader see EOF once the child exits).
+    close_all(&[child_stdin, child_stdout, child_stderr]);
+    if created == 0 {
+        let e = SpawnError::last("CreateProcessW");
+        close_all(&[parent_stderr_read]);
+        return Err(e);
+    }
+
+    // Job Object: one process only (no children), memory-capped, kill-on-close. On
+    // any job-setup failure the child is created-but-suspended (never resumed):
+    // terminate + close it and the parent pipe end so nothing leaks.
+    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+    if job.is_null() {
+        let e = SpawnError::last("CreateJobObject");
+        teardown_unstarted(&pi, &[parent_stderr_read]);
+        return Err(e);
+    }
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { core::mem::zeroed() };
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+    info.BasicLimitInformation.ActiveProcessLimit = 1;
+    info.ProcessMemoryLimit = memory_cap_bytes as usize;
+    let set = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if set == 0 {
+        let e = SpawnError::last("SetInformationJobObject");
+        unsafe { CloseHandle(job) };
+        teardown_unstarted(&pi, &[parent_stderr_read]);
+        return Err(e);
+    }
+    if unsafe { AssignProcessToJobObject(job, pi.hProcess) } == 0 {
+        let e = SpawnError::last("AssignProcessToJobObject");
+        unsafe { CloseHandle(job) };
+        teardown_unstarted(&pi, &[parent_stderr_read]);
+        return Err(e);
+    }
+    // Now that confinement is in place, let ffmpeg run.
+    unsafe { ResumeThread(pi.hThread) };
+
+    Ok(ConfinedExeChild {
+        guard: JobGuard {
+            job,
+            pi,
+            armed: true,
+        },
+        parent_stderr_read,
+    })
+    // `sid_guard` drops here (and on every early-error return above), freeing the
+    // SID now that the process is created / the spawn has failed.
+}
+
+/// Drain a confined child's stderr `File` to EOF, retaining only the first `cap`
+/// bytes (head-kept) but ALWAYS continuing to read past the cap so the child never
+/// blocks on a full pipe (which would otherwise defeat the bounded-wait kill). A
+/// read error ends the drain (the pipe broke = the child died). Returns the bounded
+/// tail.
+fn read_bounded_stderr(mut f: std::fs::File, cap: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut out: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        match f.read(&mut tmp) {
+            Ok(0) => break, // EOF — the child closed (or was killed and closed) stderr.
+            Ok(n) => {
+                if out.len() < cap {
+                    let take = n.min(cap - out.len());
+                    out.extend_from_slice(&tmp[..take]);
+                }
+                // Beyond the cap: keep draining + discarding so the child can't block.
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// Spawn `program` with `args` **confined** (Task 2.2, D-2): inside the
+/// capability-free AppContainer (no network, a low-IL token that cannot read the
+/// user's keys) + a Job Object (no child processes, `memory_cap_bytes`,
+/// kill-on-close + a bounded-wait-then-kill safety net), with stdin/stdout = NUL
+/// and a BOUNDED stderr capture. `grants` are applied (Task-2.1
+/// [`grant_path_to_appcontainer`]) BEFORE the spawn and held — as RAII
+/// [`PathGrant`]s — across the wait, then revoked when this function returns on
+/// EVERY path (success, non-zero exit, timeout-kill, or a panic unwinding through
+/// the guard vector). Typically a single `(per_job_dir, GrantAccess::ReadWrite)`
+/// grant scopes the confined ffmpeg to exactly its input + output files.
+///
+/// Returns ffmpeg's exit code + the bounded stderr tail. The CALLER (Phase 3) then
+/// reads the output file from the granted dir.
+pub fn spawn_confined_exe(
+    program: &Path,
+    args: &[OsString],
+    grants: &[(&Path, GrantAccess)],
+    memory_cap_bytes: u64,
+) -> Result<ConfinedExeOutput, SpawnError> {
+    // Apply the scoped path grants up front; the RAII guards are held for the whole
+    // spawn and revoked when `_grants` drops (success OR any early `?` / panic).
+    let mut grant_guards: Vec<PathGrant> = Vec::with_capacity(grants.len());
+    for (path, access) in grants {
+        grant_guards.push(grant_path_to_appcontainer(path, *access)?);
+    }
+
+    let ConfinedExeChild {
+        guard,
+        parent_stderr_read,
+    } = setup_confined_exe_child(program, args, memory_cap_bytes)?;
+
+    // Drain stderr (bounded) on a reader thread so a verbose ffmpeg can't block on a
+    // full pipe — leaving the bounded wait + kill on THIS thread to bound a runaway.
+    // SAFETY: we own `parent_stderr_read`; the `File` takes ownership and closes it
+    // exactly once (when the reader thread drops it). `File` is `Send`, so it (not
+    // the raw `HANDLE`) is what crosses to the thread.
+    let stderr_file = unsafe { std::fs::File::from_raw_handle(parent_stderr_read as _) };
+    let reader =
+        std::thread::spawn(move || read_bounded_stderr(stderr_file, FFMPEG_STDERR_CAP_BYTES));
+
+    // `guard` RAII-owns the Job + child until `finish_confined` disarms it: a bounded
+    // wait, a kill on timeout, the exit code, and the handle teardown. Once it
+    // returns, the child is dead → its stderr write end is closed → the reader hits
+    // EOF and the join completes.
+    let exit_code = finish_confined(guard);
+    let stderr_tail = reader.join().unwrap_or_default();
+
+    Ok(ConfinedExeOutput {
+        exit_code,
+        stderr_tail,
+    })
+    // `grant_guards` drops here → every path grant is revoked (DACL + label restored).
 }
