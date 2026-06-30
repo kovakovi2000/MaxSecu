@@ -113,20 +113,30 @@ pub fn ensure_ffmpeg(appdir: &Path) -> Result<PathBuf, UiError> {
     let bin_dir = target.parent().ok_or_else(video_unavailable)?;
     std::fs::create_dir_all(bin_dir).map_err(|_| video_unavailable())?;
 
-    // Write to a same-directory temp file, then atomically rename. A crash
-    // mid-write leaves only the temp file, never a half-written final exe.
+    // Write to a same-directory temp file, then atomically rename into place. A
+    // crash mid-write leaves only the temp file, never a half-written final exe.
+    // `create_new` (exclusive create) refuses to follow or truncate a pre-existing
+    // name at the temp path — defense-in-depth against a planted symlink — and
+    // `sync_all` flushes the bytes to disk before the rename publishes them.
     let tmp = bin_dir.join(format!("ffmpeg-{}.exe.tmp-{}", sha8(), unique_suffix()));
-    if std::fs::write(&tmp, FFMPEG_BYTES).is_err() {
+    let write_tmp = || -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(FFMPEG_BYTES)?;
+        f.sync_all()
+    };
+    if write_tmp().is_err() {
         let _ = std::fs::remove_file(&tmp);
         return Err(video_unavailable());
     }
 
-    // Windows refuses `rename` onto an existing path; clear any stale/tampered
-    // target first so the re-extract (tamper-recovery) case succeeds.
-    if target.exists() && std::fs::remove_file(&target).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(video_unavailable());
-    }
+    // `std::fs::rename` on Windows is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`,
+    // so it atomically replaces any stale/tampered target in a single syscall — no
+    // remove-first absence window and no concurrent-remove race; the tamper-recovery
+    // (re-extract) case is covered by this same atomic replace.
     if std::fs::rename(&tmp, &target).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return Err(video_unavailable());
