@@ -18,10 +18,16 @@ fn main() {
     // not crash startup.
     let _ = maxsecu_client_app::layout::ensure_portable_layout(&app_dir);
 
-    // Initial cache cap from persisted settings (normalized to the live RAM
-    // bounds at save-time). MiB → bytes.
-    let cap_bytes =
-        SettingsConfig::load(&app_dir).performance.ram_cache_cap_mb as usize * 1024 * 1024;
+    // Initial cache cap from persisted settings, clamped to the live RAM bounds.
+    // `load` normalizes a present file, but the missing-file default (256 MiB)
+    // is not; `normalized()` here also bounds that first-run default to the
+    // (total − 6 GB) ceiling so a small-RAM machine can't start over-cap. MiB → bytes.
+    let cap_bytes = SettingsConfig::load(&app_dir)
+        .normalized()
+        .performance
+        .ram_cache_cap_mb as usize
+        * 1024
+        * 1024;
 
     let app = tauri::Builder::default()
         .manage(AppDir(app_dir))
