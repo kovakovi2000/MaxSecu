@@ -72,6 +72,7 @@ body {
 }
 a { color: var(--mx-accent-1); }
 :root[data-theme="dark"] a { color: #9ec1ff; }
+:root[data-theme="light"] a { color: #1d4ed8; } /* AA: ~6:1 on the light surface */
 
 /* ---------- Shell: header / nav rail / status strip ---------- */
 .app-header {
