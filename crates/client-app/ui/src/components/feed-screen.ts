@@ -1,7 +1,7 @@
-import { call } from "../core/rpc.ts";
+import { call, on } from "../core/rpc.ts";
 import { serial, cancelPending } from "../core/serial.ts";
 import { toast } from "../core/toast.ts";
-import type { FeedEntry, FeedFilter, FeedSort, SearchHit } from "../core/types.ts";
+import type { FeedEntry, FeedFilter, FeedSort, SearchHit, UploadMsg } from "../core/types.ts";
 import "./media-card.ts";
 import "./state-badge.ts";
 import "./skeleton-card.ts";
@@ -20,12 +20,21 @@ import "./skeleton-card.ts";
 interface FeedView { entries: FeedEntry[]; filter: FeedFilter; sort: FeedSort; scrollY: number }
 const retained: Record<"all" | "mine", FeedView | null> = { all: null, mine: null };
 
+// Invalidate the retained feed when an upload completes, so returning to the
+// feed after posting shows the new item instead of a stale cached list.
+void on<UploadMsg>("maxsecu://upload-state", (m) => {
+  if (m.phase === "done") {
+    retained.all = null;
+    retained.mine = null;
+  }
+});
+
 export class FeedScreen extends HTMLElement {
   private filter: FeedFilter = "all";
   private sort: FeedSort = "newest-first";
   private mineOnly = false;
 
-  private get key(): "all" | "mine" { return this.mineOnly ? "mine" : "all"; }
+  private get key(): "all" | "mine" { return this.hasAttribute("mine") ? "mine" : "all"; }
 
   connectedCallback() {
     this.mineOnly = this.hasAttribute("mine");
@@ -75,7 +84,7 @@ export class FeedScreen extends HTMLElement {
       const d = new FormData(form);
       this.filter = (d.get("type") as FeedFilter) ?? "all";
       this.sort = (d.get("sort") as FeedSort) ?? "newest-first";
-      if (!this.mineOnly) this.mineOnly = !!d.get("mine");
+      if (!this.hasAttribute("mine")) this.mineOnly = !!d.get("mine");
       this.load();
     });
     const q = form.querySelector('input[name="q"]') as HTMLInputElement;
