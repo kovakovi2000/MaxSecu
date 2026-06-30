@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use maxsecu_client_app::commands::auth::{AppDir, ConnectLock, Session};
+use maxsecu_client_app::config::SettingsConfig;
+use maxsecu_client_app::content_cache::ContentCache;
+use tauri::Manager;
 
 fn main() {
     // Portable layout: keystore/config/pinned-cert live beside the exe so the
@@ -15,12 +18,18 @@ fn main() {
     // not crash startup.
     let _ = maxsecu_client_app::layout::ensure_portable_layout(&app_dir);
 
-    tauri::Builder::default()
+    // Initial cache cap from persisted settings (normalized to the live RAM
+    // bounds at save-time). MiB → bytes.
+    let cap_bytes =
+        SettingsConfig::load(&app_dir).performance.ram_cache_cap_mb as usize * 1024 * 1024;
+
+    let app = tauri::Builder::default()
         .manage(AppDir(app_dir))
         .manage(Session::new())
         .manage(ConnectLock::new())
         .manage(maxsecu_client_app::jobs::UploadJobs::new())
         .manage(maxsecu_client_app::jobs::VideoJobs::new())
+        .manage(ContentCache::new(cap_bytes))
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
             maxsecu_client_app::commands::auth::unlock_keystore,
@@ -45,11 +54,22 @@ fn main() {
             maxsecu_client_app::commands::settings::set_settings,
             maxsecu_client_app::commands::settings::change_password,
             maxsecu_client_app::commands::settings::export_keystore,
+            maxsecu_client_app::ram::ram_limits,
             maxsecu_client_app::commands::video::open_video,
             maxsecu_client_app::commands::video::video_seek,
             maxsecu_client_app::commands::video::video_set_volume,
             maxsecu_client_app::commands::video::cancel_video,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running MaxSecu client");
+
+    // Zeroize the decrypted-content cache on shutdown so no plaintext survives the
+    // process (spec §6 — zeroized on app close, in addition to on-evict).
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(cache) = app_handle.try_state::<ContentCache>() {
+                cache.clear_and_zeroize();
+            }
+        }
+    });
 }
