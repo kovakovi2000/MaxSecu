@@ -10,7 +10,6 @@ import type { Settings, RamLimits } from "../core/types.ts";
 export class QuickSettings extends HTMLElement {
   private open = false;
   private limits: RamLimits | null = null;
-  private unsub: (() => void) | null = null;
 
   connectedCallback() {
     this.innerHTML = `
@@ -26,9 +25,6 @@ export class QuickSettings extends HTMLElement {
         btn.focus();
       }
     });
-  }
-  disconnectedCallback() {
-    this.unsub?.();
   }
 
   private async toggle() {
@@ -78,7 +74,7 @@ export class QuickSettings extends HTMLElement {
     ramLabel.textContent = "RAM cache cap (MB) ";
     const range = document.createElement("input");
     range.type = "range";
-    range.min = String(limits.min_mb); range.max = String(limits.max_mb); range.step = "16";
+    range.min = String(limits.min_mb); range.max = String(limits.max_mb); range.step = "1";
     range.value = String(s.performance.ram_cache_cap_mb);
     range.setAttribute("aria-label", "RAM cache cap (MB)");
     const num = document.createElement("input");
