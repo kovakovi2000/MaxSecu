@@ -1,13 +1,16 @@
 import { call } from "../core/rpc.ts";
-import { applySettings } from "../core/settings.ts";
-import type { Settings } from "../core/types.ts";
+import { settingsStore, updateSettings } from "../core/settings.ts";
+import type { Settings, RamLimits } from "../core/types.ts";
 
-// ⚡ Quick-settings popover (spec §5): the most-used a11y/behavior toggles with
-// instant apply. Accessible: the trigger has aria-expanded/aria-controls; the
-// popover is keyboard-dismissible (Esc) and focus-managed; all toggles labelled.
+// ⚡ Quick-settings popover (spec §4): reduced to the two most-used controls —
+// Theme toggle + RAM cache cap (slider bound to a number input, both clamped to
+// the live `ram_limits`). Reads/writes the SHARED settings store so it stays in
+// sync with the full Settings screen and applies live. Accessible: aria-expanded/
+// -controls on the trigger, Esc-dismiss + focus return, all controls labelled.
 export class QuickSettings extends HTMLElement {
   private open = false;
-  private current: Settings | null = null;
+  private limits: RamLimits | null = null;
+  private unsub: (() => void) | null = null;
 
   connectedCallback() {
     this.innerHTML = `
@@ -17,7 +20,6 @@ export class QuickSettings extends HTMLElement {
       </div>`;
     const btn = this.querySelector("#qs-btn") as HTMLButtonElement;
     btn.addEventListener("click", () => this.toggle());
-    // Esc closes the popover and returns focus to the trigger.
     this.addEventListener("keydown", (e) => {
       if ((e as KeyboardEvent).key === "Escape" && this.open) {
         this.close();
@@ -25,74 +27,76 @@ export class QuickSettings extends HTMLElement {
       }
     });
   }
+  disconnectedCallback() {
+    this.unsub?.();
+  }
 
   private async toggle() {
     if (this.open) { this.close(); return; }
-    // Load current settings when opening so the toggles reflect reality.
-    try { this.current = await call<Settings>("get_settings"); } catch { this.current = null; }
+    if (!this.limits) {
+      try { this.limits = await call<RamLimits>("ram_limits"); } catch { this.limits = { default_mb: 256, min_mb: 64, max_mb: 4096 }; }
+    }
     this.renderPopover();
     this.open = true;
     const pop = this.querySelector("#qs-pop") as HTMLElement;
     const btn = this.querySelector("#qs-btn") as HTMLButtonElement;
     pop.hidden = false;
     btn.setAttribute("aria-expanded", "true");
-    // Move focus to the first control for keyboard users.
     (pop.querySelector("input,select,button") as HTMLElement | null)?.focus();
   }
-
   private close() {
     this.open = false;
-    const pop = this.querySelector("#qs-pop") as HTMLElement;
-    const btn = this.querySelector("#qs-btn") as HTMLButtonElement;
-    pop.hidden = true;
-    btn.setAttribute("aria-expanded", "false");
+    (this.querySelector("#qs-pop") as HTMLElement).hidden = true;
+    (this.querySelector("#qs-btn") as HTMLButtonElement).setAttribute("aria-expanded", "false");
   }
 
   private renderPopover() {
-    const s = this.current ?? defaults();
+    const s = settingsStore.get();
+    const limits = this.limits!;
     const pop = this.querySelector("#qs-pop") as HTMLElement;
     pop.replaceChildren();
 
-    pop.appendChild(this.checkbox(s, "Reduced motion", s.a11y.reduced_motion, (v) => { s.a11y.reduced_motion = v; }));
-    pop.appendChild(this.checkbox(s, "High contrast", s.a11y.high_contrast, (v) => { s.a11y.high_contrast = v; }));
-
-    // Text size select.
-    const tl = document.createElement("label");
-    tl.textContent = "Text size ";
-    const sel = document.createElement("select");
-    for (const opt of ["normal", "large", "larger"] as const) {
+    // Theme toggle.
+    const themeLabel = document.createElement("label");
+    themeLabel.textContent = "Theme ";
+    const themeSel = document.createElement("select");
+    for (const opt of ["dark", "light"] as const) {
       const o = document.createElement("option");
       o.value = opt; o.textContent = opt;
-      if (s.a11y.text_size === opt) o.selected = true;
-      sel.appendChild(o);
+      if (s.appearance.theme === opt) o.selected = true;
+      themeSel.appendChild(o);
     }
-    sel.addEventListener("change", () => {
-      const v = sel.value;
-      s.a11y.text_size = (v === "large" || v === "larger") ? v : "normal";
-      void this.save(s);
+    themeSel.addEventListener("change", () => {
+      const theme = themeSel.value === "light" ? "light" : "dark";
+      void this.save({ appearance: { theme } });
     });
-    tl.appendChild(sel);
-    pop.appendChild(tl);
+    themeLabel.appendChild(themeSel);
+    pop.appendChild(themeLabel);
 
-    pop.appendChild(this.checkbox(s, "Confirm destructive actions", s.behavior.confirm_destructive, (v) => { s.behavior.confirm_destructive = v; }));
-
-    // Tor (disabled placeholder).
-    const torLabel = document.createElement("label");
-    const tor = document.createElement("input");
-    tor.type = "checkbox"; tor.disabled = true; tor.checked = s.connection.use_tor;
-    torLabel.append(tor, document.createTextNode(" Route over Tor (later)"));
-    pop.appendChild(torLabel);
+    // RAM cap: range + number, both clamped to [min,max].
+    const ramLabel = document.createElement("label");
+    ramLabel.textContent = "RAM cache cap (MB) ";
+    const range = document.createElement("input");
+    range.type = "range";
+    range.min = String(limits.min_mb); range.max = String(limits.max_mb); range.step = "16";
+    range.value = String(s.performance.ram_cache_cap_mb);
+    range.setAttribute("aria-label", "RAM cache cap (MB)");
+    const num = document.createElement("input");
+    num.type = "number";
+    num.min = String(limits.min_mb); num.max = String(limits.max_mb); num.step = "1";
+    num.value = String(s.performance.ram_cache_cap_mb);
+    num.setAttribute("aria-label", "RAM cache cap (MB), exact");
+    const syncFrom = (v: number) => {
+      const clamped = Math.min(Math.max(v, limits.min_mb), limits.max_mb);
+      range.value = String(clamped); num.value = String(clamped);
+      void this.save({ performance: { ram_cache_cap_mb: clamped } });
+    };
+    range.addEventListener("change", () => syncFrom(Number(range.value)));
+    num.addEventListener("change", () => syncFrom(Number(num.value)));
+    ramLabel.append(range, num);
+    pop.appendChild(ramLabel);
 
     pop.appendChild(this.status());
-  }
-
-  private checkbox(s: Settings, labelText: string, checked: boolean, set: (v: boolean) => void): HTMLLabelElement {
-    const label = document.createElement("label");
-    const box = document.createElement("input");
-    box.type = "checkbox"; box.checked = checked;
-    box.addEventListener("change", () => { set(box.checked); void this.save(s); });
-    label.append(box, document.createTextNode(` ${labelText}`));
-    return label;
   }
 
   private status(): HTMLParagraphElement {
@@ -101,12 +105,10 @@ export class QuickSettings extends HTMLElement {
     return p;
   }
 
-  private async save(s: Settings) {
+  private async save(patch: Partial<Settings>) {
     const status = this.querySelector("#qs-status");
     try {
-      const norm = await call<Settings>("set_settings", { settings: s });
-      this.current = norm;
-      applySettings(norm);
+      await updateSettings(patch);
       if (status) status.textContent = "Saved.";
     } catch (x) {
       if (status) status.textContent = errMsg(x, "Could not save.");
@@ -114,9 +116,6 @@ export class QuickSettings extends HTMLElement {
   }
 }
 
-function defaults(): Settings {
-  return { a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" }, behavior: { confirm_destructive: false }, performance: { ram_cache_cap_mb: 256 }, connection: { use_tor: false }, appearance: { theme: "dark" } };
-}
 function errMsg(x: unknown, fallback: string): string {
   if (x && typeof x === "object" && "message" in x) {
     const m = (x as { message?: unknown }).message;
