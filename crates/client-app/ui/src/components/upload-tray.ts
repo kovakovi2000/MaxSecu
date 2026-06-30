@@ -14,7 +14,7 @@ export class UploadTray extends HTMLElement {
 
   async connectedCallback() {
     this.innerHTML = `
-      <section class="upload-tray" aria-label="Active uploads">
+      <section class="upload-tray" aria-label="Active uploads" hidden>
         <h2 class="ut-title">Uploads</h2>
         <ul id="ut-list" aria-live="polite"></ul>
       </section>`;
@@ -29,6 +29,7 @@ export class UploadTray extends HTMLElement {
     const list = this.querySelector("#ut-list") as HTMLUListElement;
     let li = list.querySelector<HTMLLIElement>(`li[data-job="${cssEscape(jobId)}"]`);
     if (!li) {
+      (this.querySelector(".upload-tray") as HTMLElement | null)?.removeAttribute("hidden");
       li = document.createElement("li");
       li.setAttribute("data-job", jobId);
       const badge = document.createElement("state-badge");
@@ -102,6 +103,10 @@ export class UploadTray extends HTMLElement {
     window.setTimeout(() => {
       const li = this.querySelector(`li[data-job="${cssEscape(jobId)}"]`);
       li?.remove();
+      const list = this.querySelector("#ut-list") as HTMLUListElement | null;
+      if (list && list.children.length === 0) {
+        (this.querySelector(".upload-tray") as HTMLElement | null)?.setAttribute("hidden", "");
+      }
     }, 4000);
   }
 }

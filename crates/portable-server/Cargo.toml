@@ -28,6 +28,11 @@ axum = "0.8"
 rcgen = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Persistent-DEV profile (DATABASE_URL set): the launcher builds a Postgres pool
+# and composes `AppState` over `PgStore`. Same 0.8 + identical feature set the
+# server crate already resolves (no TLS — the demo DB is a 127.0.0.1 loopback /
+# WSL-forwarded connection), so cargo-deny sees no new external version.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
 
 [dev-dependencies]
 # HTTP client plane for the Phase-6 boot smoke test (the same hyper/http stack the

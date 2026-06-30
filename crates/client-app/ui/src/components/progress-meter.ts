@@ -8,15 +8,17 @@ export class ProgressMeter extends HTMLElement {
     const value = Number(this.getAttribute("value") ?? "0");
     const max = Number(this.getAttribute("max") ?? "0");
     const detail = this.getAttribute("detail") ?? "";
-    const pct = max > 0 ? Math.round((value / max) * 100) : null;
+    const pct = max > 0 ? Math.max(0, Math.min(100, Math.round((value / max) * 100))) : null;
     this.setAttribute("role", "progressbar");
     if (pct !== null) {
       this.setAttribute("aria-valuenow", String(pct));
       this.setAttribute("aria-valuemin", "0");
       this.setAttribute("aria-valuemax", "100");
+      this.style.setProperty("--mx-progress", `${pct}%`);
       this.textContent = `${pct}%${detail ? ` — ${detail}` : ""}`;
     } else {
       this.removeAttribute("aria-valuenow");
+      this.style.removeProperty("--mx-progress");
       this.textContent = detail || "Working…";
     }
   }

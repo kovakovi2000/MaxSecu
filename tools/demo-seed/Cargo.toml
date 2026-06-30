@@ -1,0 +1,28 @@
+[package]
+name = "maxsecu-demo-seed"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "DEV/DEMO-ONLY: provision root(admin)+bob(user) against a running portable-server using the on-disk dev D5 seed (scripted offline ceremony). Never a production path."
+
+[[bin]]
+name = "maxsecu-demo-seed"
+path = "src/main.rs"
+
+[dependencies]
+maxsecu-client-app = { path = "../../crates/client-app" }
+maxsecu-client-core = { path = "../../crates/client-core" }
+maxsecu-ceremony-harness = { path = "../ceremony-harness" }
+maxsecu-crypto = { path = "../../crates/crypto" }
+maxsecu-encoding = { path = "../../crates/encoding" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio-rustls = { workspace = true }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+base64 = "0.22"
+serde_json = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

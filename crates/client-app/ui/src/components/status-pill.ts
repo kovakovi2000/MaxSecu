@@ -5,9 +5,13 @@ const ICON: Record<string, string> = {
   resolving: "…", "tls-handshake": "…", "channel-binding": "…", idle: "○",
 };
 export class StatusPill extends HTMLElement {
+  connectedCallback() {
+    if (!this.textContent?.trim()) this.state = "idle";
+  }
   set state(s: string) {
     this.setAttribute("role", "status");
     this.setAttribute("aria-live", "polite");
+    this.setAttribute("data-state", s);
     this.textContent = `${ICON[s] ?? "?"} ${s.replace(/-/g, " ")}`;
   }
 }

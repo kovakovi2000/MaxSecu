@@ -2,6 +2,14 @@
 /target
 **/*.rs.bk
 
+# Local demo staging (built .exe binaries + demo data) — not source, never committed
+/dist/
+
+# Frontend redesign drops + scratch handed in/out during UI work
+/maxsecu-frontend*.zip
+/clipboard-*.png
+/install-design.ps1
+
 # Never commit secrets. The Dropbox token / app secret and the offline D5/D6
 # key material are injected at runtime / kept air-gapped (DESIGN.md §16.6,
 # stack.md §5.1) — they must never land in the repo.

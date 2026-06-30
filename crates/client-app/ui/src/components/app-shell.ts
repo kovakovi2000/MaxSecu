@@ -34,13 +34,17 @@ export class AppShell extends HTMLElement {
     ).join("");
     this.innerHTML = `
       <header role="banner" class="app-header">
+        <div class="app-brand" aria-label="MaxSecu">
+          <span class="app-brand-mark" aria-hidden="true">◆</span>
+          <span>MaxSecu <small>secure media</small></span>
+        </div>
         <nav role="navigation" aria-label="Primary" class="nav-rail">${links}</nav>
         <div class="header-actions">
           <quick-settings id="qs"></quick-settings>
         </div>
         <div class="status-strip" role="region" aria-label="Status">
           <status-pill id="pill"></status-pill>
-          <span id="sync-ind" class="sync-ind" role="status" aria-live="polite"></span>
+          <span id="sync-ind" class="sync-ind" role="status" aria-live="polite">Zero-knowledge session</span>
           <span id="tasks-ind" class="tasks-ind" role="status" aria-live="polite">No active tasks</span>
         </div>
         <upload-tray></upload-tray>
@@ -55,11 +59,21 @@ export class AppShell extends HTMLElement {
     const pill = this.querySelector("#pill") as StatusPill;
     const qs = this.querySelector("#qs") as HTMLElement;
 
-    new Router((r) => {
-      qs.toggleAttribute("hidden", r === "settings");
+    new Router((incomingRoute) => {
+      let r = incomingRoute;
+      const hasSession = getUsername().trim().length > 0;
+      const publicRoute = r === "connect" || r === "bootstrap";
+      if (!hasSession && !publicRoute) {
+        r = "connect";
+        if (location.hash !== "#/connect") history.replaceState(null, "", "#/connect");
+      }
+
+      const showAppChrome = hasSession && r !== "connect" && r !== "bootstrap" && r !== "pending";
+      this.toggleAttribute("data-app-chrome", showAppChrome);
+      qs.toggleAttribute("hidden", showAppChrome && r === "settings");
       this.querySelectorAll<HTMLAnchorElement>(".nav-rail a").forEach((a) => {
-        const isActive = a.getAttribute("data-route") === r
-          || (r === "mine" && a.getAttribute("data-route") === "mine");
+        const isActive = showAppChrome && (a.getAttribute("data-route") === r
+          || (r === "mine" && a.getAttribute("data-route") === "mine"));
         a.toggleAttribute("aria-current", isActive);
         a.classList.toggle("active", isActive);
       });

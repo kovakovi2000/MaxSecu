@@ -35,6 +35,16 @@ impl Ceremony {
         }
     }
 
+    /// Reconstruct the ceremony from a persisted 32-byte D5 seed (the portable
+    /// launcher's dev `config/d5_secret.bin`) so a scripted seeding flow signs
+    /// bindings that verify under the *running server's* pinned D5. TEST/DEV-ONLY,
+    /// like the rest of this crate — never a production path.
+    pub fn from_seed(seed: &[u8; 32]) -> Ceremony {
+        Ceremony {
+            d5: DirectorySigner::from_seed(seed),
+        }
+    }
+
     /// The pinned D5 public key clients + the server are configured with.
     pub fn directory_pub(&self) -> [u8; 32] {
         self.d5.public_key()

@@ -19,6 +19,7 @@ members = [
     "crates/client-app",
     "crates/portable-server",
     "tools/ceremony-harness",
+    "tools/demo-seed",
 ]
 
 [workspace.package]

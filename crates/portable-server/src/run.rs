@@ -11,6 +11,7 @@ use tokio_rustls::rustls::ServerConfig;
 
 use maxsecu_server::{
     router, serve, AppState, AuthConfig, AuthService, FsBlobStore, MemoryStore, NullAuditSink,
+    PgStore,
 };
 
 use crate::config::{LauncherConfig, Profile};
@@ -33,18 +34,11 @@ pub struct Prepared {
 /// `AppState` (DEV: `MemoryStore` + persistent `FsBlobStore` + `NullAuditSink`),
 /// and bind the listener. Reusable by the smoke test. DEV profile only.
 pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
-    if cfg.profile == Profile::Prod {
-        // PROD parity is type-checked but requires Postgres (unavailable in this
-        // env): a `PgStore` + an injected (non-self-signed) cert + an external
-        // audit sink + a `schema.sql` self-apply. The DEV profile (no
-        // `DATABASE_URL`) runs with `MemoryStore` + a self-signed pinned cert.
-        return Err(std::io::Error::other(format!(
-            "prod profile (DATABASE_URL={}) requires Postgres: set up PgStore + an injected \
-             cert/sink + schema.sql; the dev profile (no DATABASE_URL) runs with MemoryStore + \
-             a self-signed cert",
-            cfg.database_url.as_deref().unwrap_or("<unset>")
-        )));
-    }
+    // Dev artifacts are identical on BOTH profiles: the persistent profile is a
+    // SECURITY-DEGRADED *persistent-DEV* (Postgres persistence + dev cert/D5/
+    // bootstrap), NOT the production ceremony profile (which additionally requires
+    // an injected non-self-signed cert + an external WORM/audit sink + the offline
+    // ceremony key). Only the Store backend differs: MemoryStore vs PgStore.
     let layout = Layout::ensure(&cfg.data_dir)?;
     pki::ensure_dev_cert(&layout)?;
     let directory_pub = bootstrap::ensure_dev_d5(&layout)?;
@@ -53,20 +47,48 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
         .ok_or_else(|| std::io::Error::other("bootstrap hash missing after ensure"))?;
 
     let server_config = pki::load_server_config(&layout)?;
-    let store = MemoryStore::new();
     let auth_cfg = AuthConfig::default()
         .with_directory_pub(directory_pub)
         .with_bootstrap_secret_hash(hash);
-    let state = AppState {
-        auth: Arc::new(AuthService::new(store, auth_cfg)),
-        blobs: Arc::new(FsBlobStore::new(layout.blobs_dir())),
-        audit: Arc::new(NullAuditSink),
-        direct_links_enabled: false,
+    let blobs = Arc::new(FsBlobStore::new(layout.blobs_dir()));
+
+    // Compose the router over the profile's Store. Each branch builds a distinct
+    // `AppState<S>` and type-erases it via `router(..)` into the shared
+    // `axum::Router`, so the differing store type never leaks into `Prepared`.
+    let app_router = match cfg.profile {
+        Profile::Dev => {
+            let state = AppState {
+                auth: Arc::new(AuthService::new(MemoryStore::new(), auth_cfg)),
+                blobs,
+                audit: Arc::new(NullAuditSink),
+                direct_links_enabled: false,
+            };
+            router(state)
+        }
+        Profile::Prod => {
+            let url = cfg.database_url.clone().ok_or_else(|| {
+                std::io::Error::other("DATABASE_URL is required for the persistent profile")
+            })?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(8)
+                .acquire_timeout(std::time::Duration::from_secs(10))
+                .connect(&url)
+                .await
+                .map_err(|e| std::io::Error::other(format!("postgres connect: {e}")))?;
+            let state = AppState {
+                auth: Arc::new(AuthService::new(PgStore::new(pool), auth_cfg)),
+                blobs,
+                audit: Arc::new(NullAuditSink),
+                direct_links_enabled: false,
+            };
+            router(state)
+        }
     };
+
     let listener = TcpListener::bind(("127.0.0.1", cfg.port)).await?;
     let local_addr = listener.local_addr()?;
     Ok(Prepared {
-        router: router(state),
+        router: app_router,
         listener,
         server_config,
         bootstrap_secret,
@@ -87,8 +109,12 @@ pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
     pki::export_client_pin(&layout, &client_pins)?;
     bootstrap::export_client_pin_d5(&layout, &client_pins)?;
 
+    let profile_label = match cfg.profile {
+        Profile::Dev => "DEV / ephemeral MemoryStore",
+        Profile::Prod => "persistent-DEV / Postgres (SECURITY-DEGRADED dev cert+D5+secret)",
+    };
     eprintln!(
-        "maxsecu-portable-server (DEV profile) listening on https://{}",
+        "maxsecu-portable-server ({profile_label}) listening on https://{}",
         prepared.local_addr
     );
     eprintln!(
