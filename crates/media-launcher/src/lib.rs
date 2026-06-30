@@ -57,6 +57,15 @@ pub const DEFAULT_WORKER_MEMORY_CAP_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(windows)]
 pub const DEFAULT_FFMPEG_MEMORY_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Default per-job forced-kill timeout for the confined ffmpeg ingest (Task 2.2).
+/// The worker decode path's fixed 2-minute bound is too short for universal video
+/// ingest — a large/long source can legitimately take longer — so the ffmpeg path
+/// uses this generous-but-FINITE default (10 minutes), overridable via
+/// [`FfmpegLauncher::with_timeout`]. It is a DoS ceiling: past it the confined
+/// process is terminated rather than waited on forever.
+#[cfg(windows)]
+pub const DEFAULT_FFMPEG_TIMEOUT_MS: u32 = 600_000;
+
 /// Length-prefixed duplex **framing** for the persistent video-session protocol
 /// (Task 3.3). Each frame on the pipe is a `u32` little-endian length prefix
 /// followed by exactly that many bytes = one `client-core::video` message body
@@ -1420,6 +1429,7 @@ pub struct FfmpegOutcome {
 pub struct FfmpegLauncher {
     ffmpeg_path: PathBuf,
     memory_cap_bytes: u64,
+    timeout_ms: u32,
 }
 
 #[cfg(windows)]
@@ -1429,6 +1439,7 @@ impl FfmpegLauncher {
         FfmpegLauncher {
             ffmpeg_path: ffmpeg_path.into(),
             memory_cap_bytes: DEFAULT_FFMPEG_MEMORY_CAP_BYTES,
+            timeout_ms: DEFAULT_FFMPEG_TIMEOUT_MS,
         }
     }
 
@@ -1438,7 +1449,18 @@ impl FfmpegLauncher {
         FfmpegLauncher {
             ffmpeg_path: ffmpeg_path.into(),
             memory_cap_bytes: cap,
+            timeout_ms: DEFAULT_FFMPEG_TIMEOUT_MS,
         }
+    }
+
+    /// Override the per-job forced-kill timeout (default [`DEFAULT_FFMPEG_TIMEOUT_MS`]).
+    /// This is a FINITE DoS ceiling, not a soft hint: past it the confined ffmpeg is
+    /// terminated. Size it for the largest source the ingest accepts — a long 4K
+    /// transcode legitimately exceeds the worker path's 2-minute bound, so the ffmpeg
+    /// path is configurable while still never waiting `INFINITE`.
+    pub fn with_timeout(mut self, timeout_ms: u32) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
     }
 
     /// Run ffmpeg confined with `args` (the discrete argv elements — inputs/outputs
@@ -1452,6 +1474,19 @@ impl FfmpegLauncher {
     /// Low-IL container can write) and is REVOKED when this returns on every path.
     /// The argv must reference only paths inside `grant_dir` — anything outside is
     /// denied by the confinement (proven by the D-2 differential test).
+    ///
+    /// CLEANUP OBLIGATION (security requirement, not mere hygiene): after this
+    /// returns, the CALLER MUST delete the WHOLE `grant_dir`. The dir-grant revoke
+    /// restores the directory's prior DACL/label, but the OUTPUT file ffmpeg created
+    /// inside it inherited the container-SID allow ACE (and a Low integrity label) at
+    /// creation, and that inherited ACE on the child file CANNOT be retroactively
+    /// stripped by revoking the dir grant. Wholesale deletion of the per-job dir is
+    /// the only correct cleanup — leaving it behind leaves a container-accessible,
+    /// Low-IL artifact on disk.
+    ///
+    /// The run is bounded by a FINITE forced-kill timeout (default
+    /// [`DEFAULT_FFMPEG_TIMEOUT_MS`], see [`with_timeout`](Self::with_timeout)): a
+    /// generous DoS ceiling, after which the confined ffmpeg is killed.
     pub fn run(
         &self,
         args: &[std::ffi::OsString],
@@ -1462,6 +1497,7 @@ impl FfmpegLauncher {
             args,
             &[(grant_dir, GrantAccess::ReadWrite)],
             self.memory_cap_bytes,
+            self.timeout_ms,
         )?;
         Ok(FfmpegOutcome {
             exit_code: out.exit_code,

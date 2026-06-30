@@ -54,8 +54,8 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, STARTUPINFOW,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 /// A launch/confinement failure: which Win32 step failed + its `GetLastError`/
@@ -899,11 +899,20 @@ fn setup_confined_child(
 /// worker is actively terminated (then briefly waited on) rather than relied upon
 /// to exit voluntarily.
 fn finish_confined(guard: JobGuard) -> u32 {
+    finish_confined_with_timeout(guard, WORKER_WAIT_TIMEOUT_MS)
+}
+
+/// [`finish_confined`] with an explicit forced-kill timeout. The worker path uses
+/// the fixed [`WORKER_WAIT_TIMEOUT_MS`] (via [`finish_confined`], unchanged); the
+/// ffmpeg ingest path ([`spawn_confined_exe`]) passes a per-job bound, because a
+/// legitimate large/long transcode can exceed two minutes and must not be wrongly
+/// killed — yet the wait must still be FINITE (a DoS bound), then force-killed.
+fn finish_confined_with_timeout(guard: JobGuard, timeout_ms: u32) -> u32 {
     let (job, pi) = guard.disarm();
     // SAFETY: `pi.hProcess` is the live confined child; wait up to the bound, then
-    // — on timeout — actively kill it so a spinning worker can't hang the launcher.
+    // — on timeout — actively kill it so a spinning child can't hang the launcher.
     unsafe {
-        if WaitForSingleObject(pi.hProcess, WORKER_WAIT_TIMEOUT_MS) == WAIT_TIMEOUT {
+        if WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_TIMEOUT {
             TerminateProcess(pi.hProcess, 1);
             // Let the kill land before reading the exit code / releasing handles.
             WaitForSingleObject(pi.hProcess, WORKER_KILL_GRACE_MS);
@@ -1183,14 +1192,26 @@ fn setup_confined_exe_child(
         }
     };
 
-    // Build the proc-thread attribute list holding the security capabilities.
+    // The EXACT set of handles the confined child may inherit. `CreateProcessW` is
+    // called with `bInheritHandles = TRUE`, so without an explicit allow-list the
+    // child would inherit EVERY inheritable handle open in the key-holding parent —
+    // an ambient-inheritance gap across the RCE boundary. `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+    // restricts inheritance to precisely these three: NUL stdin, NUL stdout, and the
+    // stderr-write pipe end (all already inheritable — NUL opened inheritable, the
+    // pipe end inheritable via `make_pipe`). This array MUST outlive `CreateProcessW`
+    // (the attribute holds a pointer into it), so it is a local that lives to the end
+    // of the function.
+    let inherit_handles: [HANDLE; 3] = [child_stdin, child_stdout, child_stderr];
+
+    // Build the proc-thread attribute list holding BOTH the security capabilities and
+    // the handle allow-list (TWO attributes).
     let mut attr_size: usize = 0;
     // SAFETY: first call computes the required size (returns FALSE).
-    unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut attr_size) };
+    unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 2, 0, &mut attr_size) };
     let mut attr_buf = vec![0u8; attr_size];
     let attr_list = attr_buf.as_mut_ptr() as *mut core::ffi::c_void;
     // SAFETY: buffer is sized exactly as requested above.
-    if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(attr_list, 2, 0, &mut attr_size) } == 0 {
         let e = SpawnError::last("InitializeProcThreadAttributeList");
         close_all(&[child_stdin, child_stdout, child_stderr, parent_stderr_read]);
         return Err(e);
@@ -1208,7 +1229,26 @@ fn setup_confined_exe_child(
         )
     };
     if upd == 0 {
-        let e = SpawnError::last("UpdateProcThreadAttribute");
+        let e = SpawnError::last("UpdateProcThreadAttribute.caps");
+        unsafe { DeleteProcThreadAttributeList(attr_list) };
+        close_all(&[child_stdin, child_stdout, child_stderr, parent_stderr_read]);
+        return Err(e);
+    }
+    // SAFETY: `inherit_handles` outlives CreateProcessW below; the attribute holds a
+    // pointer into it for exactly its `len()*size_of::<HANDLE>()` bytes.
+    let upd_hl = unsafe {
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            inherit_handles.as_ptr() as *const core::ffi::c_void,
+            core::mem::size_of_val(&inherit_handles),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if upd_hl == 0 {
+        let e = SpawnError::last("UpdateProcThreadAttribute.handle_list");
         unsafe { DeleteProcThreadAttributeList(attr_list) };
         close_all(&[child_stdin, child_stdout, child_stderr, parent_stderr_read]);
         return Err(e);
@@ -1350,6 +1390,11 @@ fn read_bounded_stderr(mut f: std::fs::File, cap: usize) -> Vec<u8> {
 /// the guard vector). Typically a single `(per_job_dir, GrantAccess::ReadWrite)`
 /// grant scopes the confined ffmpeg to exactly its input + output files.
 ///
+/// `timeout_ms` is the per-job forced-kill bound (a FINITE DoS ceiling): the child
+/// is waited on up to this long, then actively terminated. Sized by the caller for
+/// a legitimate large/long transcode (the worker path's fixed 2-minute bound is too
+/// short for universal video ingest) — generous but never `INFINITE`.
+///
 /// Returns ffmpeg's exit code + the bounded stderr tail. The CALLER (Phase 3) then
 /// reads the output file from the granted dir.
 pub fn spawn_confined_exe(
@@ -1357,6 +1402,7 @@ pub fn spawn_confined_exe(
     args: &[OsString],
     grants: &[(&Path, GrantAccess)],
     memory_cap_bytes: u64,
+    timeout_ms: u32,
 ) -> Result<ConfinedExeOutput, SpawnError> {
     // Apply the scoped path grants up front; the RAII guards are held for the whole
     // spawn and revoked when `_grants` drops (success OR any early `?` / panic).
@@ -1383,7 +1429,7 @@ pub fn spawn_confined_exe(
     // wait, a kill on timeout, the exit code, and the handle teardown. Once it
     // returns, the child is dead → its stderr write end is closed → the reader hits
     // EOF and the join completes.
-    let exit_code = finish_confined(guard);
+    let exit_code = finish_confined_with_timeout(guard, timeout_ms);
     let stderr_tail = reader.join().unwrap_or_default();
 
     Ok(ConfinedExeOutput {
