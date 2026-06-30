@@ -1,4 +1,4 @@
-import { Router } from "../core/router.ts";
+import { Router, type Route } from "../core/router.ts";
 import { on } from "../core/rpc.ts";
 import { getUsername } from "../core/session.ts";
 import "./status-pill.ts";
@@ -12,32 +12,65 @@ import "./upload-screen.ts";
 import "./upload-tray.ts";
 import "./settings-screen.ts";
 import "./quick-settings.ts";
-import { loadAndApplySettings } from "../core/settings.ts";
+import "./toast-host.ts";
+import "./skeleton-card.ts";
+import { loadAndApplySettings, bindDocumentToSettings } from "../core/settings.ts";
+import { activeTasks } from "../core/tasks.ts";
 import type { StatusPill } from "./status-pill.ts";
 import type { ConnState } from "../core/types.ts";
 
+const NAV: Array<{ route: Route; label: string }> = [
+  { route: "feed", label: "Feed" },
+  { route: "mine", label: "My Content" },
+  { route: "upload", label: "Upload" },
+  { route: "admin", label: "Admin" },
+  { route: "settings", label: "Settings" },
+];
+
 export class AppShell extends HTMLElement {
   connectedCallback() {
+    const links = NAV.map(
+      (n) => `<a href="#/${n.route}" data-route="${n.route}">${n.label}</a>`,
+    ).join("");
     this.innerHTML = `
-      <header role="banner">
-        <nav role="navigation" aria-label="Primary">
-          <a href="#/feed">Feed</a> &middot; <span>My Content</span> &middot; <a href="#/upload">Upload</a> &middot; <a href="#/admin">Admin</a> &middot; <a href="#/settings">Settings</a>
-        </nav>
-        <status-pill id="pill"></status-pill>
-        <quick-settings></quick-settings>
+      <header role="banner" class="app-header">
+        <nav role="navigation" aria-label="Primary" class="nav-rail">${links}</nav>
+        <div class="header-actions">
+          <quick-settings id="qs"></quick-settings>
+        </div>
+        <div class="status-strip" role="region" aria-label="Status">
+          <status-pill id="pill"></status-pill>
+          <span id="sync-ind" class="sync-ind" role="status" aria-live="polite"></span>
+          <span id="tasks-ind" class="tasks-ind" role="status" aria-live="polite">No active tasks</span>
+        </div>
         <upload-tray></upload-tray>
       </header>
+      <toast-host></toast-host>
       <div id="outlet"></div>`;
-    // Apply persisted a11y prefs at startup, regardless of the current route.
+
     void loadAndApplySettings();
+    bindDocumentToSettings();
+
     const outlet = this.querySelector("#outlet")!;
     const pill = this.querySelector("#pill") as StatusPill;
+    const qs = this.querySelector("#qs") as HTMLElement;
+
     new Router((r) => {
+      qs.toggleAttribute("hidden", r === "settings");
+      this.querySelectorAll<HTMLAnchorElement>(".nav-rail a").forEach((a) => {
+        const isActive = a.getAttribute("data-route") === r
+          || (r === "mine" && a.getAttribute("data-route") === "mine");
+        a.toggleAttribute("aria-current", isActive);
+        a.classList.toggle("active", isActive);
+      });
+
       if (r === "pending") {
-        // Build via the DOM (not innerHTML) so the username goes into an
-        // attribute, never parsed as markup.
         const el = document.createElement("pending-screen");
         el.setAttribute("username", getUsername());
+        outlet.replaceChildren(el);
+      } else if (r === "mine") {
+        const el = document.createElement("feed-screen");
+        el.setAttribute("mine", "");
         outlet.replaceChildren(el);
       } else {
         outlet.innerHTML = r === "feed"
@@ -54,13 +87,16 @@ export class AppShell extends HTMLElement {
           ? "<bootstrap-screen></bootstrap-screen>"
           : "<connect-screen></connect-screen>";
       }
-      // WCAG 2.4.3: the old content (incl. the focused control) was just
-      // removed; move focus to the new screen's main landmark so focus order
-      // is preserved and screen readers land on the new view.
       const main = outlet.querySelector<HTMLElement>("#main");
       main?.focus();
     });
+
     on<ConnState>("maxsecu://connection-state", (s) => { pill.state = s.state; });
+
+    const tasksInd = this.querySelector("#tasks-ind") as HTMLElement;
+    activeTasks.subscribe((n) => {
+      tasksInd.textContent = n === 0 ? "No active tasks" : `${n} active task${n === 1 ? "" : "s"}`;
+    });
   }
 }
 customElements.define("app-shell", AppShell);
