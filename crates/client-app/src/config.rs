@@ -114,6 +114,19 @@ pub struct ConnectionSettings {
     pub use_tor: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppearanceSettings {
+    /// "dark" (default) | "light". Applied via `<html data-theme>` in the UI.
+    pub theme: String,
+}
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            theme: "dark".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SettingsConfig {
     #[serde(default)]
@@ -124,6 +137,8 @@ pub struct SettingsConfig {
     pub performance: PerformanceSettings,
     #[serde(default)]
     pub connection: ConnectionSettings,
+    #[serde(default)]
+    pub appearance: AppearanceSettings,
 }
 
 impl SettingsConfig {
@@ -144,13 +159,26 @@ impl SettingsConfig {
         )
     }
 
-    /// Clamp/normalize untrusted values (hand-edited file or UI bug): cap the RAM
-    /// cache and constrain text_size to the known set.
+    /// Clamp/normalize untrusted values using the live RAM bounds. Convenience
+    /// wrapper that reads the system RAM; the pure work is `normalized_with_ram`.
     pub fn normalized(&self) -> SettingsConfig {
+        let limits = crate::ram::compute_ram_limits(crate::ram::system_total_mb_public());
+        self.normalized_with_ram(&limits)
+    }
+
+    /// Pure normalization against explicit RAM bounds (unit-testable): clamp the
+    /// RAM cache cap into [min,max], constrain text_size + theme to known sets.
+    pub fn normalized_with_ram(&self, limits: &crate::ram::RamLimits) -> SettingsConfig {
         let mut s = self.clone();
-        s.performance.ram_cache_cap_mb = s.performance.ram_cache_cap_mb.clamp(16, 4096);
+        s.performance.ram_cache_cap_mb = s
+            .performance
+            .ram_cache_cap_mb
+            .clamp(limits.min_mb, limits.max_mb);
         if !matches!(s.a11y.text_size.as_str(), "normal" | "large" | "larger") {
             s.a11y.text_size = "normal".into();
+        }
+        if !matches!(s.appearance.theme.as_str(), "dark" | "light") {
+            s.appearance.theme = "dark".into();
         }
         s
     }
@@ -236,10 +264,39 @@ mod tests {
         let mut bad = SettingsConfig::default();
         bad.performance.ram_cache_cap_mb = 99_999_999;
         bad.a11y.text_size = "huge".into();
+        let limits = crate::ram::compute_ram_limits(crate::ram::system_total_mb_public());
         let norm = bad.normalized();
-        assert!(norm.performance.ram_cache_cap_mb <= 4096);
+        assert!(norm.performance.ram_cache_cap_mb <= limits.max_mb);
+        assert!(norm.performance.ram_cache_cap_mb >= limits.min_mb);
         assert_eq!(norm.a11y.text_size, "normal");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appearance_theme_defaults_dark_and_normalizes() {
+        let s = SettingsConfig::default();
+        assert_eq!(s.appearance.theme, "dark");
+        // An unknown theme normalizes back to dark.
+        let mut bad = SettingsConfig::default();
+        bad.appearance.theme = "neon".into();
+        assert_eq!(bad.normalized().appearance.theme, "dark");
+    }
+
+    #[test]
+    fn ram_cap_clamps_into_computed_bounds() {
+        use crate::ram::compute_ram_limits;
+        let limits = compute_ram_limits(16384); // min 64, max 10240
+        let mut s = SettingsConfig::default();
+        s.performance.ram_cache_cap_mb = 99_999;
+        assert_eq!(
+            s.normalized_with_ram(&limits).performance.ram_cache_cap_mb,
+            10240
+        );
+        s.performance.ram_cache_cap_mb = 1;
+        assert_eq!(
+            s.normalized_with_ram(&limits).performance.ram_cache_cap_mb,
+            64
+        );
     }
 
     fn n() -> u128 {

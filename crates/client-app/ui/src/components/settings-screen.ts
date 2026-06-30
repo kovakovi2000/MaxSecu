@@ -13,6 +13,7 @@ const DEFAULTS: Settings = {
   behavior: { confirm_destructive: false },
   performance: { ram_cache_cap_mb: 256 },
   connection: { use_tor: false },
+  appearance: { theme: "dark" },
 };
 
 export class SettingsScreen extends HTMLElement {
@@ -116,6 +117,7 @@ export class SettingsScreen extends HTMLElement {
       behavior: { confirm_destructive: this.input("confirm_destructive").checked },
       performance: { ram_cache_cap_mb: Number.isFinite(ram) ? ram : DEFAULTS.performance.ram_cache_cap_mb },
       connection: { use_tor: this.input("use_tor").checked },
+      appearance: { theme: DEFAULTS.appearance.theme },
     };
   }
 

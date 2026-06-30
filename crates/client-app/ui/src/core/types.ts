@@ -79,4 +79,8 @@ export interface Settings {
   behavior: { confirm_destructive: boolean };
   performance: { ram_cache_cap_mb: number };
   connection: { use_tor: boolean };
+  appearance: { theme: "dark" | "light" };
 }
+
+// The RAM-cache slider/number bounds from the `ram_limits` command (Task 1).
+export interface RamLimits { default_mb: number; min_mb: number; max_mb: number }

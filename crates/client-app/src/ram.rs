@@ -43,6 +43,12 @@ fn system_total_mb() -> u64 {
     sys.total_memory() / (1024 * 1024)
 }
 
+/// Public shim so `config::SettingsConfig::normalized()` can source the live total
+/// without duplicating the sysinfo read. (Tests use `compute_ram_limits` directly.)
+pub fn system_total_mb_public() -> u64 {
+    system_total_mb()
+}
+
 /// `ram_limits` — the slider/number bounds + first-run default for the RAM-cache
 /// control. Read by the Settings screen + quick-settings so the UI cannot select
 /// a cap above (total − 6 GB).

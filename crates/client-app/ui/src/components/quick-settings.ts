@@ -115,7 +115,7 @@ export class QuickSettings extends HTMLElement {
 }
 
 function defaults(): Settings {
-  return { a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" }, behavior: { confirm_destructive: false }, performance: { ram_cache_cap_mb: 256 }, connection: { use_tor: false } };
+  return { a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" }, behavior: { confirm_destructive: false }, performance: { ram_cache_cap_mb: 256 }, connection: { use_tor: false }, appearance: { theme: "dark" } };
 }
 function errMsg(x: unknown, fallback: string): string {
   if (x && typeof x === "object" && "message" in x) {
