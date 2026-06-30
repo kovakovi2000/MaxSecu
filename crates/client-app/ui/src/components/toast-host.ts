@@ -9,8 +9,8 @@ export class ToastHost extends HTMLElement {
   connectedCallback() {
     this.innerHTML = `
       <div class="toast-stack">
-        <div id="toast-assertive" role="alert" aria-live="assertive" aria-atomic="true"></div>
-        <div id="toast-polite" role="status" aria-live="polite" aria-atomic="true"></div>
+        <div id="toast-assertive" role="alert" aria-live="assertive"></div>
+        <div id="toast-polite" role="status" aria-live="polite"></div>
       </div>`;
     this.off = subscribeToasts((e) => this.show(e));
   }
