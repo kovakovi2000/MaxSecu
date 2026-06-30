@@ -1,19 +1,208 @@
-:root { --mx-text-scale: 1; }
+/* MaxSecu media client — token-driven design system (spec §3).
+   Dark is the default; <html data-theme="light"> swaps the token block. Text
+   scaling lives on :root font-size so every rem grows. Motion tokens gate all
+   transitions/shimmer so reduced-motion (attr + OS media query) actually stills
+   motion. AA contrast; status is never color-only (handled in components). */
+
+/* ---------- Tokens: dark (default) ---------- */
+:root {
+  --mx-accent-1: #3b82f6; /* electric blue */
+  --mx-accent-2: #8b5cf6; /* violet */
+  --mx-accent: linear-gradient(135deg, var(--mx-accent-1), var(--mx-accent-2));
+
+  --mx-base: #0b0f1a;
+  --mx-surface-1: #121829;
+  --mx-surface-2: #1a2236;
+  --mx-surface-3: #232d45;
+  --mx-text: #eef2fb;
+  --mx-muted: #9aa6c2;
+  --mx-border: #2b3754;
+
+  --mx-glow: 0 0 0 1px rgba(139, 92, 246, 0.35), 0 8px 30px rgba(59, 130, 246, 0.18);
+  --mx-elev-1: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --mx-elev-2: 0 8px 24px rgba(0, 0, 0, 0.45);
+
+  --mx-radius: 12px;
+  --mx-radius-sm: 8px;
+  --mx-space-1: 0.25rem;
+  --mx-space-2: 0.5rem;
+  --mx-space-3: 0.75rem;
+  --mx-space-4: 1rem;
+  --mx-space-6: 1.5rem;
+
+  --mx-fs-1: 0.85rem;
+  --mx-fs-2: 1rem;
+  --mx-fs-3: 1.25rem;
+  --mx-fs-4: 1.6rem;
+
+  --mx-dur-fast: 120ms;
+  --mx-dur: 220ms;
+  --mx-ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+  --mx-text-scale: 1;
+}
+
+/* ---------- Tokens: light ---------- */
+:root[data-theme="light"] {
+  --mx-base: #f5f7fc;
+  --mx-surface-1: #ffffff;
+  --mx-surface-2: #eef2fb;
+  --mx-surface-3: #e2e8f6;
+  --mx-text: #131a2b;
+  --mx-muted: #4d5872;
+  --mx-border: #cbd5ea;
+  --mx-glow: 0 0 0 1px rgba(139, 92, 246, 0.25), 0 8px 30px rgba(59, 130, 246, 0.12);
+  --mx-elev-1: 0 1px 2px rgba(20, 30, 60, 0.12);
+  --mx-elev-2: 0 8px 24px rgba(20, 30, 60, 0.14);
+}
+
+/* ---------- Text scaling on :root so every rem grows ---------- */
 :root[data-text-size="large"]  { --mx-text-scale: 1.25; }
 :root[data-text-size="larger"] { --mx-text-scale: 1.5; }
-body { font-size: calc(1rem * var(--mx-text-scale)); }
+html { font-size: calc(100% * var(--mx-text-scale)); }
 
-:root[data-high-contrast] { filter: contrast(1.2); }
+/* ---------- Base ---------- */
+body {
+  margin: 0;
+  background: var(--mx-base);
+  color: var(--mx-text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: var(--mx-fs-2);
+  line-height: 1.5;
+}
+a { color: var(--mx-accent-1); }
+:root[data-theme="dark"] a { color: #9ec1ff; }
+
+/* ---------- Shell: header / nav rail / status strip ---------- */
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--mx-space-4);
+  padding: var(--mx-space-3) var(--mx-space-4);
+  background: var(--mx-surface-1);
+  border-bottom: 1px solid var(--mx-border);
+  box-shadow: var(--mx-elev-1);
+}
+.nav-rail { display: flex; gap: var(--mx-space-3); align-items: center; flex-wrap: wrap; }
+.nav-rail a {
+  text-decoration: none;
+  color: var(--mx-muted);
+  padding: var(--mx-space-2) var(--mx-space-3);
+  border-radius: var(--mx-radius-sm);
+  transition: color var(--mx-dur) var(--mx-ease), background var(--mx-dur) var(--mx-ease);
+}
+.nav-rail a:hover { color: var(--mx-text); background: var(--mx-surface-2); }
+.nav-rail a.active, .nav-rail a[aria-current] {
+  color: #fff;
+  background: var(--mx-accent);
+  box-shadow: var(--mx-glow);
+}
+.header-actions { margin-left: auto; }
+.status-strip {
+  display: flex; align-items: center; gap: var(--mx-space-3);
+  flex-basis: 100%; color: var(--mx-muted); font-size: var(--mx-fs-1);
+}
+.tasks-ind, .sync-ind { font-variant-numeric: tabular-nums; }
+
+/* The shell toggles `hidden` on <quick-settings> for the Settings route; ensure
+   the attribute reliably hides it regardless of any layout display rule. */
+quick-settings[hidden] { display: none !important; }
+
+/* ---------- Glassy surfaces (cards, popovers, viewer, tray, toasts) ---------- */
+.qs #qs-pop, .upload-tray, video-player, #vw-body, .toast {
+  background: color-mix(in srgb, var(--mx-surface-2) 92%, transparent);
+  border: 1px solid var(--mx-border);
+  border-radius: var(--mx-radius);
+  box-shadow: var(--mx-elev-2);
+  backdrop-filter: blur(8px);
+}
+
+/* Feed grid + cards */
+#grid {
+  display: grid; gap: var(--mx-space-4);
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  padding: var(--mx-space-4);
+}
+media-card article {
+  display: block;
+  background: var(--mx-surface-2);
+  border: 1px solid var(--mx-border);
+  border-radius: var(--mx-radius);
+  padding: var(--mx-space-3);
+  box-shadow: var(--mx-elev-1);
+  transition: transform var(--mx-dur) var(--mx-ease), box-shadow var(--mx-dur) var(--mx-ease);
+}
+media-card article:hover { transform: translateY(-2px); box-shadow: var(--mx-glow); }
+media-card img { max-width: 100%; height: auto; border-radius: var(--mx-radius-sm); display: block; }
+media-card .title { font-size: var(--mx-fs-3); margin: var(--mx-space-2) 0 0; }
+media-card .tags { color: var(--mx-muted); font-size: var(--mx-fs-1); }
+
+/* Controls */
+input, select, button, textarea { font: inherit; color: inherit; }
+select, input[type="text"], input[type="search"], input[type="number"],
+input[type="password"], textarea {
+  background: var(--mx-surface-1);
+  border: 1px solid var(--mx-border);
+  border-radius: var(--mx-radius-sm);
+  padding: var(--mx-space-2) var(--mx-space-3);
+}
+button {
+  background: var(--mx-accent); color: #fff; border: 0;
+  border-radius: var(--mx-radius-sm);
+  padding: var(--mx-space-2) var(--mx-space-4); cursor: pointer;
+  transition: filter var(--mx-dur) var(--mx-ease), box-shadow var(--mx-dur) var(--mx-ease);
+}
+button:hover { filter: brightness(1.1); box-shadow: var(--mx-glow); }
+button:disabled { filter: grayscale(0.6) opacity(0.6); cursor: not-allowed; }
+
+/* Quick-settings + upload tray */
+.qs { position: relative; }
+.qs #qs-btn { background: var(--mx-surface-2); }
+.qs #qs-pop {
+  position: absolute; right: 0; z-index: 20; min-width: 260px;
+  display: grid; gap: var(--mx-space-3); padding: var(--mx-space-4);
+}
+.qs #qs-pop label { display: grid; gap: var(--mx-space-1); }
+.upload-tray { padding: var(--mx-space-3); min-width: 220px; }
+.upload-tray .ut-title { font-size: var(--mx-fs-2); margin: 0 0 var(--mx-space-2); }
+.upload-tray ul { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--mx-space-2); }
+.upload-tray li { display: flex; gap: var(--mx-space-2); align-items: center; flex-wrap: wrap; }
+
+/* Toasts */
+.toast-stack { position: fixed; right: var(--mx-space-4); bottom: var(--mx-space-4); z-index: 50; display: grid; gap: var(--mx-space-2); }
+.toast {
+  padding: var(--mx-space-3) var(--mx-space-4); min-width: 220px; max-width: 360px;
+  animation: mx-toast-in var(--mx-dur) var(--mx-ease);
+}
+.toast-success { border-left: 4px solid #22c55e; }
+.toast-info { border-left: 4px solid var(--mx-accent-1); }
+.toast-error { border-left: 4px solid #ef4444; }
+@keyframes mx-toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* Skeletons (shimmer driven by motion tokens) */
+.skeleton-card { display: grid; gap: var(--mx-space-2); padding: var(--mx-space-3);
+  background: var(--mx-surface-2); border: 1px solid var(--mx-border); border-radius: var(--mx-radius); }
+.sk { background: linear-gradient(90deg, var(--mx-surface-2), var(--mx-surface-3), var(--mx-surface-2));
+  background-size: 200% 100%; border-radius: var(--mx-radius-sm); animation: mx-shimmer 1.2s infinite linear; }
+.sk-thumb { height: 120px; }
+.sk-line { height: 0.9rem; }
+.sk-line-lg { width: 80%; }
+.sk-line-sm { width: 50%; }
+@keyframes mx-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+/* High contrast */
+:root[data-high-contrast] { filter: contrast(1.25); }
 :root[data-high-contrast] a { text-decoration: underline; }
 
-/* Reduced motion: the explicit user setting. */
+/* Reduced motion: explicit user setting … */
 :root[data-reduced-motion] * {
   animation-duration: 0.001ms !important;
   animation-iteration-count: 1 !important;
   transition-duration: 0.001ms !important;
   scroll-behavior: auto !important;
 }
-/* Reduced motion: respect the OS preference too. */
+/* … and respect the OS preference too. */
 @media (prefers-reduced-motion: reduce) {
   * {
     animation-duration: 0.001ms !important;
@@ -24,7 +213,7 @@ body { font-size: calc(1rem * var(--mx-text-scale)); }
 }
 
 /* Always-visible focus for keyboard users (WCAG 2.4.7). */
-:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+:focus-visible { outline: 2px solid var(--mx-accent-1); outline-offset: 2px; }
 
 /* --- Sandboxed video player (Gate 5.3) chrome --- */
 video-player .vp-stage canvas { max-width: 100%; height: auto; background: #000; display: block; }
