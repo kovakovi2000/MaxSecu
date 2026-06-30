@@ -16,6 +16,7 @@ pub mod index;
 pub mod jobs;
 pub mod keystore;
 pub mod layout;
+pub mod ram;
 pub mod session;
 pub mod state;
 pub mod transport;

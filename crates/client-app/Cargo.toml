@@ -31,6 +31,10 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 base64 = "0.22"
+# Physical-RAM read for the in-memory decrypted-content cache sizing (the cap is
+# bounded to total-RAM − 6 GB). The ONLY new dependency in the UI-overhaul work;
+# flagged for `cargo deny`/`cargo audit`. Pure-Rust on Windows (no new C).
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
