@@ -24,16 +24,22 @@ use std::path::Path;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-    WAIT_TIMEOUT,
+    CloseHandle, LocalFree, SetHandleInformation, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
+    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+    GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
-use windows_sys::Win32::Security::{PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES};
+use windows_sys::Win32::Security::{
+    FreeSid, GetSecurityDescriptorSacl, ACL, DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION,
+    NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
     JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -171,6 +177,390 @@ fn appcontainer_pipe_security(sid: PSID) -> Result<*mut core::ffi::c_void, Spawn
         return Err(SpawnError::last("ConvertStringSecurityDescriptor"));
     }
     Ok(psd)
+}
+
+// ---------------------------------------------------------------------------
+// Scoped per-path ACL grant for a confined spawn (Task 2.1, media-sandbox).
+//
+// A capability-free, Low-IL AppContainer can only open a filesystem path if (a)
+// the path's DACL grants the container SID, and (b) for *write*, the object's
+// mandatory integrity label permits it (a default Medium-IL object blocks a
+// Low-IL subject's write-up). [`grant_path_to_appcontainer`] MERGES one allow ACE
+// for the container SID into the path's *existing* DACL (never clobbering it) and,
+// for the writable workspace case, drops the object to a Low integrity label so
+// the confined worker (Task 2.2's `ffmpeg.exe`) can read its copied-in input and
+// write its output while staying network-less / key-less / child-less. The
+// returned [`PathGrant`] is an RAII guard that restores the prior DACL (and the
+// prior label) on `Drop` — mirroring [`JobGuard`] — so an unwind mid-job cannot
+// leave a lingering grant on the user's filesystem.
+// ---------------------------------------------------------------------------
+
+/// Access to grant the confined AppContainer worker over a single path for one
+/// job. `ReadExecute` is for an input source the worker only reads (e.g. a
+/// copied-in media file); `ReadWrite` is for the per-job output workspace the
+/// confined transcoder reads from and writes into (and is additionally given a
+/// Low integrity label so the Low-IL worker can write to it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantAccess {
+    /// Read + execute (traverse). For a read-only input.
+    ReadExecute,
+    /// Read + write. For the writable output workspace; also gets a Low label.
+    ReadWrite,
+}
+
+impl GrantAccess {
+    /// The access-rights mask merged into the path's DACL for the container SID.
+    /// Generic rights (as used by the pipe descriptor's `GA`) — the OS maps them
+    /// to the file/directory-specific set at access-check time.
+    fn rights(self) -> u32 {
+        match self {
+            GrantAccess::ReadExecute => GENERIC_READ | GENERIC_EXECUTE,
+            GrantAccess::ReadWrite => GENERIC_READ | GENERIC_WRITE,
+        }
+    }
+
+    /// `ReadWrite` additionally needs a Low mandatory label so the Low-IL
+    /// AppContainer is not blocked writing up to a default Medium-IL object.
+    fn needs_low_label(self) -> bool {
+        matches!(self, GrantAccess::ReadWrite)
+    }
+}
+
+/// SDDL for a **Low** mandatory integrity label (`LW`) with the standard
+/// no-write-up policy (`NW`). Applied to a `ReadWrite` workspace so a Low-IL
+/// AppContainer subject can write to it (equal-level write is permitted; only
+/// subjects *below* Low are blocked).
+const LOW_LABEL_SDDL: &str = "S:(ML;;NW;;;LW)";
+
+/// RAII guard for a [`grant_path_to_appcontainer`] grant. On [`revoke`](Self::revoke)
+/// or `Drop` it restores the path's prior DACL (removing the merged container ACE)
+/// and, if it set one, the prior integrity label — best-effort, so a panicking job
+/// driver cannot leave the grant behind. Holds the captured prior security
+/// descriptor (which backs `prior_dacl`/`prior_sacl`) until it is freed.
+pub struct PathGrant {
+    /// The granted path, wide + NUL-terminated (for the restore call).
+    path: Vec<u16>,
+    /// Owned descriptor captured at grant time; backs `prior_dacl`/`prior_sacl`.
+    prior_sd: PSECURITY_DESCRIPTOR,
+    /// The path's DACL before the grant (may be null = no prior DACL).
+    prior_dacl: *mut ACL,
+    /// The path's label SACL before the grant (may be null = no prior label).
+    prior_sacl: *mut ACL,
+    /// Whether this grant applied a Low label that revoke must undo.
+    set_label: bool,
+    /// Set once the prior state has been restored, so `Drop` after an explicit
+    /// `revoke` is a no-op (no double-restore).
+    revoked: bool,
+}
+
+impl PathGrant {
+    /// Explicitly restore the path's prior DACL/label and free the captured
+    /// descriptor. `Drop` is the safety net; this returns the restore result for
+    /// callers that want to observe a restore failure.
+    pub fn revoke(mut self) -> Result<(), SpawnError> {
+        let r = self.do_revoke();
+        self.free();
+        r
+    }
+
+    /// Restore the prior DACL (and prior label, if we set one). Idempotent.
+    fn do_revoke(&mut self) -> Result<(), SpawnError> {
+        if self.revoked {
+            return Ok(());
+        }
+        self.revoked = true;
+        // Remove our merged ACE by re-applying exactly the captured prior DACL.
+        let dacl_res = restore_dacl(&self.path, self.prior_dacl);
+        // Then restore the prior integrity label, if this grant changed it.
+        let label_res = if self.set_label {
+            restore_label(&self.path, self.prior_sacl)
+        } else {
+            Ok(())
+        };
+        dacl_res.and(label_res)
+    }
+
+    /// Free the captured prior descriptor (after `do_revoke` has consumed the
+    /// `prior_dacl`/`prior_sacl` pointers that point into it). Idempotent.
+    fn free(&mut self) {
+        if !self.prior_sd.is_null() {
+            // SAFETY: `prior_sd` was LocalAlloc'd by GetNamedSecurityInfoW and is
+            // freed exactly once (the pointers into it are no longer used).
+            unsafe { LocalFree(self.prior_sd as _) };
+            self.prior_sd = ptr::null_mut();
+            self.prior_dacl = ptr::null_mut();
+            self.prior_sacl = ptr::null_mut();
+        }
+    }
+}
+
+impl Drop for PathGrant {
+    fn drop(&mut self) {
+        // Safety net: if the caller did not `revoke`, restore the prior state now
+        // so an unwind mid-job cannot leave the grant on the user's filesystem.
+        let _ = self.do_revoke();
+        self.free();
+    }
+}
+
+/// Free a SID returned by [`appcontainer_sid`]. Both `CreateAppContainerProfile`
+/// and `DeriveAppContainerSidFromAppContainerName` return an owned SID that must
+/// be released with [`FreeSid`].
+fn free_sid(sid: PSID) {
+    if !sid.is_null() {
+        // SAFETY: `sid` was produced by the AppContainer SID APIs above and is
+        // freed exactly once here.
+        unsafe { FreeSid(sid) };
+    }
+}
+
+/// Re-apply exactly `prior_dacl` to `wpath`'s DACL (a null `prior_dacl` reverts to
+/// the "no DACL" state the path had before the grant). Writes only DACL info.
+fn restore_dacl(wpath: &[u16], prior_dacl: *const ACL) -> Result<(), SpawnError> {
+    // SAFETY: `wpath` is a valid NUL-terminated wide path; `prior_dacl` is the
+    // captured prior DACL (or null); only DACL info is written.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            wpath.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            prior_dacl,
+            ptr::null(),
+        )
+    };
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(SpawnError {
+            ctx: "SetNamedSecurityInfo.restore_dacl",
+            code: err,
+        })
+    }
+}
+
+/// Restore the prior integrity label after a `ReadWrite` grant: re-apply the
+/// captured `prior_sacl` (or, if the object had no prior label, apply a NULL label
+/// SACL, which drops the Low label this grant added and reverts the object to its
+/// implicit Medium integrity). Writes only LABEL info.
+fn restore_label(wpath: &[u16], prior_sacl: *const ACL) -> Result<(), SpawnError> {
+    // SAFETY: `wpath` is valid; `prior_sacl` is the captured prior label SACL or
+    // null (null with LABEL info removes the explicit mandatory label).
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            wpath.as_ptr(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null(),
+            prior_sacl,
+        )
+    };
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(SpawnError {
+            ctx: "SetNamedSecurityInfo.restore_label",
+            code: err,
+        })
+    }
+}
+
+/// Apply the Low mandatory integrity label ([`LOW_LABEL_SDDL`]) to `wpath` so a
+/// Low-IL AppContainer can write to it. Reuses the SDDL→descriptor API, extracts
+/// the label SACL, and writes it via `LABEL_SECURITY_INFORMATION`.
+fn set_low_label(wpath: &[u16]) -> Result<(), SpawnError> {
+    let sddl = wide(LOW_LABEL_SDDL);
+    let mut psd: *mut core::ffi::c_void = ptr::null_mut();
+    // SAFETY: `sddl` is a valid NUL-terminated wide string; `psd` receives an
+    // owned (LocalAlloc'd) descriptor on success.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut psd,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(SpawnError::last("ConvertStringSecurityDescriptor.label"));
+    }
+    let mut present: windows_sys::core::BOOL = 0;
+    let mut sacl: *mut ACL = ptr::null_mut();
+    let mut defaulted: windows_sys::core::BOOL = 0;
+    // SAFETY: `psd` is the descriptor just built; the out-params are valid and the
+    // returned `sacl` points into `psd` (alive across the Set call below).
+    let got = unsafe { GetSecurityDescriptorSacl(psd, &mut present, &mut sacl, &mut defaulted) };
+    if got == 0 || present == 0 || sacl.is_null() {
+        // SAFETY: `psd` is the descriptor we just allocated; freed exactly once.
+        unsafe { LocalFree(psd) };
+        return Err(SpawnError::last("GetSecurityDescriptorSacl.label"));
+    }
+    // SAFETY: write only the label (SACL); `sacl` points into `psd`, alive here.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            wpath.as_ptr(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null(),
+            sacl,
+        )
+    };
+    // SAFETY: `psd` is freed exactly once after the label has been applied.
+    unsafe { LocalFree(psd) };
+    if err != 0 {
+        return Err(SpawnError {
+            ctx: "SetNamedSecurityInfo.label",
+            code: err,
+        });
+    }
+    Ok(())
+}
+
+/// Grant the capability-free AppContainer worker `access` to `path` (a file or a
+/// directory) for the lifetime of the returned [`PathGrant`]. The grant MERGES one
+/// allow ACE for the container SID into the path's existing DACL (preserving every
+/// existing ACE) and, for [`GrantAccess::ReadWrite`], also drops the object to a
+/// Low integrity label. A directory grant is made inheritable
+/// (`SUB_CONTAINERS_AND_OBJECTS_INHERIT`) so files the worker creates inside the
+/// workspace inherit the container's access. Dropping (or [`revoke`](PathGrant::revoke))
+/// the guard restores the path's prior DACL and label.
+pub fn grant_path_to_appcontainer(
+    path: &Path,
+    access: GrantAccess,
+) -> Result<PathGrant, SpawnError> {
+    let wpath = wide(&path.to_string_lossy());
+    let sid = appcontainer_sid()?;
+
+    // Capture the path's CURRENT DACL and label so revoke restores it exactly —
+    // we MERGE into the DACL, we never replace it.
+    let mut prior_dacl: *mut ACL = ptr::null_mut();
+    let mut prior_sacl: *mut ACL = ptr::null_mut();
+    let mut prior_sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `wpath` is a valid wide path; the out-params are valid; on success
+    // `prior_sd` owns a LocalAlloc'd descriptor backing `prior_dacl`/`prior_sacl`.
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            wpath.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut prior_dacl,
+            &mut prior_sacl,
+            &mut prior_sd,
+        )
+    };
+    if err != 0 {
+        free_sid(sid);
+        return Err(SpawnError {
+            ctx: "GetNamedSecurityInfo",
+            code: err,
+        });
+    }
+
+    // Build ONE allow ACE for the container SID, then MERGE it into the prior DACL
+    // (SetEntriesInAclW copies the existing ACEs into a fresh ACL — non-clobbering).
+    let mut trustee: TRUSTEE_W = unsafe { core::mem::zeroed() };
+    trustee.pMultipleTrustee = ptr::null_mut();
+    trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
+    trustee.TrusteeForm = TRUSTEE_IS_SID;
+    trustee.TrusteeType = TRUSTEE_IS_USER;
+    // For TRUSTEE_IS_SID, `ptstrName` carries the SID pointer (cast to PWSTR).
+    trustee.ptstrName = sid as windows_sys::core::PWSTR;
+
+    let mut ea: EXPLICIT_ACCESS_W = unsafe { core::mem::zeroed() };
+    ea.grfAccessPermissions = access.rights();
+    ea.grfAccessMode = GRANT_ACCESS;
+    // A directory grant is inheritable so files the worker creates in the
+    // workspace inherit the container's access (Task 2.2 writes outputs there); a
+    // single-file grant carries no inheritance.
+    ea.grfInheritance = if path.is_dir() {
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    } else {
+        NO_INHERITANCE
+    };
+    ea.Trustee = trustee;
+
+    let mut new_dacl: *mut ACL = ptr::null_mut();
+    // SAFETY: `ea` is fully initialized; `prior_dacl` is the captured DACL (may be
+    // null); `new_dacl` receives a LocalAlloc'd merged ACL on success.
+    let err = unsafe { SetEntriesInAclW(1, &ea, prior_dacl, &mut new_dacl) };
+    if err != 0 {
+        // SAFETY: `prior_sd` is the captured descriptor; freed once. No DACL was
+        // changed, so there is nothing to roll back.
+        unsafe { LocalFree(prior_sd as _) };
+        free_sid(sid);
+        return Err(SpawnError {
+            ctx: "SetEntriesInAcl",
+            code: err,
+        });
+    }
+
+    // Apply the merged DACL to the path.
+    // SAFETY: `new_dacl` is the merged ACL; only DACL info is written.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            wpath.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_dacl,
+            ptr::null(),
+        )
+    };
+    // SAFETY: `new_dacl` was LocalAlloc'd by SetEntriesInAclW; freed once now that
+    // it has been applied (the OS copied it into the object's security descriptor).
+    unsafe { LocalFree(new_dacl as _) };
+    if err != 0 {
+        // SAFETY: `prior_sd` freed once. The DACL set failed, so nothing to undo.
+        unsafe { LocalFree(prior_sd as _) };
+        free_sid(sid);
+        return Err(SpawnError {
+            ctx: "SetNamedSecurityInfo.dacl",
+            code: err,
+        });
+    }
+
+    // For a writable workspace, drop the object to a Low integrity label so the
+    // Low-IL AppContainer worker can write to it.
+    let mut set_label = false;
+    if access.needs_low_label() {
+        if let Err(e) = set_low_label(&wpath) {
+            // Roll back the DACL grant we just applied before failing.
+            let _ = restore_dacl(&wpath, prior_dacl);
+            // SAFETY: `prior_sd` freed once after its `prior_dacl` was consumed.
+            unsafe { LocalFree(prior_sd as _) };
+            free_sid(sid);
+            return Err(e);
+        }
+        set_label = true;
+    }
+
+    free_sid(sid);
+    Ok(PathGrant {
+        path: wpath,
+        prior_sd,
+        prior_dacl,
+        prior_sacl,
+        set_label,
+        revoked: false,
+    })
+}
+
+/// The capability-free AppContainer SID as its `S-1-…` string. Test/diagnostic
+/// support for asserting an ACE targets exactly this container; not on the hot
+/// path. (The SID is derived, stringified, and freed within the call.)
+pub fn appcontainer_sid_string() -> Result<String, SpawnError> {
+    let sid = appcontainer_sid()?;
+    let r = sid_to_string(sid);
+    free_sid(sid);
+    r
 }
 
 /// Make an inheritable pipe (with the AppContainer-granting security descriptor)

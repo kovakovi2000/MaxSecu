@@ -41,7 +41,10 @@ use zeroize::Zeroize;
 #[cfg(windows)]
 mod win32;
 #[cfg(windows)]
-pub use win32::{ConfinedOutput, SpawnError};
+pub use win32::{
+    appcontainer_sid_string, grant_path_to_appcontainer, ConfinedOutput, GrantAccess, PathGrant,
+    SpawnError,
+};
 
 /// Default per-worker memory cap (decompression-bomb hard kill, media-sandbox §3).
 pub const DEFAULT_WORKER_MEMORY_CAP_BYTES: u64 = 512 * 1024 * 1024;
