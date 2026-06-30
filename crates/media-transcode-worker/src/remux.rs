@@ -430,6 +430,17 @@ fn build_video_trak(
     let dinf = dinf_box();
 
     // stsd > av01 (VisualSampleEntry; NO av1C — the seq-header OBU is in-band).
+    //
+    // D-7 even-dimension / SAR handling: `w`/`h` are the AV1 CODED dimensions demuxed
+    // from ffmpeg's output, which the ingest `scale` filter has already coerced EVEN
+    // (`scale=trunc(iw/2)*2:trunc(ih/2)*2` / `-2:<h>` / even Custom) — AV1 4:2:0 requires
+    // even dims. The VisualSampleEntry width/height ARE those even coded dims, and we
+    // deliberately write NO `pasp` (pixel-aspect) box and a UNITY tkhd matrix: an odd
+    // source's display aspect is preserved by the even-coercion itself (a <0.2% rounding,
+    // e.g. 643x363 → 642x362), so the canonical fragment is SQUARE-PIXEL at the coded
+    // dims and the viewer (WebGL YUV, square pixels) renders the display aspect directly —
+    // there is no separate SAR to carry. ffmpeg's intermediate container SAR is NOT read
+    // or propagated (only `v.width`/`v.height` cross into the re-mux).
     let mut av01 = Vec::new();
     av01.extend_from_slice(&[0u8; 6]); // SampleEntry reserved
     av01.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index

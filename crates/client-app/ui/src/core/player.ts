@@ -42,8 +42,12 @@ export interface PcmDto {
 }
 
 // Backend player phase (kebab-tagged), surfaced to the component via onPhase.
+// `gap` is a BENIGN, non-terminal notice that the decode dropped `skipped` fragment(s)
+// or frame(s) (resilient-driver respawn, or the D-7 in-flight bound) — count-only, no
+// oracle. The player keeps going; the component may show a brief "skipped" hint.
 export type PlayerPhase =
   | { phase: "buffering" | "playing" | "stalled" | "codec-unavailable" }
+  | { phase: "gap"; skipped: number }
   | { phase: "error"; code: string };
 
 // A decoded frame: render planes plus the presentation timestamp we sync on.
@@ -99,6 +103,12 @@ export interface PlayerOptions {
   reducedMotion: boolean;
   // Max decoded frames retained for instant local scrub (default 16).
   ringCapacity?: number;
+  // Max decoded frames held in the pending (awaiting-pts) queue (default 96). A whole
+  // window's frames arrive together (a burst); this BOUNDS the WebView's decoded-frame
+  // memory so an extreme (4K+) clip can't accumulate unbounded I420 planes. Over the cap
+  // the OLDEST pending frame is dropped (counted toward dropped) — the same catch-up
+  // posture tick() already uses for stale frames.
+  pendingCapacity?: number;
   // Master clock in SECONDS; defaults to audio.currentTime. Injectable so tests
   // drive sync deterministically.
   audioClock?: () => number;
@@ -186,6 +196,7 @@ export function createPlayer(opts: PlayerOptions): Player {
   const subscribe: Subscribe = opts.subscribe ?? on;
   const reducedMotion = opts.reducedMotion;
   const ringCapacity = Math.max(1, opts.ringCapacity ?? 16);
+  const pendingCapacity = Math.max(1, opts.pendingCapacity ?? 96);
   const maxGain = opts.maxGain ?? 1;
   const toleranceSec = (opts.toleranceMs ?? 8) / 1000;
   const audioClock = opts.audioClock ?? (() => audio.currentTime);
@@ -269,6 +280,15 @@ export function createPlayer(opts: PlayerOptions): Player {
       v: decodeBase64(dto.v_b64),
     };
     pending.push(frame);
+    // Bound the pending queue: a window's frames arrive together (a burst), so without a
+    // cap the WebView could accumulate unbounded decoded I420 planes for an extreme (4K+)
+    // clip. Over the cap, drop the OLDEST pending frame (count it) — the catch-up posture
+    // tick() uses for stale frames. The client-app already bounds frames-per-fragment
+    // before they cross the seam; this is the WebView-side backstop (D-7).
+    while (pending.length > pendingCapacity) {
+      pending.shift();
+      droppedCount++;
+    }
     pushRing(frame);
     // Autostart on the first frame unless reduced-motion asked us to hold.
     if (!started) {

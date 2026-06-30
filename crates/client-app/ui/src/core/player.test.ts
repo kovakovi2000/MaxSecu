@@ -419,6 +419,62 @@ test("ring is bounded, evicts oldest, and scrubTo draws the nearest frame", () =
   assert.strictEqual(drawn[1].pts_ms, 200);
 });
 
+// ---- bounded pending queue (D-7) -----------------------------------------
+
+test("bounds the pending queue: a burst beyond the cap drops the oldest", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: true, // no autoplay/tick drain — isolate the bound
+    pendingCapacity: 4,
+    audioClock: () => clock,
+  });
+
+  // A burst of 10 frames at increasing window-relative pts. reducedMotion holds the
+  // tick loop, so they all land in pending and the cap must shed the 6 oldest.
+  for (let i = 0; i < 10; i++) bus.emit(EVT_VIDEO_FRAME, frameDto(i * 10));
+  assert.strictEqual(player.stats().dropped, 6, "6 oldest dropped to keep the newest 4");
+
+  // Drain far in the future: only the latest DUE frame is drawn (catch-up), the other 3
+  // retained are dropped as stale — the queue never grew unbounded.
+  player.play();
+  clock = 1000;
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "one frame drawn after catch-up");
+  assert.strictEqual(drawn[0].pts_ms, 90, "the NEWEST retained frame survives");
+  assert.strictEqual(player.stats().dropped, 9, "6 over-cap + 3 stale = 9 dropped");
+});
+
+test("under the pending cap nothing is dropped and sync is intact", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    pendingCapacity: 8,
+    audioClock: () => clock,
+  });
+  player.play();
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  bus.emit(EVT_VIDEO_FRAME, frameDto(100));
+  clock = 0;
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "pts=0 due, pts=100 held");
+  clock = 0.1;
+  player.tick();
+  assert.strictEqual(drawn.length, 2, "pts=100 releases in sync");
+  assert.strictEqual(player.stats().dropped, 0, "nothing dropped under the cap");
+});
+
 // ---- seek ----------------------------------------------------------------
 
 test("seek clears the pending queue and notifies onSeek", () => {

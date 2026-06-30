@@ -262,6 +262,84 @@ fn ffmpeg_output_remuxes_to_canonical_av1_aac_cmaf() {
     assert!(pcm_pkts >= 1, "at least one decoded PCM packet");
 }
 
+/// D-7 (Task 6.1): an ODD-dimension source must round-trip at EVEN decode dims. The
+/// ingest `scale` filter coerces odd W/H to even (AV1 4:2:0 requires it), so a 643x363
+/// source becomes 642x362; the canonical fragment carries those even coded dims with NO
+/// `pasp`/SAR box (square pixels — the even-coercion preserves the display aspect to a
+/// <0.2% rounding). We prove the canonical fragment decodes through the REAL VideoSession
+/// at exactly the even-coerced geometry and that chunk-alignment still holds.
+#[test]
+fn odd_dimension_source_round_trips_at_even_decode_dims() {
+    // 643x363 is odd on BOTH axes; the canonical even coercion floors each to even.
+    let (ow, oh) = (643u32, 363u32);
+    let (ew, eh) = (ow - ow % 2, oh - oh % 2); // 642x362
+    let Some(source) = common::make_ffmpeg_source(ow, oh, 1, 24) else {
+        eprintln!(
+            "SKIP odd_dimension_source_round_trips_at_even_decode_dims: vendored ffmpeg.exe \
+             not found at <crate>/../../vendor/ffmpeg/ffmpeg.exe"
+        );
+        return;
+    };
+
+    let out = transcode(&req(source)).expect("transcode re-muxes the odd-dim source");
+
+    // Chunk-alignment + contiguity still hold for the odd→even source.
+    assert!(!out.fragments.is_empty(), "at least one fragment");
+    assert_eq!(out.cmaf.len() % TRANSCODE_CHUNK_SIZE, 0, "cmaf chunk-aligned");
+    for (k, fr) in out.fragments.iter().enumerate() {
+        assert_eq!(fr.seq, k as u32, "seq dense 0..N");
+        if k > 0 {
+            let prev = &out.fragments[k - 1];
+            assert_eq!(
+                fr.chunk_start,
+                prev.chunk_start + prev.chunk_len,
+                "fragments contiguous"
+            );
+        }
+    }
+
+    let frags = fragment_slices(&out);
+    let n_frags = frags.len();
+
+    // Every decoded frame is at the EVEN coerced geometry (even W and H), proving the
+    // odd source was coerced and the canonical av01 geometry is the even coded dims.
+    let (frames, eofs) = on_big_stack(move || {
+        let mut session = VideoSession::new();
+        assert_eq!(
+            session.feed(ClientMsg::Open {
+                bounds: VideoBounds::default()
+            }),
+            vec![WorkerMsg::Ready],
+        );
+        let (mut frames, mut eofs) = (0usize, 0usize);
+        for (i, frag) in frags.iter().enumerate() {
+            for m in session.feed(ClientMsg::Fragment {
+                seq: i as u32,
+                bytes: frag.clone(),
+            }) {
+                match m {
+                    WorkerMsg::Video(f) => {
+                        assert_eq!((f.width, f.height), (ew, eh), "even-coerced decode dims");
+                        assert_eq!(f.width % 2, 0, "even width");
+                        assert_eq!(f.height % 2, 0, "even height");
+                        frames += 1;
+                    }
+                    WorkerMsg::Audio(_) => {}
+                    WorkerMsg::EndOfFragment { .. } => eofs += 1,
+                    WorkerMsg::Error(e) => panic!("VideoSession decode error: {e:?}"),
+                    WorkerMsg::Ready => panic!("unexpected extra Ready"),
+                }
+            }
+        }
+        assert!(session.feed(ClientMsg::Close).is_empty());
+        (frames, eofs)
+    });
+
+    assert_eq!(eofs, n_frags, "one EndOfFragment per fragment");
+    assert!(frames >= 1, "decoded at least one frame at {ew}x{eh}");
+    eprintln!("PASS odd {ow}x{oh} → even {ew}x{eh}: {frames} frame(s), {n_frags} fragment(s)");
+}
+
 #[test]
 fn rejects_hostile_input_without_panic() {
     // Random garbage is not an MP4 → DecodeFailed, never a panic.

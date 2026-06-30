@@ -85,6 +85,17 @@ const PLAY_WINDOW: u32 = 4;
 /// WebAudio in Gate 5). Keeps a hand-set value in a sane range.
 const MAX_GAIN: f32 = 4.0;
 
+/// D-7 backpressure: ceiling (bytes) on the DECODED I420 frames buffered for ONE
+/// fragment before the window-offset flush (Part C). One 4K I420 frame is ~12.4 MB and
+/// a high-res closed GOP can be dozens of frames (~600 MB), so buffering a whole such
+/// fragment in the KEY-HOLDING process is the real OOM risk for an EXTREME source. We
+/// cap the buffer and, when a fragment's decoded frames exceed it, DROP the oldest
+/// (count-only, surfaced as a benign [`PlayerPhase::Gap`]) so an extreme clip degrades
+/// to a brief frame-skip instead of exhausting RAM — never a hang/crash, no oracle.
+/// ~64 MiB holds ~5 frames at 4K (or one whole 8K frame ~50 MB) and ~20 at 1080p —
+/// ample for normal content, a hard backstop for extreme content.
+const MAX_FRAME_BUF_BYTES: usize = 64 * 1024 * 1024;
+
 /// One re-validated decoded I420 frame, base64-per-plane — the ONLY video payload
 /// that crosses the Tauri seam (the UI uploads the planes to a WebGL texture in
 /// Gate 5). Carries NO key material; RAM-only pixels.
@@ -326,6 +337,37 @@ fn window_offset_ms(index: &[FragmentEntry], seq: u32, window_start_pts: u64) ->
         .unwrap_or(0)
 }
 
+/// Decoded-frame byte size of one I420 frame (its three planes).
+fn frame_bytes(f: &I420Frame) -> usize {
+    f.y.len() + f.u.len() + f.v.len()
+}
+
+/// Push `frame` onto the per-fragment decode buffer, then DROP the OLDEST buffered
+/// frame(s) while the buffered decoded-frame bytes exceed `budget` (always retaining at
+/// least the most recent frame). Returns how many were dropped. This BOUNDS the in-flight
+/// decoded-frame RAM in the key-holding process for an EXTREME (4K+ / high-frame-count)
+/// source: a hostile GOP degrades to a benign frame-skip (surfaced by the caller as
+/// [`PlayerPhase::Gap`]) instead of OOM. The bound is enforced ON EACH PUSH, before the
+/// buffer can grow past `budget` + one frame — never after unbounded accumulation.
+/// Window-offset correctness is unaffected: the seq (hence the offset) comes from
+/// `EndOfFragment`, and every SURVIVING frame keeps its own fragment-relative pts.
+fn push_bounded(
+    buf: &mut Vec<I420Frame>,
+    buf_bytes: &mut usize,
+    frame: I420Frame,
+    budget: usize,
+) -> u32 {
+    *buf_bytes += frame_bytes(&frame);
+    buf.push(frame);
+    let mut dropped = 0u32;
+    while *buf_bytes > budget && buf.len() > 1 {
+        let old = buf.remove(0);
+        *buf_bytes -= frame_bytes(&old);
+        dropped += 1;
+    }
+    dropped
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn decode_and_emit<D, E, OnF, OnA>(
     script: ScriptGuard,
@@ -384,14 +426,29 @@ where
     // that fragment's window offset applied (`emitted = base + worker_pts`). Any frames
     // left unflushed at the end (a fragment aborted mid-decode with no `EndOfFragment`,
     // i.e. a skipped culprit) are dropped — their seq, hence their offset, is unknown.
+    //
+    // D-7 BACKPRESSURE: the per-fragment `frame_buf` is BOUNDED to `MAX_FRAME_BUF_BYTES`
+    // ([`push_bounded`]). An extreme (4K+ / high-frame-count) GOP whose decoded frames
+    // would exceed that ceiling drops its OLDEST buffered frames rather than holding
+    // hundreds of MB in the key-holding process; the drop count is surfaced once at the
+    // end as a benign count-only `Gap` (no oracle). Audio chunks stay (small — bounded by
+    // the Task-5.1 expansion ceiling). Dropping frames does NOT perturb the window offset:
+    // `base` is keyed on the `EndOfFragment` seq and each surviving frame keeps its own pts.
     let bounds = VideoBounds::default();
     let mut frame_buf: Vec<I420Frame> = Vec::new();
+    let mut frame_buf_bytes = 0usize;
     let mut audio_buf: Vec<PcmChunk> = Vec::new();
+    let mut dropped_frames = 0u32;
     for msg in outcome.msgs {
         match msg {
             WorkerMsg::Video(frame) => {
                 validate_i420(&frame, &bounds).map_err(|_| player_err())?;
-                frame_buf.push(frame);
+                dropped_frames += push_bounded(
+                    &mut frame_buf,
+                    &mut frame_buf_bytes,
+                    frame,
+                    MAX_FRAME_BUF_BYTES,
+                );
             }
             WorkerMsg::Audio(chunk) => {
                 validate_pcm(&chunk, &bounds).map_err(|_| player_err())?;
@@ -405,6 +462,7 @@ where
                     dto.pts_ms = base.saturating_add(frame.pts_ms);
                     on_frame(dto);
                 }
+                frame_buf_bytes = 0;
                 for chunk in audio_buf.drain(..) {
                     let mut dto = pcm_dto(&chunk);
                     dto.pts_ms = base.saturating_add(chunk.pts_ms);
@@ -413,6 +471,15 @@ where
             }
             WorkerMsg::Ready => {}
         }
+    }
+
+    // Surface frames dropped by the in-flight bound MINIMALLY: one benign, non-terminal
+    // `Gap` carrying only the COUNT (no decode oracle / per-frame detail), the same channel
+    // the resilient-driver fragment skip uses.
+    if dropped_frames > 0 {
+        emit(PlayerPhase::Gap {
+            skipped: dropped_frames,
+        });
     }
 
     emit(PlayerPhase::Playing);
@@ -1444,6 +1511,153 @@ mod tests {
             pts[3], 1000,
             "fragment 1 starts at its window-relative index offset, not back at 0"
         );
+    }
+
+    /// A valid I420 frame of arbitrary even-ish dims (chroma = ceil/2), used to
+    /// exercise the in-flight byte bound with realistically-large decoded frames.
+    fn big_frame(w: u32, h: u32, pts_ms: u64) -> I420Frame {
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        I420Frame {
+            width: w,
+            height: h,
+            pts_ms,
+            y: vec![0u8; (w * h) as usize],
+            u: vec![0u8; (cw * ch) as usize],
+            v: vec![0u8; (cw * ch) as usize],
+        }
+    }
+
+    /// Fake decoder that emits MANY large frames inside ONE fragment (fragment-relative
+    /// pts k*step), then its `EndOfFragment` — the D-7 extreme-source shape (a high-res /
+    /// high-frame-count GOP) the in-flight bound must contain.
+    struct BurstDecoder {
+        count: u32,
+        w: u32,
+        h: u32,
+        step_ms: u64,
+    }
+    impl VideoSessionDecoder for BurstDecoder {
+        fn run_session(&self, _script: &[ClientMsg]) -> Result<Vec<WorkerMsg>, SessionError> {
+            let mut out = vec![WorkerMsg::Ready];
+            for k in 0..self.count {
+                out.push(WorkerMsg::Video(big_frame(self.w, self.h, k as u64 * self.step_ms)));
+            }
+            out.push(WorkerMsg::EndOfFragment { seq: 0 });
+            Ok(out)
+        }
+    }
+
+    /// D-7 (6.2): `push_bounded` drops the OLDEST buffered frames once the budget is
+    /// exceeded, keeps at least the newest, returns the drop count, and never lets the
+    /// buffer grow past `budget + one frame` — the bound is enforced ON EACH PUSH.
+    #[test]
+    fn push_bounded_caps_the_buffer_and_drops_oldest() {
+        // Tiny frames (1 byte/plane region) so the test is allocation-light: each 2x2
+        // frame is 4 + 1 + 1 = 6 bytes. Budget = 18 bytes ⇒ holds 3 frames.
+        let budget = 18usize;
+        let mut buf: Vec<I420Frame> = Vec::new();
+        let mut bytes = 0usize;
+        let mut dropped = 0u32;
+        for pts in 0..6u64 {
+            dropped += push_bounded(&mut buf, &mut bytes, ok_frame(pts), budget);
+            // The invariant: bytes never exceeds budget once more than one frame is held.
+            assert!(bytes <= budget || buf.len() == 1, "bounded on each push");
+        }
+        // 6 pushed, 3 retained, 3 dropped; the survivors are the NEWEST (pts 3,4,5).
+        assert_eq!(buf.len(), 3);
+        assert_eq!(dropped, 3);
+        assert_eq!(
+            buf.iter().map(|f| f.pts_ms).collect::<Vec<_>>(),
+            vec![3, 4, 5],
+            "oldest dropped, newest survive"
+        );
+        assert_eq!(bytes, 18, "byte accounting tracks the retained frames");
+    }
+
+    /// A single frame never gets dropped even if it alone exceeds the budget — there is
+    /// always at least one frame to render (fail-safe, not a stall).
+    #[test]
+    fn push_bounded_keeps_at_least_one_frame() {
+        let mut buf: Vec<I420Frame> = Vec::new();
+        let mut bytes = 0usize;
+        let dropped = push_bounded(&mut buf, &mut bytes, ok_frame(7), 1);
+        assert_eq!(dropped, 0);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0].pts_ms, 7);
+    }
+
+    /// D-7 (6.2) end-to-end through `decode_and_emit`: an extreme GOP whose decoded
+    /// frames exceed `MAX_FRAME_BUF_BYTES` is BOUNDED in the key-holding process — the
+    /// excess is dropped, a benign count-only `Gap{skipped}` is surfaced, and the
+    /// surviving frames still flow with correct window-relative pts. No OOM, no oracle.
+    #[tokio::test]
+    async fn decode_and_emit_bounds_inflight_frames_and_surfaces_gap() {
+        // 1280x720 I420 frame = 921600 + 230400 + 230400 = 1,382,400 bytes. The 64 MiB
+        // budget holds exactly 48 such frames (48 fit, 49 do not), so a 60-frame GOP
+        // drops 12 and emits 48.
+        let fb = 1280usize * 720 + 2 * (640 * 360);
+        let budget_frames = MAX_FRAME_BUF_BYTES / fb; // 48
+        let count = (budget_frames + 12) as u32; // 60
+        let frag_index = vec![FragmentEntry {
+            seq: 0,
+            pts_ms: 0,
+            chunk_start: 0,
+            chunk_len: 1,
+        }];
+        let script = ScriptGuard(vec![
+            ClientMsg::Open {
+                bounds: VideoBounds::default(),
+            },
+            ClientMsg::Fragment {
+                seq: 0,
+                bytes: Vec::new(),
+            },
+            ClientMsg::Close,
+        ]);
+        let phases: RefCell<Vec<PlayerPhase>> = RefCell::new(Vec::new());
+        let frames: RefCell<Vec<I420FrameDto>> = RefCell::new(Vec::new());
+        decode_and_emit(
+            script,
+            BurstDecoder {
+                count,
+                w: 1280,
+                h: 720,
+                step_ms: 33,
+            },
+            frag_index,
+            0,
+            &|p| phases.borrow_mut().push(p),
+            &|f| frames.borrow_mut().push(f),
+            &|_a| {},
+        )
+        .await
+        .expect("decodes within the bound");
+
+        let emitted = frames.borrow().len();
+        let dropped = count as usize - emitted;
+        assert_eq!(emitted, budget_frames, "in-flight buffer bounded to the budget");
+        assert_eq!(dropped, 12, "the excess frames were dropped, not held");
+        // A benign count-only Gap carries exactly the drop count (no oracle/detail).
+        assert!(
+            phases.borrow().contains(&PlayerPhase::Gap {
+                skipped: dropped as u32,
+            }),
+            "Gap{{skipped}} surfaced with the drop count"
+        );
+        assert_eq!(
+            phases.borrow().last(),
+            Some(&PlayerPhase::Playing),
+            "Playing still emitted last"
+        );
+        // The SURVIVING frames are the newest of the GOP and keep window-relative,
+        // monotonic pts (= base 0 + their own fragment-relative pts). The first survivor
+        // is frame index 12 (pts 12*33), proving the OLDEST were the ones dropped.
+        let pts: Vec<u64> = frames.borrow().iter().map(|f| f.pts_ms).collect();
+        assert_eq!(pts[0], 12 * 33, "oldest frames dropped; newest survive");
+        for w in pts.windows(2) {
+            assert!(w[1] >= w[0], "surviving pts monotonic");
+        }
     }
 
     /// M1: a `feed_fragment` error mid-window still returns through the
