@@ -31,7 +31,7 @@
 //!    cached, decrypted in the TCB, decoded in the **confined session**
 //!    (`AppContainerVideoSession` on Windows / `VideoSubprocessSession` elsewhere),
 //!    and every worker frame RE-VALIDATED (`validate_i420`) back to the source dims
-//!    (16×16).
+//!    (64×64).
 //! 4. **Seek** — `fragment_for_time` maps a later pts to its fragment; playing that
 //!    window fetches + decodes exactly the mapped fragment.
 //! 5. **Back-seek hits the ciphertext cache (NO re-fetch)** — re-playing an
@@ -747,7 +747,7 @@ async fn phase7_video_author_to_view_over_real_tls() {
     let mut cache = FragmentCache::open(&cache_dir, 8 * 1024 * 1024).unwrap();
 
     // (f) play the initial bounded window through the CONFINED decode session +
-    //     re-validate every frame back to the source dims (16x16).
+    //     re-validate every frame back to the source dims (64x64).
     let mut fetch_count = 0u32;
     let window0_frames = play_window(
         &mut c,

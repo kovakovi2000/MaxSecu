@@ -172,7 +172,18 @@ pub fn prepare_video_streams(
         return Err(video_prep_err());
     }
 
-    // 5) Read ffmpeg's outputs from the granted dir; both must exist + be non-empty.
+    // 5) Read ffmpeg's outputs from the granted dir; both must exist, be non-empty,
+    //    and sit within the re-mux worker's accept ceiling. The size pre-check fails
+    //    closed BEFORE allocating an arbitrarily large `out.mp4` only for the worker's
+    //    framed codec to reject it past MAX_FRAME_BYTES — a self-OOM guard on large
+    //    sources (full large-source streaming is a deferred residual). A missing file
+    //    makes `metadata` error → `over_cap` true → fail closed (covers "must exist").
+    let cap = maxsecu_media_launcher::framing::MAX_FRAME_BYTES as u64;
+    let over_cap =
+        |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len() > cap).unwrap_or(true);
+    if over_cap(&out_mp4) || over_cap(&thumb_png) {
+        return Err(video_prep_err());
+    }
     let out_mp4_bytes = std::fs::read(&out_mp4).map_err(|_| video_prep_err())?;
     let thumb_png_bytes = std::fs::read(&thumb_png).map_err(|_| video_prep_err())?;
     if out_mp4_bytes.is_empty() || thumb_png_bytes.is_empty() {
