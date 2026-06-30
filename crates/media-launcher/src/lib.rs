@@ -38,6 +38,9 @@ use std::process::{Command, Stdio};
 
 use zeroize::Zeroize;
 
+pub mod ffmpeg_args;
+pub use ffmpeg_args::build_ffmpeg_args;
+
 pub mod transcode_opts;
 pub use transcode_opts::{Bitrate, Resolution, TranscodeOptions};
 
