@@ -143,11 +143,17 @@ pub struct CardDto {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CardRequest {
     pub file_id: String,
+    /// The version the feed already knows (D35 listing). When present, a cache hit
+    /// needs zero network. Absent → the command learns it from the §8.5 view.
+    #[serde(default)]
+    pub version: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpenContentRequest {
     pub file_id: String,
+    #[serde(default)]
+    pub version: Option<u64>,
 }
 
 /// The verified, decrypted content to display. Exactly one of `image_png_b64` /

@@ -117,11 +117,12 @@ pub async fn open_content(
     dir: State<'_, AppDir>,
     session: State<'_, Session>,
     connect_lock: State<'_, ConnectLock>,
+    cache: State<'_, crate::content_cache::ContentCache>,
 ) -> Result<OpenedContentDto, UiError> {
     let emit = |p: FetchPhase| {
         let _ = app.emit(EVT_FETCH, p);
     };
-    let out = open_content_inner(&req, &dir, &session, &connect_lock, &emit).await;
+    let out = open_content_inner(&req, &dir, &session, &connect_lock, &cache, &emit).await;
     if let Err(e) = &out {
         emit(FetchPhase::Failed {
             file_id: req.file_id.clone(),
@@ -136,12 +137,22 @@ async fn open_content_inner(
     dir: &State<'_, AppDir>,
     session: &State<'_, Session>,
     connect_lock: &State<'_, ConnectLock>,
+    cache: &State<'_, crate::content_cache::ContentCache>,
     emit: &impl Fn(FetchPhase),
 ) -> Result<OpenedContentDto, UiError> {
     // Validate the REQUESTED id up front: this is the id the served record must
     // bind to (see `run_open`), and it also rejects a malformed id before it is
     // interpolated into the request URL.
     let file_id = hex16(&req.file_id)?;
+    use crate::content_cache::{CacheKey, CachedMeta};
+    if let Some(v) = req.version {
+        if let Some(dto) = cache.get_content(CacheKey { file_id, version: v }, &req.file_id) {
+            emit(FetchPhase::Ready {
+                file_id: req.file_id.clone(),
+            });
+            return Ok(dto);
+        }
+    }
     let pinned = load_directory_pub(&dir.0)?;
     let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
@@ -172,6 +183,16 @@ async fn open_content_inner(
         return Err(UiError::new("fetch_failed", "That item is not available."));
     }
     let view = parse_file_view(&view_json)?;
+    if req.version.is_none() {
+        if let Some(dto) =
+            cache.get_content(CacheKey { file_id, version: view.version }, &req.file_id)
+        {
+            emit(FetchPhase::Ready {
+                file_id: req.file_id.clone(),
+            });
+            return Ok(dto);
+        }
+    }
     let manifest: Manifest =
         decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
     let author = resolve_and_verify_author(
@@ -215,6 +236,18 @@ async fn open_content_inner(
         file_id: req.file_id.clone(),
     });
     let (image_png_b64, blog_text) = shape_content(manifest.file_type, &opened.streams)?;
+    // Display-final content bytes for the cache (so a hit == a fresh decrypt):
+    // image → the raw canonical-PNG content plaintext (cache re-base64s it);
+    // blog → the already-sanitized `blog_text` bytes (NOT the raw plaintext).
+    let cache_content: Option<Vec<u8>> = match manifest.file_type {
+        FileType::Image => opened
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .map(|s| s.plaintext.clone()),
+        FileType::Blog => blog_text.as_ref().map(|t| t.clone().into_bytes()),
+        FileType::Video => None,
+    };
     let (title, tags) = opened
         .streams
         .iter()
@@ -225,6 +258,26 @@ async fn open_content_inner(
     emit(FetchPhase::Ready {
         file_id: req.file_id.clone(),
     });
+
+    if let Some(content) = cache_content {
+        cache.put_content(
+            CacheKey {
+                file_id,
+                version: opened.version,
+            },
+            CachedMeta {
+                file_type: file_type_name(manifest.file_type),
+                title: title.clone(),
+                tags: tags.clone(),
+                thumbnail_b64: None,
+                author_fp: hex(&author.fingerprint[..8]),
+                recovery_ok: opened.recovery_grant_ok,
+                mine: my_id == author.user_id,
+            },
+            content,
+        );
+    }
+
     Ok(OpenedContentDto {
         file_id: req.file_id.clone(),
         file_type: file_type_name(manifest.file_type),

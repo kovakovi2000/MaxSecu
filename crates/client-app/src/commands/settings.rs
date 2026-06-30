@@ -20,10 +20,13 @@ pub async fn get_settings(dir: State<'_, AppDir>) -> Result<SettingsConfig, UiEr
 pub async fn set_settings(
     settings: SettingsConfig,
     dir: State<'_, AppDir>,
+    cache: State<'_, crate::content_cache::ContentCache>,
 ) -> Result<SettingsConfig, UiError> {
     let norm = settings.normalized();
     norm.save(&dir.0)
         .map_err(|_| UiError::new("settings_failed", "Could not save settings."))?;
+    // Apply the (normalized) RAM-cache cap live: a smaller cap evicts now.
+    cache.set_cap(norm.performance.ram_cache_cap_mb as usize * 1024 * 1024);
     Ok(norm)
 }
 

@@ -171,6 +171,7 @@ pub async fn decrypt_card(
     dir: State<'_, AppDir>,
     session: State<'_, Session>,
     connect_lock: State<'_, ConnectLock>,
+    cache: State<'_, crate::content_cache::ContentCache>,
 ) -> Result<crate::dto::CardDto, UiError> {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
@@ -180,6 +181,13 @@ pub async fn decrypt_card(
     use maxsecu_encoding::types::StreamType;
 
     let file_id = hex16(&req.file_id)?;
+    use crate::content_cache::{CacheKey, CachedMeta};
+    // Zero-network hit when the caller passed the version it already knows.
+    if let Some(v) = req.version {
+        if let Some(card) = cache.get_card(CacheKey { file_id, version: v }, &req.file_id) {
+            return Ok(card);
+        }
+    }
     let pinned = crate::config::load_directory_pub(&dir.0)?;
     let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
@@ -206,6 +214,13 @@ pub async fn decrypt_card(
         return Err(UiError::new("fetch_failed", "That item is not available."));
     }
     let view = crate::download::parse_file_view(&view_json)?;
+    if req.version.is_none() {
+        if let Some(card) =
+            cache.get_card(CacheKey { file_id, version: view.version }, &req.file_id)
+        {
+            return Ok(card);
+        }
+    }
     let manifest: Manifest =
         decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
 
@@ -288,6 +303,22 @@ pub async fn decrypt_card(
             }
         }
     }
+
+    cache.put_card(
+        CacheKey {
+            file_id,
+            version: opened.version,
+        },
+        CachedMeta {
+            file_type: card.file_type.clone(),
+            title: card.title.clone(),
+            tags: card.tags.clone(),
+            thumbnail_b64: card.thumbnail_b64.clone(),
+            author_fp: card.author_fp.clone(),
+            recovery_ok: card.recovery_ok,
+            mine: card.mine,
+        },
+    );
     Ok(card)
 }
 
