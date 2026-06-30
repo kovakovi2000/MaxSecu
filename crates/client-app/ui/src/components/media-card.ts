@@ -10,18 +10,22 @@ import "./state-badge.ts";
 export class MediaCard extends HTMLElement {
   connectedCallback() {
     const id = this.getAttribute("file-id") ?? "";
+    const versionAttr = this.getAttribute("version");
+    const version = versionAttr !== null ? Number(versionAttr) : undefined;
     this.innerHTML = `
       <article aria-busy="true">
         <state-badge state="decrypting" label="Decrypting…"></state-badge>
         <h3 class="title">…</h3>
       </article>`;
-    void this.decrypt(id);
+    void this.decrypt(id, version);
   }
 
-  private async decrypt(id: string) {
+  private async decrypt(id: string, version: number | undefined) {
     const article = this.querySelector("article")!;
     try {
-      const card = await serial(() => call<Card>("decrypt_card", { req: { file_id: id } }));
+      const card = await serial(() =>
+        call<Card>("decrypt_card", { req: { file_id: id, version } }),
+      );
       if (this.hasAttribute("mine-only") && !card.mine) {
         this.remove(); // filtered out by the "only my uploads" toggle
         return;
@@ -55,7 +59,9 @@ export class MediaCard extends HTMLElement {
       }
 
       const open = document.createElement("a");
-      open.href = `#/viewer?id=${encodeURIComponent(id)}`;
+      open.href = version !== undefined
+        ? `#/viewer?id=${encodeURIComponent(id)}&v=${version}`
+        : `#/viewer?id=${encodeURIComponent(id)}`;
       open.textContent = "View";
       article.appendChild(open);
     } catch (x) {

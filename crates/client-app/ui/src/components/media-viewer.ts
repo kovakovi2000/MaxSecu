@@ -1,9 +1,11 @@
 import { call, on } from "../core/rpc.ts";
-import { serial } from "../core/serial.ts";
+import { serialPriority } from "../core/serial.ts";
 import type { OpenedContent, FetchMsg } from "../core/types.ts";
 import "./progress-meter.ts";
+import "./skeleton-card.ts";
 import "./video-player.ts";
 import type { VideoPlayer } from "./video-player.ts";
+import { toast } from "../core/toast.ts";
 
 // Viewer (spec §5): renders one decrypted post. Image → data: URL <img>; blog →
 // textContent (NEVER innerHTML). Subscribes to EVT_FETCH for live status. The
@@ -15,7 +17,10 @@ export class MediaViewer extends HTMLElement {
   private reqId = "";
 
   async connectedCallback() {
-    const id = new URLSearchParams(location.hash.split("?")[1] ?? "").get("id") ?? "";
+    const params = new URLSearchParams(location.hash.split("?")[1] ?? "");
+    const id = params.get("id") ?? "";
+    const vParam = params.get("v");
+    const version = vParam !== null ? Number(vParam) : undefined;
     this.reqId = id;
     this.innerHTML = `
       <main id="main" tabindex="-1" aria-labelledby="vw-h">
@@ -50,12 +55,21 @@ export class MediaViewer extends HTMLElement {
       }
     });
 
+    (this.querySelector("#vw-body") as HTMLElement).appendChild(
+      document.createElement("skeleton-card"),
+    );
+
     try {
-      const c = await serial(() => call<OpenedContent>("open_content", { req: { file_id: id } }));
+      const c = await serialPriority(() =>
+        call<OpenedContent>("open_content", { req: { file_id: id, version } }),
+      );
       this.render(c);
     } catch (x) {
       (this.querySelector("#vw-h") as HTMLElement).textContent = "Could not open this item";
-      status.textContent = viewerErr(x);
+      const msg = viewerErr(x);
+      (this.querySelector("#vw-status") as HTMLElement).textContent = msg;
+      (this.querySelector("#vw-body") as HTMLElement).replaceChildren();
+      toast("error", msg);
     }
   }
 
