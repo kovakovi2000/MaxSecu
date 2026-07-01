@@ -91,8 +91,8 @@ mod tests {
 use tauri::{Emitter, State};
 
 use maxsecu_client_core::{
-    verify_and_open, DirectoryVerifier, Identity, MemoryTrustStore, VerifyContext, NO_ADMINS,
-    NO_GRANTERS,
+    verify_and_open, verify_and_open_headers, DirectoryVerifier, Identity, MemoryTrustStore,
+    VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::Manifest;
@@ -103,7 +103,7 @@ use crate::commands::connection::{reauth, server_of};
 use crate::commands::feed::{file_type_name, hex, hex16, now_ms, parse_title_tags};
 use crate::config::load_directory_pub;
 use crate::directory::resolve_and_verify_author;
-use crate::download::{build_download_bundle, parse_file_view};
+use crate::download::{build_download_bundle, build_stream_header, parse_file_view};
 use crate::dto::{OpenContentRequest, OpenedContentDto};
 use crate::http_client::get_json;
 use crate::state::{FetchPhase, EVT_FETCH};
@@ -216,6 +216,62 @@ async fn open_content_inner(
         now,
     )
     .await?;
+
+    // VIDEO: return metadata via a HEADER-ONLY open (no whole-file download, no
+    // gate error) so the viewer mounts the native <video-player>, which streams the
+    // content itself via open_video + the stream:// Range protocol. Image/blog keep
+    // the full verify+decrypt path below.
+    if manifest.file_type == FileType::Video {
+        let header = build_stream_header(&mut sender, &host, &token, &req.file_id, &view).await?;
+        emit(FetchPhase::Verifying {
+            file_id: req.file_id.clone(),
+        });
+        // Borrow the unlocked identity UNDER the lock across the SYNCHRONOUS header
+        // verify (no await), mirroring run_open — no transient None window.
+        let opened = {
+            let guard = session.0.lock().await;
+            let identity = guard
+                .identity
+                .as_ref()
+                .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+            let ctx = VerifyContext {
+                file_id: Id(file_id),
+                author_sig_pub: author.sig_pub,
+                owner_sig_pub: author.sig_pub,
+                recipient_id: Id(my_id),
+                recipient_type: RecipientType::User,
+                recipient_secret: identity.enc_secret(),
+                recipient_mlkem_seed: None,
+                seen_max_version: None,
+                granter_sig_pub: &NO_GRANTERS,
+                admin_sig_pub: &NO_ADMINS,
+                tombstones: None,
+                compromise: None,
+            };
+            verify_and_open_headers(&ctx, &header)
+                .map_err(|_| UiError::new("verify_failed", "This item failed verification."))?
+        };
+        let (title, tags) = opened
+            .small_streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Metadata)
+            .map(|s| parse_title_tags(&s.plaintext))
+            .unwrap_or_else(|| ("(untitled)".to_owned(), Vec::new()));
+        emit(FetchPhase::Ready {
+            file_id: req.file_id.clone(),
+        });
+        return Ok(OpenedContentDto {
+            file_id: req.file_id.clone(),
+            file_type: file_type_name(FileType::Video),
+            version: opened.version,
+            title,
+            tags,
+            image_png_b64: None,
+            blog_text: None,
+            author_fp: hex(&author.fingerprint[..8]),
+            recovery_ok: opened.recovery_grant_ok,
+        });
+    }
 
     let bundle = build_download_bundle(&mut sender, &host, &token, &req.file_id, &view).await?;
 
