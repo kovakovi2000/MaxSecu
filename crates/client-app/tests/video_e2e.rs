@@ -513,7 +513,7 @@ async fn play_window(
 #[tokio::test]
 async fn phase7_video_author_to_view_over_real_tls() {
     // ---- worker binaries (skip the spawn gates if a bare -p run did not build them) ----
-    let Some(transcode_worker) = find_worker("media-transcode-worker") else {
+    let Some(_transcode_worker) = find_worker("media-transcode-worker") else {
         eprintln!(
             "SKIP phase7_video_author_to_view_over_real_tls: media-transcode-worker binary not \
              found in the target dir (build it, e.g. `cargo build -p maxsecu-media-transcode-worker \
@@ -547,7 +547,6 @@ async fn phase7_video_author_to_view_over_real_tls() {
     let (streams, fragments) = prepare_video_streams(
         &source_path,
         &ffmpeg,
-        &transcode_worker,
         &TranscodeOptions::default(),
         &VideoBounds::default(),
         "Holiday clip",

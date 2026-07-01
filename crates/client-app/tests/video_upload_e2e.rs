@@ -427,7 +427,7 @@ async fn phase7_video_upload_over_real_tls() {
     // ---- worker binaries + vendored ffmpeg (skip the spawn gates if absent) ----
     let transcode_worker = find_worker("media-transcode-worker");
     let decode_worker = find_worker("media-worker");
-    let Some(transcode_worker) = transcode_worker else {
+    let Some(_transcode_worker) = transcode_worker else {
         eprintln!(
             "SKIP phase7_video_upload_over_real_tls: media-transcode-worker binary not found in \
              the target dir (build it, e.g. `cargo test --workspace`, to exercise the confined \
@@ -467,7 +467,6 @@ async fn phase7_video_upload_over_real_tls() {
     let (streams, fragments) = prepare_video_streams(
         &source_path,
         &ffmpeg,
-        &transcode_worker,
         &TranscodeOptions::default(),
         &VideoBounds::default(),
         "Holiday clip",

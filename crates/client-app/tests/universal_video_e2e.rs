@@ -858,7 +858,7 @@ async fn boot_harness(pki: &TestPki) -> Harness {
 #[ignore = "capstone: ~15-20 min real ffmpeg transcodes; run explicitly with --ignored"]
 async fn universal_video_ingest_capstone_over_real_tls() {
     // ---- preconditions (skip cleanly if anything is absent) ----
-    let Some(transcode_worker) = find_worker("media-transcode-worker") else {
+    let Some(_transcode_worker) = find_worker("media-transcode-worker") else {
         eprintln!(
             "SKIP universal_video_ingest_capstone: media-transcode-worker binary not found \
              (build it: `cargo build -p maxsecu-media-transcode-worker -p maxsecu-media-worker`)."
@@ -896,7 +896,6 @@ async fn universal_video_ingest_capstone_over_real_tls() {
     let (a_streams, a_fragments) = prepare_video_streams(
         &ttget,
         &ffmpeg,
-        &transcode_worker,
         &TranscodeOptions::default(), // Original/Original
         &VideoBounds::default(),
         "Holiday clip",
@@ -1096,7 +1095,6 @@ async fn universal_video_ingest_capstone_over_real_tls() {
     let (b_streams, b_fragments) = prepare_video_streams(
         &highres,
         &ffmpeg,
-        &transcode_worker,
         &TranscodeOptions::default(),
         &VideoBounds::default(),
         "Extreme clip",
@@ -1177,7 +1175,6 @@ async fn universal_video_ingest_capstone_over_real_tls() {
     let (c_streams, _c_fragments) = prepare_video_streams(
         &ttget,
         &ffmpeg,
-        &transcode_worker,
         &TranscodeOptions {
             resolution: Resolution::Height(720),
             bitrate: Bitrate::Original,
