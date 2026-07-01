@@ -110,6 +110,15 @@ pub const EVT_VIDEO_FRAME: &str = "maxsecu://video-frame";
 /// PCM chunk (the UI feeds it to WebAudio in Gate 5).
 pub const EVT_VIDEO_AUDIO: &str = "maxsecu://video-audio";
 
+/// One-shot per-open metadata for the player UI (scrubber max + timer denominator).
+pub const EVT_VIDEO_INFO: &str = "maxsecu://video-info";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct VideoInfo {
+    pub duration_ms: u64,
+    pub fragment_count: u32,
+}
+
 /// The video player's state machine (spec §6/§7). Emitted over [`EVT_PLAYER`];
 /// the UI binds a buffering spinner / play state / error banner. `Error` carries a
 /// sanitized code (no decode oracle); `CodecUnavailable` is the honest
@@ -296,5 +305,16 @@ mod upload_phase_tests {
         })
         .unwrap();
         assert!(d.contains("\"phase\":\"done\"") && d.contains("\"file_id\":\"ab\""));
+    }
+}
+
+#[cfg(test)]
+mod video_info_tests {
+    use super::*;
+    #[test]
+    fn video_info_serializes() {
+        let s = serde_json::to_string(&VideoInfo { duration_ms: 59000, fragment_count: 5 }).unwrap();
+        assert!(s.contains("\"duration_ms\":59000"));
+        assert!(s.contains("\"fragment_count\":5"));
     }
 }

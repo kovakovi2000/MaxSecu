@@ -69,7 +69,7 @@ use crate::error::UiError;
 use crate::fragment_cache::FragmentCache;
 use crate::http_client::{get_bytes, get_json};
 use crate::jobs::{VideoJob, VideoJobs};
-use crate::state::{PlayerPhase, EVT_PLAYER, EVT_VIDEO_AUDIO, EVT_VIDEO_FRAME};
+use crate::state::{PlayerPhase, VideoInfo, EVT_PLAYER, EVT_VIDEO_AUDIO, EVT_VIDEO_FRAME, EVT_VIDEO_INFO};
 use crate::video::{chunks_for_fragment, feed_fragment, fragment_for_time, FragmentEntry};
 
 /// Fragments decoded per bounded window. Small + finite: the UI requests further
@@ -174,6 +174,19 @@ type SessionDecoder = maxsecu_media_launcher::VideoSubprocessSession;
 
 fn make_decoder(app_dir: &Path) -> SessionDecoder {
     SessionDecoder::new(worker_path(app_dir))
+}
+
+/// Approximate clip duration (ms) from the fragment index: the last fragment's start pts
+/// plus one inter-fragment gap (fragments are ~uniform). Zero for an empty index.
+fn duration_ms_from_index(index: &[FragmentEntry]) -> u64 {
+    match (index.last(), index.len()) {
+        (Some(last), n) if n >= 2 => {
+            let gap = last.pts_ms.saturating_sub(index[n - 2].pts_ms);
+            last.pts_ms.saturating_add(gap)
+        }
+        (Some(last), _) => last.pts_ms.saturating_add(1000),
+        (None, _) => 0,
+    }
 }
 
 /// The confined `media-transcode-worker` binary lives beside the portable exe
@@ -617,17 +630,12 @@ where
 
     // Phase C — decrypt the window IN THE TCB under the lock (sync), then DROP the
     // guard. If the job was cancelled during prefetch, it is gone here ⇒ abort. Also
-    // capture the (cloned) authenticated index + the window's first-fragment pts so the
-    // decode step can offset fragment-relative worker pts into the window timeline (A/V
-    // sync, Part C) — both read here under the lock, never across the decode.
-    let (script, frag_index, window_start_pts) = {
+    // capture the (cloned) authenticated index for the decode step (absolute pts:
+    // window_start_pts = 0 so emitted pts = index[seq].pts_ms + worker_pts, forming a
+    // continuous absolute timeline across windows for the streaming player).
+    let (script, frag_index) = {
         let mut guard = jobs.0.lock().await;
         let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
-        let window_start_pts = job
-            .index
-            .get(plan.start as usize)
-            .map(|e| e.pts_ms)
-            .unwrap_or(0);
         let frag_index = job.index.clone();
         let script = decrypt_window(
             job,
@@ -636,7 +644,7 @@ where
             |i| prefetched.remove(&i).ok_or_else(player_err),
             emit,
         )?;
-        (script, frag_index, window_start_pts)
+        (script, frag_index)
     };
 
     // Phase D — decode OFF the runtime + re-validate + emit (no lock, no identity).
@@ -645,7 +653,7 @@ where
         script,
         decoder,
         frag_index,
-        window_start_pts,
+        0,
         emit,
         on_frame,
         on_audio,
@@ -674,6 +682,9 @@ pub async fn open_video(
     let on_audio = |a: PcmDto| {
         let _ = app.emit(EVT_VIDEO_AUDIO, a);
     };
+    let on_info = |i: VideoInfo| {
+        let _ = app.emit(EVT_VIDEO_INFO, i);
+    };
     let out = open_video_inner(
         &file_id,
         &dir,
@@ -683,6 +694,7 @@ pub async fn open_video(
         &emit,
         &on_frame,
         &on_audio,
+        &on_info,
     )
     .await;
     if let Err(e) = &out {
@@ -698,7 +710,7 @@ pub async fn open_video(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn open_video_inner<E, OnF, OnA>(
+async fn open_video_inner<E, OnF, OnA, OnI>(
     file_id_str: &str,
     dir: &State<'_, AppDir>,
     session: &State<'_, Session>,
@@ -707,11 +719,13 @@ async fn open_video_inner<E, OnF, OnA>(
     emit: &E,
     on_frame: &OnF,
     on_audio: &OnA,
+    on_info: &OnI,
 ) -> Result<(), UiError>
 where
     E: Fn(PlayerPhase),
     OnF: Fn(I420FrameDto),
     OnA: Fn(PcmDto),
+    OnI: Fn(VideoInfo),
 {
     // Validate the REQUESTED id up front (it is what the served record must bind to
     // and is interpolated into the request URL). Canonical lowercase hex is the
@@ -773,6 +787,12 @@ where
         open_video_job_core(identity, file_id, &author, my_id, &header)
     }?;
     let version = decryptor.version();
+
+    // Emit VideoInfo from the authenticated index BEFORE it moves into VideoJob.
+    on_info(VideoInfo {
+        duration_ms: duration_ms_from_index(&index),
+        fragment_count: index.len() as u32,
+    });
 
     // Register the session. Cache cap from the Phase-5 performance setting.
     let cap = SettingsConfig::load(&dir.0).performance.ram_cache_cap_mb as u64 * 1024 * 1024;
@@ -1039,7 +1059,10 @@ pub async fn preview_video(
     let on_audio = |a: PcmDto| {
         let _ = app.emit(EVT_VIDEO_AUDIO, a);
     };
-    let out = preview_video_inner(&job_id, &dir, &jobs, &emit, &on_frame, &on_audio).await;
+    let on_info = |i: VideoInfo| {
+        let _ = app.emit(EVT_VIDEO_INFO, i);
+    };
+    let out = preview_video_inner(&job_id, &dir, &jobs, &emit, &on_frame, &on_audio, &on_info).await;
     if let Err(e) = &out {
         emit(PlayerPhase::Error {
             code: e.code.clone(),
@@ -1048,19 +1071,32 @@ pub async fn preview_video(
     out
 }
 
-async fn preview_video_inner<E, OnF, OnA>(
+async fn preview_video_inner<E, OnF, OnA, OnI>(
     job_id: &str,
     dir: &State<'_, AppDir>,
     jobs: &State<'_, crate::jobs::UploadJobs>,
     emit: &E,
     on_frame: &OnF,
     on_audio: &OnA,
+    on_info: &OnI,
 ) -> Result<(), UiError>
 where
     E: Fn(PlayerPhase),
     OnF: Fn(I420FrameDto),
     OnA: Fn(PcmDto),
+    OnI: Fn(VideoInfo),
 {
+    // Emit VideoInfo at open (only at initial open, not on seek): briefly lock the
+    // jobs registry, read the authenticated preview index, compute + emit, drop the lock.
+    {
+        let guard = jobs.0.lock().await;
+        let staged = guard.get(job_id).ok_or_else(player_err)?;
+        let preview = staged.preview.as_ref().ok_or_else(player_err)?;
+        on_info(VideoInfo {
+            duration_ms: duration_ms_from_index(&preview.index),
+            fragment_count: preview.index.len() as u32,
+        });
+    }
     // Delegate to preview_window_inner starting from the beginning of the clip
     // (pts_ms = 0 → fragment 0 → first window). Buffering is emitted inside.
     preview_window_inner(job_id, 0, dir, jobs, emit, on_frame, on_audio).await

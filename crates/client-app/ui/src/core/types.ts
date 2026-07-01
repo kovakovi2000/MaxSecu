@@ -95,3 +95,6 @@ export interface Settings {
 
 // The RAM-cache slider/number bounds from the `ram_limits` command (Task 1).
 export interface RamLimits { default_mb: number; min_mb: number; max_mb: number }
+
+// --- Video player: one-shot duration metadata emitted at open (maxsecu://video-info) ---
+export interface VideoInfo { duration_ms: number; fragment_count: number }
