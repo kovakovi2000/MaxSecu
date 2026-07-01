@@ -21,6 +21,7 @@ use crate::http_client::get_bytes;
 pub struct StreamSpec {
     pub stream_type: StreamType,
     pub chunk_count: u64,
+    pub chunk_size: u64,
 }
 
 /// The parsed, non-secret framing of a file view: which streams exist + the
@@ -97,6 +98,7 @@ pub fn parse_file_view(json: &serde_json::Value) -> Result<ParsedView, UiError> 
         streams.push(StreamSpec {
             stream_type: st,
             chunk_count: s["chunk_count"].as_u64().ok_or_else(bad)?,
+            chunk_size: s["chunk_size"].as_u64().ok_or_else(bad)?,
         });
     }
     Ok(ParsedView {
@@ -268,5 +270,16 @@ mod tests {
     fn malformed_view_is_a_sanitized_error() {
         let bad = serde_json::json!({ "version": "nope" });
         assert_eq!(parse_file_view(&bad).unwrap_err().code, "fetch_failed");
+    }
+
+    #[test]
+    fn parses_content_chunk_size() {
+        let p = parse_file_view(&view_json()).unwrap();
+        let content = p
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .unwrap();
+        assert_eq!(content.chunk_size, 4096);
     }
 }
