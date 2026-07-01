@@ -5,11 +5,25 @@
 //! it never crosses the Tauri seam.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use http_body_util::Full;
+use hyper::body::Bytes;
+use hyper::client::conn::http1::SendRequest;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 use maxsecu_client_core::UploadBundle;
+
+/// One persistent authed HTTP/1.1 channel for an open video session: the live
+/// `SendRequest` plus the host + bearer token bound to it. All range fetches for a
+/// session reuse this ONE connection (serialized via the tokio Mutex around it),
+/// instead of re-authing per range (which contended the ConnectLock → spurious 500s).
+pub struct AuthedChannel {
+    pub sender: SendRequest<Full<Bytes>>,
+    pub host: String,
+    pub token: String,
+}
 
 /// The canonical (already-plaintext) video held for the **preview-before-upload**
 /// local decode (Phase 7, Gate 6). `cmaf` is the transcoded AV1/CMAF content stream
@@ -71,6 +85,11 @@ pub struct VideoJob {
     /// UI playback gain preference (0.0..=4.0). Has NO decode effect — the UI
     /// applies it via WebAudio (Gate 5); stored here so it survives across windows.
     pub gain: f32,
+    /// The persistent authed connection for range serving. `Option` only so pure
+    /// `commands::video` unit tests (which never serve ranges) can build a job with
+    /// `None`; the real open path + the e2e always populate `Some`. Behind an `Arc<Mutex>`
+    /// so overlapping range requests serialize over the one HTTP/1.1 connection.
+    pub channel: Option<Arc<tokio::sync::Mutex<AuthedChannel>>>,
 }
 
 /// Managed state: `file_id_hex -> VideoJob`. Async mutex (commands are async).

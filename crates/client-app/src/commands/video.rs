@@ -42,6 +42,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -68,7 +69,7 @@ use crate::download::{build_stream_header, parse_file_view};
 use crate::error::UiError;
 use crate::fragment_cache::FragmentCache;
 use crate::http_client::{get_bytes, get_json};
-use crate::jobs::{VideoJob, VideoJobs};
+use crate::jobs::{AuthedChannel, VideoJob, VideoJobs};
 use crate::state::{PlayerPhase, VideoInfo, EVT_PLAYER, EVT_VIDEO_AUDIO, EVT_VIDEO_FRAME, EVT_VIDEO_INFO};
 use crate::video::{chunks_for_fragment, feed_fragment, fragment_for_time, FragmentEntry};
 
@@ -135,6 +136,10 @@ pub struct PcmDto {
 fn player_err() -> UiError {
     UiError::new("video_failed", "The video could not be played.")
 }
+
+/// The connection for this session dropped; the caller (stream_media_inner) may
+/// reconnect once and retry. Distinct from player_err so the retry is targeted.
+fn channel_dead() -> UiError { UiError::new("channel_dead", "The video connection dropped.") }
 
 /// Base64 a validated frame's planes into the seam DTO.
 fn frame_dto(f: &I420Frame) -> I420FrameDto {
@@ -574,34 +579,37 @@ struct WindowPlan {
 /// Probe the total plaintext content length by decrypting the LAST chunk once
 /// over the real server (fetch its ciphertext, then `open_range`), caching the
 /// ciphertext as a side effect. Returns `(n-1)*chunk_size + last_chunk_plaintext`.
+/// Uses the job's stored `AuthedChannel` (no per-call reauth).
 async fn probe_total_len(
-    sender: &mut hyper::client::conn::http1::SendRequest<http_body_util::Full<hyper::body::Bytes>>,
-    host: &str,
-    token: &str,
     jobs: &VideoJobs,
     file_id_hex: &str,
     chunk_size: u64,
 ) -> Result<u64, UiError> {
-    // Plan: the last chunk's absolute index + the content chunk count + version,
-    // under the lock (sync).
-    let (n, last_idx, version) = {
+    // Phase 1 (global lock): read n, last_idx, version, and clone the channel Arc.
+    let (n, last_idx, version, channel) = {
         let guard = jobs.0.lock().await;
         let job = guard.get(file_id_hex).ok_or_else(player_err)?;
         let n = job.decryptor.content_chunk_count();
         if n == 0 {
             return Err(player_err());
         }
-        (n, n - 1, job.version)
+        let channel = job.channel.clone().ok_or_else(player_err)?;
+        (n, n - 1, job.version, channel)
     };
-    // Fetch the last ciphertext chunk (no lock held).
-    let uri = format!(
-        "/v1/files/{file_id_hex}/versions/{version}/streams/content/chunks/{last_idx}"
-    );
-    let (status, ct) = get_bytes(sender, &uri, Some(token), host).await?;
-    if status != hyper::StatusCode::OK {
-        return Err(player_err());
-    }
-    // Decrypt just that chunk under the lock to learn its plaintext length.
+    // Phase 2 (channel lock, no global lock): fetch the last ciphertext chunk.
+    let ct = {
+        let mut ch = channel.lock().await;
+        let AuthedChannel { sender, host, token } = &mut *ch;
+        let uri = format!(
+            "/v1/files/{file_id_hex}/versions/{version}/streams/content/chunks/{last_idx}"
+        );
+        let (status, ct) = get_bytes(sender, &uri, Some(token.as_str()), host.as_str()).await?;
+        if status != hyper::StatusCode::OK {
+            return Err(player_err());
+        }
+        ct
+    };
+    // Phase 3 (global lock): decrypt just that chunk to learn its plaintext length.
     let last_len = {
         let guard = jobs.0.lock().await;
         let job = guard.get(file_id_hex).ok_or_else(player_err)?;
@@ -856,6 +864,14 @@ where
     // ciphertext is cached as a side effect (a back-seek to the end is warm).
     let cap = SettingsConfig::load(&dir.0).performance.ram_cache_cap_mb as u64 * 1024 * 1024;
     let cache = FragmentCache::open(&dir.0, cap).map_err(|_| player_err())?;
+
+    // Move the open-time authed connection into a persistent channel for all range
+    // fetches in this session (probe_total_len + every serve_range). After this point
+    // `sender`/`host`/`token` are consumed — all subsequent network access goes
+    // through the channel's Mutex, serializing overlapping range requests.
+    let channel = Arc::new(tokio::sync::Mutex::new(
+        AuthedChannel { sender, host, token },
+    ));
     jobs.0.lock().await.insert(
         file_id_hex.clone(),
         VideoJob {
@@ -867,12 +883,13 @@ where
             chunk_size,
             total_len: 0, // set below
             gain: 1.0,
+            channel: Some(channel),
         },
     );
 
-    // Probe total_len via the last fragment (reuses the streaming plan/prefetch/
-    // assemble path against the real server — mirrors play_window_command Phase B).
-    let total = probe_total_len(&mut sender, &host, &token, jobs, &file_id_hex, chunk_size).await?;
+    // Probe total_len via the last fragment (uses the job's persistent channel —
+    // no extra reauth needed).
+    let total = probe_total_len(jobs, &file_id_hex, chunk_size).await?;
     if let Some(job) = jobs.0.lock().await.get_mut(&file_id_hex) {
         job.total_len = total;
     }
@@ -1184,17 +1201,16 @@ pub async fn preview_seek(
 
 /// Serve one plaintext byte range for an OPEN video session over the real server:
 /// (A) plan the covering fragment span + which ciphertext chunks are missing, under
-/// the jobs lock; (B) prefetch the missing ciphertext with NO lock held; (C) assemble
-/// + slice under the lock. Fail-closed. The content key never leaves this process;
+/// the jobs lock; (B) prefetch the missing ciphertext under the JOB's persistent
+/// `AuthedChannel` lock (no global jobs lock held, no per-range reauth); (C) assemble
+/// + slice under the jobs lock. Fail-closed. The content key never leaves this process;
 /// only the sliced plaintext is returned. `first`/`last_inclusive` are the parsed
-/// HTTP byte-range bounds.
+/// HTTP byte-range bounds. Returns `channel_dead` on a transport error so the caller
+/// can reconnect once and retry.
 ///
 /// Public: the stream:// protocol core (carries no secret across the seam — only sliced
 /// plaintext the protocol already exposes).
 pub async fn serve_range(
-    sender: &mut hyper::client::conn::http1::SendRequest<http_body_util::Full<hyper::body::Bytes>>,
-    host: &str,
-    token: &str,
     jobs: &VideoJobs,
     file_id_hex: &str,
     first: u64,
@@ -1203,7 +1219,8 @@ pub async fn serve_range(
     use crate::stream::{assemble_range, plan_range, resolve_range};
 
     // Phase A — resolve the request + plan the fragment span + fetch list, under the lock.
-    let (req, plan, total_len, version, fetch_indices) = {
+    // Also clone the channel Arc (a cheap ref-count bump) before dropping the guard.
+    let (req, plan, total_len, version, fetch_indices, channel) = {
         let mut guard = jobs.0.lock().await;
         let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
         let req = resolve_range(first, last_inclusive, job.total_len, MAX_RANGE_BODY)
@@ -1217,18 +1234,29 @@ pub async fn serve_range(
                 fetch_indices.extend(cs..end);
             }
         }
-        (req, plan, job.total_len, job.version, fetch_indices)
+        let channel = job.channel.clone().ok_or_else(player_err)?;
+        (req, plan, job.total_len, job.version, fetch_indices, channel)
     };
 
-    // Phase B — prefetch missing ciphertext with NO lock held.
+    // Phase B — prefetch missing ciphertext under the channel lock (no global jobs lock
+    // held). Overlapping range requests serialize here over the single HTTP/1.1 connection
+    // instead of contending the ConnectLock with concurrent reauths.
     let mut prefetched: HashMap<u64, Vec<u8>> = HashMap::new();
-    for i in fetch_indices {
-        let uri = format!("/v1/files/{file_id_hex}/versions/{version}/streams/content/chunks/{i}");
-        let (status, bytes) = get_bytes(sender, &uri, Some(token), host).await?;
-        if status != hyper::StatusCode::OK {
-            return Err(player_err());
+    {
+        let mut ch = channel.lock().await;
+        let AuthedChannel { sender, host, token } = &mut *ch;
+        for i in fetch_indices {
+            let uri = format!(
+                "/v1/files/{file_id_hex}/versions/{version}/streams/content/chunks/{i}"
+            );
+            match get_bytes(sender, &uri, Some(token.as_str()), host.as_str()).await {
+                Ok((status, bytes)) if status == hyper::StatusCode::OK => {
+                    prefetched.insert(i, bytes);
+                }
+                Ok(_) => return Err(player_err()),    // server refused → not a dead channel
+                Err(_) => return Err(channel_dead()), // transport error → reconnectable
+            }
         }
-        prefetched.insert(i, bytes);
     }
 
     // Phase C — assemble + slice under the lock (sync decrypt in the TCB).
@@ -1347,29 +1375,31 @@ async fn stream_media_inner(
     // Parse "bytes=first-[last]" (default first=0 when absent).
     let (first, last_inclusive) = parse_byte_range(range_header);
 
-    let server = server_of(&dir.0).map_err(|_| 500u16)?;
-    // The <video> element issues OVERLAPPING range requests (read-ahead + seek) that
-    // BYPASS the serial.ts command queue. `reauth` `try_lock`s the shared ConnectLock
-    // and returns "busy" on contention, so two overlapping reads would race and one
-    // would get a spurious 500 — stalling playback. Serialize overlapping reads by
-    // WAITING-AND-RETRYING on "busy" (the lock is only held for the login handshake,
-    // not the prefetch), bounded so it still fails closed (~1 s max → 500).
-    let (mut sender, host, token) = {
-        let mut attempt = 0u32;
-        loop {
-            match reauth(&dir.0, &server, &session, &connect_lock).await {
-                Ok(ch) => break ch,
-                Err(e) if e.code == "busy" && attempt < 50 => {
-                    attempt += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-                Err(_) => return Err(500u16),
+    // First attempt over the session's persistent authed channel (no reauth needed
+    // for normal operation — overlapping range requests serialize via the channel Mutex).
+    match serve_range(&jobs, &file_id_hex, first, last_inclusive).await {
+        Ok(r) => Ok(r),
+        Err(e) if e.code == "channel_dead" => {
+            // The persistent connection dropped. Reconnect ONCE (needs app state),
+            // replace the job's channel in-place, and retry the range.
+            let server = server_of(&dir.0).map_err(|_| 500u16)?;
+            let (sender, host, token) =
+                reauth(&dir.0, &server, &session, &connect_lock).await.map_err(|_| 500u16)?;
+            let chan = {
+                let g = jobs.0.lock().await;
+                g.get(&file_id_hex).and_then(|j| j.channel.clone())
             }
+            .ok_or(404u16)?;
+            {
+                let mut c = chan.lock().await;
+                *c = AuthedChannel { sender, host, token };
+            }
+            serve_range(&jobs, &file_id_hex, first, last_inclusive)
+                .await
+                .map_err(|e| if e.code == "range_not_satisfiable" { 416 } else { 500 })
         }
-    };
-    serve_range(&mut sender, &host, &token, &jobs, &file_id_hex, first, last_inclusive)
-        .await
-        .map_err(|e| if e.code == "range_not_satisfiable" { 416 } else { 500 })
+        Err(e) => Err(if e.code == "range_not_satisfiable" { 416 } else { 500 }),
+    }
 }
 
 /// Parse an HTTP `Range: bytes=first-[last]` value into `(first, last_inclusive)`.
@@ -1628,6 +1658,7 @@ mod tests {
             chunk_size: 4096,
             total_len: 0,
             gain: 1.0,
+            channel: None, // unit tests never serve ranges
         };
         (job, chunks)
     }

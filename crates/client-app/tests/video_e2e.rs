@@ -1118,6 +1118,17 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
     // Register the VideoJob: decryptor, authenticated index, empty cache.
     // total_len = content_len: the last chunk has 1000 plaintext bytes (no padding),
     // so (41-1)*4096 + 1000 == content_len exactly.
+    //
+    // Build the persistent authed channel from the harness connection (c.sender is
+    // not used after build_stream_header above). All serve_range calls serialize over
+    // this one HTTP/1.1 connection instead of re-authing per range.
+    let channel = std::sync::Arc::new(tokio::sync::Mutex::new(
+        maxsecu_client_app::jobs::AuthedChannel {
+            sender: c.sender,          // MOVE — c.sender not used after this point
+            host: "localhost".to_string(),
+            token: token.clone(),
+        },
+    ));
     let jobs = maxsecu_client_app::jobs::VideoJobs::new();
     jobs.0.lock().await.insert(
         fid_hex.clone(),
@@ -1130,6 +1141,7 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
             chunk_size: 4096u64,
             total_len: content_len as u64,
             gain: 1.0,
+            channel: Some(channel),
         },
     );
 
@@ -1142,9 +1154,6 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
     let mut off = 0u64;
     loop {
         let r = maxsecu_client_app::commands::video::serve_range(
-            &mut c.sender,
-            "localhost",
-            &token,
             &jobs,
             &fid_hex,
             off,
@@ -1173,9 +1182,6 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
     // because all 41 chunks are already cached after the full forward pass.
     // ===================================================================
     let again = maxsecu_client_app::commands::video::serve_range(
-        &mut c.sender,
-        "localhost",
-        &token,
         &jobs,
         &fid_hex,
         0,
