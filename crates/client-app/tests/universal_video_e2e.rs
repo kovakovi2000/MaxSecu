@@ -851,7 +851,11 @@ async fn boot_harness(pki: &TestPki) -> Harness {
     }
 }
 
+// Capstone: three real preset-8 AV1 transcodes via confined ffmpeg + confined decode
+// workers over real TLS — ~15-20 min. Marked #[ignore] so routine `cargo test` skips it;
+// run explicitly: `cargo test -p maxsecu-client-app --test universal_video_e2e -- --ignored --test-threads=1`.
 #[tokio::test]
+#[ignore = "capstone: ~15-20 min real ffmpeg transcodes; run explicitly with --ignored"]
 async fn universal_video_ingest_capstone_over_real_tls() {
     // ---- preconditions (skip cleanly if anything is absent) ----
     let Some(transcode_worker) = find_worker("media-transcode-worker") else {
