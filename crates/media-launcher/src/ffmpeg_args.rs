@@ -135,6 +135,13 @@ pub fn build_ffmpeg_args(
     arg!("-ac");
     arg!("2");
 
+    // Fragmented-MP4: single continuous fMP4 (init moov + moof/mdat fragments)
+    // proven to play natively in WebView2 via the Media Source Extensions path.
+    // Must be placed before the output path so it applies ONLY to the main mp4
+    // (not to the thumbnail second output).
+    arg!("-movflags");
+    arg!("+frag_keyframe+empty_moov+default_base_moof");
+
     arg!(output.as_os_str());
 
     // --- Second output: one first-frame thumbnail PNG -------------------------
@@ -324,6 +331,22 @@ mod tests {
         assert_eq!(
             value_after(&args, "-b:v"),
             format!("{}k", crate::transcode_opts::MAX_BITRATE_KBPS)
+        );
+    }
+
+    #[test]
+    fn main_output_is_fragmented_mp4() {
+        let (i, o, t) = paths();
+        let opts = TranscodeOptions::default();
+        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds());
+
+        assert!(
+            contains(&args, "-movflags"),
+            "-movflags must be present for fragmented-MP4"
+        );
+        assert_eq!(
+            value_after(&args, "-movflags"),
+            "+frag_keyframe+empty_moov+default_base_moof"
         );
     }
 
