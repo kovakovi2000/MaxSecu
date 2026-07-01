@@ -1,3 +1,4 @@
+import "media-chrome";
 import { call, on } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import {
@@ -78,6 +79,10 @@ export class VideoPlayer extends HTMLElement {
   // decrypt) instead of open_video. Set by the upload screen's preview surface.
   private _previewJob = "";
 
+  // True when the native <video> + Media Chrome path is active (view path only;
+  // the author-preview path keeps the confined-decode canvas engine).
+  private native = false;
+
   // file-id may be supplied as a property (media-viewer sets it) or attribute.
   set fileId(v: string) {
     this._fileId = v;
@@ -97,6 +102,11 @@ export class VideoPlayer extends HTMLElement {
   }
 
   connectedCallback() {
+    // VIEW path → native <video> + Media Chrome. Author PREVIEW (previewJob)
+    // keeps the existing confined-decode canvas engine below (spec: reversal is
+    // view-only).
+    if (!this.previewJob) { this.connectNative(); return; }
+    // ---- existing confined-preview setup continues UNCHANGED below ----
     this.reqId = this.fileId;
     // Static chrome skeleton — NO dynamic interpolation into innerHTML (XSS
     // guard). All dynamic text below goes through textContent/setAttribute.
@@ -263,7 +273,58 @@ export class VideoPlayer extends HTMLElement {
     if (audio) void audio.close().catch(() => {});
   }
 
-  // ---- backend session ----------------------------------------------------
+  // ---- native view path (stream:// Range protocol + Media Chrome) ----------
+
+  private connectNative() {
+    this.native = true;
+    this.reqId = this.fileId;
+    // Static chrome — NO dynamic interpolation into innerHTML (XSS guard).
+    this.innerHTML = `
+      <section id="vp-region" tabindex="-1" role="region" aria-label="Video player">
+        <p id="vp-status" role="status" aria-live="polite" hidden></p>
+        <media-controller style="width:100%;aspect-ratio:16/9;background:#000">
+          <video slot="media" playsinline preload="metadata"></video>
+          <media-control-bar>
+            <media-play-button></media-play-button>
+            <media-time-range></media-time-range>
+            <media-time-display showduration></media-time-display>
+            <media-mute-button></media-mute-button>
+            <media-volume-range></media-volume-range>
+            <media-fullscreen-button></media-fullscreen-button>
+          </media-control-bar>
+        </media-controller>
+      </section>`;
+    (this.querySelector("#vp-region") as HTMLElement).focus();
+    const video = this.querySelector("video") as HTMLVideoElement;
+    video.addEventListener("error", () => {
+      const s = this.querySelector("#vp-status") as HTMLElement | null;
+      if (s) {
+        s.textContent = "⚠ This video could not be played.";
+        s.removeAttribute("hidden");
+      }
+    });
+    void this.openNative(video);
+  }
+
+  private async openNative(video: HTMLVideoElement) {
+    try {
+      this.opened = true;
+      // open_video registers the decrypt-while-stream session (register-only +
+      // total-length probe). Only decrypted plaintext crosses the stream:// seam.
+      await serial(() => call<void>("open_video", { fileId: this.reqId }));
+      // Point the native element at the stream:// range protocol; the browser
+      // owns demux/decode/seek/buffer/sync.
+      video.src = `stream://media/${this.reqId}`;
+    } catch (x) {
+      const s = this.querySelector("#vp-status") as HTMLElement | null;
+      if (s) {
+        s.textContent = `⚠ Error: ${phaseCode(x)}`;
+        s.removeAttribute("hidden");
+      }
+    }
+  }
+
+  // ---- backend session (preview/legacy path) --------------------------------
 
   private async open() {
     try {
