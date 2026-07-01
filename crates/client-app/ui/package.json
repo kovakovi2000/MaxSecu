@@ -14,5 +14,8 @@
     "@types/node": "20.14.2",
     "esbuild": "0.21.5",
     "typescript": "5.4.5"
+  },
+  "dependencies": {
+    "media-chrome": "^4.19.2"
   }
 }
