@@ -69,7 +69,7 @@ use crate::download::{build_stream_header, parse_file_view};
 use crate::error::UiError;
 use crate::fragment_cache::FragmentCache;
 use crate::http_client::{get_bytes, get_json};
-use crate::jobs::{AuthedChannel, VideoJob, VideoJobs};
+use crate::jobs::{AuthedChannel, UploadJobs, VideoJob, VideoJobs};
 use crate::state::{PlayerPhase, VideoInfo, EVT_PLAYER, EVT_VIDEO_AUDIO, EVT_VIDEO_FRAME, EVT_VIDEO_INFO};
 use crate::video::{chunks_for_fragment, feed_fragment, fragment_for_time, FragmentEntry};
 
@@ -1339,66 +1339,106 @@ fn stream_log(app: &tauri::AppHandle, msg: &str) {
     }
 }
 
-/// Inner: resolve `file_id` from the path, mint an authed channel, parse the Range
-/// header, and call `serve_range`. Returns an HTTP status code (`u16`) on error.
+/// Slice one satisfiable byte range out of an in-memory plaintext buffer (the
+/// author's staged fMP4). Returns None (⇒ 416) for an unsatisfiable range. Pure —
+/// no lock, no network, no decrypt. `resolve_range` bounds/caps the slice.
+fn preview_slice(buf: &[u8], first: u64, last_inclusive: Option<u64>) -> Option<RangeResponse> {
+    let total = buf.len() as u64;
+    let req = crate::stream::resolve_range(first, last_inclusive, total, MAX_RANGE_BODY)?;
+    let start = req.start as usize;
+    let end = start.checked_add(req.len as usize)?;
+    if end > buf.len() { return None; }
+    Some(RangeResponse { start: req.start, len: req.len, total_len: total, body: buf[start..end].to_vec() })
+}
+
+/// Serve one byte range of an author PREVIEW's staged fMP4 (UploadJobs' StagedVideo
+/// preview cmaf) — plaintext the author already owns; NO decrypt, NO auth, NO network.
+/// Unknown job / no preview ⇒ not_found; unsatisfiable range ⇒ range_not_satisfiable.
+async fn serve_preview_range(jobs: &UploadJobs, job_id: &str, first: u64, last_inclusive: Option<u64>) -> Result<RangeResponse, UiError> {
+    let guard = jobs.0.lock().await;
+    let job = guard.get(job_id).ok_or_else(|| UiError::new("not_found", "unknown preview"))?;
+    let preview = job.preview.as_ref().ok_or_else(|| UiError::new("not_found", "no preview"))?;
+    preview_slice(&preview.cmaf, first, last_inclusive).ok_or_else(|| UiError::new("range_not_satisfiable", "range"))
+}
+
+/// Inner: resolve the namespace and id from the path, dispatch to the media (view)
+/// or preview (author staged fMP4) handler, parse the Range header, and serve.
+/// Returns an HTTP status code (`u16`) on error.
 async fn stream_media_inner(
     app: &tauri::AppHandle,
     path: &str,
     range_header: Option<&str>,
 ) -> Result<RangeResponse, u16> {
     use tauri::Manager;
-    // The UI mints `stream://media/<file_id_hex>`. The exact split into (host, path)
-    // is platform-dependent on WebView2: `media` may arrive as the URI HOST with
-    // path `/<id>`, or as part of the path `/media/<id>`. Handle both by taking the
-    // LAST non-empty path segment as the id — then validate it is real hex16 and
-    // (below) that a live session exists; anything else 404s.
-    let file_id_hex = path
-        .rsplit('/')
-        .find(|s| !s.is_empty())
-        .map(str::to_string)
-        .ok_or(404u16)?;
-    let _ = hex16(&file_id_hex).map_err(|_| 404u16)?; // reject non-hex ids
+    // Parse `/<ns>/<id>` from the path. The host is `stream.localhost`; the FIRST
+    // non-empty segment is the namespace (`media` or `preview`), the SECOND is the id.
+    // Anything else (missing segment, extra segments, bare path) 404s.
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (ns, id) = match segs.as_slice() { [ns, id] => (*ns, *id), _ => return Err(404u16) };
 
-    let dir = app.state::<AppDir>();
-    let session = app.state::<Session>();
-    let connect_lock = app.state::<ConnectLock>();
-    let jobs = app.state::<VideoJobs>();
+    match ns {
+        "media" => {
+            // Validate the file id — must be 16 raw hex bytes (32 hex chars).
+            let file_id_hex = id.to_string();
+            let _ = hex16(&file_id_hex).map_err(|_| 404u16)?;
 
-    // The session must already be open (open_video registered it).
-    {
-        let guard = jobs.0.lock().await;
-        if !guard.contains_key(&file_id_hex) {
-            return Err(404);
-        }
-    }
+            let dir = app.state::<AppDir>();
+            let session = app.state::<Session>();
+            let connect_lock = app.state::<ConnectLock>();
+            let jobs = app.state::<VideoJobs>();
 
-    // Parse "bytes=first-[last]" (default first=0 when absent).
-    let (first, last_inclusive) = parse_byte_range(range_header);
-
-    // First attempt over the session's persistent authed channel (no reauth needed
-    // for normal operation — overlapping range requests serialize via the channel Mutex).
-    match serve_range(&jobs, &file_id_hex, first, last_inclusive).await {
-        Ok(r) => Ok(r),
-        Err(e) if e.code == "channel_dead" => {
-            // The persistent connection dropped. Reconnect ONCE (needs app state),
-            // replace the job's channel in-place, and retry the range.
-            let server = server_of(&dir.0).map_err(|_| 500u16)?;
-            let (sender, host, token) =
-                reauth(&dir.0, &server, &session, &connect_lock).await.map_err(|_| 500u16)?;
-            let chan = {
-                let g = jobs.0.lock().await;
-                g.get(&file_id_hex).and_then(|j| j.channel.clone())
-            }
-            .ok_or(404u16)?;
+            // The session must already be open (open_video registered it).
             {
-                let mut c = chan.lock().await;
-                *c = AuthedChannel { sender, host, token };
+                let guard = jobs.0.lock().await;
+                if !guard.contains_key(&file_id_hex) {
+                    return Err(404);
+                }
             }
-            serve_range(&jobs, &file_id_hex, first, last_inclusive)
-                .await
-                .map_err(|e| if e.code == "range_not_satisfiable" { 416 } else { 500 })
+
+            // Parse "bytes=first-[last]" (default first=0 when absent).
+            let (first, last_inclusive) = parse_byte_range(range_header);
+
+            // First attempt over the session's persistent authed channel (no reauth
+            // needed for normal operation — overlapping requests serialize via the
+            // channel Mutex).
+            match serve_range(&jobs, &file_id_hex, first, last_inclusive).await {
+                Ok(r) => Ok(r),
+                Err(e) if e.code == "channel_dead" => {
+                    // The persistent connection dropped. Reconnect ONCE (needs app
+                    // state), replace the job's channel in-place, and retry the range.
+                    let server = server_of(&dir.0).map_err(|_| 500u16)?;
+                    let (sender, host, token) =
+                        reauth(&dir.0, &server, &session, &connect_lock).await.map_err(|_| 500u16)?;
+                    let chan = {
+                        let g = jobs.0.lock().await;
+                        g.get(&file_id_hex).and_then(|j| j.channel.clone())
+                    }
+                    .ok_or(404u16)?;
+                    {
+                        let mut c = chan.lock().await;
+                        *c = AuthedChannel { sender, host, token };
+                    }
+                    serve_range(&jobs, &file_id_hex, first, last_inclusive)
+                        .await
+                        .map_err(|e| if e.code == "range_not_satisfiable" { 416 } else { 500 })
+                }
+                Err(e) => Err(if e.code == "range_not_satisfiable" { 416 } else { 500 }),
+            }
         }
-        Err(e) => Err(if e.code == "range_not_satisfiable" { 416 } else { 500 }),
+        "preview" => {
+            // Serve the author's staged plaintext fMP4 by range. No hex16 validation —
+            // a job_id is an opaque string, not a file hex16. No decrypt, no auth, no
+            // network — the author already owns this plaintext.
+            let upload_jobs = app.state::<UploadJobs>();
+            let (first, last_inclusive) = parse_byte_range(range_header);
+            serve_preview_range(&upload_jobs, id, first, last_inclusive).await
+                .map_err(|e| match e.code.as_str() {
+                    "not_found" => 404u16,
+                    "range_not_satisfiable" => 416,
+                    _ => 500,
+                })
+        }
+        _ => Err(404u16),
     }
 }
 
@@ -2336,6 +2376,30 @@ mod tests {
         assert_eq!(super::parse_byte_range(Some("bytes=500-")), (500, None));
         assert_eq!(super::parse_byte_range(Some("garbage")), (0, None));
         assert_eq!(super::parse_byte_range(Some("bytes=0-99,200-299")), (0, Some(99)));
+    }
+
+    #[test]
+    fn preview_slice_bounds() {
+        let buf: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+
+        // Exact bounded range: [100, 199] inclusive → start=100, len=100, body=buf[100..200].
+        let r = preview_slice(&buf, 100, Some(199)).expect("bounded range should be satisfiable");
+        assert_eq!(r.start, 100);
+        assert_eq!(r.len, 100);
+        assert_eq!(r.total_len, 1000);
+        assert_eq!(r.body, buf[100..200].to_vec());
+
+        // Open-ended [0, ): 1000 bytes < MAX_RANGE_BODY → entire buffer returned.
+        let r2 = preview_slice(&buf, 0, None).expect("open-ended range should be satisfiable");
+        assert_eq!(r2.start, 0);
+        assert_eq!(r2.len, 1000);
+        assert_eq!(r2.total_len, 1000);
+
+        // Unsatisfiable: first == total_len → None (⇒ 416).
+        assert!(
+            preview_slice(&buf, 1000, None).is_none(),
+            "first == total_len must be unsatisfiable (416)"
+        );
     }
 
     #[test]

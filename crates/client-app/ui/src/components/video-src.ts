@@ -11,3 +11,12 @@
 export function streamSrc(fileId: string): string {
   return `http://stream.localhost/media/${fileId}`;
 }
+
+/// Build the custom-protocol URL for an author PREVIEW (the staged, not-yet-uploaded
+/// fMP4). Same Windows WebView2 `http://<scheme>.localhost/<path>` form as streamSrc,
+/// under the `preview` namespace; the Rust `serve_preview_range` handler serves the
+/// author's OWN staged plaintext by byte range (no decrypt, no auth). `jobId` is the
+/// upload job id from stage_upload.
+export function previewSrc(jobId: string): string {
+  return `http://stream.localhost/preview/${jobId}`;
+}

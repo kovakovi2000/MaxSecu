@@ -1,6 +1,6 @@
 import "media-chrome";
 import { call, on } from "../core/rpc.ts";
-import { streamSrc } from "./video-src.ts";
+import { streamSrc, previewSrc } from "./video-src.ts";
 import { serial } from "../core/serial.ts";
 import {
   createYuvRenderer,
@@ -103,10 +103,11 @@ export class VideoPlayer extends HTMLElement {
   }
 
   connectedCallback() {
-    // VIEW path → native <video> + Media Chrome. Author PREVIEW (previewJob)
-    // keeps the existing confined-decode canvas engine below (spec: reversal is
-    // view-only).
-    if (!this.previewJob) { this.connectNative(); return; }
+    // Both the view and the author preview now use the native <video> + Media Chrome
+    // path. The confined-decode engine below is retained only until Task 7 deletes it;
+    // it is no longer reached.
+    this.connectNative();
+    return;
     // ---- existing confined-preview setup continues UNCHANGED below ----
     this.reqId = this.fileId;
     // Static chrome skeleton — NO dynamic interpolation into innerHTML (XSS
@@ -176,7 +177,7 @@ export class VideoPlayer extends HTMLElement {
       this.audio = new AudioContext();
     } catch {
       this.setPhase({ phase: "error", code: "audio" });
-      this.renderer.dispose();
+      this.renderer?.dispose();
       this.renderer = null;
       this.disableControls(); // no audio graph → same: no inert focusable chrome
       return;
@@ -315,7 +316,15 @@ export class VideoPlayer extends HTMLElement {
     ["loadstart", "loadedmetadata", "canplay", "playing", "stalled"].forEach((ev) =>
       video.addEventListener(ev, () => dlog(`video-${ev} t=${video.currentTime.toFixed(2)}`)),
     );
-    void this.openNative(video);
+    if (this.previewJob) {
+      // Author preview: serve the OWN staged fMP4 by range — no open_video, no
+      // preview_video/preview_seek/cancel_video (the staged job is owned by the
+      // upload flow). Point the element straight at the preview namespace.
+      dlog(`connectNative: preview job=${this.previewJob}`);
+      video.src = previewSrc(this.previewJob);
+    } else {
+      void this.openNative(video);   // view path: open_video (register+probe) then streamSrc
+    }
   }
 
   private async openNative(video: HTMLVideoElement) {
