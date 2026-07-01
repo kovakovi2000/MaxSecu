@@ -64,15 +64,6 @@ pub const DEFAULT_WORKER_MEMORY_CAP_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(windows)]
 pub const DEFAULT_FFMPEG_MEMORY_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Default per-job forced-kill timeout for the confined ffmpeg ingest (Task 2.2).
-/// The worker decode path's fixed 2-minute bound is too short for universal video
-/// ingest — a large/long source can legitimately take longer — so the ffmpeg path
-/// uses this generous-but-FINITE default (10 minutes), overridable via
-/// [`FfmpegLauncher::with_timeout`]. It is a DoS ceiling: past it the confined
-/// process is terminated rather than waited on forever.
-#[cfg(windows)]
-pub const DEFAULT_FFMPEG_TIMEOUT_MS: u32 = 600_000;
-
 /// **Progress-based stall timeout** for the confined ffmpeg ingest (Task B). The
 /// fixed wall-clock kill is replaced by this: the confined ffmpeg is force-killed
 /// only if its `-progress` `out_time` fails to advance for this long (reset on every
@@ -1918,5 +1909,16 @@ mod tests {
         trunc.extend_from_slice(&[1u8, 2u8]);
         let (_m, end) = drive_framed_session_partial(Vec::new(), std::io::Cursor::new(trunc), &[]);
         assert_eq!(end, Some(DriveEnd::WorkerGone));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ffmpeg_launcher_bounds_are_stall_watchdog_plus_backstop() {
+        // The confined ffmpeg ingest is bounded by the progress-based stall watchdog
+        // (primary) + a 1-hour absolute DoS backstop — the old fixed 10-min hard cap
+        // (DEFAULT_FFMPEG_TIMEOUT_MS) is gone.
+        let launcher = FfmpegLauncher::new("ffmpeg.exe");
+        assert_eq!(launcher.stall_timeout_ms, FFMPEG_STALL_TIMEOUT_MS);
+        assert_eq!(launcher.max_total_ms, FFMPEG_MAX_TOTAL_MS);
     }
 }
