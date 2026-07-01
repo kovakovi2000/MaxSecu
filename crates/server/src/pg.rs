@@ -32,7 +32,7 @@ use time::OffsetDateTime;
 use crate::control::{decode_control, role_from_text, role_text};
 use crate::error::{ControlAppendError, StoreError};
 use crate::files::{
-    AddWrapError, DeleteWrapError, FinalizeError, ListFilter, ParsedStage, StageError,
+    AddWrapError, DeleteWrapError, DiscardError, FinalizeError, ListFilter, ParsedStage, StageError,
     VersionSelector, WrapInput,
 };
 use crate::store::{
@@ -1087,6 +1087,59 @@ impl Store for PgStore {
             })
             .collect();
         Ok(Some(out))
+    }
+
+    async fn discard_unfinalized(
+        &self,
+        file_id: [u8; 16],
+        caller_id: [u8; 16],
+    ) -> Result<Vec<String>, DiscardError> {
+        let op = "discard_unfinalized";
+        let serr = |e: sqlx::Error| DiscardError::Store(store_err(op)(e));
+
+        // Check the file exists, verify caller is the owner, and confirm there is no
+        // finalized version (the append-only model forbids removing finalized content).
+        let frow = sqlx::query("SELECT owner_id, current_version FROM files WHERE file_id = $1")
+            .bind(&file_id[..])
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(serr)?;
+        let Some(frow) = frow else {
+            return Ok(vec![]); // idempotent: absent file has no staged version
+        };
+        let owner_id: [u8; 16] = col_fixed(&frow, op, "owner_id").map_err(DiscardError::Store)?;
+        if owner_id != caller_id {
+            return Err(DiscardError::NotFound); // no oracle
+        }
+        let current_version: i64 = frow.get("current_version");
+        if current_version >= 1 {
+            return Err(DiscardError::HasFinalizedVersion);
+        }
+
+        // Collect blob_refs of the unfinalized version's streams before deleting rows.
+        let srows = sqlx::query(
+            "SELECT fs.blob_ref FROM file_streams fs \
+             JOIN file_versions fv ON fv.file_id = fs.file_id AND fv.version = fs.version \
+             WHERE fs.file_id = $1 AND fv.finalized = false",
+        )
+        .bind(&file_id[..])
+        .fetch_all(&self.pool)
+        .await
+        .map_err(serr)?;
+        let blob_refs: Vec<String> = srows.iter().map(|r| r.get("blob_ref")).collect();
+
+        // Delete the unfinalized file_versions row; CASCADE removes file_streams and
+        // file_key_wraps rows (same path as the idempotent re-stage overwrite, §12).
+        // The append-only trigger only blocks finalized=true rows; WHERE finalized=false
+        // is the exact same predicate used by the re-stage DELETE in stage_version.
+        sqlx::query("DELETE FROM file_versions WHERE file_id = $1 AND finalized = false")
+            .bind(&file_id[..])
+            .execute(&self.pool)
+            .await
+            .map_err(serr)?;
+
+        // Leave file_genesis (immutable, §11.7) and files (inert, current_version = 0).
+        Ok(blob_refs)
     }
 }
 

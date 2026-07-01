@@ -215,6 +215,25 @@ impl From<StoreError> for DeleteWrapError {
     }
 }
 
+/// Why a staged-but-never-finalized file discard (`DELETE /v1/files/{id}`)
+/// was rejected. Fail-closed; missing-vs-not-owner collapses to the same
+/// outcome (no oracle, §9.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscardError {
+    /// The file is absent or the caller is not the owner — same code, no oracle.
+    NotFound,
+    /// A finalized version exists; the append-only model forbids removal (§11.7).
+    HasFinalizedVersion,
+    /// A backend fault (→ 500, logged).
+    Store(StoreError),
+}
+
+impl From<StoreError> for DiscardError {
+    fn from(e: StoreError) -> Self {
+        DiscardError::Store(e)
+    }
+}
+
 /// Which version of a file `GET /v1/files/{id}` should return (api.md §8.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionSelector {

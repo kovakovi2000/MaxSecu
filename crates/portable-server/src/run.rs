@@ -62,6 +62,7 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
                 blobs,
                 audit: Arc::new(NullAuditSink),
                 direct_links_enabled: false,
+                max_file_bytes: None,
             };
             router(state)
         }
@@ -80,6 +81,7 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
                 blobs,
                 audit: Arc::new(NullAuditSink),
                 direct_links_enabled: false,
+                max_file_bytes: None,
             };
             router(state)
         }

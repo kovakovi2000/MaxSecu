@@ -810,6 +810,7 @@ async fn boot_harness(pki: &TestPki) -> Harness {
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
+        max_file_bytes: None,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

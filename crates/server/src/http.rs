@@ -11,8 +11,8 @@
 use crate::auth::AuthService;
 use crate::error::{AuthError, ChallengeError, ControlAppendError, ProveError};
 use crate::files::{
-    parse_stage, AddWrapError, DeleteWrapError, FinalizeError, GenesisInput, ListFilter, StageError,
-    StageInput, VersionSelector, WrapInput,
+    parse_stage, AddWrapError, DeleteWrapError, DiscardError, FinalizeError, GenesisInput,
+    ListFilter, StageError, StageInput, VersionSelector, WrapInput,
 };
 use crate::audit::{AuditSink, GrantAction, GrantEdge};
 use crate::blob::BlobStore;
@@ -22,7 +22,7 @@ use maxsecu_encoding::structs::{DirBinding, Manifest};
 use maxsecu_encoding::types::Role;
 use maxsecu_encoding::decode;
 use maxsecu_crypto::VerifyingKey;
-use axum::extract::{FromRequestParts, Json, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Json, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{request::Parts, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -54,6 +54,12 @@ pub struct AppState<S: Store> {
     /// direct_disabled`. A client also forces server-proxy under Tor (D34) by not
     /// calling it.
     pub direct_links_enabled: bool,
+    /// Optional per-upload content size cap (operator-configured, default `None`
+    /// = unlimited). When `Some(limit)`, staging a manifest whose content stream's
+    /// `chunk_count × chunk_size` exceeds `limit` is rejected with `413
+    /// Payload Too Large`. Other streams (metadata/thumbnail/preview) are not
+    /// counted toward the quota.
+    pub max_file_bytes: Option<u64>,
 }
 
 impl<S: Store> Clone for AppState<S> {
@@ -63,6 +69,7 @@ impl<S: Store> Clone for AppState<S> {
             blobs: self.blobs.clone(),
             audit: self.audit.clone(),
             direct_links_enabled: self.direct_links_enabled,
+            max_file_bytes: self.max_file_bytes,
         }
     }
 }
@@ -88,7 +95,7 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         .route("/v1/pending", get(list_pending::<S>))
         .route("/v1/vouchers", post(issue_voucher::<S>))
         .route("/v1/files", get(list_files::<S>).post(create_file::<S>))
-        .route("/v1/files/{file_id}", get(get_file::<S>))
+        .route("/v1/files/{file_id}", get(get_file::<S>).delete(discard_file::<S>))
         .route(
             "/v1/files/{file_id}/recipients",
             get(list_recipients::<S>),
@@ -119,6 +126,11 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
             post(direct_link::<S>),
         )
         .with_state(state)
+        // Raise the body limit to 8 MiB + 64 KiB so 6 MiB ciphertext chunks (plus
+        // the AEAD tag) are accepted while clearly oversized bodies are rejected.
+        // Applied globally — other bodies (JSON staging requests etc.) are small,
+        // so this is safe. Default axum limit is 2 MB which would block 6 MiB PUTs.
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024 + 64 * 1024))
 }
 
 /// Direct-link TTL — short-lived, scoped, read-only (parameters.md §8, api §9.4).
@@ -880,6 +892,17 @@ async fn stage_and_respond<S: Store>(st: &AppState<S>, input: StageInput) -> Res
         Ok(p) => p,
         Err(e) => return stage_status(e),
     };
+    // Optional per-upload content quota: reject if the content stream's
+    // declared size (chunk_count × chunk_size) exceeds the operator cap.
+    // Checked after parse so the manifest is already decoded + bound-checked.
+    if let Some(limit) = st.max_file_bytes {
+        if let Some(s) = parsed.streams.iter().find(|s| s.stream_type == 1) {
+            let declared = (s.chunk_count).saturating_mul(s.chunk_size as u64);
+            if declared > limit {
+                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            }
+        }
+    }
     // Capture the authored grant edges (upload + rotation carry-forward) before
     // the parse is consumed; emit them to the sink on a successful stage (§16.5).
     let edges: Vec<([u8; 16], [u8; 16])> = parsed
@@ -1389,6 +1412,34 @@ async fn delete_wrap<S: Store + 'static>(
     }
 }
 
+/// `DELETE /v1/files/{file_id}` — discard a staged-but-never-finalized upload.
+/// Owner-only; idempotent (absent-or-already-discarded staged version is success).
+/// `204` on success; `404` for absent/not-owner (no oracle); `409` if a finalized
+/// version exists (append-only model — cannot remove committed content, §11.7).
+async fn discard_file<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    session: AuthedSession,
+    Path(file_id_hex): Path<String>,
+) -> Response {
+    let Some(file_id) = hex_fixed::<16>(&file_id_hex) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st.auth.store().discard_unfinalized(file_id, session.user_id).await {
+        Ok(blob_refs) => {
+            // Best-effort blob cleanup; the discard already committed in the store.
+            for r in &blob_refs {
+                if let Err(e) = st.blobs.delete_stream(r).await {
+                    log_internal(e);
+                }
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(DiscardError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(DiscardError::HasFinalizedVersion) => StatusCode::CONFLICT.into_response(),
+        Err(DiscardError::Store(e)) => internal_error(e),
+    }
+}
+
 #[derive(Serialize)]
 struct RecipientOut {
     recipient_id: String,
@@ -1646,6 +1697,7 @@ mod tests {
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
+            max_file_bytes: None,
         };
         let router = router(state).layer(Extension(TlsExporter(exporter)));
         (router, sk)
@@ -1819,6 +1871,7 @@ mod tests {
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
+            max_file_bytes: None,
         };
         router(state).layer(Extension(TlsExporter(EXPORTER)))
     }
@@ -1896,6 +1949,7 @@ mod tests {
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
+            max_file_bytes: None,
         };
         router(state).layer(Extension(TlsExporter(EXPORTER)))
     }
@@ -1950,6 +2004,7 @@ mod tests {
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
+            max_file_bytes: None,
         };
         router(state).layer(Extension(TlsExporter(EXPORTER)))
     }
@@ -2007,6 +2062,7 @@ mod tests {
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
+            max_file_bytes: None,
         };
         let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
 
@@ -2029,6 +2085,7 @@ mod tests {
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
+            max_file_bytes: None,
         };
         let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
         let sk = SigningKey::generate();
@@ -2158,6 +2215,7 @@ mod tests {
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
+            max_file_bytes: None,
         })
         .layer(Extension(TlsExporter(EXPORTER)));
 
@@ -2306,6 +2364,7 @@ mod tests {
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: audit.clone(),
             direct_links_enabled: false,
+            max_file_bytes: None,
         })
         .layer(Extension(TlsExporter(EXPORTER)));
         (router, admin_sk, bob_sk, audit)
@@ -2482,6 +2541,7 @@ mod tests {
             blobs,
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: true,
+            max_file_bytes: None,
         })
         .layer(Extension(TlsExporter(EXPORTER)));
         (router, admin_sk, bob_sk)
@@ -2634,6 +2694,7 @@ mod tests {
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
+            max_file_bytes: None,
         };
         let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
 

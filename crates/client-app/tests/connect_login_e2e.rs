@@ -69,6 +69,7 @@ async fn spawn_server() -> (std::net::SocketAddr, CertificateDer<'static>) {
         blobs: Arc::new(maxsecu_server::MemoryBlobStore::new()),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
+        max_file_bytes: None,
     };
     let router = maxsecu_server::router(state);
 
