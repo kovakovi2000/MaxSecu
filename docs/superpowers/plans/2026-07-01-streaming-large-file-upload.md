@@ -131,30 +131,50 @@ Build the signed manifest/genesis/wraps + the SMALL sealed streams given the str
 `(digest, chunk_count)` — without ever materializing the content ciphertext — and expose recovering the DEK
 from a self-wrap for resume.
 
-- [ ] **Step 1 (failing test A):** Add a test that builds an upload two ways over the SAME `Dek` seed +
-  params: (a) the existing `build_upload(params, streams_with_content)`; (b) a new
-  `StreamingUpload`/`build_upload_streaming` path where the content is provided via `ContentStreamSealer`
-  (digest+count) and only the small streams as bytes. Assert the resulting `manifest` (bytes), `manifest_sig`,
-  `genesis`, `genesis_sig`, and `wraps` are IDENTICAL, and the small `SealedStreamOut`s match. (The content
-  chunks are absent from the streaming path by design.)
-- [ ] **Step 2 (failing test B):** Add a test that takes the self-`WrapOut` from a build, and recovers the
-  `Dek` via a new `recover_dek(self_secret, &wrapped_dek, &WrapContext) -> Dek`, then shows a
-  `ContentStreamSealer::new(&recovered_dek, ...)` driven over a `Cursor` of the same content reproduces the
-  same emitted ciphertext chunks + digest as the original. (Reuse the existing `unwrap_dek`.)
-- [ ] **Step 3:** Run → FAIL.
-- [ ] **Step 4 (implement):** Introduce a builder that OWNS the freshly-generated `Dek` (kept inside
-  client-core — never returned), can construct a `ContentStreamSealer::new(&dek, file_id, FIRST_VERSION,
-  Content, chunk_size)` for the content stream, seals the small streams via existing `seal_streams`, and
-  `finish(content_digest, content_chunk_count, params) -> UploadRecords { manifest, manifest_sig, genesis,
-  genesis_sig, wraps, small_streams: Vec<SealedStreamOut> }` (no content chunks; the manifest's `content`
-  Stream carries the passed-in `content_digest`/`content_chunk_count`). Add `recover_dek(...)`. Keep the
-  self-wrap pre-check (§12.2 step 7).
-- [ ] **Step 5:** Run `cargo test -p maxsecu-client-core --lib upload::` → PASS.
-- [ ] **Step 6:** Commit: `feat(core): streaming upload records (manifest/genesis/wraps without content) + DEK recovery from self-wrap`.
+> **`Dek` is not `Clone`** (it wraps `Zeroizing<[u8;32]>`), so a byte-identical A/B test must drive BOTH paths
+> from the **same `&Dek`**. Refactor `build_upload` to delegate to a `pub(crate) fn build_upload_inner(dek:
+> &Dek, params, streams) -> UploadBundle` (public `build_upload` = `build_upload_inner(&Dek::generate(), …)`),
+> and give the streaming path a matching `pub(crate) fn build_records_inner(dek: &Dek, params, small: &SmallStreams,
+> content_digest, content_chunk_count) -> UploadRecords`. DRY the manifest/genesis/wrap assembly into ONE shared
+> private helper both call (so the two can never diverge). The small-stream sealing loop of `seal_streams`
+> should be factored so the streaming path seals only metadata/thumbnail/preview (content is NOT sealed here —
+> its manifest `Stream` entry is `{Content, None, content_chunk_count, content_digest}`, prepended first since
+> Content sorts lowest).
 
-**Security pass:** the DEK never leaves client-core (builder owns it; only wraps + records cross); records
-are byte-identical to the monolithic path; `recover_dek` fails closed on a wrong secret/ctx; no key material
-is logged.
+- [ ] **Step 1 (failing test A — byte-identical records):** Over one `let dek = Dek::generate();` and one
+  `params`, call (a) `build_upload_inner(&dek, &params, &full_streams)` and (b) the streaming path: seal the
+  content with `ContentStreamSealer::new(&dek, file_id, FIRST_VERSION, Content, chunk_size)` over a `Cursor`
+  to get `(content_chunk_count, content_digest)`, then `build_records_inner(&dek, &params, &small_streams,
+  content_digest, content_chunk_count)`. Assert `manifest` (encoded bytes), `manifest_sig`, `genesis`,
+  `genesis_sig`, and `wraps` (recipient_id/type, wrapped_dek bytes, grant, grant_sig) are IDENTICAL, and the
+  small `SealedStreamOut`s (metadata/thumbnail/preview) match the corresponding ones from (a). (Content chunks
+  are absent from the streaming path by design.) Do this for a V1 build (no ML-KEM) at minimum.
+- [ ] **Step 2 (failing test B — DEK recovery round-trips, V1 AND V2):** From a build's self-`WrapOut`, recover
+  the `Dek` and show a `ContentStreamSealer` from it reproduces the original content ciphertext + digest.
+  Cover both suites: **V1** via `recover_dek(self_enc_secret: &EncSecretKey, &wrapped_dek, &WrapContext) ->
+  Result<Dek, CryptoError>` (reuse `unwrap_dek`); **V2** via `recover_dek_hybrid(self_hybrid_secret:
+  &HybridEncSecretKey, &wrapped_dek, &WrapContext) -> Result<Dek, CryptoError>` (reuse `unpack_hybrid_wrap` +
+  `unwrap_dek_hybrid`). Also test the client-app-facing `resume_content_sealer(owner: &Identity,
+  self_wrapped_dek, ctx, suite, file_id, version, chunk_size) -> Result<ContentStreamSealer, UploadError>`
+  (branches on `suite`, recovers the `Dek` INTERNALLY, returns only a sealer — the `Dek` never leaves the
+  crate) reproduces the original content ciphertext for both a V1 and a V2 upload.
+- [ ] **Step 3:** Run → FAIL.
+- [ ] **Step 4 (implement):** Add the `build_upload_inner`/`build_records_inner` refactor + shared assembly
+  helper, `SmallStreams { metadata, thumbnail, preview }`, `UploadRecords { file_id, file_type, genesis,
+  genesis_sig, manifest, manifest_sig, wraps, small_streams }`, and a `StreamingUploadBuilder` (public;
+  OWNS a freshly-generated `Dek`, never returns it) with `content_sealer(file_id, chunk_size) ->
+  ContentStreamSealer` and `finish(&params, &small, content_digest, content_chunk_count) -> UploadRecords`
+  (delegates to `build_records_inner(&self.dek, …)`). Add `recover_dek`/`recover_dek_hybrid` (pub(crate)) and
+  the public `resume_content_sealer`. Keep the existing self-wrap pre-check inside `wrap_and_grant[_hybrid]`
+  (§12.2 step 7) — the streaming path reuses those unchanged.
+- [ ] **Step 5:** Run `cargo test -p maxsecu-client-core --lib upload::` → PASS (all existing tests too).
+- [ ] **Step 6:** Commit: `feat(core): streaming upload records (manifest/genesis/wraps without content) + DEK recovery from self-wrap (V1+V2)`.
+
+**Security pass:** the `Dek` never leaves the crate — the builder owns it, `resume_content_sealer` recovers it
+internally and returns only a `ContentStreamSealer` (holding just the content subkey); only wraps + records +
+ciphertext cross the seam. Records are byte-identical to the monolithic path (shared assembly helper).
+`recover_dek*` fail closed on a wrong secret/ctx/suite. No key material is logged. The self-wrap pre-check
+still runs on build.
 
 ## Task 3: media-launcher — drop the hard transcode timeout (keep stall watchdog)
 
