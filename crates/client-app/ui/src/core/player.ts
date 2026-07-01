@@ -203,7 +203,6 @@ function decodeI16Le(b64: string): Int16Array {
 export function createPlayer(opts: PlayerOptions): Player {
   const audio = opts.audio;
   const subscribe: Subscribe = opts.subscribe ?? on;
-  const reducedMotion = opts.reducedMotion;
   const ringCapacity = Math.max(1, opts.ringCapacity ?? 16);
   const pendingCapacity = Math.max(1, opts.pendingCapacity ?? 96);
   const maxGain = opts.maxGain ?? 1;
@@ -226,7 +225,6 @@ export function createPlayer(opts: PlayerOptions): Player {
   const liveSources = new Set<AudioBufferSourceLike>();
 
   let playing = false;
-  let started = false; // first-frame autostart latch
   let disposed = false;
   let volume = clamp(1, 0, maxGain);
   let rate = 1;
@@ -299,11 +297,6 @@ export function createPlayer(opts: PlayerOptions): Player {
       droppedCount++;
     }
     pushRing(frame);
-    // Autostart on the first frame unless reduced-motion asked us to hold.
-    if (!started) {
-      started = true;
-      if (!reducedMotion) play();
-    }
   }
 
   function onAudio(dto: PcmDto): void {
@@ -380,7 +373,6 @@ export function createPlayer(opts: PlayerOptions): Player {
   function play(): void {
     if (disposed) return;
     playing = true;
-    started = true;
     void audio.resume?.();
     startLoop();
   }

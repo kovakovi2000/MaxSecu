@@ -382,7 +382,7 @@ test("reducedMotion blocks autoplay until an explicit play()", () => {
   assert.strictEqual(drawn.length, 1, "explicit play() releases the due frame");
 });
 
-test("without reducedMotion the first frame autostarts playback", () => {
+test("with reducedMotion:false a frame is drawn after explicit play()", () => {
   const bus = makeBus();
   const audio = new FakeAudio();
   const drawn: YuvFrame[] = [];
@@ -393,8 +393,9 @@ test("without reducedMotion the first frame autostarts playback", () => {
     reducedMotion: false,
   });
 
+  player.play();
   bus.emit(EVT_VIDEO_FRAME, frameDto(0));
-  assert.strictEqual(player.isPlaying(), true, "autoplay on first frame");
+  assert.strictEqual(player.isPlaying(), true, "playing after explicit play()");
   player.tick();
   assert.strictEqual(drawn.length, 1);
 });
@@ -582,4 +583,26 @@ test("dispose unsubscribes all events", async () => {
   player.dispose();
   await Promise.resolve();
   assert.strictEqual(bus.has(EVT_VIDEO_FRAME), false, "events torn down");
+});
+
+test("does not autostart on the first frame; play() is required", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  assert.strictEqual(player.isPlaying(), false, "no autostart");
+  player.tick();
+  assert.strictEqual(drawn.length, 0, "nothing drawn until play()");
+  player.play();
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "draws after play()");
+  player.dispose();
 });
