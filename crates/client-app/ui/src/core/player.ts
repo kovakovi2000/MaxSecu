@@ -118,6 +118,8 @@ export interface PlayerOptions {
   // at lower resolutions where each frame's absolute footprint (and thus 96 frames) is
   // modest. The two caps compose to bound the total decoded-frame footprint end to end.
   pendingCapacity?: number;
+  // Total clip duration in ms (from the fragment index). May be set later via setDuration().
+  durationMs?: number;
   // Master clock in SECONDS; defaults to audio.currentTime. Injectable so tests
   // drive sync deterministically.
   audioClock?: () => number;
@@ -155,6 +157,12 @@ export interface Player {
   stats(): { drawn: number; dropped: number };
   readonly volume: number;
   readonly rate: number;
+  // Current play position in ms (from the clock). Returns 0 before play() is called.
+  positionMs(): number;
+  // Total clip duration in ms (set by the component via setDuration).
+  durationMs(): number;
+  // Update the clip duration (from the fragment index, available after headers are parsed).
+  setDuration(ms: number): void;
 }
 
 // ---- portable base64 (atob may be absent under node) ---------------------
@@ -231,21 +239,19 @@ export function createPlayer(opts: PlayerOptions): Player {
   let drawnCount = 0;
   let droppedCount = 0;
   let nextAudioTime = 0; // playout cursor for the audio graph (seconds)
-  // The audio-clock reading captured when playback begins (first scheduled audio
-  // chunk, or first frame when video-only). The audio is master and is scheduled
-  // gaplessly from here, so video frames sync against ELAPSED time since this origin
-  // (audioClock() - playbackStart) rather than the raw clock — otherwise window-relative
-  // pts (which start near 0) would all read as "due" against a nonzero wall clock and
-  // the whole window would burst then stall. Reset on seek (a new window). null until
-  // the first frame/audio establishes the origin.
+  // The audio-clock reading captured when playback begins (at play()). The audio is
+  // master and is scheduled gaplessly from here, so video frames sync against ELAPSED
+  // time since this origin (audioClock() - playbackStart) rather than the raw clock —
+  // otherwise window-relative pts (which start near 0) would all read as "due" against
+  // a nonzero wall clock and the whole window would burst then stall. Reset on seek (a
+  // new window). null until play() establishes the origin.
   let playbackStart: number | null = null;
+  let durationMs = Math.max(0, opts.durationMs ?? 0);
 
   gain.gain.value = volume;
-
-  // Capture the playback-start origin exactly once, at the first audio chunk or frame.
-  function ensurePlaybackStart(): void {
-    if (playbackStart === null) playbackStart = audioClock();
-  }
+  // No autoplay: start suspended so the audio clock is frozen and any pre-play audio
+  // chunks stay silent until the user presses Play (which resume()s the context).
+  void audio.suspend?.();
 
   // rAF pacing when in a browser; under node the loop is inert and tests drive
   // tick() directly.
@@ -275,9 +281,6 @@ export function createPlayer(opts: PlayerOptions): Player {
 
   function onFrame(dto: I420FrameDto): void {
     if (disposed) return;
-    // Establish the playback origin on the first frame (covers the video-only case;
-    // for A/V the first audio chunk usually sets it first — whichever fires first wins).
-    ensurePlaybackStart();
     const frame: YuvFrame = {
       width: dto.width,
       height: dto.height,
@@ -301,9 +304,6 @@ export function createPlayer(opts: PlayerOptions): Player {
 
   function onAudio(dto: PcmDto): void {
     if (disposed || dto.channels <= 0) return;
-    // Audio is master: the first scheduled chunk establishes the playback origin the
-    // video syncs against.
-    ensurePlaybackStart();
     const samples = decodeI16Le(dto.samples_b64);
     const frames = Math.floor(samples.length / dto.channels);
     if (frames <= 0) return;
@@ -343,6 +343,12 @@ export function createPlayer(opts: PlayerOptions): Player {
     opts.onPhase?.(phase);
   }
 
+  // Current play position in ms: elapsed since playbackStart, or 0 before it is set.
+  function positionMs(): number {
+    if (playbackStart === null) return 0;
+    return Math.max(0, Math.round((audioClock() - playbackStart) * 1000));
+  }
+
   // ---- A/V sync scheduler ----
   // Audio is master. Walk the pending queue: future frames (pts beyond clock +
   // tolerance) are HELD; among consecutive DUE frames only the latest is drawn
@@ -374,6 +380,7 @@ export function createPlayer(opts: PlayerOptions): Player {
     if (disposed) return;
     playing = true;
     void audio.resume?.();
+    if (playbackStart === null) playbackStart = audioClock();
     startLoop();
   }
 
@@ -463,6 +470,11 @@ export function createPlayer(opts: PlayerOptions): Player {
     },
     get rate() {
       return rate;
+    },
+    positionMs,
+    durationMs: () => durationMs,
+    setDuration: (ms: number) => {
+      durationMs = Math.max(0, ms);
     },
   };
 }

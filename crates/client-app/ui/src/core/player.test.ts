@@ -560,12 +560,14 @@ test("pause() suspends the audio context; play() resumes it", () => {
     reducedMotion: false,
     audioClock: () => audio.currentTime,
   });
+  // createPlayer suspends the context once at init; baseline after construction.
+  const s0 = audio.suspended, r0 = audio.resumed;
   player.play();
-  assert.strictEqual(audio.resumed, 1, "play() resumes the context");
+  assert.strictEqual(audio.resumed, r0 + 1, "play() resumes the context");
   player.pause();
-  assert.strictEqual(audio.suspended, 1, "pause() suspends the context");
+  assert.strictEqual(audio.suspended, s0 + 1, "pause() suspends the context");
   player.play();
-  assert.strictEqual(audio.resumed, 2, "play() resumes again");
+  assert.strictEqual(audio.resumed, r0 + 2, "play() resumes again");
   player.dispose();
 });
 
@@ -604,5 +606,43 @@ test("does not autostart on the first frame; play() is required", () => {
   player.play();
   player.tick();
   assert.strictEqual(drawn.length, 1, "draws after play()");
+  player.dispose();
+});
+
+test("positionMs tracks the clock from play(); duration is settable", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  player.setDuration(59000);
+  assert.strictEqual(player.durationMs(), 59000);
+  player.play(); // clock=0 -> playbackStart captured at 0
+  clock = 2.5; // 2.5 s elapsed
+  assert.strictEqual(player.positionMs(), 2500, "position follows the clock");
+  player.dispose();
+});
+
+test("origin is captured at play(), not at frame arrival (wait-then-play does not skip)", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0)); // buffered as a poster; origin NOT set yet
+  assert.strictEqual(player.positionMs(), 0, "no origin before play()");
+  clock = 5; // the user stares at the poster for 5 s
+  player.play(); // origin captured NOW (at clock=5)
+  assert.strictEqual(player.positionMs(), 0, "elapsed is 0 at play, not 5000 — no skip");
   player.dispose();
 });
