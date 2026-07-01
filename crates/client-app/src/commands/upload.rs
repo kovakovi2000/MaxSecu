@@ -7,10 +7,10 @@ use tauri::State;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use maxsecu_client_core::{
-    build_upload, DirectoryVerifier, Identity, MemoryTrustStore, UploadParams,
+    build_upload, DirectoryVerifier, Identity, MemoryTrustStore, PlaintextStreams, UploadParams,
 };
 use maxsecu_crypto::EncPublicKey;
 use maxsecu_encoding::types::{Id, Timestamp};
@@ -29,6 +29,7 @@ use crate::jobs::{StagedUpload, StagedVideoPreview, UploadJobs, VideoPrepareCanc
 use crate::state::{PreparePhase, UploadPhase, EVT_UPLOAD, EVT_VIDEO_PREPARE};
 use crate::upload::{
     prepare_blog_streams, prepare_image_streams, prepare_video_streams, run_pipeline, total_chunks,
+    PreparedVideo,
 };
 
 use tauri::Emitter;
@@ -65,10 +66,23 @@ pub async fn stage_upload(
     jobs: State<'_, UploadJobs>,
     prepare_cancel: State<'_, VideoPrepareCancel>,
 ) -> Result<UploadPreview, UiError> {
+    // RAII guard that deletes the per-job temp dir on any error path AFTER a
+    // successful `prepare_video_streams` (which forgot its own guard and handed the
+    // dir to us). Disarmed (set to None) immediately after `jobs.insert` so the dir
+    // survives to serve preview ranges while the job is staged.
+    struct DirCleanup(Option<std::path::PathBuf>);
+    impl Drop for DirCleanup {
+        fn drop(&mut self) {
+            if let Some(d) = &self.0 {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
     // 1) Prepare the plaintext streams from the user's own content. For a video the
     //    transcode runs in the CONFINED worker (no network) and additionally yields
-    //    the canonical plaintext + fragment index held for the local preview.
-    let (file_type, mut streams, video_preview) = match req.kind {
+    //    the on-disk fMP4 path + fragment index held for the local preview.
+    let (file_type, mut streams, video_preview, video_job_dir) = match req.kind {
         UploadKind::Blog => {
             let text = req.content.clone().unwrap_or_default();
             if text.len() as u64 > MAX_UPLOAD_BYTES {
@@ -77,6 +91,7 @@ pub async fn stage_upload(
             (
                 maxsecu_encoding::types::FileType::Blog,
                 prepare_blog_streams(text.into_bytes(), &req.title, &req.tags),
+                None,
                 None,
             )
         }
@@ -93,7 +108,7 @@ pub async fn stage_upload(
             let bytes = std::fs::read(&path)
                 .map_err(|_| UiError::new("bad_request", "That file could not be read."))?;
             let (ft, s) = prepare_image_streams(&bytes, &req.title, &req.tags)?;
-            (ft, s, None)
+            (ft, s, None, None)
         }
         UploadKind::Video => {
             // The video source is now an ARBITRARY file (a path from the Browse
@@ -144,7 +159,7 @@ pub async fn stage_upload(
             // Clear the stored token on EVERY outcome (completion / cancel / error) so a
             // later `cancel_video_prepare` cannot flip a dead token.
             *prepare_cancel.0.lock().unwrap() = None;
-            let (s, frags) = match staged {
+            let prepared: PreparedVideo = match staged {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
                     // Emit the sanitized terminal phase mirroring the returned code: a
@@ -172,9 +187,21 @@ pub async fn stage_upload(
                     ));
                 }
             };
-            // Hold the canonical plaintext + the authenticated seek index for the
-            // local WYSIWYG preview (the bundle also carries the ciphertext form).
-            let index: Vec<crate::video::FragmentEntry> = frags
+            // BRIDGE: read the on-disk fMP4 back into RAM for `build_upload`.
+            // A later task removes this read and streams directly from disk; for now
+            // it is the minimal delta (no change to build_upload / PlaintextStreams).
+            let content = std::fs::read(&prepared.out_mp4_path).map_err(|_| {
+                UiError::new("encrypt_failed", "Could not prepare the upload.")
+            })?;
+            let streams = PlaintextStreams {
+                content,
+                metadata: Some(prepared.metadata),
+                thumbnail: Some(prepared.thumbnail),
+                preview: Some(prepared.preview),
+            };
+            // Build the authenticated fragment seek index (VIDEO_CHUNK_SIZE units).
+            let index: Vec<crate::video::FragmentEntry> = prepared
+                .fragments
                 .iter()
                 .map(|f| crate::video::FragmentEntry {
                     seq: f.seq,
@@ -183,20 +210,25 @@ pub async fn stage_upload(
                     chunk_len: f.chunk_len,
                 })
                 .collect();
-            // Hold the canonical plaintext in a Zeroizing buffer so the full-file
-            // plaintext is wiped on drop (confirm/cancel) — matching the per-window
-            // ScriptGuard zeroize discipline. It is RAM-only, never on disk.
+            // File-backed preview: hold the on-disk path, NOT the bytes. Range
+            // requests are served by seek+read via `preview_slice_file`.
             let preview = StagedVideoPreview {
-                cmaf: Zeroizing::new(s.content.clone()),
+                out_mp4_path: prepared.out_mp4_path.clone(),
                 index,
             };
             (
                 maxsecu_encoding::types::FileType::Video,
-                s,
+                streams,
                 Some(preview),
+                Some(prepared.job_dir),
             )
         }
     };
+    // Arm the stage-error cleanup guard. For video, any `?` error between here and
+    // `jobs.insert` (recipient resolution, build_upload, etc.) triggers Drop → dir
+    // wipe. For blog/image, DirCleanup(None) is a no-op. Disarmed after insert.
+    let mut dir_cleanup = DirCleanup(video_job_dir.clone());
+
     let thumbnail_b64 = streams.thumbnail.as_ref().map(|t| B64.encode(t));
     let byte_size = streams.content.len() as u64;
 
@@ -263,8 +295,13 @@ pub async fn stage_upload(
             total_chunks: total,
             byte_size,
             preview: video_preview,
+            job_dir: video_job_dir,
         },
     );
+    // Ownership of the temp dir now lives in StagedUpload — disarm the guard so it
+    // does not clean up the dir on return. If anything above panics after insert (not
+    // expected here), the dir persists, which is acceptable.
+    dir_cleanup.0 = None;
     Ok(UploadPreview {
         job_id,
         file_type: file_type_str,
@@ -371,22 +408,36 @@ async fn confirm_inner(
     .await;
 
     match result {
-        Ok(()) => Ok(file_id_hex),
+        Ok(()) => {
+            // Upload committed: the on-disk transcode is no longer needed. Delete the
+            // per-job temp dir (video) or no-op (image/blog where job_dir is None).
+            if let Some(d) = &staged.job_dir {
+                let _ = std::fs::remove_dir_all(d);
+            }
+            Ok(file_id_hex)
+        }
         Err(e) => {
-            jobs.0.lock().await.insert(job_id, staged); // retain for retry
+            // Retain the job (and its job_dir) for retry — the on-disk fMP4 must
+            // still be readable so preview ranges keep working in the upload tray.
+            jobs.0.lock().await.insert(job_id, staged);
             Err(e)
         }
     }
 }
 
 /// `cancel_upload` — drop a staged (pre-confirm or retained-after-failure) job. An
-/// in-flight confirm is not interrupted (documented Phase-4 limitation).
+/// in-flight confirm is not interrupted (documented Phase-4 limitation). Also deletes
+/// the per-job temp dir (video) so no Low-IL container artifacts linger on disk.
 #[tauri::command]
 pub async fn cancel_upload(
     req: CancelUploadRequest,
     jobs: State<'_, UploadJobs>,
 ) -> Result<(), UiError> {
-    jobs.0.lock().await.remove(&req.job_id);
+    if let Some(s) = jobs.0.lock().await.remove(&req.job_id) {
+        if let Some(d) = s.job_dir {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
     Ok(())
 }
 

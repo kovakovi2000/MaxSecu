@@ -11,8 +11,6 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::client::conn::http1::SendRequest;
 use tokio::sync::Mutex;
-use zeroize::Zeroizing;
-
 use maxsecu_client_core::UploadBundle;
 
 /// One persistent authed HTTP/1.1 channel for an open video session: the live
@@ -25,24 +23,26 @@ pub struct AuthedChannel {
     pub token: String,
 }
 
-/// The canonical (already-plaintext) video held for the **preview-before-upload**
-/// local decode (Phase 7, Gate 6). `cmaf` is the transcoded AV1/CMAF content stream
-/// the bundle ALSO carries in encrypted form; the author's own plaintext is bounded
-/// here only so `preview_video` can drive the confined decode session over it
-/// without a server fetch or a decrypt. It is dropped when the job leaves the
-/// registry (confirm/cancel) — and, being `Zeroizing`, the full-file plaintext is
-/// WIPED on that drop (matching the per-window `ScriptGuard` discipline). `index` is
-/// the authenticated fragment seek-map (in VIDEO_CHUNK_SIZE units), used to slice
-/// `cmaf` into per-fragment decode inputs.
+/// File-backed author preview for the **preview-before-upload** local decode (Phase 7,
+/// Gate 6). Holds the on-disk path of the transcoded fMP4 (`out.mp4` in the per-job
+/// temp dir) instead of an in-RAM plaintext buffer — range requests from the native
+/// `<video>` element are served by reading bounded slices from disk
+/// (`serve_preview_range` / `preview_slice_file`). `index` is the authenticated
+/// fragment seek-map (in VIDEO_CHUNK_SIZE units), used to locate per-fragment byte
+/// ranges in the file. Dropped when the job leaves the registry (confirm/cancel); the
+/// on-disk file is then also deleted via `StagedUpload.job_dir` cleanup.
 pub struct StagedVideoPreview {
-    pub cmaf: Zeroizing<Vec<u8>>,
+    /// On-disk path of the transcoded fMP4 (`out.mp4` in the per-job temp dir). Byte
+    /// ranges are served by seek+read — no full-file plaintext in RAM.
+    pub out_mp4_path: std::path::PathBuf,
     pub index: Vec<crate::video::FragmentEntry>,
 }
 
 /// One staged upload held pending the user's confirm. `bundle` carries the signed,
 /// encrypted records + ciphertext chunks (never sent to the UI). For a video,
-/// `preview` additionally holds the canonical plaintext + fragment index so the
-/// author can WYSIWYG-preview the transcoded result before confirming.
+/// `preview` holds the on-disk fMP4 path + fragment index so the author can
+/// WYSIWYG-preview the transcoded result before confirming. `job_dir` is the
+/// per-job temp dir (video only); deleted on confirm-success or cancel.
 pub struct StagedUpload {
     pub bundle: UploadBundle,
     pub file_type: String,
@@ -50,6 +50,10 @@ pub struct StagedUpload {
     pub total_chunks: u64,
     pub byte_size: u64,
     pub preview: Option<StagedVideoPreview>,
+    /// Per-job temp dir (video only; `None` for image/blog). Deleted on
+    /// confirm-success or cancel. Retained on failed-confirm so the retry can still
+    /// serve preview ranges from the on-disk fMP4.
+    pub job_dir: Option<std::path::PathBuf>,
 }
 
 /// Managed state: `job_id -> StagedUpload`. Async mutex (commands are async).
@@ -171,6 +175,7 @@ mod tests {
             total_chunks: 1,
             byte_size: 2,
             preview: None,
+            job_dir: None,
         }
     }
 

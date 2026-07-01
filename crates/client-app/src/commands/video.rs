@@ -1098,7 +1098,13 @@ where
         let staged = guard.get(job_id).ok_or_else(player_err)?;
         let preview = staged.preview.as_ref().ok_or_else(player_err)?;
         let start_seq = fragment_for_time(&preview.index, pts_ms).unwrap_or(0);
-        let script = build_preview_window_script(&preview.cmaf, &preview.index, start_seq, PLAY_WINDOW)?;
+        // Legacy confined-decode path: lazily read the on-disk fMP4 for the decode
+        // script. The canonical preview path is the native <video> range protocol
+        // (serve_preview_range / preview_slice_file); this read-then-decode path
+        // remains for the WebGL YUV player but is not expected on the hot path.
+        let cmaf = std::fs::read(&preview.out_mp4_path)
+            .map_err(|_| UiError::new("video_failed", "preview"))?;
+        let script = build_preview_window_script(&cmaf, &preview.index, start_seq, PLAY_WINDOW)?;
         let frag_index = preview.index.clone();
         (script, frag_index)
     };
@@ -1339,26 +1345,29 @@ fn stream_log(app: &tauri::AppHandle, msg: &str) {
     }
 }
 
-/// Slice one satisfiable byte range out of an in-memory plaintext buffer (the
-/// author's staged fMP4). Returns None (⇒ 416) for an unsatisfiable range. Pure —
-/// no lock, no network, no decrypt. `resolve_range` bounds/caps the slice.
-fn preview_slice(buf: &[u8], first: u64, last_inclusive: Option<u64>) -> Option<RangeResponse> {
-    let total = buf.len() as u64;
+/// Serve one bounded byte range from the on-disk staged fMP4 (`out.mp4` in the
+/// per-job temp dir). Bounded — never reads the whole file; caps the response to
+/// [`MAX_RANGE_BODY`]. Returns `None` (⇒ 416) for an unsatisfiable range or any
+/// I/O error (fail-closed). Pure — no lock, no network, no decrypt.
+fn preview_slice_file(path: &std::path::Path, first: u64, last_inclusive: Option<u64>) -> Option<RangeResponse> {
+    use std::io::{Read, Seek, SeekFrom};
+    let total = std::fs::metadata(path).ok()?.len();
     let req = crate::stream::resolve_range(first, last_inclusive, total, MAX_RANGE_BODY)?;
-    let start = req.start as usize;
-    let end = start.checked_add(req.len as usize)?;
-    if end > buf.len() { return None; }
-    Some(RangeResponse { start: req.start, len: req.len, total_len: total, body: buf[start..end].to_vec() })
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(req.start)).ok()?;
+    let mut body = vec![0u8; req.len as usize];
+    file.read_exact(&mut body).ok()?;
+    Some(RangeResponse { start: req.start, len: req.len, total_len: total, body })
 }
 
-/// Serve one byte range of an author PREVIEW's staged fMP4 (UploadJobs' StagedVideo
-/// preview cmaf) — plaintext the author already owns; NO decrypt, NO auth, NO network.
+/// Serve one byte range of an author PREVIEW's staged fMP4 — plaintext the author
+/// already owns, read by range from disk; NO decrypt, NO auth, NO network.
 /// Unknown job / no preview ⇒ not_found; unsatisfiable range ⇒ range_not_satisfiable.
 async fn serve_preview_range(jobs: &UploadJobs, job_id: &str, first: u64, last_inclusive: Option<u64>) -> Result<RangeResponse, UiError> {
     let guard = jobs.0.lock().await;
     let job = guard.get(job_id).ok_or_else(|| UiError::new("not_found", "unknown preview"))?;
     let preview = job.preview.as_ref().ok_or_else(|| UiError::new("not_found", "no preview"))?;
-    preview_slice(&preview.cmaf, first, last_inclusive).ok_or_else(|| UiError::new("range_not_satisfiable", "range"))
+    preview_slice_file(&preview.out_mp4_path, first, last_inclusive).ok_or_else(|| UiError::new("range_not_satisfiable", "range"))
 }
 
 /// Inner: resolve the namespace and id from the path, dispatch to the media (view)
@@ -2378,28 +2387,51 @@ mod tests {
         assert_eq!(super::parse_byte_range(Some("bytes=0-99,200-299")), (0, Some(99)));
     }
 
+    /// `preview_slice_file` reads exactly the requested bounded range from disk, caps
+    /// open-ended requests at `MAX_RANGE_BODY`, and returns `None` for an unsatisfiable
+    /// range (`first == total_len`). Exercises the seek+read_exact path without a whole-
+    /// file read.
     #[test]
-    fn preview_slice_bounds() {
-        let buf: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+    fn preview_slice_file_reads_bounded_range() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "mxs-pvf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.mp4");
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        {
+            let mut f = std::fs::File::create(&path).expect("create test file");
+            f.write_all(&data).expect("write test data");
+        }
 
-        // Exact bounded range: [100, 199] inclusive → start=100, len=100, body=buf[100..200].
-        let r = preview_slice(&buf, 100, Some(199)).expect("bounded range should be satisfiable");
+        // Bounded range [100, 199] inclusive → exactly 100 bytes at the right offset.
+        let r = preview_slice_file(&path, 100, Some(199))
+            .expect("bounded range should be satisfiable");
         assert_eq!(r.start, 100);
         assert_eq!(r.len, 100);
-        assert_eq!(r.total_len, 1000);
-        assert_eq!(r.body, buf[100..200].to_vec());
+        assert_eq!(r.total_len, 5000);
+        assert_eq!(r.body, data[100..200].to_vec(), "body must match file bytes [100,200)");
 
-        // Open-ended [0, ): 1000 bytes < MAX_RANGE_BODY → entire buffer returned.
-        let r2 = preview_slice(&buf, 0, None).expect("open-ended range should be satisfiable");
-        assert_eq!(r2.start, 0);
-        assert_eq!(r2.len, 1000);
-        assert_eq!(r2.total_len, 1000);
+        // Open-ended [0, ): 5000 < MAX_RANGE_BODY → entire file returned.
+        let r2 = preview_slice_file(&path, 0, None)
+            .expect("open-ended range should be satisfiable");
+        assert_eq!(r2.len, 5000);
+        assert_eq!(r2.total_len, 5000);
+        assert_eq!(r2.body, data, "open-ended body must equal entire file");
 
         // Unsatisfiable: first == total_len → None (⇒ 416).
         assert!(
-            preview_slice(&buf, 1000, None).is_none(),
-            "first == total_len must be unsatisfiable (416)"
+            preview_slice_file(&path, 5000, None).is_none(),
+            "first == total_len must be unsatisfiable (None/416)"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

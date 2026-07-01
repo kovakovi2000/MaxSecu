@@ -71,6 +71,29 @@ fn video_cancelled_err() -> UiError {
     UiError::new("cancelled", "Transcode cancelled.")
 }
 
+/// Outcome of a successful confined transcode. `out.mp4` stays on disk — it is NOT
+/// read into RAM here (disk-backed path). The caller owns `job_dir` and MUST delete
+/// it on confirm-success, cancel, or any stage-error that occurs after prepare
+/// returns. All error/cancel paths inside [`prepare_video_streams`] still wipe the
+/// dir via [`JobDirGuard`]; only the success path calls `std::mem::forget` to hand
+/// ownership here.
+pub struct PreparedVideo {
+    /// On-disk path of the transcoded fMP4 (`out.mp4` in the per-job temp dir).
+    pub out_mp4_path: std::path::PathBuf,
+    /// The per-job temp dir (Low-IL container artifacts). Caller must delete.
+    pub job_dir: std::path::PathBuf,
+    /// On-disk byte size of `out.mp4` (used to derive `n_chunks`, not re-read here).
+    pub output_size: u64,
+    /// Serialized `{"title","tags","fragments"}` metadata blob.
+    pub metadata: Vec<u8>,
+    /// Derived thumbnail bytes (canonical image stream, from `thumb.png`).
+    pub thumbnail: Vec<u8>,
+    /// Derived preview bytes (canonical preview stream, from `thumb.png`).
+    pub preview: Vec<u8>,
+    /// Chunk-grouped fragment seek index (VIDEO_CHUNK_SIZE units).
+    pub fragments: Vec<TranscodeFragment>,
+}
+
 /// RAII guard that recursively deletes a per-job temp dir on **every** exit path
 /// (success and error). This is the [`FfmpegLauncher::run`] CLEANUP OBLIGATION, not
 /// mere hygiene: the confined ffmpeg writes output files inside the granted dir that
@@ -165,7 +188,7 @@ pub fn prepare_video_streams(
     tags: &[String],
     on_phase: impl Fn(crate::state::PreparePhase) + Sync,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<(PlaintextStreams, Vec<TranscodeFragment>), UiError> {
+) -> Result<PreparedVideo, UiError> {
     // 1) Fresh, unique, freshly-created per-job dir. The guard recursively deletes
     //    the WHOLE dir on every return path (security cleanup, see JobDirGuard).
     let dir = unique_job_dir();
@@ -212,14 +235,11 @@ pub fn prepare_video_streams(
         return Err(video_prep_err());
     }
 
-    // 5) Read ffmpeg's outputs from the granted dir; both must exist and be
-    //    non-empty. The 64 MiB cap is removed — large-source RAM-frugality is
-    //    handled by the streaming upload path. A missing file is caught by the
-    //    `fs::read` returning an error; an empty file is caught by the `is_empty`
-    //    check below.
-    let out_mp4_bytes = std::fs::read(&out_mp4).map_err(|_| video_prep_err())?;
+    // 5) Get file sizes — out.mp4 is NOT read into RAM (disk-backed path). thumb.png
+    //    IS read for the pure-Rust image codec. Both must exist and be non-empty.
     let thumb_png_bytes = std::fs::read(&thumb_png).map_err(|_| video_prep_err())?;
-    if out_mp4_bytes.is_empty() || thumb_png_bytes.is_empty() {
+    let output_size = std::fs::metadata(&out_mp4).map_err(|_| video_prep_err())?.len();
+    if output_size == 0 || thumb_png_bytes.is_empty() {
         return Err(video_prep_err());
     }
 
@@ -230,13 +250,10 @@ pub fn prepare_video_streams(
         .transcode(&thumb_png_bytes, &MediaBounds::default())
         .map_err(|_| video_prep_err())?;
 
-    // 7) Build the chunk-grouped fragment seek index directly from the fMP4 content.
-    //    `content` is the raw fragmented-MP4 from ffmpeg; `n_chunks` is the number of
-    //    VIDEO_CHUNK_SIZE-byte chunks it occupies (div_ceil → last chunk is short when
-    //    the file is not a multiple of 4096, which is normal for a continuous fMP4).
-    let content = out_mp4_bytes;
-    let chunk = VIDEO_CHUNK_SIZE as usize;
-    let n_chunks = content.len().div_ceil(chunk) as u64;
+    // 7) Build the chunk-grouped fragment seek index from `output_size` (no in-RAM
+    //    buffer needed). `n_chunks` is the number of VIDEO_CHUNK_SIZE-byte chunks the
+    //    fMP4 occupies on disk (div_ceil → last chunk is short, which is normal).
+    let n_chunks = output_size.div_ceil(VIDEO_CHUNK_SIZE as u64);
     let fragments = chunk_grouped_index(n_chunks, FRAG_CHUNKS);
     let metadata = build_metadata_with_fragments(title, tags, &fragments);
 
@@ -255,15 +272,21 @@ pub fn prepare_video_streams(
         return Err(video_prep_err());
     }
 
-    // 9) Assemble — canonical fMP4 content + metadata, derived thumbnail + preview.
-    let streams = PlaintextStreams {
-        content,
-        metadata: Some(metadata),
-        thumbnail: Some(derived.thumbnail),
-        preview: Some(derived.preview),
-    };
-    // 10) `_guard` drops here → the per-job dir is recursively deleted.
-    Ok((streams, fragments))
+    // 9) Success path: forget the guard so the dir is NOT deleted here. All
+    //    `?`/early-return paths above still drop `_guard` and wipe the dir (the
+    //    security-cleanup obligation — Low-IL container artifacts). Only this path
+    //    reaches `forget`. CALLER OWNS `job_dir` and MUST delete it on
+    //    confirm-success, cancel, or any stage-error that occurs after this return.
+    std::mem::forget(_guard);
+    Ok(PreparedVideo {
+        out_mp4_path: out_mp4.clone(),
+        job_dir: dir.clone(),
+        output_size,
+        metadata,
+        thumbnail: derived.thumbnail,
+        preview: derived.preview,
+        fragments,
+    })
 }
 
 /// Blog: `content` is the plain UTF-8 bytes; metadata is the JSON title/tags; no
