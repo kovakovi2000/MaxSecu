@@ -13,6 +13,15 @@ cargo build --release -p maxsecu-portable-server
 if ($LASTEXITCODE -ne 0) { throw "cargo build (portable-server) failed" }
 cargo build --release -p maxsecu-client-app
 if ($LASTEXITCODE -ne 0) { throw "cargo build (client-app) failed" }
+# The confined VIDEO worker binaries. The client spawns these BESIDE its own exe
+# (see client-app video::{worker_path,transcode_worker_path}) — the decode
+# `media-worker` and the author-side re-mux `media-transcode-worker`. Without them
+# staged next to the client, image posts work (in-process) but every VIDEO upload
+# fails with "That video could not be processed." (transcode worker not found).
+cargo build --release -p maxsecu-media-worker
+if ($LASTEXITCODE -ne 0) { throw "cargo build (media-worker) failed" }
+cargo build --release -p maxsecu-media-transcode-worker
+if ($LASTEXITCODE -ne 0) { throw "cargo build (media-transcode-worker) failed" }
 
 Write-Host "==> Laying out the portable SERVER folder ($Out\MaxSecuServer)"
 $Server = Join-Path $Out "MaxSecuServer"
@@ -25,6 +34,12 @@ Write-Host "==> Laying out the portable CLIENT folder ($Out\MaxSecuClient)"
 $Client = Join-Path $Out "MaxSecuClient"
 foreach ($d in @("config", "keystore", "index", "cache", "logs")) { New-Item -ItemType Directory -Force -Path (Join-Path $Client $d) | Out-Null }
 Copy-Item (Join-Path $Root "target\release\maxsecu-client-app.exe") $Client -Force
+# The confined video worker binaries MUST sit BESIDE the client exe — the client
+# resolves them relative to its own AppDir. (ffmpeg itself is embedded in the client
+# via include_bytes! + materialized at runtime, so it needs no staging here.)
+foreach ($w in @("media-worker.exe", "media-transcode-worker.exe")) {
+  Copy-Item (Join-Path $Root "target\release\$w") $Client -Force
+}
 # Embedded UI assets (the WebView loads these).
 $UiDist = Join-Path $Root "crates\client-app\ui\dist"
 if (Test-Path $UiDist) {
