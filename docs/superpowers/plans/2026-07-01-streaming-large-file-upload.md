@@ -82,30 +82,46 @@ should include a large-file run. Reconcile at that time.
 
 **Files:** `crates/client-core/src/upload.rs` (or new `upload_stream.rs`), tests in the same crate.
 
-The heart of the feature: seal content by chunk index deterministically and reproduce `seal_stream`'s
-`digest` incrementally, so the whole content need never be in memory.
+The heart of the feature: seal content chunk-at-a-time from disk while reproducing `seal_stream`'s `digest`
+byte-identically, so the whole content need never be in memory — **and keep the DEK/content-subkey inside
+client-core** (client-app only ever gets ciphertext chunks via a callback).
+
+> **Reuse the tested TCB primitive — do NOT reinvent it.** `maxsecu_crypto` ALREADY exposes
+> `seal_stream_streaming(ck, file_id, version, stream_type, chunk_size, reader, emit) -> (chunk_count, digest)`
+> (`crates/crypto/src/aead.rs`), which seals one `chunk_size` frame at a time from a `Read`er, calls
+> `emit(index, &ciphertext)` per chunk (O(one chunk) RAM), determines `is_last` via one-frame **lookahead**,
+> and returns the `(chunk_count, digest)` that is **byte-identical to `seal_stream`** for the same input.
+> A crypto-crate parity test (`stream_streaming_matches_whole`) already guards that equivalence, so the DRY
+> requirement is met at the crypto layer — there is **no cross-crate `seal_stream` refactor to do** (an
+> index-only `seal(index, chunk)` API is deliberately NOT used: it cannot compute the final chunk's `is_last`
+> AAD without the total count, which a reader with lookahead gets for free). Task 1 is a thin **client-core
+> wrapper that owns the content subkey and delegates to this primitive.**
 
 - [ ] **Step 1 (failing parity test):** In `crates/client-core/src/upload.rs` tests, add a test that, for a
-  content plaintext of several sizes (empty-except-1-byte, exactly N×`chunk_size`, and N×`chunk_size`+short),
-  seals it two ways: (a) the existing `seal_stream(&ck, file_id, version, Content, frame, plaintext)`, and
-  (b) a new `ContentStreamSealer` fed the same plaintext one `chunk_size`-sized slice at a time. Assert the
-  per-chunk ciphertext bytes are IDENTICAL and the final `(chunk_count, digest)` are IDENTICAL. Use a fixed
-  `Dek` seed so it is deterministic.
+  content plaintext of several sizes (1 byte, exactly N×`chunk_size`, and N×`chunk_size`+short, and empty),
+  seals it two ways over a fixed `Dek` seed: (a) the existing `seal_stream(&dek.stream_subkey(Content),
+  file_id, version, Content, chunk_size, plaintext)`; (b) a new `ContentStreamSealer` (constructed from the
+  same `Dek` + `(file_id, version, Content, chunk_size)`) driven over a `std::io::Cursor` of the same
+  plaintext, collecting every emitted `(index, ciphertext)`. Assert the per-chunk ciphertext bytes are
+  IDENTICAL and the returned `(chunk_count, digest)` are IDENTICAL to `seal_stream`'s.
 - [ ] **Step 2:** Run it → FAIL (`ContentStreamSealer` missing).
-- [ ] **Step 3 (implement):** Add `ContentStreamSealer` holding the content subkey + `(file_id, version,
-  stream_type, chunk_size)` + a running digest accumulator: `new(subkey, file_id, version, stream_type,
-  chunk_size)`, `seal(&mut self, index: u64, plaintext_chunk: &[u8]) -> Vec<u8>` (deterministic nonce per
-  index EXACTLY as `seal_stream` derives it; folds the ciphertext into the digest), `finish(self) ->
-  (chunk_count, [u8;32])`. Then **refactor `seal_stream` to build a `ContentStreamSealer` and loop** so the
-  two share one implementation (DRY the TCB — they must never diverge). Do NOT change `seal_stream`'s public
-  signature or output.
+- [ ] **Step 3 (implement):** Add `ContentStreamSealer` to client-core holding the **content subkey**
+  (derived internally via `dek.stream_subkey(stream_type)` — the raw `Dek` is never stored here and never
+  returned) + `(file_id, version, stream_type, chunk_size)`. Give it `new(dek: &Dek, file_id, version,
+  stream_type, chunk_size)` and a reader/emit method
+  `seal_from_reader<R: Read, E: FnMut(u64, &[u8]) -> Result<(), CryptoError>>(&self, reader: &mut R, emit: E)
+  -> Result<(u64, [u8; 32]), CryptoError>` that simply calls `maxsecu_crypto::seal_stream_streaming` with the
+  held subkey + framing. The subkey field should be zeroized on drop (reuse the crate's existing zeroize
+  pattern). Do NOT expose the subkey bytes and do NOT change `seal_stream`/`seal_streams`' public API.
 - [ ] **Step 4:** Run `cargo test -p maxsecu-client-core --lib upload::` → PASS (incl. the existing
   `per_stream_digest_matches_sealed_chunks`).
-- [ ] **Step 5:** Commit: `feat(core): ContentStreamSealer — incremental per-index content sealing + digest (seal_stream refactored onto it)`.
+- [ ] **Step 5:** Commit: `feat(core): ContentStreamSealer — client-core reader/emit content sealer over crypto::seal_stream_streaming (DEK stays in core)`.
 
-**Security pass:** confirm the nonce derivation is unchanged (no nonce reuse across indices), the digest is
-byte-identical to `seal_stream`, no plaintext is retained/logged, and `seal` is a pure function of
-`(subkey,file_id,version,stream_type,chunk_size,index,plaintext)`.
+**Security pass:** the content subkey never leaves the sealer (no getter; zeroized on drop) and the raw DEK is
+never stored/returned; the `(chunk_count, digest)` is byte-identical to `seal_stream` (delegates to the
+already-parity-tested `seal_stream_streaming`, so nonce derivation + `is_last` framing are unchanged, no nonce
+reuse); no plaintext is retained/logged; sealing is a pure function of
+`(subkey, file_id, version, stream_type, chunk_size, reader-bytes)`.
 
 ## Task 2: client-core records-without-content builder + DEK-recovery-from-self-wrap **[two-stage review]**
 
@@ -123,14 +139,16 @@ from a self-wrap for resume.
   chunks are absent from the streaming path by design.)
 - [ ] **Step 2 (failing test B):** Add a test that takes the self-`WrapOut` from a build, and recovers the
   `Dek` via a new `recover_dek(self_secret, &wrapped_dek, &WrapContext) -> Dek`, then shows a
-  `ContentStreamSealer` from the recovered DEK reproduces the same content ciphertext + digest as the
-  original. (Reuse the existing `unwrap_dek`.)
+  `ContentStreamSealer::new(&recovered_dek, ...)` driven over a `Cursor` of the same content reproduces the
+  same emitted ciphertext chunks + digest as the original. (Reuse the existing `unwrap_dek`.)
 - [ ] **Step 3:** Run → FAIL.
 - [ ] **Step 4 (implement):** Introduce a builder that OWNS the freshly-generated `Dek` (kept inside
-  client-core — never returned), hands out a `ContentStreamSealer` for the content stream, seals the small
-  streams via existing `seal_streams`, and `finish(content_digest, content_chunk_count, params) ->
-  UploadRecords { manifest, manifest_sig, genesis, genesis_sig, wraps, small_streams: Vec<SealedStreamOut> }`
-  (no content chunks). Add `recover_dek(...)`. Keep the self-wrap pre-check (§12.2 step 7).
+  client-core — never returned), can construct a `ContentStreamSealer::new(&dek, file_id, FIRST_VERSION,
+  Content, chunk_size)` for the content stream, seals the small streams via existing `seal_streams`, and
+  `finish(content_digest, content_chunk_count, params) -> UploadRecords { manifest, manifest_sig, genesis,
+  genesis_sig, wraps, small_streams: Vec<SealedStreamOut> }` (no content chunks; the manifest's `content`
+  Stream carries the passed-in `content_digest`/`content_chunk_count`). Add `recover_dek(...)`. Keep the
+  self-wrap pre-check (§12.2 step 7).
 - [ ] **Step 5:** Run `cargo test -p maxsecu-client-core --lib upload::` → PASS.
 - [ ] **Step 6:** Commit: `feat(core): streaming upload records (manifest/genesis/wraps without content) + DEK recovery from self-wrap`.
 

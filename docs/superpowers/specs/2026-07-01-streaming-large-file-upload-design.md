@@ -81,13 +81,17 @@ CANCEL/ABANDON: delete local staging + discard server orphan
 New, security-critical. Two-stage review (spec, then security) mandatory.
 
 - **`ContentStreamSealer`** (owns the content subkey; the DEK never leaves client-core):
-  - Constructed from the file's `Dek` + `(file_id, version, StreamType::Content, chunk_size)`.
-  - `seal(index: u64, plaintext_chunk: &[u8]) -> Vec<u8>` — deterministic per index (nonce derived from
-    `file_id/version/stream_type/index`, exactly as `seal_stream` does today), returns the ciphertext chunk.
-  - A digest accumulator that reproduces `seal_stream`'s per-stream `digest` **byte-identically**, fed by the
-    pass-1 ciphertext, yielding `(chunk_count, [u8;32])` at the end.
-  - **`seal_stream` is refactored to be implemented in terms of this sealer** so the two can never diverge
-    (DRY the TCB). A test asserts the streaming path and `seal_stream` produce identical chunks + digest.
+  - Constructed from the file's `Dek` + `(file_id, version, StreamType::Content, chunk_size)`; it derives and
+    holds only the content subkey (zeroized on drop), never the raw DEK.
+  - `seal_from_reader(reader, emit) -> (chunk_count, [u8;32])` — reads one `chunk_size` frame at a time from a
+    `Read`er, seals it, and calls `emit(index, &ciphertext)` (O(one chunk) RAM); `is_last` is resolved by
+    one-frame lookahead, so the returned `(chunk_count, digest)` is **byte-identical to `seal_stream`**.
+  - **Delegates to the existing, parity-tested `maxsecu_crypto::seal_stream_streaming`** (a crypto-crate test
+    already asserts it matches `seal_stream` chunk-for-chunk + digest), so there is no cross-crate
+    `seal_stream` refactor and no reimplemented nonce/framing to drift. The wrapper's job is purely to keep
+    the subkey inside client-core. An index-only `seal(index, chunk)` API is intentionally avoided (it cannot
+    compute the final chunk's `is_last` without the total count). Pass 1 (digest) drives it with a no-op
+    `emit`; pass 2/resume drive it with an `emit` that PUTs (skipping indices already uploaded).
 - **Records-without-content builder:** a `build_upload`-style path that takes the small `PlaintextStreams`
   (no content) + the **content digest/chunk_count** (from the sealer) + `UploadParams`, and returns the
   signed `manifest`/`genesis`, `wraps` (self + recovery), and the small streams' `SealedStreamOut` — but
