@@ -89,11 +89,20 @@ export function serialPriority<T>(task: () => Promise<T>): Promise<T> {
   return enqueue(task, true);
 }
 
-// Reject everything still queued (not the running task). Used when navigating
-// away from the feed so a backlog of card decrypts cannot wedge the lock.
+// Reject the queued NON-priority backlog (not the running task). Used when
+// navigating away from the feed so a backlog of card decrypts cannot wedge the
+// lock. PRIORITY jobs are RETAINED: they are user-initiated (a viewer open via
+// `serialPriority`) and must survive a feed-teardown flush — otherwise navigating
+// feed→viewer while cards are still decrypting cancels the open ("cancelled" /
+// "Could not open this item"), a timing race that broke video (and any) playback.
 export function cancelPending(): void {
+  const kept: Job[] = [];
   while (queue.length) {
     const job = queue.shift()!;
-    job.reject(new CancelledError());
+    if (job.priority) kept.push(job);
+    else job.reject(new CancelledError());
   }
+  // Restore the retained priority jobs (order preserved) and resume the queue.
+  queue.push(...kept);
+  pump();
 }
