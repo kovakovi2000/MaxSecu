@@ -109,7 +109,6 @@ pub async fn stage_upload(
             // sanitized video error (no internal detail crosses).
             let ffmpeg_path = ensure_ffmpeg(&dir.0)
                 .map_err(|_| UiError::new("video_failed", "That video could not be processed."))?;
-            let tw_path = crate::commands::video::transcode_worker_path(&dir.0);
             let options = req.options.clone().unwrap_or_default();
             // Confined ingest OFF the async runtime (two confined subprocess spawns +
             // file/pipe I/O must not run on a tokio worker thread). NO network here —
@@ -133,7 +132,6 @@ pub async fn stage_upload(
                 prepare_video_streams(
                     &input_path,
                     &ffmpeg_path,
-                    &tw_path,
                     &options,
                     &maxsecu_client_core::video::VideoBounds::default(),
                     &title,

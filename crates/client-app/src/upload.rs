@@ -6,13 +6,11 @@
 
 use std::path::Path;
 
-use maxsecu_client_core::media::{
-    FragmentEntry as TranscodeFragment, TranscodeRequest, TranscodeResult,
-};
+use maxsecu_client_core::media::FragmentEntry as TranscodeFragment;
 use maxsecu_client_core::video::VideoBounds;
 use maxsecu_client_core::{MediaBounds, PlaintextStreams, RustImageCodec, Transcoder};
 use maxsecu_encoding::types::FileType;
-use maxsecu_media_launcher::{build_ffmpeg_args, FfmpegLauncher, TranscodeLauncher, TranscodeOptions};
+use maxsecu_media_launcher::{build_ffmpeg_args, FfmpegLauncher, TranscodeOptions};
 
 use crate::error::UiError;
 
@@ -25,6 +23,9 @@ use crate::error::UiError;
 /// (The worker's `TRANSCODE_CHUNK_SIZE` lives in a crate this codec-free process
 /// does not depend on, so the constant is duplicated here and checked at runtime.)
 pub const VIDEO_CHUNK_SIZE: u32 = 4096;
+
+/// Content chunks per fMP4 seek fragment (~256 KiB at 4096-byte chunks).
+const FRAG_CHUNKS: u64 = 64;
 
 /// Build the canonical metadata blob: JSON `{"title","tags"}` (UTF-8) — exactly
 /// what `commands::feed::parse_title_tags` reads back.
@@ -103,12 +104,31 @@ fn unique_job_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("maxsecu-vjob-{unique}"))
 }
 
-/// Transcode the author's **arbitrary** source video to canonical AV1/CMAF streams
-/// via TWO confined spawns, keeping this key-holding process CODEC-FREE (it links
-/// only the codec-free `media-launcher` + the pure-Rust `RustImageCodec`; rav1d /
-/// symphonia never enter it).
+/// Build a contiguous, chunk-grouped fragment seek index for `n_chunks` content
+/// chunks. Each fragment covers up to `frag_chunks` whole chunks; the last fragment
+/// is short when `n_chunks` is not an exact multiple. `seq` is 0-based; `pts_ms` is
+/// 0 for every fragment (unused by native `<video>` playback). Requires
+/// `n_chunks >= 1` and `frag_chunks >= 1`.
+fn chunk_grouped_index(n_chunks: u64, frag_chunks: u64) -> Vec<TranscodeFragment> {
+    let mut frags = Vec::new();
+    let mut chunk_start: u64 = 0;
+    let mut seq: u32 = 0;
+    while chunk_start < n_chunks {
+        let remaining = n_chunks - chunk_start;
+        let chunk_len = frag_chunks.min(remaining);
+        frags.push(TranscodeFragment { seq, pts_ms: 0, chunk_start, chunk_len });
+        chunk_start += chunk_len;
+        seq += 1;
+    }
+    frags
+}
+
+/// Transcode the author's **arbitrary** source video to a canonical AV1+AAC
+/// fragmented-MP4 (`fMP4`) via ONE confined spawn, keeping this key-holding process
+/// CODEC-FREE (it links only the codec-free `media-launcher` + the pure-Rust
+/// `RustImageCodec`; rav1d / symphonia never enter it).
 ///
-/// Flow (topology A — two confined spawns):
+/// Flow (single confined spawn):
 /// 1. A fresh, unique, freshly-created per-job dir is made; a [`JobDirGuard`]
 ///    recursively deletes the WHOLE dir on every return path (the
 ///    [`FfmpegLauncher::run`] cleanup obligation).
@@ -116,36 +136,32 @@ fn unique_job_dir() -> std::path::PathBuf {
 ///    the single ReadWrite grant), preserving the extension so ffmpeg can sniff it.
 /// 3. **Confined ffmpeg** ([`FfmpegLauncher`], no net/keys/children, mem cap,
 ///    bounded timeout) runs the pinned [`build_ffmpeg_args`] argv — ONE invocation
-///    producing both `out.mp4` (AV1 + AAC) and `thumb.png` (first frame). A nonzero
-///    exit fails closed; the bounded stderr tail is diagnostic only and never
+///    producing both `out.mp4` (AV1+AAC fragmented-MP4 via `-movflags
+///    +frag_keyframe+empty_moov+default_base_moof`) and `thumb.png` (first frame). A
+///    nonzero exit fails closed; the bounded stderr tail is diagnostic only and never
 ///    surfaced to the UI (no decode oracle).
-/// 4. **Confined re-mux worker** ([`TranscodeLauncher`]) takes `out.mp4`'s BYTES and
-///    returns the canonical [`TranscodeResult`] (CMAF fragments; its
-///    `thumbnail`/`preview` are empty — derived below instead).
+/// 4. `out.mp4` is stored DIRECTLY as the encrypted content (no re-mux worker). The
+///    fragment seek index is built by [`chunk_grouped_index`] over the content's
+///    [`VIDEO_CHUNK_SIZE`]-chunk count, grouped in [`FRAG_CHUNKS`]-sized bands.
 /// 5. The real thumbnail + preview are derived from `thumb.png` via the pure-Rust
 ///    [`RustImageCodec`] (the same path image uploads use).
 ///
-/// Maps `TranscodeResult.cmaf` → `content`, the derived image streams →
+/// Maps `out.mp4` bytes → `content`, the derived image streams →
 /// `thumbnail`/`preview`, and `build_metadata_with_fragments(title, tags,
 /// &fragments)` → `metadata`. This does **NO network** — it is the
 /// preview-before-upload transcode.
 ///
-/// **Chunk-size invariant.** The fragment index is expressed in
-/// [`VIDEO_CHUNK_SIZE`] (4096)-byte units. This re-validates the worker's index
-/// against the canonical content: it must parse + validate as a contiguous index
-/// (`parse_fragment_index`) AND cover the `cmaf` exactly in whole 4096-byte chunks
-/// (so the upload's content chunks map one-for-one onto the fragment ranges). A
-/// worker that returns a misaligned stream/index fails closed here rather than
-/// silently breaking seek after upload.
-// Each input is a distinct concern of the confined two-stage transcode (source path,
-// the two confined binaries, options/bounds, the title/tags baked into metadata, the
+/// **Defense-in-depth.** After building the chunk-grouped index, `prepare_video_streams`
+/// round-trips the metadata through `parse_fragment_index` and asserts the last
+/// fragment covers exactly `n_chunks`, failing closed on any mismatch.
+// Each input is a distinct concern of the single confined transcode (source path,
+// the confined binary, options/bounds, the title/tags baked into metadata, the
 // progress sink, and the cancel flag); a params struct would only indirect the one
 // call site in `commands::upload::stage_upload`.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_video_streams(
     input_path: &Path,
     ffmpeg_path: &Path,
-    transcode_worker_path: &Path,
     options: &TranscodeOptions,
     bounds: &VideoBounds,
     title: &str,
@@ -217,49 +233,26 @@ pub fn prepare_video_streams(
         return Err(video_prep_err());
     }
 
-    // 6) Re-mux out.mp4's bytes → canonical AV1/CMAF in the SECOND confined spawn.
-    //    The worker's thumbnail/preview come back empty (derived below). `cancel` is
-    //    forwarded so a user cancel tears the re-mux child down promptly rather than
-    //    waiting out the full bound; a cancel-induced worker failure maps to the
-    //    distinct `cancelled` error, a real failure to the sanitized one.
-    on_phase(crate::state::PreparePhase::Remuxing);
-    let result: TranscodeResult = TranscodeLauncher::new(transcode_worker_path)
-        .transcode(
-            &TranscodeRequest {
-                source: out_mp4_bytes,
-                bounds: *bounds,
-            },
-            cancel,
-        )
-        .map_err(|_| {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                video_cancelled_err()
-            } else {
-                video_prep_err()
-            }
-        })?;
-    // A cancel that raced the worker's clean exit still returns the benign terminal.
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(video_cancelled_err());
-    }
-
-    // 7) Derive the real thumbnail + preview from ffmpeg's first-frame PNG via the
-    //    pure-Rust image codec — NO C codec enters this key-holding process. This +
-    //    the index validation + assemble are the final local step.
+    // 6) Derive the real thumbnail + preview from ffmpeg's first-frame PNG via the
+    //    pure-Rust image codec — NO C codec enters this key-holding process.
     on_phase(crate::state::PreparePhase::Finalizing);
     let derived = RustImageCodec
         .transcode(&thumb_png_bytes, &MediaBounds::default())
         .map_err(|_| video_prep_err())?;
 
-    let metadata = build_metadata_with_fragments(title, tags, &result.fragments);
-
-    // 8) Enforce the chunk-size mapping (seek correctness). The metadata fragment
-    //    index must validate (contiguity/ordering/coverage) AND tile the canonical
-    //    content exactly in whole VIDEO_CHUNK_SIZE chunks.
+    // 7) Build the chunk-grouped fragment seek index directly from the fMP4 content.
+    //    `content` is the raw fragmented-MP4 from ffmpeg; `n_chunks` is the number of
+    //    VIDEO_CHUNK_SIZE-byte chunks it occupies (div_ceil → last chunk is short when
+    //    the file is not a multiple of 4096, which is normal for a continuous fMP4).
+    let content = out_mp4_bytes;
     let chunk = VIDEO_CHUNK_SIZE as usize;
-    if result.cmaf.is_empty() || !result.cmaf.len().is_multiple_of(chunk) {
-        return Err(video_prep_err());
-    }
+    let n_chunks = content.len().div_ceil(chunk) as u64;
+    let fragments = chunk_grouped_index(n_chunks, FRAG_CHUNKS);
+    let metadata = build_metadata_with_fragments(title, tags, &fragments);
+
+    // 8) Defense-in-depth: round-trip the index through the viewer's authenticated
+    //    metadata reader to confirm it is contiguous, coverage-complete, and
+    //    consistent with the content chunk count.
     let meta_json: serde_json::Value =
         serde_json::from_slice(&metadata).map_err(|_| video_prep_err())?;
     let index = crate::video::parse_fragment_index(&meta_json)?;
@@ -268,19 +261,19 @@ pub fn prepare_video_streams(
         .chunk_start
         .checked_add(last.chunk_len)
         .ok_or_else(video_prep_err)?;
-    if covered_chunks != (result.cmaf.len() / chunk) as u64 {
+    if covered_chunks != n_chunks {
         return Err(video_prep_err());
     }
 
-    // 9) Assemble — canonical content + metadata, derived thumbnail + preview.
+    // 9) Assemble — canonical fMP4 content + metadata, derived thumbnail + preview.
     let streams = PlaintextStreams {
-        content: result.cmaf,
+        content,
         metadata: Some(metadata),
         thumbnail: Some(derived.thumbnail),
         preview: Some(derived.preview),
     };
     // 10) `_guard` drops here → the per-job dir is recursively deleted.
-    Ok((streams, result.fragments))
+    Ok((streams, fragments))
 }
 
 /// Blog: `content` is the plain UTF-8 bytes; metadata is the JSON title/tags; no
@@ -513,6 +506,54 @@ mod tests {
                 chunk_len: 3,
             }
         );
+    }
+
+    #[test]
+    fn chunk_grouped_index_contiguous_and_covers() {
+        // Non-multiple: 133 = 64*2 + 5 → 3 fragments, last is short (5)
+        let frags = chunk_grouped_index(133, 64);
+        assert_eq!(frags.len(), 3);
+        // seq is 0..len contiguous
+        for (i, f) in frags.iter().enumerate() {
+            assert_eq!(f.seq, i as u32);
+        }
+        // chunk_start[0] == 0
+        assert_eq!(frags[0].chunk_start, 0);
+        // each chunk_start[k] == chunk_start[k-1] + chunk_len[k-1]
+        for k in 1..frags.len() {
+            assert_eq!(frags[k].chunk_start, frags[k - 1].chunk_start + frags[k - 1].chunk_len);
+        }
+        // last fragment's chunk_len is the short remainder (5)
+        assert_eq!(frags.last().unwrap().chunk_len, 5);
+        // sum(chunk_len) == n_chunks
+        assert_eq!(frags.iter().map(|f| f.chunk_len).sum::<u64>(), 133);
+
+        // Exact multiple: 128 = 64*2 → 2 fragments, each full (64)
+        let frags2 = chunk_grouped_index(128, 64);
+        assert_eq!(frags2.len(), 2);
+        assert_eq!(frags2.last().unwrap().chunk_len, 64);
+    }
+
+    #[test]
+    fn chunk_grouped_index_single_short_fragment() {
+        // n_chunks smaller than frag_chunks → exactly one short fragment
+        let frags = chunk_grouped_index(3, 64);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].seq, 0);
+        assert_eq!(frags[0].chunk_start, 0);
+        assert_eq!(frags[0].chunk_len, 3);
+    }
+
+    #[test]
+    fn chunk_grouped_index_round_trips_through_parse() {
+        let frags = chunk_grouped_index(133, 64);
+        let meta = build_metadata_with_fragments("t", &[], &frags);
+        let json: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+        let parsed = crate::video::parse_fragment_index(&json).unwrap();
+        assert_eq!(parsed.len(), frags.len());
+        // last fragment covers exactly n_chunks
+        let last = parsed.last().unwrap();
+        assert_eq!(last.chunk_start + last.chunk_len, 133);
     }
 
     #[test]
