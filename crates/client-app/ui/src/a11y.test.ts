@@ -180,6 +180,21 @@ test("screens use a live region for feedback", () => {
     assert.match(up, /<label><input name="origbitrate"/, "Original-bitrate checkbox must be labelled");
   });
 
+  test("upload-screen live transcode progress + Cancel are present + labelled", () => {
+    const up = readFileSync("src/components/upload-screen.ts", "utf8");
+    // A <progress> element carries an accessible name (aria-label) for the
+    // transcode; status text goes through the existing #up-status live region.
+    assert.match(up, /createElement\("progress"\)/, "transcode progress uses a <progress> element");
+    assert.match(up, /"aria-label",\s*"Transcode progress"/, "the <progress> must be labelled");
+    // A Cancel control that calls cancel_video_prepare and disables itself to
+    // avoid a double-fire.
+    assert.match(up, /"Cancel"/, "a Cancel control must be present");
+    assert.match(up, /cancel_video_prepare/, "Cancel must call cancel_video_prepare");
+    assert.match(up, /cancelBtn\.disabled\s*=\s*true/, "Cancel must disable itself on click");
+    // Progress text is set via textContent, never innerHTML interpolation.
+    assert.match(up, /status\.textContent\s*=/, "status updates via textContent");
+  });
+
   test("quick-settings + settings expose a labelled Theme + RAM control", () => {
     const qs = readFileSync("src/components/quick-settings.ts", "utf8");
     const set = readFileSync("src/components/settings-screen.ts", "utf8");

@@ -16,6 +16,7 @@ import "./toast-host.ts";
 import "./skeleton-card.ts";
 import { loadAndApplySettings, bindDocumentToSettings } from "../core/settings.ts";
 import { activeTasks } from "../core/tasks.ts";
+import { subscribeBusy, isBusy } from "../core/busy.ts";
 import type { StatusPill } from "./status-pill.ts";
 import type { ConnState } from "../core/types.ts";
 
@@ -58,6 +59,29 @@ export class AppShell extends HTMLElement {
     const outlet = this.querySelector("#outlet")!;
     const pill = this.querySelector("#pill") as StatusPill;
     const qs = this.querySelector("#qs") as HTMLElement;
+    const nav = this.querySelector(".nav-rail") as HTMLElement;
+
+    // Navigation guard: while a transcode/upload is in flight the nav rail is
+    // disabled (visually + functionally) and closing the tab/window warns. The
+    // router (see router.ts) independently refuses hash changes; blocking the
+    // click here also stops keyboard Enter on a focused link. Focus is NOT
+    // trapped — links stay focusable, only their activation is suppressed.
+    nav.addEventListener("click", (e) => {
+      if (isBusy()) e.preventDefault();
+    });
+    subscribeBusy((busy) => {
+      nav.querySelectorAll<HTMLAnchorElement>("a").forEach((a) => {
+        a.toggleAttribute("aria-disabled", busy);
+        a.classList.toggle("nav-disabled", busy);
+      });
+      window.onbeforeunload = busy
+        ? (e: BeforeUnloadEvent) => {
+          e.preventDefault();
+          e.returnValue = "";
+          return "";
+        }
+        : null;
+    });
 
     new Router((incomingRoute) => {
       let r = incomingRoute;

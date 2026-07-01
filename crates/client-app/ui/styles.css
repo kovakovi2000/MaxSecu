@@ -234,6 +234,24 @@ app-shell { display: block; min-height: 100vh; }
   background: var(--mx-accent);
   box-shadow: var(--mx-glow);
 }
+/* Nav rail is disabled while a transcode/upload is in flight (see busy.ts). The
+   click is suppressed in JS (so keyboard Enter is blocked too); this only styles
+   it. Links stay focusable — focus is not trapped. */
+.nav-rail a[aria-disabled="true"], .nav-rail a.nav-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* Live transcode progress + Cancel next to the upload status live region. */
+.up-prepare {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.5rem 0;
+}
+.up-prepare progress {
+  flex: 1;
+  min-width: 8rem;
+}
 .header-actions {
   grid-area: actions;
   display: flex;

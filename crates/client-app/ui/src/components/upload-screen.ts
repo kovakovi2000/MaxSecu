@@ -1,6 +1,7 @@
-import { call } from "../core/rpc.ts";
+import { call, on } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
-import type { UploadKind, UploadPreview } from "../core/types.ts";
+import { setBusy, clearBusy } from "../core/busy.ts";
+import type { PreparePhase, UploadKind, UploadPreview } from "../core/types.ts";
 import { normalizeOptions, resolutionForPreset, suggestKbps } from "../core/transcode-opts.ts";
 import type { Bitrate, Resolution } from "../core/transcode-opts.ts";
 import "./video-player.ts";
@@ -23,6 +24,11 @@ import type { VideoPlayer } from "./video-player.ts";
 //
 // Accessible: landmark, labelled controls, role=status live region.
 export class UploadScreen extends HTMLElement {
+  // Unlisten for the in-flight maxsecu://video-prepare subscription (null when
+  // no transcode is running). Always cleared on completion/cancel/failure and on
+  // teardown so no listener leaks.
+  private prepareUnlisten: (() => void) | null = null;
+
   connectedCallback() {
     this.innerHTML = `
       <main id="main" tabindex="-1" aria-labelledby="up-h">
@@ -159,7 +165,8 @@ export class UploadScreen extends HTMLElement {
 
   private async onPreview(e: Event, form: HTMLFormElement) {
     e.preventDefault();
-    const status = this.querySelector("#up-status")!;
+    const status = this.querySelector("#up-status") as HTMLElement;
+    const submitBtn = form.querySelector('button[type="submit"]') as HTMLButtonElement;
     status.textContent = "Preparing…";
     const d = new FormData(form);
     const kind = (d.get("kind") as UploadKind) ?? "image";
@@ -188,17 +195,118 @@ export class UploadScreen extends HTMLElement {
       const bitrate: Bitrate = d.get("origbitrate") != null ? "Original" : { Kbps: Number(d.get("kbps")) };
       req.path = vpath;
       req.options = normalizeOptions({ resolution, bitrate });
+      // Video: stage under a live transcode-progress + Cancel UI (own path).
+      await this.previewVideo(req, status, submitBtn);
+      return;
     } else {
       req.path = d.get("path");
     }
     try {
       const preview = await call<UploadPreview>("stage_upload", { req });
       this.renderPreview(preview);
-      status.textContent =
-        preview.file_type === "video" ? "Transcoded — preview below before uploading." : "Ready to upload.";
+      status.textContent = "Ready to upload.";
     } catch (x) {
       status.textContent = errMsg(x, "Could not prepare the upload.");
     }
+  }
+
+  // Video preview: stage the CONFINED ffmpeg ingest + transcode while surfacing
+  // live progress (maxsecu://video-prepare) into the #up-status live region and a
+  // labelled <progress>, with a Cancel button (cancel_video_prepare). The app is
+  // marked busy for the duration so navigation is blocked; Cancel is the escape
+  // hatch. Cancellation (the `cancelled` phase OR a stage_upload `code:"cancelled"`
+  // rejection) returns the screen to idle with a neutral note — NOT an error.
+  private async previewVideo(
+    req: Record<string, unknown>,
+    status: HTMLElement,
+    submitBtn: HTMLButtonElement,
+  ) {
+    // Build the accessible progress + Cancel controls next to the live region.
+    const box = document.createElement("div");
+    box.id = "up-prepare";
+    box.className = "up-prepare";
+    const progress = document.createElement("progress");
+    progress.id = "up-progress";
+    progress.max = 100;
+    progress.setAttribute("aria-label", "Transcode progress");
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.id = "up-cancel";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => {
+      cancelBtn.disabled = true; // avoid a double-fire; terminal event/rejection drives the rest
+      status.textContent = "Cancelling…";
+      // The cancelled phase + the stage_upload rejection return us to idle.
+      void call("cancel_video_prepare").catch(() => {});
+    });
+    box.append(progress, cancelBtn);
+    status.after(box);
+    submitBtn.disabled = true;
+    setBusy("Transcoding video");
+
+    let cancelledPhase = false;
+    // Subscribe BEFORE staging so no early phase is missed. Render text via
+    // textContent (no innerHTML) and drive the <progress> value/indeterminate.
+    const unlisten = await on<PreparePhase>("maxsecu://video-prepare", (p) => {
+      switch (p.phase) {
+        case "transcoding":
+          if (p.percent == null) {
+            status.textContent = "Transcoding…";
+            progress.removeAttribute("value"); // indeterminate
+          } else {
+            status.textContent = `Transcoding… ${p.percent}%`;
+            progress.value = p.percent;
+          }
+          break;
+        case "remuxing":
+          status.textContent = "Re-muxing…";
+          progress.removeAttribute("value");
+          break;
+        case "finalizing":
+          status.textContent = "Finalizing…";
+          progress.removeAttribute("value");
+          break;
+        case "cancelled":
+          cancelledPhase = true; // benign terminal; teardown happens below
+          break;
+        case "failed":
+          // Sanitized failure is surfaced via the stage_upload rejection path.
+          break;
+      }
+    }).catch(() => null);
+    this.prepareUnlisten = unlisten;
+
+    try {
+      const preview = await call<UploadPreview>("stage_upload", { req });
+      this.teardownPrepare();
+      submitBtn.disabled = false;
+      this.renderPreview(preview);
+      status.textContent = "Transcoded — preview below before uploading.";
+    } catch (x) {
+      this.teardownPrepare();
+      submitBtn.disabled = false;
+      if (cancelledPhase || isCancelledErr(x)) {
+        status.textContent = "Transcode cancelled.";
+      } else {
+        status.textContent = errMsg(x, "Could not prepare the upload.");
+      }
+    }
+  }
+
+  // Unlisten the prepare subscription (if any), remove the progress/Cancel UI,
+  // and clear the busy flag. Safe to call more than once.
+  private teardownPrepare() {
+    if (this.prepareUnlisten) {
+      this.prepareUnlisten();
+      this.prepareUnlisten = null;
+    }
+    this.querySelector("#up-prepare")?.remove();
+    clearBusy();
+  }
+
+  disconnectedCallback() {
+    // No listener leaks if the screen is torn down mid-transcode.
+    this.teardownPrepare();
   }
 
   private renderPreview(p: UploadPreview) {
@@ -241,6 +349,8 @@ export class UploadScreen extends HTMLElement {
   private async onConfirm(jobId: string, btn: HTMLButtonElement) {
     const status = this.querySelector("#up-status")!;
     btn.disabled = true;
+    // Mark busy for the whole upload so navigation is blocked until it settles.
+    setBusy("Uploading");
     status.textContent = "Uploading… (see the uploads tray)";
     try {
       await serial(() => call<string>("confirm_upload", { req: { job_id: jobId } }));
@@ -249,8 +359,19 @@ export class UploadScreen extends HTMLElement {
     } catch (x) {
       btn.disabled = false;
       status.textContent = errMsg(x, "Upload failed.");
+    } finally {
+      clearBusy();
     }
   }
+}
+
+// True when a rejection is the backend's user-initiated cancel (UiError code
+// "cancelled") — treated as a return-to-idle, never an error toast/message.
+function isCancelledErr(x: unknown): boolean {
+  return (
+    !!x && typeof x === "object" && "code" in x &&
+    (x as { code?: unknown }).code === "cancelled"
+  );
 }
 
 function errMsg(x: unknown, fallback: string): string {

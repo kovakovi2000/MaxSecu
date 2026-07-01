@@ -72,6 +72,17 @@ export type UploadMsg =
   | { phase: "done"; job_id: string; file_id: string }
   | { phase: "failed"; job_id: string; code: string };
 
+// --- Universal video ingest: transcode lifecycle events (maxsecu://video-prepare) ---
+// kebab-tagged on "phase". `transcoding.percent` is null (indeterminate) until
+// ffmpeg reports the source Duration; `cancelled` is a benign terminal; `failed`
+// carries a sanitized code. Mirrors the Rust `PreparePhase` serde shape.
+export type PreparePhase =
+  | { phase: "transcoding"; percent: number | null }
+  | { phase: "remuxing" }
+  | { phase: "finalizing" }
+  | { phase: "cancelled" }
+  | { phase: "failed"; code: string };
+
 // --- Phase 5 (settings + a11y) DTO mirror of the Rust SettingsConfig serde shape ---
 // Section objects, snake_case fields — match server/core serde exactly.
 export interface Settings {
