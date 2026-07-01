@@ -69,6 +69,7 @@ fn main() {
             maxsecu_client_app::commands::video::video_seek,
             maxsecu_client_app::commands::video::video_set_volume,
             maxsecu_client_app::commands::video::cancel_video,
+            maxsecu_client_app::commands::video::stream_debug_log,
         ])
         .register_asynchronous_uri_scheme_protocol("stream", |ctx, request, responder| {
             let app = ctx.app_handle().clone();

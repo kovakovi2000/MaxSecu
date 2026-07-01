@@ -296,27 +296,42 @@ export class VideoPlayer extends HTMLElement {
         </media-controller>
       </section>`;
     (this.querySelector("#vp-region") as HTMLElement).focus();
+    // TEMP DIAGNOSTIC: surface CSP violations (which are otherwise invisible w/o
+    // devtools) to the backend log so we can see if the stream URL is blocked.
+    dlog(`connectNative id=${this.reqId} media-controller-defined=${!!customElements.get("media-controller")}`);
+    document.addEventListener("securitypolicyviolation", (e) => {
+      dlog(`CSP-VIOLATION directive=${e.violatedDirective} blocked=${e.blockedURI}`);
+    });
     const video = this.querySelector("video") as HTMLVideoElement;
     video.addEventListener("error", () => {
+      const code = video.error?.code ?? -1;
+      dlog(`video-error code=${code} src=${video.currentSrc || video.src}`);
       const s = this.querySelector("#vp-status") as HTMLElement | null;
       if (s) {
         s.textContent = "⚠ This video could not be played.";
         s.removeAttribute("hidden");
       }
     });
+    ["loadstart", "loadedmetadata", "canplay", "playing", "stalled"].forEach((ev) =>
+      video.addEventListener(ev, () => dlog(`video-${ev} t=${video.currentTime.toFixed(2)}`)),
+    );
     void this.openNative(video);
   }
 
   private async openNative(video: HTMLVideoElement) {
     try {
       this.opened = true;
+      dlog(`openNative: calling open_video id=${this.reqId}`);
       // open_video registers the decrypt-while-stream session (register-only +
       // total-length probe). Only decrypted plaintext crosses the stream:// seam.
       await serial(() => call<void>("open_video", { fileId: this.reqId }));
       // Point the native element at the stream:// range protocol; the browser
       // owns demux/decode/seek/buffer/sync.
-      video.src = streamSrc(this.reqId);
+      const url = streamSrc(this.reqId);
+      dlog(`openNative: open_video OK, setting src=${url}`);
+      video.src = url;
     } catch (x) {
+      dlog(`openNative: open_video ERR code=${phaseCode(x)}`);
       const s = this.querySelector("#vp-status") as HTMLElement | null;
       if (s) {
         s.textContent = `⚠ Error: ${phaseCode(x)}`;
@@ -487,6 +502,12 @@ export class VideoPlayer extends HTMLElement {
     const scrub = this.querySelector("#vp-scrub") as HTMLInputElement | null;
     scrub?.setAttribute("aria-valuetext", text);
   }
+}
+
+// TEMP DIAGNOSTIC: fire-and-forget a line to the backend log (<appdir>/logs/
+// stream.log) so we can trace the native player without devtools. Remove later.
+function dlog(msg: string): void {
+  void call<void>("stream_debug_log", { msg }).catch(() => {});
 }
 
 // Sanitized error -> a short stable code for the status line (no oracle).
