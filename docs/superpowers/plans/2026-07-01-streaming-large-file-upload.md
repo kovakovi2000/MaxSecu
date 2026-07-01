@@ -210,40 +210,66 @@ still runs on build.
 - [ ] **Step 3:** `cargo build -p maxsecu-media-launcher` + `cargo test -p maxsecu-media-launcher` → PASS.
 - [ ] **Step 4:** Commit: `refactor(video): remove the dead 10-min ffmpeg hard-cap constant; stall watchdog (primary) + 1h backstop remain`.
 
-## Task 4: client-app `prepare_video_streams` → disk-backed (6 MiB, no over_cap)
+## Task 4: client-app — 6 MiB video chunks + remove the 64 MiB `over_cap` (unblock the target file)
 
-**Files:** `crates/client-app/src/upload.rs`, `crates/client-app/src/commands/upload.rs`.
+**Files:** `crates/client-app/src/upload.rs`.
 
-- [ ] **Step 1 (failing unit test):** Add a pure unit test for a new `content_chunk_count(len, chunk)` /
-  chunk-grouped index over the 6 MiB chunk size (contiguity + coverage + short-last), and assert
-  `VIDEO_CHUNK_SIZE` is now `6 * 1024 * 1024`.
-- [ ] **Step 2:** Change `VIDEO_CHUNK_SIZE` to 6 MiB. Rework `prepare_video_streams` to (a) NOT
-  `fs::read(out.mp4)`, (b) NOT delete the per-job dir (the `out.mp4` must persist through confirm), (c)
-  REMOVE the `over_cap`/`MAX_FRAME_BYTES` ceiling, (d) return a disk-backed handle
-  `PreparedVideo { out_mp4_path, output_size, chunk_size, fragment_index, thumbnail, preview }` instead of a
-  `PlaintextStreams` whose `content` holds the bytes. Derive thumbnail/preview from `thumb.png` as today
-  (small, RAM). The job dir is now owned by the staging lifecycle (Task 5), not `JobDirGuard`.
-- [ ] **Step 3:** Update `stage_upload`'s video branch to consume the new handle. `cargo test -p
-  maxsecu-client-app --lib upload::` → PASS; `cargo build -p maxsecu-client-app`.
-- [ ] **Step 4:** Commit: `feat(video): prepare_video_streams keeps the transcode on disk (6 MiB chunks, no 64 MiB cap) for streaming upload`.
+> **Resequenced (2026-07-01):** the disk-backed `PreparedVideo` handle + not-deleting-the-per-job-dir moved to
+> **Task 5** (which owns the on-disk staging lifecycle + file-backed preview), so the video path stays WORKING
+> and green at every commit. Task 4 is the minimal unblock: after it, the 305 MB→159 MiB target already uploads
+> end-to-end (still in-RAM on the client desktop — acceptable there; the RAM-frugality + resume come in Tasks
+> 5/7). NOTE: 6 MiB PUT bodies need the server body limit (**Task 6**) before a *network* upload works; Task 4's
+> tests are unit/compile-only so it stays green, and Task 6 lands before the e2e (Task 12) / smoke (Task 13).
 
-## Task 5: staging-record module + file-backed preview **[two-stage review]**
+- [ ] **Step 1 (failing unit test):** Assert `VIDEO_CHUNK_SIZE == 6 * 1024 * 1024`, and add a pure unit test
+  that `chunk_grouped_index(n_chunks, FRAG_CHUNKS)` over a realistic 6 MiB-chunk count (e.g. a 159 MiB file ⇒
+  `159*1024*1024).div_ceil(6*1024*1024)` chunks) is contiguous, coverage-complete, and short-last (reuse the
+  existing `chunk_grouped_index` assertions). (Update the existing `assert_eq!(VIDEO_CHUNK_SIZE, 4096)` test at
+  ~line 564 to the new value.)
+- [ ] **Step 2:** Change `VIDEO_CHUNK_SIZE` to `6 * 1024 * 1024`. In `prepare_video_streams`, **remove the
+  `over_cap`/`MAX_FRAME_BYTES` ceiling** (delete the `cap`/`over_cap` block at ~lines 224-229 that rejects
+  `out.mp4`/`thumb.png` above 64 MiB) — keep the "both files exist + non-empty" checks (re-express them via
+  `fs::metadata`/the existing `is_empty()` guard without the size ceiling). **Fix the now-stale doc** on
+  `VIDEO_CHUNK_SIZE` (lines 17-24): it references the removed re-mux worker's `TRANSCODE_CHUNK_SIZE`; the
+  fragment index is now self-computed from the content's `VIDEO_CHUNK_SIZE`-chunk count, so reword it to say
+  the manifest `chunk_size` and the fragment index's chunk unit are both this value (no external worker
+  constant). Leave the return type (`(PlaintextStreams, Vec<TranscodeFragment>)`), the `JobDirGuard`, and the
+  in-RAM `fs::read(out.mp4)` AS-IS (Task 5 makes it disk-backed). Do NOT touch `FRAG_CHUNKS` yet (Task 10).
+- [ ] **Step 3:** `cargo test -p maxsecu-client-app --lib upload::` → PASS; `cargo build -p maxsecu-client-app`.
+- [ ] **Step 4:** Commit: `feat(video): 6 MiB video chunks + drop the 64 MiB transcode-output cap (unblocks large uploads)`.
 
-**Files:** `crates/client-app/src/upload_staging.rs` (new), `crates/client-app/src/jobs.rs`, `lib.rs`.
+## Task 5: disk-backed `prepare_video_streams` + staging-record module + file-backed preview **[two-stage review]**
 
-- [ ] **Step 1 (failing test):** Round-trip test: build a `StagingRecord { file_id, manifest+sig,
-  genesis+sig, wraps, file_type, title, out_mp4_path, chunk_size, content_chunk_count,
-  small_stream_ciphertext, progress:0, created_ms, last_progress_ms, finalized:false }`, persist to a temp
-  staging dir, load it back, assert equality; assert it contains **no DEK and no content ciphertext**.
+**Files:** `crates/client-app/src/upload.rs` (disk-backed `prepare_video_streams` + `PreparedVideo` handle),
+`crates/client-app/src/upload_staging.rs` (new), `crates/client-app/src/jobs.rs`, `crates/client-app/src/commands/upload.rs`, `lib.rs`.
+
+This is where the on-disk lifecycle lands: the transcode `out.mp4` persists in a staging dir through confirm
+(no whole-file-in-RAM), the preview is served from that file, and a small staging record enables resume.
+
+- [ ] **Step 1a — disk-backed prepare:** Rework `prepare_video_streams` to (a) NOT `fs::read(out.mp4)` into a
+  `content` buffer, (b) NOT delete the per-job dir on success (remove/relax `JobDirGuard` so the dir persists;
+  KEEP the recursive-delete cleanup on the ERROR/cancel paths — a failed transcode must still wipe the Low-IL
+  dir), (c) return a disk-backed handle `PreparedVideo { out_mp4_path, job_dir, output_size, fragments,
+  thumbnail, preview }` (thumbnail/preview derived from `thumb.png` as today — small, RAM). The confirmed
+  upload's staging lifecycle now owns `job_dir`/`out_mp4_path`.
+- [ ] **Step 1b — staging record round-trip test (failing):** `StagingRecord { file_id, manifest+sig,
+  genesis+sig, wraps, file_type, title, out_mp4_path, chunk_size, content_chunk_count, small_stream_ciphertext,
+  progress:0, created_ms, last_progress_ms, finalized:false }` persist→load→equal; assert it holds **no DEK and
+  no content ciphertext**.
 - [ ] **Step 2:** Implement `upload_staging.rs`: the record type (serde), `persist`/`load`/`list_pending`/
-  `remove`, a per-upload staging dir under the app dir holding the record + the (moved/linked) `out.mp4` +
-  the small-stream ciphertext. Change `StagedVideoPreview` to be **file-backed** (holds `out_mp4_path`, not
-  `Zeroizing<Vec<u8>>`); update `UploadJobs`/`StagedUpload` accordingly.
-- [ ] **Step 3:** `cargo test -p maxsecu-client-app --lib` → PASS.
-- [ ] **Step 4:** Commit: `feat(video): disk-backed upload staging record (no DEK/ciphertext at rest) + file-backed preview`.
+  `remove`, a per-upload staging dir under the app dir holding the record + the (moved/linked) `out.mp4` + the
+  small-stream ciphertext. Change `StagedVideoPreview` to **file-backed** (holds `out_mp4_path`, not
+  `Zeroizing<Vec<u8>>`); update `UploadJobs`/`StagedUpload` and `stage_upload`'s video branch to consume the
+  `PreparedVideo` handle + the file-backed preview. (The full streaming stage/confirm — pass-1 digest, pass-2
+  seal-and-PUT from disk — is Task 7; here `stage_upload` may still build the in-RAM bundle by reading
+  `out_mp4_path` as a BRIDGE, OR Task 7 wires streaming; keep it compiling + green either way. If bridging,
+  the staging dir must be cleaned on the confirm/cancel path.)
+- [ ] **Step 3:** `cargo test -p maxsecu-client-app --lib` → PASS; `cargo build -p maxsecu-client-app`.
+- [ ] **Step 4:** Commit: `feat(video): disk-backed prepare + staging record (no DEK/ciphertext at rest) + file-backed preview`.
 
-**Security pass:** the record persists NO DEK and NO content ciphertext; the `out.mp4` sits in a
-Low-IL/AppContainer-ACL staging dir; file perms are least-privilege; load fails closed on a corrupt record.
+**Security pass:** the transcode plaintext `out.mp4` lives in a Low-IL/AppContainer-ACL staging dir; error/
+cancel paths still wipe it; the record persists NO DEK and NO content ciphertext; file perms least-privilege;
+load fails closed on a corrupt record.
 
 ## Task 6: server — body limit + discard-unfinalized endpoint + configurable quota **[two-stage review]**
 
