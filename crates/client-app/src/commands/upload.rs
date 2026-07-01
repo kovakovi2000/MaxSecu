@@ -36,9 +36,9 @@ use tauri::Emitter;
 /// Max bytes we read from a chosen file / accept as blog text (DoS guard).
 const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// The `build_upload` chunk size for EVERY kind. This is the SINGLE source of truth
-/// for the 4096-byte chunking — it is `crate::upload::VIDEO_CHUNK_SIZE`, the same
-/// constant the video fragment-index validator uses. Tying them here makes it
-/// impossible to stage video at a `chunk_size` that differs from the fragment
+/// for the content chunk size — it is `crate::upload::VIDEO_CHUNK_SIZE` (6 MiB),
+/// the same constant the video fragment-index validator uses. Tying them here makes
+/// it impossible to stage video at a `chunk_size` that differs from the fragment
 /// index's chunk unit (a divergence would silently misseek after upload).
 const CHUNK_SIZE: u32 = crate::upload::VIDEO_CHUNK_SIZE;
 

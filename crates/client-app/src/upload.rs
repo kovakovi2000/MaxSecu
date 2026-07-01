@@ -14,15 +14,12 @@ use maxsecu_media_launcher::{build_ffmpeg_args, FfmpegLauncher, TranscodeOptions
 
 use crate::error::UiError;
 
-/// The upload `chunk_size` for video content. It **MUST** equal the transcode
-/// worker's `TRANSCODE_CHUNK_SIZE` (4096): the fragment index's `chunk_start` /
-/// `chunk_len` are expressed in whole units of this size, so the upload's content
-/// chunks line up one-for-one with the fragment ranges. A mismatch would silently
-/// break seek (`chunks_for_fragment` would resolve a fragment to the wrong byte
-/// range), so [`prepare_video_streams`] enforces the alignment against this value.
-/// (The worker's `TRANSCODE_CHUNK_SIZE` lives in a crate this codec-free process
-/// does not depend on, so the constant is duplicated here and checked at runtime.)
-pub const VIDEO_CHUNK_SIZE: u32 = 4096;
+/// The upload `chunk_size` for video content (6 MiB). Both the manifest
+/// `chunk_size` and the fragment index's `chunk_start`/`chunk_len` unit are this
+/// value, so the content chunks line up one-for-one with the fragment ranges (a
+/// mismatch would silently misseek — `chunks_for_fragment` would resolve a
+/// fragment to the wrong byte range).
+pub const VIDEO_CHUNK_SIZE: u32 = 6 * 1024 * 1024;
 
 /// Content chunks per fMP4 seek fragment (~256 KiB at 4096-byte chunks).
 const FRAG_CHUNKS: u64 = 64;
@@ -215,18 +212,11 @@ pub fn prepare_video_streams(
         return Err(video_prep_err());
     }
 
-    // 5) Read ffmpeg's outputs from the granted dir; both must exist, be non-empty,
-    //    and sit within the re-mux worker's accept ceiling. The size pre-check fails
-    //    closed BEFORE allocating an arbitrarily large `out.mp4` only for the worker's
-    //    framed codec to reject it past MAX_FRAME_BYTES — a self-OOM guard on large
-    //    sources (full large-source streaming is a deferred residual). A missing file
-    //    makes `metadata` error → `over_cap` true → fail closed (covers "must exist").
-    let cap = maxsecu_media_launcher::framing::MAX_FRAME_BYTES as u64;
-    let over_cap =
-        |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len() > cap).unwrap_or(true);
-    if over_cap(&out_mp4) || over_cap(&thumb_png) {
-        return Err(video_prep_err());
-    }
+    // 5) Read ffmpeg's outputs from the granted dir; both must exist and be
+    //    non-empty. The 64 MiB cap is removed — large-source RAM-frugality is
+    //    handled by the streaming upload path. A missing file is caught by the
+    //    `fs::read` returning an error; an empty file is caught by the `is_empty`
+    //    check below.
     let out_mp4_bytes = std::fs::read(&out_mp4).map_err(|_| video_prep_err())?;
     let thumb_png_bytes = std::fs::read(&thumb_png).map_err(|_| video_prep_err())?;
     if out_mp4_bytes.is_empty() || thumb_png_bytes.is_empty() {
@@ -559,9 +549,24 @@ mod tests {
     #[test]
     fn video_chunk_size_matches_the_upload_chunk_size() {
         // The fragment index is in VIDEO_CHUNK_SIZE units; the upload stages video
-        // content at exactly this chunk size so the ranges map one-for-one. This is
-        // the same 4096 the transcode worker's TRANSCODE_CHUNK_SIZE pads to.
-        assert_eq!(VIDEO_CHUNK_SIZE, 4096);
+        // content at exactly this chunk size so the ranges map one-for-one.
+        assert_eq!(VIDEO_CHUNK_SIZE, 6 * 1024 * 1024);
+    }
+
+    #[test]
+    fn chunk_grouped_index_covers_a_159mib_file_at_6mib() {
+        let cs = VIDEO_CHUNK_SIZE as u64;
+        let file_len: u64 = 159 * 1024 * 1024;
+        let n_chunks = file_len.div_ceil(cs); // 27
+        let frags = chunk_grouped_index(n_chunks, FRAG_CHUNKS);
+        // contiguous + coverage-complete
+        assert_eq!(frags[0].chunk_start, 0);
+        for k in 1..frags.len() {
+            assert_eq!(frags[k].chunk_start, frags[k - 1].chunk_start + frags[k - 1].chunk_len);
+        }
+        let last = frags.last().unwrap();
+        assert_eq!(last.chunk_start + last.chunk_len, n_chunks);
+        assert_eq!(frags.iter().map(|f| f.chunk_len).sum::<u64>(), n_chunks);
     }
 
     #[test]
