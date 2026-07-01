@@ -64,6 +64,10 @@ pub struct VideoJob {
     pub cache: crate::fragment_cache::FragmentCache,
     pub file_id_hex: String,
     pub version: u64,
+    /// Plaintext content chunk size (bytes) — the byte↔chunk unit for range serving.
+    pub chunk_size: u64,
+    /// Total plaintext content length (bytes) — the `Content-Range` denominator.
+    pub total_len: u64,
     /// UI playback gain preference (0.0..=4.0). Has NO decode effect — the UI
     /// applies it via WebAudio (Gate 5); stored here so it survives across windows.
     pub gain: f32,

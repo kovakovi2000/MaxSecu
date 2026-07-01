@@ -143,6 +143,20 @@ pub fn slice_range(assembled: &[u8], base: u64, req: &RangeReq) -> Result<Vec<u8
     Ok(assembled[lo..hi].to_vec())
 }
 
+/// Total plaintext byte length of the content: `(n-1) * chunk_size +
+/// last_chunk_plaintext_len`, where `n = content_chunk_count`. The last chunk's
+/// plaintext length is supplied by the caller (learned once by decrypting the
+/// final fragment at open). `chunk_size > 0` and `n >= 1` required.
+pub fn total_len(content_chunk_count: u64, chunk_size: u64, last_chunk_plaintext_len: u64) -> Result<u64, UiError> {
+    if content_chunk_count == 0 || chunk_size == 0 {
+        return Err(range_err());
+    }
+    (content_chunk_count - 1)
+        .checked_mul(chunk_size)
+        .and_then(|x| x.checked_add(last_chunk_plaintext_len))
+        .ok_or_else(range_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +371,23 @@ mod tests {
         .unwrap();
         assert_eq!(fetches2, 0, "warm range performed no fetch");
         assert_eq!(got2, got);
+    }
+
+    #[test]
+    fn total_len_sums_full_chunks_plus_last() {
+        // 6 chunks of 4096, last chunk 123 bytes → 5*4096 + 123.
+        assert_eq!(total_len(6, 4096, 123).unwrap(), 5 * 4096 + 123);
+        assert!(total_len(0, 4096, 1).is_err());
+        assert!(total_len(6, 0, 1).is_err());
+    }
+
+    #[test]
+    fn total_len_matches_real_content() {
+        let (owner, header, ct, content, cs) = build();
+        let dec = decryptor_of(&owner, &header);
+        let n = dec.content_chunk_count();
+        // Decrypt the last chunk to learn its plaintext length.
+        let last = dec.open_range(n - 1, &[ct[(n - 1) as usize].clone()]).unwrap();
+        assert_eq!(total_len(n, cs, last.len() as u64).unwrap(), content.len() as u64);
     }
 }

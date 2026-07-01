@@ -559,6 +559,48 @@ struct WindowPlan {
     fetch_indices: Vec<u64>,
 }
 
+/// Probe the total plaintext content length by decrypting the LAST chunk once
+/// over the real server (fetch its ciphertext, then `open_range`), caching the
+/// ciphertext as a side effect. Returns `(n-1)*chunk_size + last_chunk_plaintext`.
+async fn probe_total_len(
+    sender: &mut hyper::client::conn::http1::SendRequest<http_body_util::Full<hyper::body::Bytes>>,
+    host: &str,
+    token: &str,
+    jobs: &VideoJobs,
+    file_id_hex: &str,
+    chunk_size: u64,
+) -> Result<u64, UiError> {
+    // Plan: the last chunk's absolute index + the content chunk count + version,
+    // under the lock (sync).
+    let (n, last_idx, version) = {
+        let guard = jobs.0.lock().await;
+        let job = guard.get(file_id_hex).ok_or_else(player_err)?;
+        let n = job.decryptor.content_chunk_count();
+        if n == 0 {
+            return Err(player_err());
+        }
+        (n, n - 1, job.version)
+    };
+    // Fetch the last ciphertext chunk (no lock held).
+    let uri = format!(
+        "/v1/files/{file_id_hex}/versions/{version}/streams/content/chunks/{last_idx}"
+    );
+    let (status, ct) = get_bytes(sender, &uri, Some(token), host).await?;
+    if status != hyper::StatusCode::OK {
+        return Err(player_err());
+    }
+    // Decrypt just that chunk under the lock to learn its plaintext length.
+    let last_len = {
+        let guard = jobs.0.lock().await;
+        let job = guard.get(file_id_hex).ok_or_else(player_err)?;
+        job.decryptor
+            .open_range(last_idx, &[ct])
+            .map_err(|_| player_err())?
+            .len() as u64
+    };
+    crate::stream::total_len(n, chunk_size, last_len)
+}
+
 /// Drive one bounded window end-to-end while holding the global `VideoJobs` lock
 /// ONLY for the two short synchronous critical sections — planning and the in-TCB
 /// decrypt — and NEVER across the network prefetch or the blocking decode (review
@@ -716,10 +758,10 @@ async fn open_video_inner<E, OnF, OnA, OnI>(
     session: &State<'_, Session>,
     connect_lock: &State<'_, ConnectLock>,
     jobs: &State<'_, VideoJobs>,
-    emit: &E,
-    on_frame: &OnF,
-    on_audio: &OnA,
-    on_info: &OnI,
+    _emit: &E,
+    _on_frame: &OnF,
+    _on_audio: &OnA,
+    _on_info: &OnI,
 ) -> Result<(), UiError>
 where
     E: Fn(PlayerPhase),
@@ -788,13 +830,18 @@ where
     }?;
     let version = decryptor.version();
 
-    // Emit VideoInfo from the authenticated index BEFORE it moves into VideoJob.
-    on_info(VideoInfo {
-        duration_ms: duration_ms_from_index(&index),
-        fragment_count: index.len() as u32,
-    });
+    // Content chunk size from the (authenticated-envelope) view — the byte↔chunk
+    // unit for range serving.
+    let chunk_size = view
+        .streams
+        .iter()
+        .find(|s| s.stream_type == StreamType::Content)
+        .map(|s| s.chunk_size)
+        .ok_or_else(player_err)?;
 
-    // Register the session. Cache cap from the Phase-5 performance setting.
+    // Register the session first (so the fragment cache exists), then probe the
+    // total plaintext length by decrypting ONLY the last fragment once — its
+    // ciphertext is cached as a side effect (a back-seek to the end is warm).
     let cap = SettingsConfig::load(&dir.0).performance.ram_cache_cap_mb as u64 * 1024 * 1024;
     let cache = FragmentCache::open(&dir.0, cap).map_err(|_| player_err())?;
     jobs.0.lock().await.insert(
@@ -805,25 +852,19 @@ where
             cache,
             file_id_hex: file_id_hex.clone(),
             version,
+            chunk_size,
+            total_len: 0, // set below
             gain: 1.0,
         },
     );
 
-    // Play the initial bounded window from the start.
-    play_window_command(
-        &mut sender,
-        &host,
-        &token,
-        jobs,
-        &file_id_hex,
-        0,
-        PLAY_WINDOW,
-        &dir.0,
-        emit,
-        on_frame,
-        on_audio,
-    )
-    .await
+    // Probe total_len via the last fragment (reuses the streaming plan/prefetch/
+    // assemble path against the real server — mirrors play_window_command Phase B).
+    let total = probe_total_len(&mut sender, &host, &token, jobs, &file_id_hex, chunk_size).await?;
+    if let Some(job) = jobs.0.lock().await.get_mut(&file_id_hex) {
+        job.total_len = total;
+    }
+    Ok(())
 }
 
 /// `video_seek` — map `pts_ms` to its fragment and play a bounded window from
@@ -1359,6 +1400,8 @@ mod tests {
             cache,
             file_id_hex: file_id_hex(),
             version,
+            chunk_size: 4096,
+            total_len: 0,
             gain: 1.0,
         };
         (job, chunks)
