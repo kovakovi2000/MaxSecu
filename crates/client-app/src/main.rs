@@ -70,6 +70,25 @@ fn main() {
             maxsecu_client_app::commands::video::video_set_volume,
             maxsecu_client_app::commands::video::cancel_video,
         ])
+        .register_asynchronous_uri_scheme_protocol("stream", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            // Parse "…/media/<file_id_hex>" and the Range header up front (cheap, sync).
+            let path = request.uri().path().to_string();
+            let range_header = request
+                .headers()
+                .get(http::header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            tauri::async_runtime::spawn(async move {
+                let resp = maxsecu_client_app::commands::video::stream_media(
+                    &app,
+                    &path,
+                    range_header.as_deref(),
+                )
+                .await;
+                responder.respond(resp);
+            });
+        })
         .build(tauri::generate_context!())
         .expect("error while running MaxSecu client");
 

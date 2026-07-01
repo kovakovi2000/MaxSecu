@@ -85,6 +85,18 @@ const PLAY_WINDOW: u32 = 4;
 /// WebAudio in Gate 5). Keeps a hand-set value in a sane range.
 const MAX_GAIN: f32 = 4.0;
 
+/// Cap on a single range response body (open-ended `bytes=N-` streams in pieces).
+const MAX_RANGE_BODY: u64 = 4 * 1024 * 1024;
+
+/// The body + metadata of one satisfied range response (206). `total_len` is the
+/// Content-Range denominator; `start`/`len` describe the returned slice.
+pub struct RangeResponse {
+    pub start: u64,
+    pub len: u64,
+    pub total_len: u64,
+    pub body: Vec<u8>,
+}
+
 /// D-7 backpressure: ceiling (bytes) on the DECODED I420 frames buffered for ONE
 /// fragment before the window-offset flush (Part C). One 4K I420 frame is ~12.4 MB and
 /// a high-res closed GOP can be dozens of frames (~600 MB), so buffering a whole such
@@ -1162,6 +1174,162 @@ pub async fn preview_seek(
     out
 }
 
+// ===========================================================================
+// stream:// range protocol (Task 5). Serves per-range-decrypted plaintext bytes
+// to a native <video> element via a Tauri async URI-scheme protocol. The content
+// key NEVER leaves this process; only sliced plaintext is returned. Errors are
+// oracle-free: 404 (unknown/closed id or bad path), 416 (unsatisfiable range),
+// 500 (everything else), empty bodies.
+// ===========================================================================
+
+/// Serve one plaintext byte range for an OPEN video session over the real server:
+/// (A) plan the covering fragment span + which ciphertext chunks are missing, under
+/// the jobs lock; (B) prefetch the missing ciphertext with NO lock held; (C) assemble
+/// + slice under the lock. Fail-closed. The content key never leaves this process;
+/// only the sliced plaintext is returned. `first`/`last_inclusive` are the parsed
+/// HTTP byte-range bounds.
+async fn serve_range(
+    sender: &mut hyper::client::conn::http1::SendRequest<http_body_util::Full<hyper::body::Bytes>>,
+    host: &str,
+    token: &str,
+    jobs: &VideoJobs,
+    file_id_hex: &str,
+    first: u64,
+    last_inclusive: Option<u64>,
+) -> Result<RangeResponse, UiError> {
+    use crate::stream::{assemble_range, plan_range, resolve_range};
+
+    // Phase A — resolve the request + plan the fragment span + fetch list, under the lock.
+    let (req, plan, total_len, version, fetch_indices) = {
+        let mut guard = jobs.0.lock().await;
+        let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
+        let req = resolve_range(first, last_inclusive, job.total_len, MAX_RANGE_BODY)
+            .ok_or_else(|| UiError::new("range_not_satisfiable", "range"))?;
+        let plan = plan_range(&job.index, job.chunk_size, &req)?;
+        let mut fetch_indices: Vec<u64> = Vec::new();
+        for seq in plan.f0..=plan.f1 {
+            let (cs, cl) = chunks_for_fragment(&job.index, seq).ok_or_else(player_err)?;
+            if !cached_fragment_valid(&mut job.cache, &job.file_id_hex, seq, cl) {
+                let end = cs.checked_add(cl).ok_or_else(player_err)?;
+                fetch_indices.extend(cs..end);
+            }
+        }
+        (req, plan, job.total_len, job.version, fetch_indices)
+    };
+
+    // Phase B — prefetch missing ciphertext with NO lock held.
+    let mut prefetched: HashMap<u64, Vec<u8>> = HashMap::new();
+    for i in fetch_indices {
+        let uri = format!("/v1/files/{file_id_hex}/versions/{version}/streams/content/chunks/{i}");
+        let (status, bytes) = get_bytes(sender, &uri, Some(token), host).await?;
+        if status != hyper::StatusCode::OK {
+            return Err(player_err());
+        }
+        prefetched.insert(i, bytes);
+    }
+
+    // Phase C — assemble + slice under the lock (sync decrypt in the TCB).
+    let body = {
+        let mut guard = jobs.0.lock().await;
+        let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
+        // Split borrows: index/decryptor are read-only, cache is &mut.
+        let VideoJob { index, cache, decryptor, file_id_hex: fid, .. } = &mut *job;
+        assemble_range(index, cache, decryptor, fid, &plan, &req, |i| {
+            prefetched.remove(&i).ok_or_else(player_err)
+        })?
+    };
+
+    Ok(RangeResponse { start: req.start, len: req.len, total_len, body })
+}
+
+/// The `stream://media/<file_id_hex>` protocol entry point. Resolves the open
+/// session, mints a fresh authed channel (Phase-3 reauth), serves the requested
+/// byte range, and builds a `206 Partial Content` response. Errors map to 416
+/// (unsatisfiable range) or 500 (everything else) with an empty body — no oracle.
+pub async fn stream_media(
+    app: &tauri::AppHandle,
+    path: &str,
+    range_header: Option<&str>,
+) -> http::Response<Vec<u8>> {
+    match stream_media_inner(app, path, range_header).await {
+        Ok(r) => http::Response::builder()
+            .status(206)
+            .header(http::header::CONTENT_TYPE, "video/mp4")
+            .header(http::header::ACCEPT_RANGES, "bytes")
+            .header(
+                http::header::CONTENT_RANGE,
+                format!("bytes {}-{}/{}", r.start, r.start + r.len - 1, r.total_len),
+            )
+            .header(http::header::CONTENT_LENGTH, r.len.to_string())
+            .body(r.body)
+            .unwrap_or_else(|_| http::Response::builder().status(500).body(Vec::new()).unwrap()),
+        Err(code) => {
+            let status = if code == 416 { 416 } else { 500 };
+            http::Response::builder().status(status).body(Vec::new()).unwrap()
+        }
+    }
+}
+
+/// Inner: resolve `file_id` from the path, mint an authed channel, parse the Range
+/// header, and call `serve_range`. Returns an HTTP status code (`u16`) on error.
+async fn stream_media_inner(
+    app: &tauri::AppHandle,
+    path: &str,
+    range_header: Option<&str>,
+) -> Result<RangeResponse, u16> {
+    use tauri::Manager;
+    // The UI mints `stream://media/<file_id_hex>`. The exact split into (host, path)
+    // is platform-dependent on WebView2: `media` may arrive as the URI HOST with
+    // path `/<id>`, or as part of the path `/media/<id>`. Handle both by taking the
+    // LAST non-empty path segment as the id — then validate it is real hex16 and
+    // (below) that a live session exists; anything else 404s.
+    let file_id_hex = path
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or(404u16)?;
+    let _ = hex16(&file_id_hex).map_err(|_| 404u16)?; // reject non-hex ids
+
+    let dir = app.state::<AppDir>();
+    let session = app.state::<Session>();
+    let connect_lock = app.state::<ConnectLock>();
+    let jobs = app.state::<VideoJobs>();
+
+    // The session must already be open (open_video registered it).
+    {
+        let guard = jobs.0.lock().await;
+        if !guard.contains_key(&file_id_hex) {
+            return Err(404);
+        }
+    }
+
+    // Parse "bytes=first-[last]" (default first=0 when absent).
+    let (first, last_inclusive) = parse_byte_range(range_header);
+
+    let server = server_of(&dir.0).map_err(|_| 500u16)?;
+    let (mut sender, host, token) = reauth(&dir.0, &server, &session, &connect_lock)
+        .await
+        .map_err(|_| 500u16)?;
+    serve_range(&mut sender, &host, &token, &jobs, &file_id_hex, first, last_inclusive)
+        .await
+        .map_err(|e| if e.code == "range_not_satisfiable" { 416 } else { 500 })
+}
+
+/// Parse an HTTP `Range: bytes=first-[last]` value into `(first, last_inclusive)`.
+/// A missing/garbled header defaults to `(0, None)` (whole resource from the start,
+/// capped by `MAX_RANGE_BODY` in `resolve_range`). Only a single range is honored.
+fn parse_byte_range(h: Option<&str>) -> (u64, Option<u64>) {
+    let Some(h) = h else { return (0, None) };
+    let Some(spec) = h.trim().strip_prefix("bytes=") else { return (0, None) };
+    let spec = spec.split(',').next().unwrap_or("").trim();
+    let mut parts = spec.splitn(2, '-');
+    let first = parts.next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+    let last = parts
+        .next()
+        .and_then(|s| { let s = s.trim(); if s.is_empty() { None } else { s.parse::<u64>().ok() } });
+    (first, last)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2070,6 +2238,16 @@ mod tests {
         want.extend_from_slice(&0x0102i16.to_le_bytes());
         want.extend_from_slice(&(-1i16).to_le_bytes());
         assert_eq!(pcm.samples_b64, B64.encode(&want));
+    }
+
+    #[test]
+    fn parse_byte_range_forms() {
+        assert_eq!(super::parse_byte_range(None), (0, None));
+        assert_eq!(super::parse_byte_range(Some("bytes=0-")), (0, None));
+        assert_eq!(super::parse_byte_range(Some("bytes=100-199")), (100, Some(199)));
+        assert_eq!(super::parse_byte_range(Some("bytes=500-")), (500, None));
+        assert_eq!(super::parse_byte_range(Some("garbage")), (0, None));
+        assert_eq!(super::parse_byte_range(Some("bytes=0-99,200-299")), (0, Some(99)));
     }
 
     #[test]
