@@ -574,15 +574,15 @@ git commit -m "feat(player): streaming scheduler requests the next window at the
 
 ---
 
-## Task 6: Seek re-requests the window at the target
+## Task 6: Absolute-pts timeline + seek re-requests the window at the target
 
 **Files:**
 - Modify: `crates/client-app/ui/src/core/player.ts`
 - Test: `crates/client-app/ui/src/core/player.test.ts`
 
-`seek(pts)` must clear the buffer, stop in-flight audio, reset the frontier to the target, and request the window at the target (so it plays from there instead of vanishing).
+**Why absolute pts.** The backend emits each decoded frame's pts on the ABSOLUTE clip timeline (0..duration) — see Tasks 7–8, which pass `window_start_pts = 0` so streamed windows compose continuously (a frame's pts = its fragment's absolute `pts_ms` + the worker's fragment-relative pts). The player must therefore track an **absolute base**, `originPtsMs` — the absolute pts corresponding to elapsed = 0. Normal playback keeps `originPtsMs = 0` (the timeline runs from 0, windows advance continuously). A **seek** shifts `originPtsMs` to the target so the position, the frame-release comparison, and the timer are all absolute. `seek(pts)` clears the buffer, stops in-flight audio, sets the base + frontier to the target, and requests the window there (so it plays from the target instead of vanishing).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 ```typescript
 test("seek clears the buffer and requests the window at the target", () => {
@@ -609,16 +609,65 @@ test("seek clears the buffer and requests the window at the target", () => {
   assert.deepStrictEqual(requested, [30000], "requested the window at the seek target");
   player.dispose();
 });
+
+test("after seek the position/timeline is absolute (origin shifts to the target)", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+    requestWindow: () => {},
+  });
+  player.play();
+  player.seek(30000);     // base shifts to 30000; playbackStart reset to null
+  clock = 0.5;
+  player.tick();          // first tick after seek re-captures playbackStart at clock=0.5
+  // A frame at the ABSOLUTE target pts is due right at the seek point.
+  bus.emit(EVT_VIDEO_FRAME, frameDto(30000));
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "the absolute-pts frame at the target is drawn");
+  clock = 1.0;            // 0.5 s of real elapsed since the re-capture
+  assert.strictEqual(player.positionMs(), 30500, "position = seek target + elapsed");
+  player.dispose();
+});
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [ ] **Step 2: Run to verify they fail**
 
 Run: `cd crates/client-app/ui && npm test`
-Expected: FAIL — `seek()` clears but does not call `requestWindow`.
+Expected: FAIL — `seek()` does not call `requestWindow`; and (without `originPtsMs`) the position after seek is `500`, not `30500`, and the absolute-pts frame reads as far-future and is not drawn.
 
-- [ ] **Step 3: Implement seek re-request**
+- [ ] **Step 3: Implement absolute base + seek re-request (all in `player.ts`)**
 
-Rewrite `seek()`:
+(a) Add the base state next to `let playbackStart`:
+
+```typescript
+  // Absolute clip pts (ms) that corresponds to elapsed = 0. 0 for normal playback; a seek
+  // shifts it to the target so position/frame-release/timer stay on the absolute timeline.
+  let originPtsMs = 0;
+```
+
+(b) Make `positionMs()` absolute:
+
+```typescript
+  function positionMs(): number {
+    if (playbackStart === null) return originPtsMs;
+    return Math.max(0, originPtsMs + Math.round((audioClock() - playbackStart) * 1000));
+  }
+```
+
+(c) In `tick()`, make the "now" the ABSOLUTE position in seconds (add `originPtsMs / 1000`). Replace the `const now = audioClock() - playbackStart;` line with:
+
+```typescript
+    const now = originPtsMs / 1000 + (audioClock() - playbackStart);
+```
+
+(d) Rewrite `seek()` (replace the current body, including the Task-5 `frontierMs = 0; windowOutstanding = false;` lines):
 
 ```typescript
   function seek(pts_ms: number): void {
@@ -626,14 +675,17 @@ Rewrite `seek()`:
     ring.length = 0;
     bufferedBytes = 0;
     nextAudioTime = 0;
-    playbackStart = null;
-    frontierMs = pts_ms;      // the new window begins at the target
-    windowOutstanding = true; // we are about to request it; guard until frames arrive
+    playbackStart = null;      // re-anchored on the next tick
+    originPtsMs = pts_ms;      // the new timeline base = the absolute seek target
+    frontierMs = pts_ms;       // the new window begins at the target
+    windowOutstanding = true;  // we are about to request it; guard until frames arrive
     stopAllSources();
     opts.onSeek?.(pts_ms);
     requestWindow?.(pts_ms);
   }
 ```
+
+Existing tests with `originPtsMs = 0` are unaffected (`positionMs` and `now` reduce to their previous forms). Run `npm test` — if any pre-existing seek test asserted the old `frontierMs = 0` reset semantics, update it to the target-based reset (do not weaken other assertions) and report it.
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -720,7 +772,11 @@ fn build_preview_window_script(
 }
 ```
 
-Refactor `preview_video_inner` to decode window 0 only (use `PLAY_WINDOW` and `build_preview_window_script(&preview.cmaf, &preview.index, 0, PLAY_WINDOW)` instead of `build_preview_script`), compute `window_start_pts` from `preview.index[0]`, and emit `VideoInfo` (Task 8). Add a `preview_seek` command:
+Refactor `preview_video_inner` to decode window 0 only (use `PLAY_WINDOW` and `build_preview_window_script(&preview.cmaf, &preview.index, 0, PLAY_WINDOW)` instead of `build_preview_script`) and emit `VideoInfo` (Task 8).
+
+**ABSOLUTE PTS (required by Task 6):** call `decode_and_emit(..., window_start_pts = 0, ...)` — pass `0`, NOT the window's first-fragment pts. With `window_start_pts = 0`, `window_offset_ms` yields `index[seq].pts_ms`, so each emitted frame/audio pts is ABSOLUTE on the clip timeline (`index[seq].pts_ms + worker_pts`). The streaming player needs a single continuous absolute timeline across windows; subtracting the window start would restart each window near 0 and break advance/seek.
+
+Add a `preview_seek` command:
 
 ```rust
 /// `preview_seek` — decode the preview window covering `pts_ms` (author-side, staged cmaf,
@@ -742,7 +798,7 @@ pub async fn preview_seek(
 }
 ```
 
-Factor a `preview_window_inner(job_id, pts_ms, ...)` that: locks `UploadJobs`, gets `staged.preview`, maps `pts_ms` -> `start_seq` via `fragment_for_time(&preview.index, pts_ms).unwrap_or(0)`, builds `build_preview_window_script(&preview.cmaf, &preview.index, start_seq, PLAY_WINDOW)`, clones the index + window_start_pts, releases the lock, then `decode_and_emit(...)`. Make `preview_video_inner` delegate to `preview_window_inner(job_id, 0, ...)` after emitting `VideoInfo`.
+Factor a `preview_window_inner(job_id, pts_ms, ...)` that: locks `UploadJobs`, gets `staged.preview`, maps `pts_ms` -> `start_seq` via `fragment_for_time(&preview.index, pts_ms).unwrap_or(0)`, builds `build_preview_window_script(&preview.cmaf, &preview.index, start_seq, PLAY_WINDOW)`, clones the index, releases the lock, then calls `decode_and_emit(script, decoder, frag_index, /* window_start_pts */ 0, ...)` (ABSOLUTE pts — pass `0`, see the callout above). Make `preview_video_inner` delegate to `preview_window_inner(job_id, 0, ...)` after emitting `VideoInfo`.
 
 - [ ] **Step 4: Register `preview_seek` and run tests**
 
@@ -834,6 +890,8 @@ Emit in `open_video_inner` (after `index` is known, before the first `play_windo
 ```
 
 (For `open_video_inner`, thread the `app`/emit closure through as the other emits are; the command already has `app: tauri::AppHandle`. Add an `on_info` emit alongside `emit`/`on_frame`/`on_audio` in `open_video`/`preview_video` and pass it down.)
+
+**ABSOLUTE PTS for the download path (required by Task 6).** Also change `play_window_command` (the existing download windower, called by `open_video` and `video_seek`) to emit ABSOLUTE pts: in its Phase C, drop the `let window_start_pts = job.index.get(plan.start as usize).map(|e| e.pts_ms).unwrap_or(0);` computation and pass `window_start_pts = 0` to `decode_and_emit(...)`. With `0`, `window_offset_ms` yields `index[seq].pts_ms`, so streamed windows carry a continuous absolute timeline (matching the preview path in Task 7). Without this, advancing past the first download window would restart pts near 0 and the player would drop the "past" frames.
 
 - [ ] **Step 4: Run tests**
 
