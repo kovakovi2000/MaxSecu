@@ -74,6 +74,7 @@ should include a large-file run. Reconcile at that time.
 - `crates/media-launcher/src/lib.rs`: drop the hard ffmpeg timeout; keep the stall watchdog.
 - `crates/server/src/{serve.rs,http.rs,store.rs,pg.rs,files.rs}`: request body limit; discard-unfinalized endpoint; configurable quota.
 - `crates/client-app/ui/src/components/upload-tray.ts` (+ upload-screen): MB/s + resume prompt.
+- `crates/client-app/src/commands/app_memory.rs` (new) + `quick-settings.ts` + `styles.css`: left-edge rainbow RAM gauge (Task 11b).
 - Tests: `crates/client-core` lib tests; `crates/client-app/tests/*` e2e; `crates/server/tests/*`.
 
 ---
@@ -145,10 +146,14 @@ from a self-wrap for resume.
   `params`, call (a) `build_upload_inner(&dek, &params, &full_streams)` and (b) the streaming path: seal the
   content with `ContentStreamSealer::new(&dek, file_id, FIRST_VERSION, Content, chunk_size)` over a `Cursor`
   to get `(content_chunk_count, content_digest)`, then `build_records_inner(&dek, &params, &small_streams,
-  content_digest, content_chunk_count)`. Assert `manifest` (encoded bytes), `manifest_sig`, `genesis`,
-  `genesis_sig`, and `wraps` (recipient_id/type, wrapped_dek bytes, grant, grant_sig) are IDENTICAL, and the
-  small `SealedStreamOut`s (metadata/thumbnail/preview) match the corresponding ones from (a). (Content chunks
-  are absent from the streaming path by design.) Do this for a V1 build (no ML-KEM) at minimum.
+  content_digest, content_chunk_count)`. Assert the DETERMINISTIC outputs are byte-IDENTICAL: `manifest`
+  (encoded bytes), `manifest_sig`, `genesis`, `genesis_sig`, and per wrap the `recipient_id`, `recipient_type`,
+  `granted_by`, `grant`, and `grant_sig` (Ed25519 is deterministic; the grant binds `dek_commit`, not the
+  wrap). Do NOT assert `wrapped_dek` bytes equal — HPKE uses a fresh random ephemeral per call, so those bytes
+  differ; instead assert each path's self-`wrapped_dek` **opens to the same committed DEK**
+  (`recovered.commit() == manifest.dek_commit.0`). Assert the small `SealedStreamOut`s
+  (metadata/thumbnail/preview) match (a)'s byte-for-byte. (Content chunks are absent from the streaming path by
+  design.) Do this for a V1 build (no ML-KEM) at minimum.
 - [ ] **Step 2 (failing test B — DEK recovery round-trips, V1 AND V2):** From a build's self-`WrapOut`, recover
   the `Dek` and show a `ContentStreamSealer` from it reproduces the original content ciphertext + digest.
   Cover both suites: **V1** via `recover_dek(self_enc_secret: &EncSecretKey, &wrapped_dek, &WrapContext) ->
@@ -172,7 +177,8 @@ from a self-wrap for resume.
 
 **Security pass:** the `Dek` never leaves the crate — the builder owns it, `resume_content_sealer` recovers it
 internally and returns only a `ContentStreamSealer` (holding just the content subkey); only wraps + records +
-ciphertext cross the seam. Records are byte-identical to the monolithic path (shared assembly helper).
+ciphertext cross the seam. The deterministic records (manifest/sigs/genesis/grants) are byte-identical to the
+monolithic path via the shared assembly helper, and the (randomized) wraps open to the same committed DEK.
 `recover_dek*` fail closed on a wrong secret/ctx/suite. No key material is logged. The self-wrap pre-check
 still runs on build.
 
@@ -320,6 +326,39 @@ the staged one (no traversal from client input).
 - [ ] **Step 3:** `npm run typecheck && npm test && npm run test:a11y` → PASS.
 - [ ] **Step 4:** Commit: `feat(upload): MB/s throughput in the tray + resume-interrupted-upload prompt`.
 
+## Task 11b: quick-settings live RAM gauge (rainbow bar)
+
+**Why:** with large streaming uploads + video decode buffers, give the user an at-a-glance sense of how much of
+the app's memory budget is in use. **Added by user request (2026-07-01).**
+
+**Files:** `crates/client-app/src/commands/` (a small memory-stats command, e.g. `app_memory.rs`; register in
+`main.rs`), `crates/client-app/src/state.rs` or `config.rs` (budget derivation), `crates/client-app/ui/src/components/quick-settings.ts`, `crates/client-app/ui/src/styles.css`, UI + a11y tests.
+
+**What:** a thin **vertical bar pinned to the LEFT edge of `<quick-settings>`** that fills bottom→top in
+proportion to how much of the app's allocated memory budget is currently **occupied**, painted with a **rainbow
+gradient** (fixed full-spectrum hue sweep, masked to the fill height so more usage ⇒ more of the spectrum
+shows). **Metric (documented assumption — confirm at the GUI smoke):** `occupied` = the process's current
+working-set/resident bytes; `budget` = the app's configured memory budget = the two-tier caps
+(decoded-frame-buffer cap + `FragmentCache` byte cap from `SettingsConfig`) + a fixed base allowance. The gauge
+shows `occupied / budget`.
+
+- [ ] **Step 1 (failing tests):** (a) `node:test` for a pure `ramGaugeModel(usedBytes, budgetBytes) ->
+  { pct: number, fillFraction: number, label: string, hidden: boolean }` — clamps `pct` to `0..100`,
+  `fillFraction` to `0..1`, `label` like `"420 / 512 MB (82%)"`, and `hidden: true` when `usedBytes == null`
+  (OS query unavailable). (b) a Rust unit test that the budget is derived from settings caps + base and that
+  the command's return shape (`{ used_bytes: Option<u64>, budget_bytes: u64 }`) serializes.
+- [ ] **Step 2:** Backend: add a `memory_stats` command returning `{ used_bytes, budget_bytes }`. `used_bytes`
+  = process working set (Windows `GetProcessMemoryInfo`→`WorkingSetSize`; use a minimal cross-platform helper
+  or a tiny crate like `memory-stats`; **fail-soft** ⇒ `None` when unavailable, never panic). `budget_bytes`
+  from the settings-derived budget above. Do NOT put this on any crypto/TCB path.
+- [ ] **Step 3:** UI: render the left-edge rainbow bar in `<quick-settings>`, polling `memory_stats` every
+  ~1.5s (clear the timer on disconnect/teardown). WCAG-AA: `role="meter"` + `aria-valuemin/max/now` + a visible
+  numeric `label` (non-color-only); respect reduced-motion (no animated shimmer — static fill). Hide the bar
+  when `hidden`. `npm run build`.
+- [ ] **Step 4:** `npm run typecheck && npm test && npm run test:a11y`; `cargo test -p maxsecu-client-app --lib`
+  → PASS.
+- [ ] **Step 5:** Commit: `feat(ui): live RAM-usage rainbow gauge on the left edge of quick settings`.
+
 ## Task 12: end-to-end tests over real TLS
 
 **Files:** `crates/client-app/tests/streaming_upload_e2e.rs` (new), reuse the video e2e harness.
@@ -341,6 +380,9 @@ Controller builds+stages the release exe to both dist dirs + relaunches; user dr
   continuous progress with **MB/s**, no OOM, completes, then plays (view path) with sound + seek.
 - **Quit the app mid-upload**, relaunch → the **resume prompt** appears; accept → it finishes; the file plays.
 - Confirm the author **preview** (before confirm) plays from disk; no console/CSP errors.
+- Confirm the **quick-settings left-edge rainbow RAM gauge** (Task 11b) renders, moves as memory changes
+  (e.g. rises during upload/decode), and its numeric label is sensible — and **confirm the intended metric**
+  (occupied working-set vs. app budget) reads right to you (adjust if you meant something else).
 Fix before proceeding on any failure (invoke **superpowers:systematic-debugging**). STOP if it fails.
 
 ## Task 14: security sign-off **[two-stage review]**
@@ -367,6 +409,7 @@ Fix before proceeding on any failure (invoke **superpowers:systematic-debugging*
 - Server body limit + discard + quota (4 GB-frugal) → Task 6. ✓
 - Streaming stage/confirm + MB/s → Task 7. ✓  Resume + 24h sweep + cancel/discard → Task 8. ✓
 - Preview-from-disk → Task 9. ✓  6 MiB view tuning → Task 10. ✓  UI MB/s + resume prompt → Task 11. ✓
+- Quick-settings left-edge rainbow RAM gauge (user request) → Task 11b. ✓ (verified at the Task 13 smoke)
 - e2e (upload/resume/sweep) → Task 12. ✓  GUI smoke → Task 13. ✓  Security sign-off → Task 14. ✓
 - No client cap / configurable server quota default-off → Tasks 4 (no cap) + 6 (quota). ✓
 - Pauses fMP4 Tasks 6–10; resume after. ✓
