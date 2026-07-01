@@ -126,6 +126,14 @@ export interface PlayerOptions {
   onSeek?: (pts_ms: number) => void;
   // Receives every player-state phase from the backend.
   onPhase?: (phase: PlayerPhase) => void;
+  // Streaming: `bufferAheadMs` is the (reserved) target horizon of frames buffered ahead of
+  // the playhead; `lowWaterMs` is the trigger — when the buffered frontier leads the playhead
+  // by less than this, the next window is requested. `requestWindow(fromPtsMs)` asks the
+  // component to decode the window covering fromPtsMs (it maps pts -> fragment seq and calls
+  // the backend).
+  bufferAheadMs?: number;
+  lowWaterMs?: number;
+  requestWindow?: (fromPtsMs: number) => void;
 }
 
 export interface Player {
@@ -214,6 +222,8 @@ export function createPlayer(opts: PlayerOptions): Player {
   const maxGain = opts.maxGain ?? 1;
   const toleranceSec = (opts.toleranceMs ?? 8) / 1000;
   const audioClock = opts.audioClock ?? (() => audio.currentTime);
+  const lowWaterMs = opts.lowWaterMs ?? 1500;
+  const requestWindow = opts.requestWindow;
   const renderer = opts.renderer;
   const drawFrame: (f: YuvFrame) => void =
     typeof renderer === "function" ? renderer : (f) => renderer.draw(f);
@@ -246,6 +256,8 @@ export function createPlayer(opts: PlayerOptions): Player {
   let playbackStart: number | null = null;
   let durationMs = Math.max(0, opts.durationMs ?? 0);
   let bufferedBytes = 0;
+  let frontierMs = 0;            // max pts received so far
+  let windowOutstanding = false; // a requestWindow is in flight (until the frontier advances)
 
   function frameBytes(f: YuvFrame): number {
     return f.y.length + f.u.length + f.v.length;
@@ -296,6 +308,10 @@ export function createPlayer(opts: PlayerOptions): Player {
     bufferedBytes += frameBytes(frame);
     evictBuffer();
     pushRing(frame);
+    if (frame.pts_ms > frontierMs) {
+      frontierMs = frame.pts_ms;
+      windowOutstanding = false; // new frames arrived; allow the next request
+    }
   }
 
   function onAudio(dto: PcmDto): void {
@@ -360,12 +376,23 @@ export function createPlayer(opts: PlayerOptions): Player {
     }
   }
 
+  function maybePrefetch(): void {
+    if (!playing || windowOutstanding || !requestWindow) return;
+    // Ahead = how far the buffered frontier leads the playhead.
+    const ahead = frontierMs - positionMs();
+    if (ahead < lowWaterMs && (durationMs === 0 || frontierMs < durationMs)) {
+      windowOutstanding = true;
+      requestWindow(frontierMs); // decode the window starting after the frontier
+    }
+  }
+
   // ---- A/V sync scheduler ----
   // Audio is master. Walk the pending queue: future frames (pts beyond clock +
   // tolerance) are HELD; among consecutive DUE frames only the latest is drawn
   // and the earlier ones are DROPPED, so video catches up to audio.
   function tick(): void {
     if (!playing || disposed) return;
+    maybePrefetch();
     // Sync against ELAPSED time since playback start, not the raw clock, so the
     // window-relative pts (which start near 0) line up with the audio that began at
     // playbackStart. If no frame/audio has set the origin yet, set it now.
@@ -409,6 +436,8 @@ export function createPlayer(opts: PlayerOptions): Player {
     bufferedBytes = 0;
     ring.length = 0;
     nextAudioTime = 0;
+    frontierMs = 0;
+    windowOutstanding = false;
     // A new window restarts the timeline: re-establish the playback origin from the
     // first frame/audio of the new window.
     playbackStart = null;
@@ -466,6 +495,8 @@ export function createPlayer(opts: PlayerOptions): Player {
     pending.length = 0;
     bufferedBytes = 0;
     ring.length = 0;
+    frontierMs = 0;
+    windowOutstanding = false;
   }
 
   return {

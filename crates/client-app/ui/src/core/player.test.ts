@@ -672,3 +672,35 @@ test("evicts decoded frames by BYTE budget, not a fixed count", () => {
   assert.ok(player.bufferedBytes() <= 18, `buffered ${player.bufferedBytes()} <= 18`);
   player.dispose();
 });
+
+test("requests the next window when the buffered frontier runs low", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  let clock = 0;
+  const requested: number[] = [];
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+    bufferAheadMs: 3000,
+    lowWaterMs: 1500,
+    requestWindow: (pts) => requested.push(pts),
+  });
+  player.play();
+  // Frontier at 1000 ms, position 0 => ahead = 1000 < lowWater(1500) => request once.
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  bus.emit(EVT_VIDEO_FRAME, frameDto(1000));
+  player.tick();
+  assert.deepStrictEqual(requested, [1000], "requested next window at the frontier");
+  // No duplicate request while the same window is outstanding.
+  player.tick();
+  assert.deepStrictEqual(requested, [1000], "no duplicate request");
+  // New frames extend the frontier => guard clears, but frontier is now ahead so no new request.
+  bus.emit(EVT_VIDEO_FRAME, frameDto(2000));
+  bus.emit(EVT_VIDEO_FRAME, frameDto(3000));
+  player.tick();
+  assert.deepStrictEqual(requested, [1000], "frontier now ahead; still one request");
+  player.dispose();
+});
