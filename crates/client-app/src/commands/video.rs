@@ -1307,9 +1307,25 @@ async fn stream_media_inner(
     let (first, last_inclusive) = parse_byte_range(range_header);
 
     let server = server_of(&dir.0).map_err(|_| 500u16)?;
-    let (mut sender, host, token) = reauth(&dir.0, &server, &session, &connect_lock)
-        .await
-        .map_err(|_| 500u16)?;
+    // The <video> element issues OVERLAPPING range requests (read-ahead + seek) that
+    // BYPASS the serial.ts command queue. `reauth` `try_lock`s the shared ConnectLock
+    // and returns "busy" on contention, so two overlapping reads would race and one
+    // would get a spurious 500 — stalling playback. Serialize overlapping reads by
+    // WAITING-AND-RETRYING on "busy" (the lock is only held for the login handshake,
+    // not the prefetch), bounded so it still fails closed (~1 s max → 500).
+    let (mut sender, host, token) = {
+        let mut attempt = 0u32;
+        loop {
+            match reauth(&dir.0, &server, &session, &connect_lock).await {
+                Ok(ch) => break ch,
+                Err(e) if e.code == "busy" && attempt < 50 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(_) => return Err(500u16),
+            }
+        }
+    };
     serve_range(&mut sender, &host, &token, &jobs, &file_id_hex, first, last_inclusive)
         .await
         .map_err(|e| if e.code == "range_not_satisfiable" { 416 } else { 500 })
