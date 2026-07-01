@@ -1171,6 +1171,25 @@ git commit -m "feat(ui): native <video> player over stream:// wrapped in Media C
 
 ---
 
+## Task 8b: Unblock the video VIEW path in `open_content` (integration gap, found in Task 10 smoke)
+
+**Found during the Task 10 GUI smoke:** opening a video POST shows "Video playback is not enabled yet." and hangs for minutes. Root cause: `media-viewer.ts` calls the `open_content` command and only mounts `<video-player>` on success — but `open_content` (`crates/client-app/src/commands/viewer.rs`) has a Phase-3 gate that, for `FileType::Video`, **downloads + decrypts the WHOLE file** (`build_download_bundle` + `verify_and_open`) and then `shape_content` returns `codec_unavailable`. So the player never mounts, and the full-clip download is the multi-minute hang. The Task-6 e2e drove `serve_range` directly, bypassing this command, so it wasn't caught.
+
+**Fix:** in `open_content_inner`, branch on `manifest.file_type == FileType::Video` **before** `build_download_bundle` and return the metadata via a HEADER-ONLY open (no content download, no error), so `media-viewer`'s existing `file_type === "video"` branch mounts the native `<video-player>` (which streams content itself via `open_video` + `stream://`).
+
+**Files:** Modify `crates/client-app/src/commands/viewer.rs`.
+
+- [ ] **Step 1:** After the author + `my_id` resolution and BEFORE `build_download_bundle`, insert a video branch:
+  - `build_stream_header(&mut sender, &host, &token, &req.file_id, &view).await?` (already imported? it's in `crate::download`; add the import).
+  - Under the session lock (sync, mirroring `run_open`), build the same `VerifyContext` and call `verify_and_open_headers(&ctx, &header)` (add to the `maxsecu_client_core` import). This does NOT fetch/decrypt content.
+  - Parse `(title, tags)` from the `Metadata` small stream via `parse_title_tags`.
+  - `emit(FetchPhase::Ready{..})` and return `OpenedContentDto { file_type: file_type_name(FileType::Video), version: opened.version, title, tags, image_png_b64: None, blog_text: None, author_fp: hex(&author.fingerprint[..8]), recovery_ok: opened.recovery_grant_ok, file_id: req.file_id.clone() }`.
+  - Leave the image/blog path (and `shape_content`'s now-defensive `Video` arm + its unit test) unchanged.
+- [ ] **Step 2:** `cargo build -p maxsecu-client-app && cargo test -p maxsecu-client-app --lib` → PASS (existing `shape_content` tests unchanged). The wiring itself is verified by the re-run Task-10 smoke (the video POST must now mount the native player and stream).
+- [ ] **Step 3:** Commit `fix(video): open_content returns video metadata via header-only open so the native player mounts (no whole-file download/gate)`.
+
+---
+
 ## Task 9: Frontend unit test for the new component's contract
 
 Cover the non-DOM logic: the `src` URL is built from the file id, and open/close invoke the right commands. Use `node:test` with a stubbed `invoke` (the repo already tests components this way via injected fakes — mirror `viewer-open.test.ts`).
