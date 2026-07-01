@@ -16,7 +16,7 @@ use maxsecu_crypto::{
 };
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::WrapContext;
-use maxsecu_encoding::structs::{Genesis, Grant, Manifest, Stream};
+use maxsecu_encoding::structs::{ChunkAad, Genesis, Grant, Manifest, Stream};
 use maxsecu_encoding::types::{
     Bytes32, Compression, FileType, Id, RecipientType, StreamType, Suite, Timestamp,
 };
@@ -147,6 +147,22 @@ impl ContentStreamSealer {
             reader,
             emit,
         )
+    }
+
+    /// Seal ONE content chunk at `index` (random access), for the streaming confirm/
+    /// resume pass where the total `chunk_count` is already known so the caller supplies
+    /// `is_last = (index == chunk_count - 1)`. Produces BYTE-IDENTICAL ciphertext to
+    /// `seal_from_reader` / `seal_stream` for the same index. Does NOT touch the digest
+    /// (already committed in the manifest from the pass-1 `seal_from_reader`).
+    pub fn seal_chunk(&self, index: u64, plaintext: &[u8], is_last: bool) -> Vec<u8> {
+        let aad = ChunkAad {
+            file_id: self.file_id,
+            version: self.version,
+            stream_type: self.stream_type,
+            chunk_index: index,
+            is_last,
+        };
+        maxsecu_crypto::seal_chunk(&*self.subkey, &aad, plaintext)
     }
 }
 
@@ -1336,5 +1352,51 @@ mod tests {
         assert_eq!(got, orig_content.chunks, "v2 resume sealer chunks match");
         assert_eq!(count, orig_content.chunk_count);
         assert_eq!(digest, orig_content.digest);
+    }
+
+    /// `ContentStreamSealer::seal_chunk` produces BYTE-IDENTICAL ciphertext to
+    /// `seal_from_reader` for every chunk index, including the short final chunk.
+    #[test]
+    fn seal_chunk_matches_seal_from_reader() {
+        use std::io::Cursor;
+
+        let chunk_size = 4096usize;
+        let file_id = Id([0xCC; 16]);
+        let version = 1u64;
+
+        // 3 full chunks + a short tail (exercises is_last on a short final chunk).
+        let pt_len = chunk_size * 3 + 100;
+        let plaintext: Vec<u8> = (0..pt_len).map(|i| (i % 251) as u8).collect();
+
+        let dek = Dek::generate();
+        let sealer = ContentStreamSealer::new(
+            &dek,
+            file_id,
+            version,
+            StreamType::Content,
+            chunk_size,
+        );
+
+        // (a) reference — drive seal_from_reader and collect each emitted chunk.
+        let mut reference: Vec<Vec<u8>> = Vec::new();
+        let (count, _digest) = sealer
+            .seal_from_reader(&mut Cursor::new(&plaintext), |_i, ct| {
+                reference.push(ct.to_vec());
+                Ok(())
+            })
+            .expect("seal_from_reader succeeds");
+
+        // (b) random-access — split the plaintext manually and call seal_chunk per index.
+        let chunks_in: Vec<&[u8]> = plaintext.chunks(chunk_size).collect();
+        assert_eq!(chunks_in.len() as u64, count, "chunk count matches");
+
+        for i in 0..count {
+            let is_last = i == count - 1;
+            let ct = sealer.seal_chunk(i, chunks_in[i as usize], is_last);
+            assert_eq!(
+                ct, reference[i as usize],
+                "seal_chunk({i}) bytes must match seal_from_reader chunk {i}"
+            );
+        }
     }
 }
