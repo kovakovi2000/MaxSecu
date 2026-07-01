@@ -948,42 +948,81 @@ pub async fn cancel_video(
 // transcoded result rendered in `<video-player>` BEFORE confirming the upload.
 // ===========================================================================
 
-/// Slice the STAGED canonical `cmaf` plaintext into a confined-decode `script`:
-/// `Open → Fragment{seq,bytes}* → Close`, where each fragment's bytes are
-/// `cmaf[chunk_start*CS .. (chunk_start+chunk_len)*CS]` (CS = [`crate::upload::VIDEO_CHUNK_SIZE`]),
-/// exactly as the server-fetch player addresses content chunks. The plaintext copies
-/// live ONLY inside the returned [`ScriptGuard`] (zeroized on drop). Fail-closed on an
-/// empty/out-of-range index (the index was AEAD-authenticated upstream at upload time;
-/// the bound check is defense in depth against an arithmetic mismatch).
-fn build_preview_script(cmaf: &[u8], index: &[FragmentEntry]) -> Result<ScriptGuard, UiError> {
-    if index.is_empty() {
-        return Err(player_err());
-    }
+/// Slice fragments `[start_seq, start_seq+count)` of the staged canonical `cmaf` into a
+/// confined-decode script `Open -> Fragment* -> Close`. The bounded form of the old
+/// whole-clip `build_preview_script` — so preview STREAMS a window instead of decoding the
+/// entire clip (a 59 s clip is ~2.4 GB of frames). Fail-closed on an out-of-range slice.
+fn build_preview_window_script(
+    cmaf: &[u8],
+    index: &[FragmentEntry],
+    start_seq: u32,
+    count: u32,
+) -> Result<ScriptGuard, UiError> {
+    if index.is_empty() { return Err(player_err()); }
     let cs = crate::upload::VIDEO_CHUNK_SIZE as usize;
-    let mut script = ScriptGuard(Vec::with_capacity(index.len() + 2));
-    script.0.push(ClientMsg::Open {
-        bounds: VideoBounds::default(),
-    });
-    for e in index {
-        let start = (e.chunk_start as usize)
-            .checked_mul(cs)
-            .ok_or_else(player_err)?;
+    let n = index.len() as u32;
+    if start_seq >= n { return Err(player_err()); }
+    let end = start_seq.saturating_add(count).min(n);
+    let mut script = ScriptGuard(Vec::with_capacity((end - start_seq) as usize + 2));
+    script.0.push(ClientMsg::Open { bounds: VideoBounds::default() });
+    for e in index.iter().filter(|e| e.seq >= start_seq && e.seq < end) {
+        let start = (e.chunk_start as usize).checked_mul(cs).ok_or_else(player_err)?;
         let len = (e.chunk_len as usize).checked_mul(cs).ok_or_else(player_err)?;
-        let end = start.checked_add(len).ok_or_else(player_err)?;
-        let slice = cmaf.get(start..end).ok_or_else(player_err)?;
-        script.0.push(ClientMsg::Fragment {
-            seq: e.seq,
-            bytes: slice.to_vec(),
-        });
+        let end_b = start.checked_add(len).ok_or_else(player_err)?;
+        let slice = cmaf.get(start..end_b).ok_or_else(player_err)?;
+        script.0.push(ClientMsg::Fragment { seq: e.seq, bytes: slice.to_vec() });
     }
     script.0.push(ClientMsg::Close);
     Ok(script)
 }
 
+/// Decode the preview window covering `pts_ms` from the staged canonical `cmaf`
+/// (author-side, no server, no decrypt). Emits `Buffering` on entry. Maps `pts_ms`
+/// to a fragment via [`fragment_for_time`], builds a [`build_preview_window_script`]
+/// covering [`PLAY_WINDOW`] fragments, clones the index then DROPS the jobs lock
+/// before the off-runtime decode so the lock is never held across `spawn_blocking`.
+/// Passes `window_start_pts = 0` to [`decode_and_emit`] so emitted frame/audio pts
+/// are ABSOLUTE on the clip timeline (`index[seq].pts_ms + worker_pts`) — the
+/// streaming player requires a single continuous absolute timeline across windows;
+/// subtracting the window start would restart each window near 0 and break seek.
+async fn preview_window_inner<E, OnF, OnA>(
+    job_id: &str,
+    pts_ms: u64,
+    dir: &State<'_, AppDir>,
+    jobs: &State<'_, crate::jobs::UploadJobs>,
+    emit: &E,
+    on_frame: &OnF,
+    on_audio: &OnA,
+) -> Result<(), UiError>
+where
+    E: Fn(PlayerPhase),
+    OnF: Fn(I420FrameDto),
+    OnA: Fn(PcmDto),
+{
+    emit(PlayerPhase::Buffering);
+    // Build the windowed decode script under the jobs lock (sync slice copy), then
+    // DROP the guard before the off-runtime decode (the lock is never held across
+    // spawn_blocking — same discipline as play_window_command).
+    let (script, frag_index) = {
+        let guard = jobs.0.lock().await;
+        let staged = guard.get(job_id).ok_or_else(player_err)?;
+        let preview = staged.preview.as_ref().ok_or_else(player_err)?;
+        let start_seq = fragment_for_time(&preview.index, pts_ms).unwrap_or(0);
+        let script = build_preview_window_script(&preview.cmaf, &preview.index, start_seq, PLAY_WINDOW)?;
+        let frag_index = preview.index.clone();
+        (script, frag_index)
+    };
+    // Confined decode OFF the runtime + re-validate every worker output + emit DTOs.
+    // window_start_pts = 0: emitted pts = index[seq].pts_ms + worker_pts (absolute).
+    let decoder = make_decoder(&dir.0);
+    decode_and_emit(script, decoder, frag_index, 0, emit, on_frame, on_audio).await
+}
+
 /// `preview_video` — locally decode the STAGED canonical video for the author's
 /// WYSIWYG preview (no server, no decrypt). Drives the confined decode session over
 /// the held plaintext, re-validates every frame/PCM chunk in the main process, and
-/// emits the same DTOs + [`PlayerPhase`] as `open_video`. Sanitized errors.
+/// emits the same DTOs + [`PlayerPhase`] as `open_video`. Decodes only the initial
+/// bounded window; the UI drives further windows via [`preview_seek`]. Sanitized errors.
 #[tauri::command]
 pub async fn preview_video(
     job_id: String,
@@ -1022,31 +1061,28 @@ where
     OnF: Fn(I420FrameDto),
     OnA: Fn(PcmDto),
 {
-    emit(PlayerPhase::Buffering);
-    // Build the decode script from the staged canonical plaintext under the jobs
-    // lock (sync slice copy), then DROP the guard before the off-runtime decode. The
-    // preview window covers ALL fragments, so the window start is the first fragment's
-    // pts; the cloned index drives the same fragment-relative→window pts offset (Part C).
-    let (script, frag_index, window_start_pts) = {
-        let guard = jobs.0.lock().await;
-        let staged = guard.get(job_id).ok_or_else(player_err)?;
-        let preview = staged.preview.as_ref().ok_or_else(player_err)?;
-        let window_start_pts = preview.index.first().map(|e| e.pts_ms).unwrap_or(0);
-        let script = build_preview_script(&preview.cmaf, &preview.index)?;
-        (script, preview.index.clone(), window_start_pts)
-    };
-    // Confined decode OFF the runtime + re-validate every worker output + emit DTOs.
-    let decoder = make_decoder(&dir.0);
-    decode_and_emit(
-        script,
-        decoder,
-        frag_index,
-        window_start_pts,
-        emit,
-        on_frame,
-        on_audio,
-    )
-    .await
+    // Delegate to preview_window_inner starting from the beginning of the clip
+    // (pts_ms = 0 → fragment 0 → first window). Buffering is emitted inside.
+    preview_window_inner(job_id, 0, dir, jobs, emit, on_frame, on_audio).await
+}
+
+/// `preview_seek` — decode the preview window covering `pts_ms` (author-side, staged
+/// cmaf, no server, no decrypt). Mirrors `video_seek` for the download path.
+/// Sanitized errors.
+#[tauri::command]
+pub async fn preview_seek(
+    job_id: String,
+    pts_ms: u64,
+    app: tauri::AppHandle,
+    dir: State<'_, AppDir>,
+    jobs: State<'_, crate::jobs::UploadJobs>,
+) -> Result<(), UiError> {
+    let emit = |p: PlayerPhase| { let _ = app.emit(EVT_PLAYER, p); };
+    let on_frame = |f: I420FrameDto| { let _ = app.emit(EVT_VIDEO_FRAME, f); };
+    let on_audio = |a: PcmDto| { let _ = app.emit(EVT_VIDEO_AUDIO, a); };
+    let out = preview_window_inner(&job_id, pts_ms, &dir, &jobs, &emit, &on_frame, &on_audio).await;
+    if let Err(e) = &out { emit(PlayerPhase::Error { code: e.code.clone() }); }
+    out
 }
 
 #[cfg(test)]
@@ -1849,7 +1885,7 @@ mod tests {
                 chunk_len: 2,
             },
         ];
-        let script = build_preview_script(&cmaf, &index).expect("script");
+        let script = build_preview_window_script(&cmaf, &index, 0, index.len() as u32).expect("script");
         // Open, two Fragments, Close.
         assert!(matches!(script.0[0], ClientMsg::Open { .. }));
         assert!(matches!(script.0[3], ClientMsg::Close));
@@ -1884,13 +1920,13 @@ mod tests {
         }];
         // `ScriptGuard` is intentionally not `Debug` (it holds plaintext), so the
         // `Ok` arm can't go through `unwrap_err`; match the error directly.
-        let err = match build_preview_script(&cmaf, &index) {
+        let err = match build_preview_window_script(&cmaf, &index, 0, index.len() as u32) {
             Ok(_) => panic!("an out-of-range index must fail closed"),
             Err(e) => e,
         };
         assert_eq!(err.code, "video_failed");
         // Empty index also fails closed.
-        let err = match build_preview_script(&cmaf, &[]) {
+        let err = match build_preview_window_script(&cmaf, &[], 0, 0) {
             Ok(_) => panic!("an empty index must fail closed"),
             Err(e) => e,
         };
@@ -1916,7 +1952,7 @@ mod tests {
                 chunk_len: 3,
             },
         ];
-        let script = build_preview_script(&cmaf, &index).expect("script");
+        let script = build_preview_window_script(&cmaf, &index, 0, index.len() as u32).expect("script");
         let phases: RefCell<Vec<PlayerPhase>> = RefCell::new(Vec::new());
         let frames: RefCell<Vec<I420FrameDto>> = RefCell::new(Vec::new());
         // The FrameDecoder fake emits one validated frame per Fragment — exactly the
@@ -1955,5 +1991,21 @@ mod tests {
         want.extend_from_slice(&0x0102i16.to_le_bytes());
         want.extend_from_slice(&(-1i16).to_le_bytes());
         assert_eq!(pcm.samples_b64, B64.encode(&want));
+    }
+
+    #[test]
+    fn preview_window_slice_covers_only_the_requested_fragments() {
+        // A 5-fragment index over a cmaf tiled in VIDEO_CHUNK_SIZE units.
+        let cs = crate::upload::VIDEO_CHUNK_SIZE as usize;
+        let index: Vec<FragmentEntry> = (0..5)
+            .map(|k| FragmentEntry { seq: k, pts_ms: k as u64 * 1000, chunk_start: k as u64, chunk_len: 1 })
+            .collect();
+        let cmaf = vec![7u8; 5 * cs];
+        // Window [1,3) -> fragments seq 1,2 -> Open + 2 Fragments + Close.
+        let guard = build_preview_window_script(&cmaf, &index, 1, 2).expect("script");
+        let frags: Vec<u32> = guard.0.iter().filter_map(|m| {
+            if let ClientMsg::Fragment { seq, .. } = m { Some(*seq) } else { None }
+        }).collect();
+        assert_eq!(frags, vec![1, 2], "only the requested window's fragments");
     }
 }
