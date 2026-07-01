@@ -76,8 +76,8 @@ use maxsecu_client_app::video::{
 use maxsecu_client_core::video::{validate_i420, ClientMsg, VideoBounds, WorkerMsg};
 use maxsecu_client_core::{
     build_upload, open_content_decryptor, verify_and_open_headers, ContentDecryptor,
-    DirectoryVerifier, Identity, MemoryTrustStore, StreamHeader, UploadParams, VerifyContext,
-    NO_ADMINS, NO_GRANTERS,
+    DirectoryVerifier, Identity, MemoryTrustStore, PlaintextStreams, StreamHeader, UploadParams,
+    VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_crypto::{sha256, EncPublicKey};
 use maxsecu_encoding::structs::{DirBinding, Manifest};
@@ -910,6 +910,308 @@ async fn phase7_video_author_to_view_over_real_tls() {
             "GATE 6: a binding signed by a non-D5 key is untrusted (fail-closed)"
         );
     }
+
+    let _ = std::fs::remove_dir_all(&blob_dir);
+    let _ = std::fs::remove_dir_all(&cache_dir);
+}
+
+/// Task 6 headline: the `stream://` range protocol proves end-to-end over REAL TLS —
+/// upload synthetic high-entropy content, register a `VideoJob`, stream it back in
+/// 50 KiB windows via `serve_range`, reassemble, and assert (1) byte-exact equality
+/// with the original plaintext, (2) the Content-Range denominator is the plaintext
+/// length, (3) a cache re-read is byte-identical, (4) the on-disk ciphertext never
+/// contains the plaintext. ALWAYS RUNS — no ffmpeg / worker binary dependency.
+#[tokio::test]
+async fn range_streaming_reassembles_plaintext_over_real_tls() {
+    // ---- Synthetic high-entropy content spanning MANY chunks + SEVERAL fragments ----
+    // 41 content chunks: 40 full (4096 B each) + 1 partial (1000 B). Non-chunk-aligned
+    // tail ensures the range plan handles partial last-chunk correctly.
+    let content_len = 40 * CHUNK + 1000;
+    let mut content = Vec::with_capacity(content_len);
+    while content.len() < content_len {
+        let arr = maxsecu_crypto::random_array::<32>();
+        content.extend_from_slice(&arr);
+    }
+    content.truncate(content_len);
+
+    // Fragment index: 5 fragments covering [0,10), [10,20), [20,30), [30,40), [40,41).
+    // Satisfies parse_fragment_index's contract: contiguous seq, non-decreasing pts_ms,
+    // chunk_len >= 1, chunk_start contiguous from 0, covers all 41 chunks exactly once.
+    let total_chunks = (content_len as u64).div_ceil(CHUNK as u64); // == 41
+    let mut frags_json = Vec::new();
+    let mut cs = 0u64;
+    let mut seq = 0u32;
+    while cs < total_chunks {
+        let cl = 10u64.min(total_chunks - cs);
+        frags_json.push(serde_json::json!({
+            "seq": seq,
+            "pts_ms": (seq as u64) * 1000,
+            "chunk_start": cs,
+            "chunk_len": cl
+        }));
+        cs += cl;
+        seq += 1;
+    }
+    let frag_count = frags_json.len();
+    let metadata_json = serde_json::json!({
+        "title": "range clip",
+        "tags": [],
+        "fragments": frags_json
+    });
+    let streams = PlaintextStreams {
+        content: content.clone(),
+        metadata: Some(serde_json::to_vec(&metadata_json).unwrap()),
+        thumbnail: None,
+        preview: None,
+    };
+
+    // ---- Server boot (verbatim from phase7_video_author_to_view_over_real_tls) ----
+    let ceremony = Ceremony::generate();
+    let pinned = ceremony.directory_pub();
+    let blob_dir = std::env::temp_dir().join(format!(
+        "mxrangeblob_{}",
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
+    let store = MemoryStore::new();
+    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    store.add_voucher(sha256(VOUCHER2.as_bytes()));
+    let state = AppState {
+        auth: Arc::new(AuthService::new(
+            store,
+            AuthConfig::default().with_directory_pub(pinned),
+        )),
+        blobs: Arc::new(FsBlobStore::new(&blob_dir)),
+        audit: Arc::new(maxsecu_server::NullAuditSink),
+        direct_links_enabled: false,
+    };
+    let pki = test_pki();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve(
+        listener,
+        pki.server_config.clone(),
+        maxsecu_server::router(state),
+    ));
+    let mut c = connect(addr, pki.client_config.clone()).await;
+
+    // ---- Author + recovery: register, login, publish D5 bindings ----
+    let owner = Identity::generate();
+    let (user_id, token) = register_and_login(&mut c, &owner, "alice", VOUCHER).await;
+    publish_binding(&mut c, &ceremony, "alice", user_id, &owner).await;
+    let recovery = Identity::generate();
+    let (recovery_uid, _rt) = register_and_login(&mut c, &recovery, "recovery-1", VOUCHER2).await;
+    publish_binding(&mut c, &ceremony, "recovery-1", recovery_uid, &recovery).await;
+
+    let verifier = DirectoryVerifier::new(pinned);
+    let mut trust = MemoryTrustStore::new();
+    let rr = resolve_recovery_recipient(
+        &mut c.sender,
+        "localhost",
+        "recovery-1",
+        &verifier,
+        &mut trust,
+        TS,
+    )
+    .await
+    .unwrap();
+
+    // ---- Upload the synthetic video ----
+    let file_id = Id(maxsecu_crypto::random_array::<16>());
+    let fid_hex = hex(&file_id.0);
+    let bundle = build_upload(
+        &UploadParams {
+            owner: &owner,
+            owner_id: Id(user_id),
+            owner_key_version: 1,
+            file_id,
+            file_type: FileType::Video,
+            chunk_size: 4096,
+            recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
+            recovery_mlkem_pub: rr.mlkem_pub,
+            created_at: Timestamp(TS),
+        },
+        &streams,
+    )
+    .unwrap();
+    run_pipeline(&mut c.sender, "localhost", &token, &bundle, |_d, _t| {})
+        .await
+        .expect("range test: video upload pipeline succeeds");
+
+    // ---- Build the VideoJob (mirror GATE 3 a-d from the phase7 test) ----
+    let (st, view_json) = get_json(
+        &mut c,
+        &format!("/v1/files/{fid_hex}?version=latest"),
+        &token,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "range test: file view fetch");
+    let view = parse_file_view(&view_json).unwrap();
+    let manifest: Manifest = decode(&view.manifest_bytes).expect("manifest decodes");
+
+    // (b) D5-verify the author BEFORE any decode.
+    let author = resolve_and_verify_author(
+        &mut c.sender,
+        "localhost",
+        &hex(&manifest.author_id.0),
+        &verifier,
+        &mut trust,
+        TS,
+    )
+    .await
+    .unwrap();
+    let my_id = resolve_my_user_id(
+        &mut c.sender,
+        "localhost",
+        "alice",
+        &verifier,
+        &mut trust,
+        TS,
+    )
+    .await
+    .unwrap();
+
+    // (c) Header (small streams only — no content fetched here).
+    let header: StreamHeader =
+        build_stream_header(&mut c.sender, "localhost", &token, &fid_hex, &view)
+            .await
+            .unwrap();
+
+    // (d) TCB header ladder: verify, parse authenticated fragment index, derive decryptor.
+    let ctx = VerifyContext {
+        file_id,
+        author_sig_pub: author.sig_pub,
+        owner_sig_pub: author.sig_pub,
+        recipient_id: Id(my_id),
+        recipient_type: RecipientType::User,
+        recipient_secret: owner.enc_secret(),
+        recipient_mlkem_seed: None,
+        seen_max_version: None,
+        granter_sig_pub: &NO_GRANTERS,
+        admin_sig_pub: &NO_ADMINS,
+        tombstones: None,
+        compromise: None,
+    };
+    let opened = verify_and_open_headers(&ctx, &header).expect("range test: header ladder opens");
+    let meta = opened
+        .small_streams
+        .iter()
+        .find(|s| s.stream_type == StreamType::Metadata)
+        .expect("metadata small stream present");
+    let meta_json: serde_json::Value = serde_json::from_slice(&meta.plaintext).unwrap();
+    let index = parse_fragment_index(&meta_json).expect("range test: fragment index parses");
+    assert_eq!(
+        index.len(),
+        frag_count,
+        "range test: fragment index has {} entries",
+        frag_count
+    );
+    let decryptor = open_content_decryptor(&ctx, &header).expect("range test: content decryptor");
+    let version = decryptor.version();
+
+    // (e) On-disk ciphertext fragment cache.
+    let cache_dir = std::env::temp_dir().join(format!(
+        "mxrangecache_{}",
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
+    let cache = FragmentCache::open(&cache_dir, 8 * 1024 * 1024).unwrap();
+
+    // Register the VideoJob: decryptor, authenticated index, empty cache.
+    // total_len = content_len: the last chunk has 1000 plaintext bytes (no padding),
+    // so (41-1)*4096 + 1000 == content_len exactly.
+    let jobs = maxsecu_client_app::jobs::VideoJobs::new();
+    jobs.0.lock().await.insert(
+        fid_hex.clone(),
+        maxsecu_client_app::jobs::VideoJob {
+            decryptor,
+            index,
+            cache,
+            file_id_hex: fid_hex.clone(),
+            version,
+            chunk_size: 4096u64,
+            total_len: content_len as u64,
+            gain: 1.0,
+        },
+    );
+
+    // ===================================================================
+    // ASSERT 1 + 2: stream + reassemble — 50,000-byte windows crossing chunk
+    // AND fragment boundaries. Each window is one serve_range call; the loop
+    // walks the full content_len and assembles the slices in order.
+    // ===================================================================
+    let mut assembled: Vec<u8> = Vec::new();
+    let mut off = 0u64;
+    loop {
+        let r = maxsecu_client_app::commands::video::serve_range(
+            &mut c.sender,
+            "localhost",
+            &token,
+            &jobs,
+            &fid_hex,
+            off,
+            Some(off + 50_000 - 1),
+        )
+        .await
+        .expect("serve_range: window served without error");
+        assert_eq!(
+            r.total_len,
+            content_len as u64,
+            "ASSERT 2: Content-Range denominator equals the plaintext length"
+        );
+        assembled.extend_from_slice(&r.body);
+        off += r.len;
+        if off >= r.total_len {
+            break;
+        }
+    }
+    assert_eq!(
+        assembled, content,
+        "ASSERT 1: reassembled ranges are byte-for-byte equal to the original content plaintext"
+    );
+
+    // ===================================================================
+    // ASSERT 3: cache-hit re-read — same bytes, no server interaction needed
+    // because all 41 chunks are already cached after the full forward pass.
+    // ===================================================================
+    let again = maxsecu_client_app::commands::video::serve_range(
+        &mut c.sender,
+        "localhost",
+        &token,
+        &jobs,
+        &fid_hex,
+        0,
+        Some(9999),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        again.body,
+        content[0..10000],
+        "ASSERT 3: re-read of a cached range returns identical plaintext bytes"
+    );
+
+    // ===================================================================
+    // ASSERT 4: ciphertext-only on disk — fragment 0's cached blob is opaque
+    // ciphertext; the plaintext (content[0..10*CHUNK]) never appears in it.
+    // ===================================================================
+    let f0_bytes = 10 * CHUNK; // fragment 0 covers 10 chunks = 40960 B of plaintext
+    let plaintext0 = &content[0..f0_bytes];
+    let cached0 = {
+        let mut g = jobs.0.lock().await;
+        let job = g.get_mut(&fid_hex).unwrap();
+        job.cache.get(&fid_hex, 0)
+    }
+    .expect("ASSERT 4: fragment 0 ciphertext is cached after the full forward pass");
+    assert_ne!(
+        cached0.as_slice(),
+        plaintext0,
+        "ASSERT 4: the cached blob is not the plaintext"
+    );
+    assert!(
+        !cached0
+            .windows(plaintext0.len().max(1))
+            .any(|w| w == plaintext0),
+        "ASSERT 4: the plaintext never appears as a subslice in the at-rest ciphertext blob"
+    );
 
     let _ = std::fs::remove_dir_all(&blob_dir);
     let _ = std::fs::remove_dir_all(&cache_dir);

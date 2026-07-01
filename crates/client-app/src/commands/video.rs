@@ -1188,7 +1188,10 @@ pub async fn preview_seek(
 /// + slice under the lock. Fail-closed. The content key never leaves this process;
 /// only the sliced plaintext is returned. `first`/`last_inclusive` are the parsed
 /// HTTP byte-range bounds.
-async fn serve_range(
+///
+/// Public: the stream:// protocol core (carries no secret across the seam — only sliced
+/// plaintext the protocol already exposes).
+pub async fn serve_range(
     sender: &mut hyper::client::conn::http1::SendRequest<http_body_util::Full<hyper::body::Bytes>>,
     host: &str,
     token: &str,
