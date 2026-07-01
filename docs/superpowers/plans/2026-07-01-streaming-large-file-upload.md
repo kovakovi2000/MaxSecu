@@ -182,19 +182,33 @@ monolithic path via the shared assembly helper, and the (randomized) wraps open 
 `recover_dek*` fail closed on a wrong secret/ctx/suite. No key material is logged. The self-wrap pre-check
 still runs on build.
 
-## Task 3: media-launcher — drop the hard transcode timeout (keep stall watchdog)
+## Task 3: media-launcher — retire the dead 10-min hard-cap constant (keep stall watchdog)
 
-**Files:** `crates/media-launcher/src/lib.rs` (+ the ffmpeg run path), tests same crate.
+**Files:** `crates/media-launcher/src/lib.rs`, tests same crate.
 
-- [ ] **Step 1 (failing/guard test):** Add/adjust a test asserting the confined ffmpeg run is NOT killed by
-  a fixed wall-clock cap while it keeps making progress, but IS killed after `FFMPEG_STALL_TIMEOUT_MS` of no
-  progress (mirror the existing confinement tests; `#[ignore]` if it needs a real spawn). At minimum,
-  assert the hard-timeout constant is no longer applied on the ffmpeg ingest path.
-- [ ] **Step 2:** Implement: remove the `DEFAULT_FFMPEG_TIMEOUT_MS` hard kill from the ffmpeg ingest
-  (`FfmpegLauncher::run`/`run_ffmpeg_confined`); keep the progress-stall watchdog + `cancel`. Update the
-  constant's doc (or delete it if unused elsewhere). Do NOT touch AppContainer/no-net/mem-cap/RAII cleanup.
-- [ ] **Step 3:** `cargo test -p maxsecu-media-launcher` → PASS.
-- [ ] **Step 4:** Commit: `feat(video): confined ffmpeg ingest has no fixed wall-clock cap; the 90s stall watchdog + cancel are the sole time bounds`.
+> **Reconciled against live code (2026-07-01):** the fixed 10-min hard kill the user asked to drop is **already
+> gone** — a prior "Task B" replaced it with the progress-based **90s stall watchdog** (`FFMPEG_STALL_TIMEOUT_MS`,
+> the primary bound) **plus a 1-hour absolute DoS backstop** (`FFMPEG_MAX_TOTAL_MS`, applied via
+> `FfmpegLauncher.max_total_ms`). The old `DEFAULT_FFMPEG_TIMEOUT_MS` (600_000) is now **dead code** — its only
+> reference is its own definition/doc (verified by grep). Both `FfmpegLauncher` constructors already use
+> `FFMPEG_STALL_TIMEOUT_MS` + `FFMPEG_MAX_TOTAL_MS`. So Task 3 collapses to: delete the dead constant, add a
+> guard test, and tidy docs. **Keep** the 90s stall watchdog AND the 1-hour backstop (the user asked to drop
+> the *10-min* kill and *keep the stall watchdog*; they did not ask to remove the 1-hour DoS backstop, which is
+> far above any in-scope transcode — the 305 MB target transcodes in ~4 min). The 1-hour backstop is recorded as
+> a residual (truly multi-hour transcodes remain bounded by it); flag it to the user for a follow-up if they
+> want it lifted for genuinely enormous sources.
+
+- [ ] **Step 1 (guard test):** In the `#[cfg(test)] mod tests` (same-crate, so it can read the private fields),
+  add a `#[cfg(windows)]` test asserting a fresh `FfmpegLauncher::new(<dummy path>)` has
+  `stall_timeout_ms == FFMPEG_STALL_TIMEOUT_MS` and `max_total_ms == FFMPEG_MAX_TOTAL_MS`, documenting that the
+  stall watchdog + user-cancel are the primary bounds and the 10-min fixed cap no longer exists. (No real spawn.)
+- [ ] **Step 2:** Delete `pub const DEFAULT_FFMPEG_TIMEOUT_MS` and its doc block; update any prose that referred
+  to a fixed 10-min cap so it names the stall watchdog (primary) + 1-hour backstop. Do NOT change
+  `FFMPEG_STALL_TIMEOUT_MS`, `FFMPEG_MAX_TOTAL_MS`, the constructors, `run`, or any AppContainer/no-net/
+  mem-cap/RAII confinement. Confirm nothing else in the workspace references the deleted constant
+  (grep `maxsecu-server`, `client-app`, `media-transcode-worker`, etc.).
+- [ ] **Step 3:** `cargo build -p maxsecu-media-launcher` + `cargo test -p maxsecu-media-launcher` → PASS.
+- [ ] **Step 4:** Commit: `refactor(video): remove the dead 10-min ffmpeg hard-cap constant; stall watchdog (primary) + 1h backstop remain`.
 
 ## Task 4: client-app `prepare_video_streams` → disk-backed (6 MiB, no over_cap)
 

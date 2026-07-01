@@ -135,12 +135,15 @@ seal pass to learn the digest, then stream the chunks, with O(one chunk) memory.
 Images/blogs keep the existing in-RAM path (always small; their content is not a file on disk). Only **video**
 uses the streaming/disk-backed path — one video path, no size branch.
 
-### 3. media-launcher — drop the hard transcode timeout
+### 3. media-launcher — retire the dead hard-cap constant (keep stall watchdog)
 
-Remove the fixed `DEFAULT_FFMPEG_TIMEOUT_MS` (10-min) hard kill from the ffmpeg ingest; keep the
-progress-based `FFMPEG_STALL_TIMEOUT_MS` (90s) stall watchdog + `cancel`. Confinement (AppContainer, no
-net/keys/children, memory cap, RAII grant/cleanup) is **unchanged**. Document that the stall watchdog +
-user-cancel are now the sole time bounds.
+**Reconciled against live code:** the fixed 10-min hard kill is **already gone** — a prior increment replaced
+it with the progress-based `FFMPEG_STALL_TIMEOUT_MS` (90s) stall watchdog (the primary bound) **plus a 1-hour
+absolute backstop** `FFMPEG_MAX_TOTAL_MS`. `DEFAULT_FFMPEG_TIMEOUT_MS` (10-min) is now dead code. So: delete
+the dead constant and tidy docs; **keep** the 90s stall watchdog + `cancel` AND the 1-hour DoS backstop.
+Confinement (AppContainer, no net/keys/children, memory cap, RAII grant/cleanup) is **unchanged**. The primary
+time bounds are the stall watchdog + user-cancel; the 1-hour backstop is a termination guarantee well above any
+in-scope transcode (the 305 MB target transcodes in ~4 min) — see residuals.
 
 ### 4. server — RAM-frugal for 4 GB; discard endpoint; optional quota
 
@@ -208,5 +211,7 @@ The range player reads `chunk_size` dynamically, so `serve_range`/`FragmentCache
 - Parallel/multiplexed chunk uploads (single serialized HTTP/1.1 connection stays; simpler + RAM-frugal).
 - Server-side background GC of orphans beyond the client-driven discard (documented).
 - Postgres tuning for 4 GB (ops runbook, not code).
-- Truly enormous files remain bounded by **local temp disk** (transcode output) and **server storage**;
-  both fail closed and are resumable/cleanable.
+- Truly enormous files remain bounded by **local temp disk** (transcode output), **server storage**, and the
+  **1-hour ffmpeg transcode backstop** (`FFMPEG_MAX_TOTAL_MS`) — a genuinely multi-hour progressing transcode
+  would hit it. Far above any in-scope source; lift it (Task 3 follow-up) only if such sources are needed.
+  All fail closed and are resumable/cleanable.
