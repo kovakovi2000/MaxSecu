@@ -896,9 +896,16 @@ async fn stream_media_inner(
     range_header: Option<&str>,
 ) -> Result<RangeResponse, u16> {
     use tauri::Manager;
-    // Path is "/media/<file_id_hex>" (leading slash). Extract + validate the id.
+    // The UI mints `stream://media/<file_id_hex>`. The exact split into (host, path)
+    // is platform-dependent on WebView2: `media` may arrive as the URI HOST with
+    // path `/<id>`, or as part of the path `/media/<id>`. Handle both by taking the
+    // LAST non-empty path segment as the id — then validate it is real hex16 and
+    // (below) that a live session exists; anything else 404s. (The literal
+    // `strip_prefix("/media/")` form is too brittle to the host split — see the
+    // Task 0/Task 10 notes that the `stream://` host form is empirically pinned.)
     let file_id_hex = path
-        .strip_prefix("/media/")
+        .rsplit('/')
+        .find(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or(404u16)?;
     let _ = hex16(&file_id_hex).map_err(|_| 404u16)?; // reject non-hex ids
