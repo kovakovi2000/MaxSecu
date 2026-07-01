@@ -254,6 +254,9 @@ export function createPlayer(opts: PlayerOptions): Player {
   // a nonzero wall clock and the whole window would burst then stall. Reset on seek (a
   // new window). null until play() establishes the origin.
   let playbackStart: number | null = null;
+  // Absolute clip pts (ms) that corresponds to elapsed = 0. 0 for normal playback; a seek
+  // shifts it to the target so position/frame-release/timer stay on the absolute timeline.
+  let originPtsMs = 0;
   let durationMs = Math.max(0, opts.durationMs ?? 0);
   let bufferedBytes = 0;
   let frontierMs = 0;            // max pts received so far
@@ -355,10 +358,11 @@ export function createPlayer(opts: PlayerOptions): Player {
     opts.onPhase?.(phase);
   }
 
-  // Current play position in ms: elapsed since playbackStart, or 0 before it is set.
+  // Current play position in ms on the ABSOLUTE clip timeline.
+  // Before play() is called, returns originPtsMs (0 normally; seek target after a seek).
   function positionMs(): number {
-    if (playbackStart === null) return 0;
-    return Math.max(0, Math.round((audioClock() - playbackStart) * 1000));
+    if (playbackStart === null) return originPtsMs;
+    return Math.max(0, originPtsMs + Math.round((audioClock() - playbackStart) * 1000));
   }
 
   // Keep the decoded buffer bounded: first drop frames well behind the playhead
@@ -397,7 +401,7 @@ export function createPlayer(opts: PlayerOptions): Player {
     // window-relative pts (which start near 0) line up with the audio that began at
     // playbackStart. If no frame/audio has set the origin yet, set it now.
     if (playbackStart === null) playbackStart = audioClock();
-    const now = audioClock() - playbackStart;
+    const now = originPtsMs / 1000 + (audioClock() - playbackStart);
     let toDraw: YuvFrame | null = null;
     while (pending.length > 0) {
       const head = pending[0];
@@ -430,19 +434,17 @@ export function createPlayer(opts: PlayerOptions): Player {
   }
 
   function seek(pts_ms: number): void {
-    // Drop the local window; the component will request a fresh one. Stop any
-    // already-scheduled audio so it doesn't bleed over the new window.
     pending.length = 0;
-    bufferedBytes = 0;
     ring.length = 0;
+    bufferedBytes = 0;
     nextAudioTime = 0;
-    frontierMs = 0;
-    windowOutstanding = false;
-    // A new window restarts the timeline: re-establish the playback origin from the
-    // first frame/audio of the new window.
-    playbackStart = null;
+    playbackStart = null;      // re-anchored on the next tick
+    originPtsMs = pts_ms;      // the new timeline base = the absolute seek target
+    frontierMs = pts_ms;       // the new window begins at the target
+    windowOutstanding = true;  // about to request it; guard until frames arrive
     stopAllSources();
     opts.onSeek?.(pts_ms);
+    requestWindow?.(pts_ms);
   }
 
   function setVolume(g: number): void {

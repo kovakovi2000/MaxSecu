@@ -704,3 +704,53 @@ test("requests the next window when the buffered frontier runs low", () => {
   assert.deepStrictEqual(requested, [1000], "frontier now ahead; still one request");
   player.dispose();
 });
+
+test("seek clears the buffer and requests the window at the target", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  let clock = 0;
+  const requested: number[] = [];
+  const seeked: number[] = [];
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+    requestWindow: (pts) => requested.push(pts),
+    onSeek: (pts) => seeked.push(pts),
+  });
+  player.play();
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  bus.emit(EVT_VIDEO_FRAME, frameDto(1000));
+  player.seek(30000);
+  assert.strictEqual(player.bufferedBytes(), 0, "buffer cleared on seek");
+  assert.deepStrictEqual(seeked, [30000], "onSeek notified with the target");
+  assert.deepStrictEqual(requested, [30000], "requested the window at the seek target");
+  player.dispose();
+});
+
+test("after seek the position/timeline is absolute (origin shifts to the target)", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+    requestWindow: () => {},
+  });
+  player.play();
+  player.seek(30000);     // base shifts to 30000; playbackStart reset to null
+  clock = 0.5;
+  player.tick();          // first tick after seek re-captures playbackStart at clock=0.5
+  bus.emit(EVT_VIDEO_FRAME, frameDto(30000)); // ABSOLUTE-pts frame at the target
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "the absolute-pts frame at the target is drawn");
+  clock = 1.0;            // 0.5 s of real elapsed since the re-capture
+  assert.strictEqual(player.positionMs(), 30500, "position = seek target + elapsed");
+  player.dispose();
+});
