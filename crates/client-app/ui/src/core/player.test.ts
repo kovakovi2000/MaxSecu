@@ -62,6 +62,14 @@ class FakeAudio implements AudioContextLike {
     this.sources.push(s);
     return s;
   }
+  suspended = 0;
+  resumed = 0;
+  async suspend(): Promise<void> {
+    this.suspended++;
+  }
+  async resume(): Promise<void> {
+    this.resumed++;
+  }
 }
 
 // A small mono PCM DTO (2 i16-LE samples).
@@ -540,6 +548,25 @@ test("dispose stops in-flight audio sources", () => {
 });
 
 // ---- dispose -------------------------------------------------------------
+
+test("pause() suspends the audio context; play() resumes it", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => audio.currentTime,
+  });
+  player.play();
+  assert.strictEqual(audio.resumed, 1, "play() resumes the context");
+  player.pause();
+  assert.strictEqual(audio.suspended, 1, "pause() suspends the context");
+  player.play();
+  assert.strictEqual(audio.resumed, 2, "play() resumes again");
+  player.dispose();
+});
 
 test("dispose unsubscribes all events", async () => {
   const bus = makeBus();

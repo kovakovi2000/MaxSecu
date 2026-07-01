@@ -85,6 +85,10 @@ export interface AudioContextLike {
   createGain(): GainLike;
   createBuffer(channels: number, length: number, sampleRate: number): AudioBufferLike;
   createBufferSource(): AudioBufferSourceLike;
+  // Pause/resume the whole audio clock so scheduled audio + the video master
+  // clock freeze together (real pause). Optional so non-audio fakes can omit them.
+  suspend?(): Promise<void>;
+  resume?(): Promise<void>;
 }
 
 // The frame sink: either the 5.1 YuvRenderer ({ draw }) or a bare function.
@@ -377,11 +381,13 @@ export function createPlayer(opts: PlayerOptions): Player {
     if (disposed) return;
     playing = true;
     started = true;
+    void audio.resume?.();
     startLoop();
   }
 
   function pause(): void {
     playing = false;
+    void audio.suspend?.();
     stopLoop();
   }
 
