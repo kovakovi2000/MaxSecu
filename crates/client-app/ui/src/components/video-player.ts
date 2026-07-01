@@ -15,6 +15,7 @@ import {
   type I420FrameDto,
   type AudioContextLike,
 } from "../core/player.ts";
+import type { VideoInfo } from "../core/types.ts";
 
 // Sandboxed-video CHROME (Gate 5.3). Pure UI, OUTSIDE the TCB.
 //
@@ -69,6 +70,8 @@ export class VideoPlayer extends HTMLElement {
   // on. Kept so the preference + its warning have a home for a future HW path.
   private hwWaiver = false;
   private lastVol = 1; // volume to restore from mute
+  private uninfo: (() => void) | null = null;
+  private durationMs = 0;
 
   // PREVIEW MODE (Gate 6): when set, the player drives the local preview_video
   // path (decode of the author's STAGED canonical content — no server fetch, no
@@ -198,6 +201,13 @@ export class VideoPlayer extends HTMLElement {
       subscribe: on,
       reducedMotion,
       onPhase: (p) => this.setPhase(p),
+      requestWindow: (pts) => {
+        if (this.previewJob) {
+          void serial(() => call<void>("preview_seek", { jobId: this.previewJob, ptsMs: Math.round(pts) })).catch(() => {});
+        } else {
+          void serial(() => call<void>("video_seek", { fileId: this.reqId, ptsMs: Math.round(pts) })).catch(() => {});
+        }
+      },
     });
 
     // Track the buffered frontier independently (the player holds future frames
@@ -211,6 +221,11 @@ export class VideoPlayer extends HTMLElement {
       if (this.disposed) un();
       else this.unframe = un;
     });
+
+    void on<VideoInfo>("maxsecu://video-info", (info) => {
+      this.player?.setDuration(info.duration_ms);
+      this.durationMs = info.duration_ms;
+    }).then((un) => { if (this.disposed) un(); else this.uninfo = un; });
 
     this.wireControls();
     this.ticker = setInterval(() => this.refreshScrubber(), 250);
@@ -231,6 +246,8 @@ export class VideoPlayer extends HTMLElement {
     }
     this.unframe?.();
     this.unframe = null;
+    this.uninfo?.();
+    this.uninfo = null;
     this.player?.dispose();
     this.player = null;
     this.renderer?.dispose();
@@ -319,15 +336,12 @@ export class VideoPlayer extends HTMLElement {
       this.updateTime(Number(scrub.value), this.loadedMs);
     });
     // 'change' commits the seek (fires for pointer release AND arrow/Home/End).
+    // player.seek() calls requestWindow() internally, which issues preview_seek
+    // or video_seek as appropriate — no separate call needed here.
     scrub.addEventListener("change", () => {
       this.dragging = false;
       const pts = Math.max(0, Math.round(Number(scrub.value)));
       this.player?.seek(pts);
-      // In preview mode there is no backend session to re-window — the whole
-      // staged clip is already decoded locally, so scrub stays local.
-      if (!this.previewJob) {
-        void serial(() => call<void>("video_seek", { fileId: this.reqId, ptsMs: pts })).catch(() => {});
-      }
     });
 
     const vol = this.querySelector("#vp-vol") as HTMLInputElement;
@@ -388,30 +402,25 @@ export class VideoPlayer extends HTMLElement {
     play.setAttribute("aria-label", playing ? "Pause" : "Play");
   }
 
-  // The scrubber range spans [0, loaded frontier]; the thumb sits at the played
-  // position, so the track itself visualises played-vs-loaded. A <progress>
-  // mirrors the loaded fragment count for an at-a-glance buffered indication.
+  // The scrubber thumb sits at the engine's current play position; max is the
+  // total clip duration from the engine (set via VideoInfo on open).
   private refreshScrubber() {
     const scrub = this.querySelector("#vp-scrub") as HTMLInputElement | null;
-    const loaded = this.querySelector("#vp-loaded") as HTMLProgressElement | null;
-    if (!scrub || !loaded) return;
-    const max = Math.max(this.loadedMs, this.playedMs);
-    scrub.max = String(max);
-    scrub.setAttribute("aria-valuemax", String(max));
+    if (!scrub || !this.player) return;
+    const pos = this.player.positionMs();
+    const dur = this.player.durationMs() || this.durationMs;
+    scrub.max = String(dur);
     if (!this.dragging) {
-      scrub.value = String(this.playedMs);
-      scrub.setAttribute("aria-valuenow", String(this.playedMs));
-      this.updateTime(this.playedMs, max);
+      scrub.value = String(pos);
+      scrub.setAttribute("aria-valuenow", String(pos));
     }
-    loaded.max = Math.max(1, this.fragments);
-    loaded.value = this.fragments;
-    loaded.setAttribute("aria-valuetext", `${this.fragments} fragment(s) loaded`);
+    this.updateTime(pos, dur);
   }
 
   private updateTime(playedMs: number, loadedMs: number) {
     const t = this.querySelector("#vp-time") as HTMLElement | null;
     if (!t) return;
-    const text = `${fmt(playedMs)} / ${fmt(loadedMs)} loaded`;
+    const text = `${fmt(playedMs)} / ${fmt(loadedMs)}`;
     t.textContent = text;
     const scrub = this.querySelector("#vp-scrub") as HTMLInputElement | null;
     scrub?.setAttribute("aria-valuetext", text);
