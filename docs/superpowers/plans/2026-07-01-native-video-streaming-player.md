@@ -1080,11 +1080,13 @@ git commit -m "build(ui): add media-chrome, bundled locally via esbuild"
 
 ## Task 8: New `<video>`-based player component wired to `stream://` + Media Chrome
 
-Replace the canvas `<video-player>` with a real `<video>` inside a Media Chrome controller, pointed at `stream://media/<file_id>`. The component opens the session (invoke `open_video`), sets `src`, and closes the session (invoke `cancel_video`) on teardown.
+Make the **VIEW** path a real `<video>` inside a Media Chrome controller, pointed at `stream://media/<file_id>`. The component opens the session (invoke `open_video`), sets `src`, and closes the session (invoke `cancel_video`) on teardown.
+
+> **CONTROLLER AMENDMENT — dual-mode, preserve the author preview.** `<video-player>` is used by TWO consumers: `media-viewer.ts` (the VIEW path, `file-id`) and `upload-screen.ts` (the AUTHOR PREVIEW-before-upload path, `preview-job` → the confined `preview_video` decode). The spec scopes this reversal to the **view path only** (and its non-goals keep the author side confined). So Task 8 must make the component **DUAL-MODE**: when `file-id` is set → the NEW native `<video src=stream://media/<file_id>>` + Media Chrome path; when `preview-job` is set → the EXISTING confined-decode canvas path, **retained unchanged** (it keeps using `core/player.ts` + `core/webgl-yuv.ts` + `preview_video`/`preview_seek` + the frame/phase events). Do NOT break author preview. `media-viewer.ts` renders the native (view) branch. `upload-screen.ts` (preview) stays as-is. The old engine modules therefore REMAIN after this task (they are still the preview path) — Task 11 is narrowed accordingly.
 
 **Files:**
-- Rewrite: `crates/client-app/ui/src/components/video-player.ts`
-- Modify: `crates/client-app/ui/src/components/media-viewer.ts` (mount the new component for videos)
+- Rewrite: `crates/client-app/ui/src/components/video-player.ts` (dual-mode: native view branch + retained confined preview branch)
+- Modify: `crates/client-app/ui/src/components/media-viewer.ts` (mount the native `<video>` view branch)
 
 - [ ] **Step 1: Rewrite the component**
 
@@ -1253,29 +1255,26 @@ On success, commit an empty marker or proceed to Task 11. On failure, invoke `su
 
 ---
 
-## Task 11: Remove the hand-rolled engine + decode-worker view path (cleanup)
+## Task 11: Remove the VIEW-path hand-rolled engine (cleanup)
 
-Only after Tasks 6 and 10 are green. Delete the now-dead playback machinery so the codebase has ONE video path.
+Only after Tasks 6 and 10 are green. Remove the now-dead **VIEW-path** playback machinery so the download/view path is native-only.
+
+> **CONTROLLER AMENDMENT — narrowed scope; the author preview stays confined.** Per Task 8, the AUTHOR PREVIEW (`preview-job`) deliberately REMAINS on the confined-decode canvas engine (spec: reversal is "view path only"; author side stays confined). Therefore `core/player.ts`, `core/webgl-yuv.ts`, `preview_video`, `preview_seek`, `decode_and_emit`, the frame/PCM DTOs, the confined `SessionDecoder`/worker wiring, and the `EVT_VIDEO_FRAME/AUDIO/PLAYER/INFO` + `PlayerPhase` + `VideoInfo` types are STILL USED by the preview path and MUST NOT be deleted. Task 11 removes ONLY code that is provably VIEW-ONLY after the native switch. **Principle: for every symbol below, `grep` the whole crate/UI and confirm ZERO remaining references before deleting; if the preview path still uses it, KEEP it.** Full unification of preview onto a native `stream://preview/<job_id>` path (serving `UploadJobs`' `StagedVideoPreview.cmaf` by range, no decrypt) is a documented FOLLOW-UP, not part of this plan.
 
 **Files:**
-- Delete: `crates/client-app/ui/src/core/player.ts`, `crates/client-app/ui/src/core/player.test.ts`, `crates/client-app/ui/src/core/webgl-yuv.ts`, `crates/client-app/ui/src/core/webgl-yuv.test.ts`
-- Modify: `crates/client-app/ui/package.json` (drop the deleted tests from the `test` script)
-- Modify: `crates/client-app/src/commands/video.rs` (remove `video_seek`, `video_set_volume`, `play_window_command`, `decrypt_window`, `decode_and_emit`, `window_offset_ms`, `push_bounded`, frame/PCM DTOs, and the preview decode commands `preview_video`/`preview_seek` if the author preview also moves to native — see Step 4)
-- Modify: `crates/client-app/src/state.rs` (remove `EVT_VIDEO_FRAME/AUDIO/PLAYER/INFO`, `PlayerPhase`, `VideoInfo`, and their tests)
-- Modify: `crates/client-app/src/main.rs` (drop the removed commands from `generate_handler!`)
-- Modify: `crates/client-app/src/jobs.rs` (drop `VideoJob.gain`)
+- Modify: `crates/client-app/src/commands/video.rs` (remove the VIEW-only `video_seek` and `video_set_volume` commands; if `play_window_command` — and any helper it alone reaches — is now referenced ONLY by the removed `video_seek`, remove it too; KEEP everything the preview path still calls)
+- Modify: `crates/client-app/src/main.rs` (drop `video_seek`/`video_set_volume` from `generate_handler!`)
+- Modify: `crates/client-app/src/jobs.rs` (drop `VideoJob.gain` — it existed only for the view-path `video_set_volume`; confirm no other reader)
+- Modify: `crates/client-app/ui/src/components/media-viewer.ts` (ensure the VIEW branch mounts only the native `<video>` component and subscribes to NO old frame/PlayerPhase events)
+- (Do NOT delete `player.ts`/`webgl-yuv.ts`/their tests, `preview_*`, `decode_and_emit`, DTOs, `state.rs` video events/types — the preview path retains them.)
 
-- [ ] **Step 1: Decide the author-preview path**
+- [ ] **Step 1: Confirm the retained preview path**
 
-The author's preview-before-upload (`preview_video`) also uses the confined decode + canvas. It can switch to the SAME native `<video>` by serving the STAGED plaintext through a second protocol path (`stream://preview/<job_id>` backed by `UploadJobs`' `StagedVideoPreview.cmaf`, sliced by byte range with NO decrypt). **If time-boxed, keep `preview_video` as-is in this task and file a follow-up** — do not block the download-path cleanup on it. Record the decision in the commit message.
+Verify (grep) that `preview_video`/`preview_seek` + `core/player.ts` + `core/webgl-yuv.ts` + `EVT_VIDEO_*`/`PlayerPhase`/`VideoInfo` are still referenced by `upload-screen.ts` / the preview branch of `video-player.ts` / `decode_and_emit`. These stay. Record in the commit message that preview remains confined (spec: view-path-only reversal) and native-preview unification is a follow-up.
 
-- [ ] **Step 2: Remove the frontend engine**
+- [ ] **Step 2: Remove the VIEW-only backend commands**
 
-Delete `player.ts`, `player.test.ts`, `webgl-yuv.ts`, `webgl-yuv.test.ts`. Remove any imports of them (grep the UI for `core/player`, `core/webgl-yuv`). Update the `test` script in `package.json` to drop `player.test.ts` and `webgl-yuv.test.ts`.
-
-- [ ] **Step 3: Remove the backend decode commands + events**
-
-In `commands/video.rs`, delete `video_seek`, `video_set_volume`, `cancel_video`'s player-event emit (keep `cancel_video` itself but simplify it to just drop the job — rename intent to "close session"), `play_window_command`, `decrypt_window`, `decode_and_emit`, `window_offset_ms`, `push_bounded`, `frame_dto`, `pcm_dto`, `I420FrameDto`, `PcmDto`, `ScriptGuard`, `make_decoder`/`SessionDecoder`/`worker_path`, and their tests. In `state.rs`, delete `EVT_VIDEO_FRAME/AUDIO/PLAYER/INFO`, `PlayerPhase`, `VideoInfo` + tests. In `main.rs`, remove `video_seek`, `video_set_volume`, `preview_seek` (if preview went native), and any handler entries for deleted commands. Drop `VideoJob.gain` and its uses.
+In `commands/video.rs`, delete the `video_seek` and `video_set_volume` commands. If `play_window_command` (and any private helper reachable ONLY through it, e.g. a `decrypt_window`) is now referenced solely by the just-removed `video_seek`, delete those too — but FIRST grep to confirm `preview_video`/`decode_and_emit` do not call them; if they do, KEEP them. Simplify `cancel_video` only if it has a view-only player-event emit that the native path no longer needs (keep `cancel_video` itself — the native view branch calls it on teardown to drop the `VideoJob`). In `main.rs`, drop `video_seek`/`video_set_volume` handler entries. Drop `VideoJob.gain` and its (view-only) uses after confirming no other reader.
 
 - [ ] **Step 4: Build + full test sweep**
 
