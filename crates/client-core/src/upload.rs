@@ -10,9 +10,9 @@
 //! and self-checks the wraps it holds the key for before returning.
 
 use maxsecu_crypto::{
-    deserialize_hybrid_wrap, seal_stream, serialize_hybrid_wrap, unwrap_dek, unwrap_dek_hybrid,
-    wrap_dek, wrap_dek_hybrid, CryptoError, Dek, EncPublicKey, EncSecretKey, HybridEncPublicKey,
-    HybridEncSecretKey, HybridWrappedDek, SigningKey, WrappedDek,
+    deserialize_hybrid_wrap, seal_stream, seal_stream_streaming, serialize_hybrid_wrap, unwrap_dek,
+    unwrap_dek_hybrid, wrap_dek, wrap_dek_hybrid, CryptoError, Dek, EncPublicKey, EncSecretKey,
+    HybridEncPublicKey, HybridEncSecretKey, HybridWrappedDek, SigningKey, WrappedDek,
 };
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::WrapContext;
@@ -80,6 +80,64 @@ pub struct SealedStreamOut {
     /// Total ciphertext bytes across all chunks (server `file_streams.total_bytes`).
     pub total_bytes: u64,
     pub chunks: Vec<Vec<u8>>,
+}
+
+/// Holds the per-stream content subkey derived from a `Dek` and delegates to
+/// [`seal_stream_streaming`] so client-app can stream-seal content from disk
+/// chunk-by-chunk without the DEK or its subkey ever crossing the crate boundary
+/// — the caller only receives ciphertext via the `emit` callback.
+///
+/// The raw `Dek` is **not** stored; only the `Zeroizing<[u8;32]>` subkey is
+/// retained, and no getter exposes it.
+pub struct ContentStreamSealer {
+    subkey: zeroize::Zeroizing<[u8; 32]>,
+    file_id: Id,
+    version: u64,
+    stream_type: StreamType,
+    chunk_size: usize,
+}
+
+impl ContentStreamSealer {
+    /// Derive and hold the per-stream subkey for `stream_type` from `dek`.
+    /// The `Dek` is consumed by reference; only the subkey is stored.
+    pub fn new(
+        dek: &Dek,
+        file_id: Id,
+        version: u64,
+        stream_type: StreamType,
+        chunk_size: usize,
+    ) -> Self {
+        Self {
+            subkey: dek.stream_subkey(stream_type),
+            file_id,
+            version,
+            stream_type,
+            chunk_size,
+        }
+    }
+
+    /// Seal bytes from `reader` chunk-at-a-time, calling `emit(index, &ciphertext)`
+    /// per chunk (O(one chunk) RAM). Returns `(chunk_count, digest)` byte-identical
+    /// to `seal_stream` for the same input. Pure delegation to `seal_stream_streaming`.
+    pub fn seal_from_reader<R, E>(
+        &self,
+        reader: &mut R,
+        emit: E,
+    ) -> Result<(u64, [u8; 32]), CryptoError>
+    where
+        R: std::io::Read,
+        E: FnMut(u64, &[u8]) -> Result<(), CryptoError>,
+    {
+        seal_stream_streaming(
+            &*self.subkey,
+            self.file_id,
+            self.version,
+            self.stream_type,
+            self.chunk_size,
+            reader,
+            emit,
+        )
+    }
 }
 
 /// One recipient's wrap plus its signed read-grant (api.md §8.1 `wraps[]`).
@@ -636,6 +694,49 @@ mod tests {
             assert_eq!(m.digest, Bytes32(sealed.digest), "manifest digest binds the stream");
             assert_eq!(m.chunk_count, sealed.chunk_count);
             assert_eq!(m.compression, Compression::None);
+        }
+    }
+
+    #[test]
+    fn content_stream_sealer_matches_seal_stream() {
+        use std::io::Cursor;
+
+        let chunk_size = 4096usize;
+        let file_id = Id([0x5A; 16]);
+        let version = 1u64;
+        let st = StreamType::Content;
+
+        let lengths: &[usize] = &[1, 2 * chunk_size, 2 * chunk_size + 123, 0];
+        for &len in lengths {
+            let dek = Dek::generate();
+            let pt: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+            // (a) expected — whole-buffer sealer via direct subkey derivation
+            let ck = dek.stream_subkey(st);
+            let expected = maxsecu_crypto::seal_stream(&ck, file_id, version, st, chunk_size, &pt);
+
+            // (b) actual — via ContentStreamSealer
+            let sealer = ContentStreamSealer::new(&dek, file_id, version, st, chunk_size);
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            let (count, digest) = sealer
+                .seal_from_reader(&mut Cursor::new(&pt), |_i, ct| {
+                    got.push(ct.to_vec());
+                    Ok(())
+                })
+                .expect("sealing succeeds");
+
+            assert_eq!(
+                got, expected.chunks,
+                "chunks match for len={}", len
+            );
+            assert_eq!(
+                count, expected.chunk_count,
+                "chunk_count matches for len={}", len
+            );
+            assert_eq!(
+                digest, expected.digest,
+                "digest matches for len={}", len
+            );
         }
     }
 
