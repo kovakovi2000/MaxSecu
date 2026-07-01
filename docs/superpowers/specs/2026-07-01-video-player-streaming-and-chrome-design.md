@@ -57,6 +57,38 @@ position; when the buffer runs low it requests the next window; frames behind th
 position are discarded. WebView memory is bounded regardless of clip length, and
 the same model serves both preview (staged CMAF) and download (server fetch).
 
+### Two-tier memory model (the YouTube behavior, sized correctly)
+
+The two representations of the video differ in size by ~1000×, so they are cached
+at different layers:
+
+- **Tier 1 — compressed source cache ("what's loaded", persists).** The
+  encrypted/compressed fragments — a few hundred MB for a several-hundred-MB
+  source. This is the grey "buffered" region: once a fragment is here, seeking to
+  it needs **no re-download**, only a re-decode. **This already exists:**
+  - Download path: `crate::fragment_cache::FragmentCache` — on-disk, encrypted
+    (ciphertext only), byte-capped by the `ram_cache_cap_mb` setting;
+    `feed_fragment` already serves cache hits with zero network.
+  - Preview path: the whole staged CMAF plaintext is already held in the
+    `UploadJobs` registry (RAM, `Zeroizing`), so every seek is a local re-decode.
+  So "keep what's already played so we don't fetch it again" is satisfied at this
+  layer today; the work is to *surface* it (buffered bar) and to make the frontend
+  rely on it instead of hoarding decoded frames.
+
+- **Tier 2 — decoded-frame rolling buffer ("what's on screen now", tiny).** I420
+  frames are ~1.4 MB each (a 59 s 720p clip fully decoded ≈ 2.4 GB; a 10–20 min
+  HD/4K clip would be tens–hundreds of GB — so it is **never** materialized).
+  Only a small window near the playhead is held, bounded in **BYTES** (not frame
+  count — a 4K frame is ~12 MB, a 1080p frame ~3 MB, so a fixed count would swing
+  wildly), e.g. a ~128–256 MB ceiling. Frames far behind/ahead of the playhead are
+  evicted; a seek-back **re-decodes from the Tier-1 cache** (fast, no network),
+  exactly as YouTube re-decodes from its buffered segments rather than storing
+  decoded pixels.
+
+The decoded rolling buffer is the hard RAM cap; the compressed cache is the
+"loaded" region. Neither grows with clip length: minutes-long 4K clips stream in
+bounded memory.
+
 ### Components
 
 1. **Pausable master clock.** Pause/resume uses `AudioContext.suspend()` /
@@ -69,10 +101,12 @@ the same model serves both preview (staged CMAF) and download (server fetch).
    target buffer horizon (e.g. ~2–3 s of frames ahead). When buffered-ahead drops
    below the low-water mark AND playback is advancing (not paused/seeking), it
    invokes an injected `requestWindow(fromPts | fromSeq)` callback (the component
-   wires it to the backend). Frames whose pts is behind the play position are
-   dropped from the buffer. Replaces the fixed 96-count `pendingCapacity` drop
-   (which discarded needed frames) with position-relative eviction. Fixes the
-   freeze, the "only first few frames," and the 2.4 GB overload.
+   wires it to the backend). Frames far from the playhead are evicted so the
+   decoded buffer stays under its **byte** ceiling (Tier 2 above) — replacing the
+   fixed 96-*count* `pendingCapacity` drop that discarded needed frames. A
+   seek-back re-requests the target window, which the backend serves from the
+   Tier-1 cache with no network. Fixes the freeze, the "only first few frames,"
+   and the 2.4 GB overload.
 
 3. **Windowed preview backend.** Add `preview_window(job_id, start_seq, count)` in
    `commands/video.rs`, mirroring `play_window_command`: slice the staged
@@ -130,9 +164,11 @@ built-in `hotkeys` (Space/←/→/F/M) and `autohide`.
 WebGL canvas, not `<video>`, so we wrap the canvas + engine in a custom element
 exposing the `HTMLMediaElement` slice Media Chrome reads/writes:
 `currentTime` (get→position / set→seek), `duration`, `paused`, `play()`,
-`pause()`, `volume`, `muted`, `buffered` (a `TimeRanges`-like shim), and it
-dispatches the events Media Chrome listens for: `play`, `pause`, `timeupdate`,
-`durationchange`, `volumechange`, `waiting`/`playing` (buffering),
+`pause()`, `volume`, `muted`, `buffered` (a `TimeRanges`-like shim that reports
+the **Tier-1 cached fragments'** pts ranges — so `<media-time-range>` draws the
+YouTube-style grey "loaded" bar and makes visible which seeks are instant/no-network),
+and it dispatches the events Media Chrome listens for: `play`, `pause`,
+`timeupdate`, `durationchange`, `volumechange`, `waiting`/`playing` (buffering),
 `loadedmetadata`. Fullscreen targets the `<media-controller>` container (the
 canvas scales to fill via CSS). The engine does the real work underneath.
 
