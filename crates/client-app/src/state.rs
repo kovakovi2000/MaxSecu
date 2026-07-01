@@ -58,6 +58,43 @@ pub enum UploadPhase {
     Failed { job_id: String, code: String },
 }
 
+/// The video **prepare** (author-side transcode) feedback channel — per-job progress
+/// for the confined ffmpeg ingest + re-mux that runs inside `stage_upload` for a
+/// video (before any bundle exists). Emitted over the Tauri event bus so the upload
+/// UI can show a live progress bar + a Cancel affordance during the slow confined
+/// transcode. Non-color-only: each variant carries a stable `phase` code.
+///
+/// # Contract (consumed by the UI task)
+/// * Event name: [`EVT_VIDEO_PREPARE`] = `"maxsecu://video-prepare"`.
+/// * Payload: this [`PreparePhase`], kebab-tagged on `"phase"` — exactly:
+///   - `{"phase":"transcoding","percent":<0..=100|null>}` (percent is `null` until
+///     ffmpeg reports the source duration),
+///   - `{"phase":"remuxing"}`,
+///   - `{"phase":"finalizing"}`,
+///   - `{"phase":"cancelled"}` (benign terminal after a cancel),
+///   - `{"phase":"failed","code":"<code>"}` (sanitized terminal).
+/// * Cancel: the `cancel_video_prepare` command (no args) cancels the in-flight
+///   transcode; `stage_upload` then returns `UiError{code:"cancelled"}` (benign — the
+///   UI returns to idle), while a real failure returns `UiError{code:"video_failed"}`.
+pub const EVT_VIDEO_PREPARE: &str = "maxsecu://video-prepare";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "phase")]
+pub enum PreparePhase {
+    /// Confined ffmpeg transcode in progress; `percent` is `None` until the source
+    /// duration is known (then `0..=100`).
+    Transcoding { percent: Option<u8> },
+    /// Re-muxing ffmpeg's output into canonical AV1/CMAF fragments (second confined
+    /// spawn).
+    Remuxing,
+    /// Deriving thumbnail/preview + validating the fragment index (final local step).
+    Finalizing,
+    /// Benign terminal: the user (or app shutdown) cancelled the transcode.
+    Cancelled,
+    /// Sanitized terminal failure (no decode oracle) — carries a stable code.
+    Failed { code: String },
+}
+
 /// The sandboxed-video player feedback channel (Phase 7, Gate 4) — per-file
 /// playback state for the `<media-viewer>` video surface. Emitted over the Tauri
 /// event bus alongside the decoded frame/PCM DTOs (`EVT_VIDEO_FRAME`/
@@ -203,6 +240,39 @@ mod player_phase_tests {
         })
         .unwrap();
         assert!(e.contains("\"phase\":\"error\"") && e.contains("\"code\":\"cancelled\""));
+    }
+}
+
+#[cfg(test)]
+mod prepare_phase_tests {
+    use super::*;
+
+    #[test]
+    fn prepare_phase_serializes_kebab_tagged() {
+        // percent present.
+        let s = serde_json::to_string(&PreparePhase::Transcoding { percent: Some(42) }).unwrap();
+        assert!(s.contains("\"phase\":\"transcoding\""), "got {s}");
+        assert!(s.contains("\"percent\":42"), "got {s}");
+        // percent unknown → null.
+        let s = serde_json::to_string(&PreparePhase::Transcoding { percent: None }).unwrap();
+        assert!(s.contains("\"percent\":null"), "got {s}");
+        assert_eq!(
+            serde_json::to_string(&PreparePhase::Remuxing).unwrap(),
+            "{\"phase\":\"remuxing\"}"
+        );
+        assert_eq!(
+            serde_json::to_string(&PreparePhase::Finalizing).unwrap(),
+            "{\"phase\":\"finalizing\"}"
+        );
+        assert_eq!(
+            serde_json::to_string(&PreparePhase::Cancelled).unwrap(),
+            "{\"phase\":\"cancelled\"}"
+        );
+        let f = serde_json::to_string(&PreparePhase::Failed {
+            code: "video_failed".into(),
+        })
+        .unwrap();
+        assert!(f.contains("\"phase\":\"failed\"") && f.contains("\"code\":\"video_failed\""));
     }
 }
 

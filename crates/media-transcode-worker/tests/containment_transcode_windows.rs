@@ -90,11 +90,15 @@ fn appcontainer_transcode_still_produces_a_canonical_clip() {
 
     // Drive the REAL confined worker (AppContainer + Job Object) end-to-end: framed
     // request in, framed result out, over the confined stdio pipes.
+    let cancel = std::sync::atomic::AtomicBool::new(false);
     let out = TranscodeLauncher::new(WORKER)
-        .transcode(&TranscodeRequest {
-            source,
-            bounds: VideoBounds::default(),
-        })
+        .transcode(
+            &TranscodeRequest {
+                source,
+                bounds: VideoBounds::default(),
+            },
+            &cancel,
+        )
         .expect("confined transcode worker should still produce a result");
 
     assert!(!out.fragments.is_empty(), "confined run produced fragments");

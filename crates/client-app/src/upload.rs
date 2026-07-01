@@ -65,6 +65,14 @@ fn video_prep_err() -> UiError {
     UiError::new("video_failed", "That video could not be processed.")
 }
 
+/// DISTINCT, benign terminal for a user-initiated (or app-shutdown) cancel of the
+/// confined transcode — the UI returns to idle rather than surfacing a failure. Kept
+/// separate from [`video_prep_err`] so a real decode failure and a deliberate cancel
+/// never look alike.
+fn video_cancelled_err() -> UiError {
+    UiError::new("cancelled", "Transcode cancelled.")
+}
+
 /// RAII guard that recursively deletes a per-job temp dir on **every** exit path
 /// (success and error). This is the [`FfmpegLauncher::run`] CLEANUP OBLIGATION, not
 /// mere hygiene: the confined ffmpeg writes output files inside the granted dir that
@@ -129,6 +137,11 @@ fn unique_job_dir() -> std::path::PathBuf {
 /// (so the upload's content chunks map one-for-one onto the fragment ranges). A
 /// worker that returns a misaligned stream/index fails closed here rather than
 /// silently breaking seek after upload.
+// Each input is a distinct concern of the confined two-stage transcode (source path,
+// the two confined binaries, options/bounds, the title/tags baked into metadata, the
+// progress sink, and the cancel flag); a params struct would only indirect the one
+// call site in `commands::upload::stage_upload`.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_video_streams(
     input_path: &Path,
     ffmpeg_path: &Path,
@@ -137,6 +150,8 @@ pub fn prepare_video_streams(
     bounds: &VideoBounds,
     title: &str,
     tags: &[String],
+    on_phase: impl Fn(crate::state::PreparePhase) + Sync,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(PlaintextStreams, Vec<TranscodeFragment>), UiError> {
     // 1) Fresh, unique, freshly-created per-job dir. The guard recursively deletes
     //    the WHOLE dir on every return path (security cleanup, see JobDirGuard).
@@ -165,9 +180,21 @@ pub fn prepare_video_streams(
     // 4) Decode the untrusted source in the CONFINED ffmpeg (no net / keys /
     //    children, mem cap, bounded timeout). A nonzero exit fails closed; the
     //    bounded stderr is diagnostic only and never reaches the UI.
+    //    `on_progress` forwards ffmpeg's sanitized percent to the UI as a
+    //    `Transcoding{percent}` phase; `cancel` is polled throughout so a user cancel
+    //    / app shutdown tears the confined child down (RAII grant revoked on that path
+    //    exactly as on every other) and returns the DISTINCT `cancelled` error.
     let outcome = FfmpegLauncher::new(ffmpeg_path)
-        .run(&args, &dir)
+        .run(
+            &args,
+            &dir,
+            |p| on_phase(crate::state::PreparePhase::Transcoding { percent: p.percent }),
+            cancel,
+        )
         .map_err(|_| video_prep_err())?;
+    if outcome.cancelled {
+        return Err(video_cancelled_err());
+    }
     if outcome.exit_code != 0 {
         return Err(video_prep_err());
     }
@@ -191,16 +218,35 @@ pub fn prepare_video_streams(
     }
 
     // 6) Re-mux out.mp4's bytes → canonical AV1/CMAF in the SECOND confined spawn.
-    //    The worker's thumbnail/preview come back empty (derived below).
+    //    The worker's thumbnail/preview come back empty (derived below). `cancel` is
+    //    forwarded so a user cancel tears the re-mux child down promptly rather than
+    //    waiting out the full bound; a cancel-induced worker failure maps to the
+    //    distinct `cancelled` error, a real failure to the sanitized one.
+    on_phase(crate::state::PreparePhase::Remuxing);
     let result: TranscodeResult = TranscodeLauncher::new(transcode_worker_path)
-        .transcode(&TranscodeRequest {
-            source: out_mp4_bytes,
-            bounds: *bounds,
-        })
-        .map_err(|_| video_prep_err())?;
+        .transcode(
+            &TranscodeRequest {
+                source: out_mp4_bytes,
+                bounds: *bounds,
+            },
+            cancel,
+        )
+        .map_err(|_| {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                video_cancelled_err()
+            } else {
+                video_prep_err()
+            }
+        })?;
+    // A cancel that raced the worker's clean exit still returns the benign terminal.
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(video_cancelled_err());
+    }
 
     // 7) Derive the real thumbnail + preview from ffmpeg's first-frame PNG via the
-    //    pure-Rust image codec — NO C codec enters this key-holding process.
+    //    pure-Rust image codec — NO C codec enters this key-holding process. This +
+    //    the index validation + assemble are the final local step.
+    on_phase(crate::state::PreparePhase::Finalizing);
     let derived = RustImageCodec
         .transcode(&thumb_png_bytes, &MediaBounds::default())
         .map_err(|_| video_prep_err())?;

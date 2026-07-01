@@ -552,6 +552,8 @@ async fn phase7_video_author_to_view_over_real_tls() {
         &VideoBounds::default(),
         "Holiday clip",
         &["beach".to_owned()],
+        |_p| {},                                    // no-op progress sink (not asserted here)
+        &std::sync::atomic::AtomicBool::new(false), // never cancelled
     )
     .expect("GATE 1: the confined ffmpeg + re-mux produced canonical streams");
     let _ = std::fs::remove_dir_all(&src_dir);

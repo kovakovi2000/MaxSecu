@@ -25,8 +25,8 @@ use crate::dto::{
 };
 use crate::error::UiError;
 use crate::ffmpeg_bin::ensure_ffmpeg;
-use crate::jobs::{StagedUpload, StagedVideoPreview, UploadJobs};
-use crate::state::{UploadPhase, EVT_UPLOAD};
+use crate::jobs::{StagedUpload, StagedVideoPreview, UploadJobs, VideoPrepareCancel};
+use crate::state::{PreparePhase, UploadPhase, EVT_UPLOAD, EVT_VIDEO_PREPARE};
 use crate::upload::{
     prepare_blog_streams, prepare_image_streams, prepare_video_streams, run_pipeline, total_chunks,
 };
@@ -59,9 +59,11 @@ fn rand_job_id() -> String {
 #[tauri::command]
 pub async fn stage_upload(
     req: StageUploadRequest,
+    app: tauri::AppHandle,
     dir: State<'_, AppDir>,
     session: State<'_, Session>,
     jobs: State<'_, UploadJobs>,
+    prepare_cancel: State<'_, VideoPrepareCancel>,
 ) -> Result<UploadPreview, UiError> {
     // 1) Prepare the plaintext streams from the user's own content. For a video the
     //    transcode runs in the CONFINED worker (no network) and additionally yields
@@ -114,7 +116,20 @@ pub async fn stage_upload(
             // this is the preview-before-upload transcode.
             let title = req.title.clone();
             let tags = req.tags.clone();
-            let (s, frags) = tokio::task::spawn_blocking(move || {
+            // Fresh cancel token for THIS transcode; store it so `cancel_video_prepare`
+            // and the app-shutdown hook can flip it (tearing the confined children
+            // down). Replaces any stale token (there is at most one in-flight prepare).
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            *prepare_cancel.0.lock().unwrap() = Some(cancel.clone());
+            // Emit live prepare phases over the Tauri bus from the blocking task via a
+            // cloned AppHandle (AppHandle is Send+Sync). Only the sanitized PreparePhase
+            // crosses — no ffmpeg stderr/paths.
+            let handle = app.clone();
+            let cancel_task = cancel.clone();
+            let staged = tokio::task::spawn_blocking(move || {
+                let on_phase = move |phase: PreparePhase| {
+                    let _ = handle.emit(EVT_VIDEO_PREPARE, phase);
+                };
                 prepare_video_streams(
                     &input_path,
                     &ffmpeg_path,
@@ -123,10 +138,42 @@ pub async fn stage_upload(
                     &maxsecu_client_core::video::VideoBounds::default(),
                     &title,
                     &tags,
+                    on_phase,
+                    &cancel_task,
                 )
             })
-            .await
-            .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))??;
+            .await;
+            // Clear the stored token on EVERY outcome (completion / cancel / error) so a
+            // later `cancel_video_prepare` cannot flip a dead token.
+            *prepare_cancel.0.lock().unwrap() = None;
+            let (s, frags) = match staged {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    // Emit the sanitized terminal phase mirroring the returned code: a
+                    // benign `Cancelled` for a user/shutdown cancel, else `Failed`.
+                    let phase = if e.code == "cancelled" {
+                        PreparePhase::Cancelled
+                    } else {
+                        PreparePhase::Failed {
+                            code: e.code.clone(),
+                        }
+                    };
+                    let _ = app.emit(EVT_VIDEO_PREPARE, phase);
+                    return Err(e);
+                }
+                Err(_) => {
+                    let _ = app.emit(
+                        EVT_VIDEO_PREPARE,
+                        PreparePhase::Failed {
+                            code: "video_failed".into(),
+                        },
+                    );
+                    return Err(UiError::new(
+                        "encrypt_failed",
+                        "Could not prepare the upload.",
+                    ));
+                }
+            };
             // Hold the canonical plaintext + the authenticated seek index for the
             // local WYSIWYG preview (the bundle also carries the ciphertext form).
             let index: Vec<crate::video::FragmentEntry> = frags
@@ -342,6 +389,22 @@ pub async fn cancel_upload(
     jobs: State<'_, UploadJobs>,
 ) -> Result<(), UiError> {
     jobs.0.lock().await.remove(&req.job_id);
+    Ok(())
+}
+
+/// `cancel_video_prepare` — request cancellation of the in-flight video `stage_upload`
+/// transcode. Best-effort: sets the stored cancel token's flag (which the confined
+/// ffmpeg + re-mux waits poll → they terminate the confined children), then
+/// `stage_upload` returns the distinct `cancelled` error and emits `PreparePhase::Cancelled`.
+/// `Ok(())` if there is no in-flight prepare (nothing to cancel). This is also invoked
+/// by the app-shutdown hook so an in-flight transcode kills its confined child on exit.
+#[tauri::command]
+pub async fn cancel_video_prepare(
+    prepare_cancel: State<'_, VideoPrepareCancel>,
+) -> Result<(), UiError> {
+    if let Some(flag) = prepare_cancel.0.lock().unwrap().as_ref() {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
 }
 

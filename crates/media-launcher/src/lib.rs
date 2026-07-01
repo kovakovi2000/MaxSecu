@@ -35,6 +35,7 @@ use maxsecu_client_core::video::{
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 
 use zeroize::Zeroize;
 
@@ -49,7 +50,7 @@ mod win32;
 #[cfg(windows)]
 pub use win32::{
     appcontainer_sid_string, grant_path_to_appcontainer, spawn_confined_exe, ConfinedExeOutput,
-    ConfinedOutput, GrantAccess, PathGrant, SpawnError,
+    ConfinedOutput, FfmpegProgress, GrantAccess, PathGrant, SpawnError,
 };
 
 /// Default per-worker memory cap (decompression-bomb hard kill, media-sandbox §3).
@@ -71,6 +72,21 @@ pub const DEFAULT_FFMPEG_MEMORY_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// process is terminated rather than waited on forever.
 #[cfg(windows)]
 pub const DEFAULT_FFMPEG_TIMEOUT_MS: u32 = 600_000;
+
+/// **Progress-based stall timeout** for the confined ffmpeg ingest (Task B). The
+/// fixed wall-clock kill is replaced by this: the confined ffmpeg is force-killed
+/// only if its `-progress` `out_time` fails to advance for this long (reset on every
+/// forward advance), so a legitimately-slow but progressing transcode is NEVER
+/// wrongly killed. 90 s of ZERO progress is a hang, not slow work.
+#[cfg(windows)]
+pub const FFMPEG_STALL_TIMEOUT_MS: u32 = 90_000;
+
+/// **Absolute backstop** for the confined ffmpeg ingest (Task B): even if `out_time`
+/// keeps advancing (a progress-spammer), the confined process is terminated past
+/// this total wall-clock bound. 1 hour is generous headroom for a large legitimate
+/// transcode while still guaranteeing termination.
+#[cfg(windows)]
+pub const FFMPEG_MAX_TOTAL_MS: u32 = 3_600_000;
 
 /// Length-prefixed duplex **framing** for the persistent video-session protocol
 /// (Task 3.3). Each frame on the pipe is a `u32` little-endian length prefix
@@ -1310,11 +1326,20 @@ impl TranscodeLauncher {
     /// ([`framing::MAX_FRAME_BYTES`]) and the body decoded with the bounds-safe
     /// `client-core` codec — a hostile / crashing / non-zero-exit worker yields a
     /// [`SessionError`], never a panic.
-    pub fn transcode(&self, req: &TranscodeRequest) -> Result<TranscodeResult, SessionError> {
+    ///
+    /// `cancel` (Task C) is polled during the confined re-mux worker's bounded exit
+    /// wait, so a user cancel / app shutdown tears a slow re-mux down promptly rather
+    /// than waiting out the full DoS bound. Pass a never-set flag for a
+    /// non-cancellable call.
+    pub fn transcode(
+        &self,
+        req: &TranscodeRequest,
+        cancel: &AtomicBool,
+    ) -> Result<TranscodeResult, SessionError> {
         let mut stdin_data = Vec::new();
         // Writing into a Vec is infallible; frame the lone request for the worker.
         let _ = framing::write_frame(&mut stdin_data, &encode_transcode_request(req));
-        let stdout = self.run_worker(&stdin_data)?;
+        let stdout = self.run_worker(&stdin_data, cancel)?;
         parse_framed_result(&stdout)
     }
 
@@ -1335,11 +1360,18 @@ impl TranscodeLauncher {
     }
 
     /// Spawn the worker inside the Windows AppContainer + Job Object, stream the
-    /// framed request on its stdin, and return the captured stdout.
+    /// framed request on its stdin, and return the captured stdout. `cancel` is polled
+    /// during the confined worker's bounded exit wait (Task C).
     #[cfg(windows)]
-    fn run_worker(&self, stdin_data: &[u8]) -> Result<Vec<u8>, SessionError> {
-        let out = win32::spawn_confined(&self.worker_path, &[], stdin_data, self.memory_cap_bytes)
-            .map_err(SessionError::Spawn)?;
+    fn run_worker(&self, stdin_data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, SessionError> {
+        let out = win32::spawn_confined_cancellable(
+            &self.worker_path,
+            &[],
+            stdin_data,
+            self.memory_cap_bytes,
+            cancel,
+        )
+        .map_err(SessionError::Spawn)?;
         if out.exit_code != 0 {
             return Err(SessionError::Io(std::io::Error::other(
                 "transcode worker exited non-zero",
@@ -1353,7 +1385,10 @@ impl TranscodeLauncher {
     /// request is streamed on a writer thread so a large request cannot deadlock
     /// against the worker filling its stdout pipe.
     #[cfg(not(windows))]
-    fn run_worker(&self, stdin_data: &[u8]) -> Result<Vec<u8>, SessionError> {
+    fn run_worker(&self, stdin_data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, SessionError> {
+        // No OS-confined cancellable wait off Windows; the cross-platform child is
+        // reaped normally. (`cancel` is honored on the Windows confined path.)
+        let _ = cancel;
         let mut child = Command::new(&self.worker_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1418,6 +1453,11 @@ fn parse_framed_result(stdout: &[u8]) -> Result<TranscodeResult, SessionError> {
 pub struct FfmpegOutcome {
     pub exit_code: u32,
     pub stderr_tail: Vec<u8>,
+    /// `true` iff the run was terminated because the caller's `cancel` flag was set
+    /// (a user cancel / app shutdown) — a DISTINCT, benign outcome the caller maps to
+    /// a `cancelled` error, NOT the sanitized `video_failed` a stall/backstop kill or
+    /// a non-zero exit produces.
+    pub cancelled: bool,
 }
 
 /// Spawn the pinned `ffmpeg.exe` inside the SAME AppContainer + Job Object
@@ -1435,7 +1475,12 @@ pub struct FfmpegOutcome {
 pub struct FfmpegLauncher {
     ffmpeg_path: PathBuf,
     memory_cap_bytes: u64,
-    timeout_ms: u32,
+    /// Progress-based stall bound (Task B): kill only after this long with NO
+    /// `-progress` advance.
+    stall_timeout_ms: u32,
+    /// Absolute wall-clock backstop (Task B): kill past this even if progress keeps
+    /// advancing (a progress-spammer).
+    max_total_ms: u32,
 }
 
 #[cfg(windows)]
@@ -1445,7 +1490,8 @@ impl FfmpegLauncher {
         FfmpegLauncher {
             ffmpeg_path: ffmpeg_path.into(),
             memory_cap_bytes: DEFAULT_FFMPEG_MEMORY_CAP_BYTES,
-            timeout_ms: DEFAULT_FFMPEG_TIMEOUT_MS,
+            stall_timeout_ms: FFMPEG_STALL_TIMEOUT_MS,
+            max_total_ms: FFMPEG_MAX_TOTAL_MS,
         }
     }
 
@@ -1455,17 +1501,25 @@ impl FfmpegLauncher {
         FfmpegLauncher {
             ffmpeg_path: ffmpeg_path.into(),
             memory_cap_bytes: cap,
-            timeout_ms: DEFAULT_FFMPEG_TIMEOUT_MS,
+            stall_timeout_ms: FFMPEG_STALL_TIMEOUT_MS,
+            max_total_ms: FFMPEG_MAX_TOTAL_MS,
         }
     }
 
-    /// Override the per-job forced-kill timeout (default [`DEFAULT_FFMPEG_TIMEOUT_MS`]).
+    /// Override the absolute forced-kill backstop (default [`FFMPEG_MAX_TOTAL_MS`]).
     /// This is a FINITE DoS ceiling, not a soft hint: past it the confined ffmpeg is
-    /// terminated. Size it for the largest source the ingest accepts — a long 4K
-    /// transcode legitimately exceeds the worker path's 2-minute bound, so the ffmpeg
-    /// path is configurable while still never waiting `INFINITE`.
-    pub fn with_timeout(mut self, timeout_ms: u32) -> Self {
-        self.timeout_ms = timeout_ms;
+    /// terminated regardless of progress. The primary bound is now the progress-based
+    /// stall watchdog ([`FFMPEG_STALL_TIMEOUT_MS`], see [`with_stall_timeout`](Self::with_stall_timeout)),
+    /// so a legitimately-slow-but-progressing transcode is never wrongly killed.
+    pub fn with_timeout(mut self, max_total_ms: u32) -> Self {
+        self.max_total_ms = max_total_ms;
+        self
+    }
+
+    /// Override the progress-based stall timeout (default [`FFMPEG_STALL_TIMEOUT_MS`]):
+    /// the confined ffmpeg is killed only after this long with NO `-progress` advance.
+    pub fn with_stall_timeout(mut self, stall_timeout_ms: u32) -> Self {
+        self.stall_timeout_ms = stall_timeout_ms;
         self
     }
 
@@ -1490,24 +1544,37 @@ impl FfmpegLauncher {
     /// the only correct cleanup — leaving it behind leaves a container-accessible,
     /// Low-IL artifact on disk.
     ///
-    /// The run is bounded by a FINITE forced-kill timeout (default
-    /// [`DEFAULT_FFMPEG_TIMEOUT_MS`], see [`with_timeout`](Self::with_timeout)): a
-    /// generous DoS ceiling, after which the confined ffmpeg is killed.
+    /// The run is bounded by a **progress-based stall watchdog** (Task B): the
+    /// confined ffmpeg is force-killed only if its `-progress` `out_time` fails to
+    /// advance for `stall_timeout_ms` (default [`FFMPEG_STALL_TIMEOUT_MS`]), plus an
+    /// absolute `max_total_ms` backstop (default [`FFMPEG_MAX_TOTAL_MS`]).
+    /// `on_progress` (Task A) is invoked live per progress tick with a sanitized
+    /// [`FfmpegProgress`] (percent + elapsed ms only — no stderr text / paths cross).
+    /// `cancel` (Task C) is polled throughout; when set, the child is terminated, the
+    /// path grant is revoked (as on every path), and the returned [`FfmpegOutcome`]
+    /// has `cancelled == true` (the caller maps that to a distinct `cancelled` error,
+    /// NOT the sanitized `video_failed`).
     pub fn run(
         &self,
         args: &[std::ffi::OsString],
         grant_dir: &std::path::Path,
+        on_progress: impl Fn(FfmpegProgress) + Send,
+        cancel: &AtomicBool,
     ) -> Result<FfmpegOutcome, SpawnError> {
         let out = win32::spawn_confined_exe(
             &self.ffmpeg_path,
             args,
             &[(grant_dir, GrantAccess::ReadWrite)],
             self.memory_cap_bytes,
-            self.timeout_ms,
+            self.stall_timeout_ms,
+            self.max_total_ms,
+            on_progress,
+            cancel,
         )?;
         Ok(FfmpegOutcome {
             exit_code: out.exit_code,
             stderr_tail: out.stderr_tail,
+            cancelled: out.cancelled,
         })
     }
 }

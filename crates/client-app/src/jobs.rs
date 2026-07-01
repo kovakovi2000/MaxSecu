@@ -86,6 +86,32 @@ impl Default for VideoJobs {
     }
 }
 
+/// Managed state holding the cancel token for the CURRENTLY in-flight video
+/// `stage_upload` transcode (there is at most one — the UI stages one video at a
+/// time). `stage_upload` installs a fresh `Arc<AtomicBool>` before the confined
+/// transcode and clears it on completion/cancel; `cancel_video_prepare` (and the app
+/// shutdown hook) set the bool to tear the confined ffmpeg/re-mux children down.
+///
+/// A **`std::sync::Mutex`** (not the async `tokio::sync::Mutex`): the lock is held
+/// only for the trivial `Option` swap/read (never across an `.await`), and the
+/// shutdown hook runs in Tauri's synchronous `RunEvent` callback where an async lock
+/// is unavailable — a std mutex lets the command AND the shutdown hook share it.
+pub struct VideoPrepareCancel(
+    pub std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+);
+
+impl VideoPrepareCancel {
+    pub fn new() -> Self {
+        VideoPrepareCancel(std::sync::Mutex::new(None))
+    }
+}
+
+impl Default for VideoPrepareCancel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

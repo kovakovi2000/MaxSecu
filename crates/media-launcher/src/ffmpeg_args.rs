@@ -90,6 +90,12 @@ pub fn build_ffmpeg_args(
 
     // --- Main output: AV1 video + AAC-LC audio --------------------------------
     arg!("-y");
+    // Machine-readable progress to stderr (fd 2, already the bounded capture pipe):
+    // the launcher parses `Duration:` + `out_time`/`progress=` lines live for the UI
+    // progress bar AND the progress-based stall watchdog (Task A/B). `pipe:2` writes
+    // to the EXISTING stderr pipe — no new stream, no media on it.
+    arg!("-progress");
+    arg!("pipe:2");
     // Defense in depth: ffmpeg may only open local files (never a URL/other
     // protocol), atop the no-network AppContainer.
     arg!("-protocol_whitelist");

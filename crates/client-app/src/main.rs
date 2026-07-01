@@ -35,6 +35,7 @@ fn main() {
         .manage(ConnectLock::new())
         .manage(maxsecu_client_app::jobs::UploadJobs::new())
         .manage(maxsecu_client_app::jobs::VideoJobs::new())
+        .manage(maxsecu_client_app::jobs::VideoPrepareCancel::default())
         .manage(ContentCache::new(cap_bytes))
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
@@ -55,6 +56,7 @@ fn main() {
             maxsecu_client_app::commands::upload::stage_upload,
             maxsecu_client_app::commands::upload::confirm_upload,
             maxsecu_client_app::commands::upload::cancel_upload,
+            maxsecu_client_app::commands::upload::cancel_video_prepare,
             maxsecu_client_app::commands::upload::upload_jobs,
             maxsecu_client_app::commands::video::preview_video,
             maxsecu_client_app::commands::settings::get_settings,
@@ -70,13 +72,28 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while running MaxSecu client");
 
-    // Zeroize the decrypted-content cache on shutdown so no plaintext survives the
-    // process (spec §6 — zeroized on app close, in addition to on-evict).
-    app.run(|app_handle, event| {
-        if let tauri::RunEvent::Exit = event {
+    // Shutdown handling:
+    // * `ExitRequested` (fired first, before teardown): flip the in-flight video
+    //   `stage_upload` transcode's cancel token so its confined ffmpeg / re-mux child
+    //   is terminated (via the watchdog's cancel poll) before the process exits — no
+    //   orphaned confined child, prompt shutdown. Best-effort (no-op if none running).
+    // * `Exit` (unchanged): zeroize the decrypted-content cache so no plaintext
+    //   survives the process (spec §6 — zeroized on app close, in addition to on-evict).
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { .. } => {
+            if let Some(prepare_cancel) =
+                app_handle.try_state::<maxsecu_client_app::jobs::VideoPrepareCancel>()
+            {
+                if let Some(flag) = prepare_cancel.0.lock().unwrap().as_ref() {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        tauri::RunEvent::Exit => {
             if let Some(cache) = app_handle.try_state::<ContentCache>() {
                 cache.clear_and_zeroize();
             }
         }
+        _ => {}
     });
 }

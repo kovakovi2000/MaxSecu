@@ -901,6 +901,8 @@ async fn universal_video_ingest_capstone_over_real_tls() {
         &VideoBounds::default(),
         "Holiday clip",
         &["beach".to_owned()],
+        |_p| {},                                    // no-op progress sink (not asserted here)
+        &std::sync::atomic::AtomicBool::new(false), // never cancelled
     )
     .expect("CASE A: confined ffmpeg + re-mux produced canonical AV1/AAC streams");
     assert!(
@@ -1099,6 +1101,8 @@ async fn universal_video_ingest_capstone_over_real_tls() {
         &VideoBounds::default(),
         "Extreme clip",
         &[],
+        |_p| {},                                    // no-op progress sink (not asserted here)
+        &std::sync::atomic::AtomicBool::new(false), // never cancelled
     )
     .expect("CASE B: confined transcode of the high-res source succeeds");
     let _ = std::fs::remove_dir_all(&src_dir);
@@ -1181,6 +1185,8 @@ async fn universal_video_ingest_capstone_over_real_tls() {
         &VideoBounds::default(),
         "Downscaled clip",
         &[],
+        |_p| {},                                    // no-op progress sink (not asserted here)
+        &std::sync::atomic::AtomicBool::new(false), // never cancelled
     )
     .expect("CASE C: confined transcode with the resolution override succeeds");
     let (c_file_id, c_fid) =

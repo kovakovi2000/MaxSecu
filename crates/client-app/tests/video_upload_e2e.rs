@@ -455,7 +455,8 @@ async fn phase7_video_upload_over_real_tls() {
     // INVARIANT (no-network-at-stage): the ingest happens with NO connection /
     // transport / server in scope. This is STRUCTURAL, not merely ordering:
     // `prepare_video_streams` takes only `(input_path, ffmpeg_path, worker_path,
-    // options, bounds, title, tags)` — it has NO `SendRequest`/host/socket parameter,
+    // options, bounds, title, tags, on_phase, cancel)` — a local progress sink + a
+    // cancel flag, NO `SendRequest`/host/socket parameter,
     // so it cannot reach the network even if a future refactor moved the server setup
     // earlier. The asserts below enforce that no networking object has been
     // constructed yet at this point: the only bindings in scope are the source +
@@ -471,6 +472,8 @@ async fn phase7_video_upload_over_real_tls() {
         &VideoBounds::default(),
         "Holiday clip",
         &["beach".to_owned()],
+        |_p| {},                                    // no-op progress sink (not asserted here)
+        &std::sync::atomic::AtomicBool::new(false), // never cancelled
     )
     .expect("GATE T: the confined ffmpeg + re-mux produced canonical streams");
     let _ = std::fs::remove_dir_all(&src_dir);
