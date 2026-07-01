@@ -72,8 +72,11 @@ pub struct StagingRecord {
     pub genesis_sig: Vec<u8>,  // 64 bytes
     pub wraps: Vec<StagedWrap>,
     pub out_mp4_path: PathBuf, // the on-disk transcode (author plaintext)
-    pub chunk_size: u32,          // content chunk size (6 MiB)
-    pub content_chunk_count: u64, // number of content chunks to (re-)seal + PUT
+    pub chunk_size: u32,            // content chunk size (6 MiB)
+    pub content_chunk_count: u64,   // number of content chunks to (re-)seal + PUT
+    /// Total sealed ciphertext bytes across all content chunks (advisory; server
+    /// uses this for listing/quota display only — not enforced at PUT/finalize).
+    pub content_total_bytes: u64,
     pub small_streams: Vec<StagedSmallStream>,
     pub progress: u64,        // last content chunk index successfully PUT (0 = none)
     pub created_ms: u64,
@@ -218,6 +221,7 @@ mod tests {
             out_mp4_path: PathBuf::from("/tmp/out.mp4"),
             chunk_size: 6 * 1024 * 1024,
             content_chunk_count: 10,
+            content_total_bytes: 10 * 6 * 1024 * 1024,
             small_streams: vec![
                 make_small_stream(2), // metadata
                 make_small_stream(3), // thumbnail

@@ -44,11 +44,13 @@ pub enum UploadPhase {
     Encrypting { job_id: String },
     /// Staging the version (POST /v1/files).
     Staging { job_id: String },
-    /// Uploading ciphertext chunks (resumable).
+    /// Uploading ciphertext chunks (resumable). `bytes_per_s` is a rolling
+    /// throughput estimate (0 for the small image/blog path; live MB/s for video).
     Uploading {
         job_id: String,
         done: u64,
         total: u64,
+        bytes_per_s: u64,
     },
     /// Finalizing the version.
     Finalizing { job_id: String },
@@ -295,10 +297,12 @@ mod upload_phase_tests {
             job_id: "j".into(),
             done: 2,
             total: 5,
+            bytes_per_s: 3_000_000,
         })
         .unwrap();
         assert!(s.contains("\"phase\":\"uploading\""), "got {s}");
         assert!(s.contains("\"done\":2") && s.contains("\"total\":5"));
+        assert!(s.contains("\"bytes_per_s\":3000000"), "got {s}");
         let d = serde_json::to_string(&UploadPhase::Done {
             job_id: "j".into(),
             file_id: "ab".into(),

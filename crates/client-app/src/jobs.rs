@@ -12,6 +12,7 @@ use hyper::body::Bytes;
 use hyper::client::conn::http1::SendRequest;
 use tokio::sync::Mutex;
 use maxsecu_client_core::UploadBundle;
+use crate::upload_staging::StagingRecord;
 
 /// One persistent authed HTTP/1.1 channel for an open video session: the live
 /// `SendRequest` plus the host + bearer token bound to it. All range fetches for a
@@ -23,6 +24,17 @@ pub struct AuthedChannel {
     pub token: String,
 }
 
+/// The upload content variant — held in the in-process job registry. Image/blog
+/// uploads keep their fully-encrypted `UploadBundle` in RAM. Video uploads use the
+/// disk-backed `StagingRecord` (no content ciphertext in RAM, only small streams).
+pub enum StagedContent {
+    /// Image or blog: the complete encrypted bundle (small enough to hold in RAM).
+    InRam(UploadBundle),
+    /// Video: disk-backed staging record with no content ciphertext. The content is
+    /// re-sealed on demand during `confirm_upload` via `resume_content_sealer`.
+    Streaming(StagingRecord),
+}
+
 /// File-backed author preview for the **preview-before-upload** local decode (Phase 7,
 /// Gate 6). Holds the on-disk path of the transcoded fMP4 (`out.mp4` in the per-job
 /// temp dir) instead of an in-RAM plaintext buffer — range requests from the native
@@ -31,6 +43,7 @@ pub struct AuthedChannel {
 /// fragment seek-map (in VIDEO_CHUNK_SIZE units), used to locate per-fragment byte
 /// ranges in the file. Dropped when the job leaves the registry (confirm/cancel); the
 /// on-disk file is then also deleted via `StagedUpload.job_dir` cleanup.
+#[derive(Clone)]
 pub struct StagedVideoPreview {
     /// On-disk path of the transcoded fMP4 (`out.mp4` in the per-job temp dir). Byte
     /// ranges are served by seek+read — no full-file plaintext in RAM.
@@ -38,13 +51,14 @@ pub struct StagedVideoPreview {
     pub index: Vec<crate::video::FragmentEntry>,
 }
 
-/// One staged upload held pending the user's confirm. `bundle` carries the signed,
-/// encrypted records + ciphertext chunks (never sent to the UI). For a video,
-/// `preview` holds the on-disk fMP4 path + fragment index so the author can
-/// WYSIWYG-preview the transcoded result before confirming. `job_dir` is the
-/// per-job temp dir (video only); deleted on confirm-success or cancel.
+/// One staged upload held pending the user's confirm. `content` is either an
+/// in-RAM `UploadBundle` (image/blog) or a disk-backed `StagingRecord` (video).
+/// Neither the bundle's DEK nor the content ciphertext ever crosses the Tauri seam.
+/// For a video, `preview` holds the on-disk fMP4 path + fragment index so the author
+/// can WYSIWYG-preview the transcoded result before confirming. `job_dir` is the
+/// staging dir (video) or None (image/blog); deleted on confirm-success or cancel.
 pub struct StagedUpload {
-    pub bundle: UploadBundle,
+    pub content: StagedContent,
     pub file_type: String,
     pub title: String,
     pub total_chunks: u64,
@@ -169,7 +183,7 @@ mod tests {
         };
         let bundle = build_upload(&params, &streams).unwrap();
         StagedUpload {
-            bundle,
+            content: StagedContent::InRam(bundle),
             file_type: "blog".into(),
             title: "T".into(),
             total_chunks: 1,
@@ -186,7 +200,9 @@ mod tests {
         assert!(jobs.0.lock().await.contains_key("job-1"));
         let taken = jobs.0.lock().await.remove("job-1");
         assert!(taken.is_some());
-        assert_eq!(taken.unwrap().title, "T");
+        let taken = taken.unwrap();
+        assert_eq!(taken.title, "T");
+        assert!(matches!(taken.content, StagedContent::InRam(_)));
         assert!(jobs.0.lock().await.remove("job-1").is_none()); // gone
     }
 }

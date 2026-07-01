@@ -339,7 +339,7 @@ fn stream_name(s: StreamType) -> &'static str {
         StreamType::Preview => "preview",
     }
 }
-fn wrap_wire(w: &WrapOut) -> Vec<u8> {
+pub(crate) fn wrap_wire(w: &WrapOut) -> Vec<u8> {
     let mut v = w.wrapped_dek.enc.to_vec();
     v.extend_from_slice(&w.wrapped_dek.ct);
     v
@@ -400,8 +400,8 @@ pub fn total_chunks(b: &UploadBundle) -> u64 {
 
 /// PUT one chunk, retrying up to MAX_CHUNK_RETRY on a transport error or non-200
 /// (idempotent by index → safe). Fail-closed `upload_chunk_failed` after retries.
-// Wired into `confirm_upload` + exercised by the Task-10 e2e.
-async fn put_chunk_retried(
+// Wired into `confirm_upload` + the streaming confirm path.
+pub(crate) async fn put_chunk_retried(
     sender: &mut SendRequest<Full<Bytes>>,
     host: &str,
     token: &str,
