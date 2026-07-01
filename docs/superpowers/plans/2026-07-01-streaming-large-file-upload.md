@@ -246,26 +246,43 @@ still runs on build.
 This is where the on-disk lifecycle lands: the transcode `out.mp4` persists in a staging dir through confirm
 (no whole-file-in-RAM), the preview is served from that file, and a small staging record enables resume.
 
+> **Absorbs old Task 9 (preview-from-disk):** making `StagedVideoPreview` file-backed forces the preview-serving
+> code (`serve_preview_range`, which reads `preview.cmaf`) to change NOW, not later — so that lands here. The
+> `StagingRecord` module is built + unit-tested in ISOLATION this task; it is WIRED into the real stage/confirm
+> pipeline in Task 7 (which replaces the bridge below with the streaming passes). Confirm keeps working via a
+> bridge here so every commit is green.
+
 - [ ] **Step 1a — disk-backed prepare:** Rework `prepare_video_streams` to (a) NOT `fs::read(out.mp4)` into a
-  `content` buffer, (b) NOT delete the per-job dir on success (remove/relax `JobDirGuard` so the dir persists;
-  KEEP the recursive-delete cleanup on the ERROR/cancel paths — a failed transcode must still wipe the Low-IL
-  dir), (c) return a disk-backed handle `PreparedVideo { out_mp4_path, job_dir, output_size, fragments,
-  thumbnail, preview }` (thumbnail/preview derived from `thumb.png` as today — small, RAM). The confirmed
-  upload's staging lifecycle now owns `job_dir`/`out_mp4_path`.
-- [ ] **Step 1b — staging record round-trip test (failing):** `StagingRecord { file_id, manifest+sig,
+  `content` buffer, (b) NOT delete the per-job dir on SUCCESS (the dir must persist through confirm) while
+  KEEPING the recursive wipe on the ERROR/cancel paths — a failed/cancelled transcode must still delete the
+  Low-IL dir (e.g. keep `JobDirGuard` but `std::mem::forget` it / disarm it on the success return, transferring
+  ownership to the caller). (c) Return a disk-backed handle `PreparedVideo { out_mp4_path, job_dir,
+  output_size, fragments, thumbnail, preview }` (thumbnail/preview derived from `thumb.png` as today — small,
+  RAM). No `content: Vec<u8>` of the whole file crosses out of prepare.
+- [ ] **Step 1b — file-backed preview + serve-from-disk (absorbs old Task 9):** Change `StagedVideoPreview` to
+  hold `out_mp4_path: PathBuf` (+ the `index`) instead of `cmaf: Zeroizing<Vec<u8>>`. Update `serve_preview_range`
+  to seek+read the requested byte range directly from `out_mp4_path` (bounded read buffers, cap open-ended to
+  `MAX_RANGE_BODY`, `first==len ⇒ 416`) — NO in-RAM `cmaf`, NO decrypt. The legacy confined-decode path
+  (`preview_video_inner` at ~video.rs:1101, which passes `&preview.cmaf` to `build_preview_window_script`) must
+  stay compiling+green: lazily `std::fs::read(&preview.out_mp4_path)` into a local buffer at call time and pass
+  that (the pure `build_preview_window_script(&[u8], …)` signature + its tests are unchanged). Add a unit test
+  for a `preview_slice_file(path, first, last)` (or the adapted `serve_preview_range`) over a temp fixture:
+  bounded range == file bytes, open-ended caps to `MAX_RANGE_BODY`, `first==len ⇒ None`.
+- [ ] **Step 1c — staging record round-trip test (failing):** `StagingRecord { file_id, manifest+sig,
   genesis+sig, wraps, file_type, title, out_mp4_path, chunk_size, content_chunk_count, small_stream_ciphertext,
   progress:0, created_ms, last_progress_ms, finalized:false }` persist→load→equal; assert it holds **no DEK and
   no content ciphertext**.
 - [ ] **Step 2:** Implement `upload_staging.rs`: the record type (serde), `persist`/`load`/`list_pending`/
-  `remove`, a per-upload staging dir under the app dir holding the record + the (moved/linked) `out.mp4` + the
-  small-stream ciphertext. Change `StagedVideoPreview` to **file-backed** (holds `out_mp4_path`, not
-  `Zeroizing<Vec<u8>>`); update `UploadJobs`/`StagedUpload` and `stage_upload`'s video branch to consume the
-  `PreparedVideo` handle + the file-backed preview. (The full streaming stage/confirm — pass-1 digest, pass-2
-  seal-and-PUT from disk — is Task 7; here `stage_upload` may still build the in-RAM bundle by reading
-  `out_mp4_path` as a BRIDGE, OR Task 7 wires streaming; keep it compiling + green either way. If bridging,
-  the staging dir must be cleaned on the confirm/cancel path.)
-- [ ] **Step 3:** `cargo test -p maxsecu-client-app --lib` → PASS; `cargo build -p maxsecu-client-app`.
-- [ ] **Step 4:** Commit: `feat(video): disk-backed prepare + staging record (no DEK/ciphertext at rest) + file-backed preview`.
+  `remove`, a per-upload staging area under the app dir. (This module is unit-tested in ISOLATION here; Task 7
+  wires it into stage/confirm + moves `out.mp4` into the staging area for resume.) Update `UploadJobs`/
+  `StagedUpload` to carry the `job_dir` so it can be wiped, and rewire `stage_upload`'s video branch to consume
+  the `PreparedVideo` handle + the file-backed preview. **BRIDGE (removed in Task 7):** `stage_upload` still
+  reads `out_mp4_path` → `build_upload` → the in-RAM `bundle` so `confirm_upload`/`run_pipeline` are unchanged
+  this task. The per-job dir (holding `out.mp4`) is deleted on confirm-success AND on cancel (add explicit
+  cleanup, since `JobDirGuard` no longer auto-deletes on success). Images/blogs are unchanged.
+- [ ] **Step 3:** `cargo test -p maxsecu-client-app --lib` → PASS; `cargo build -p maxsecu-client-app`;
+  `npm --prefix crates/client-app/ui run typecheck` (no UI change expected).
+- [ ] **Step 4:** Commit: `feat(video): disk-backed prepare + file-backed preview served from disk + staging-record module (no DEK/ciphertext at rest)`.
 
 **Security pass:** the transcode plaintext `out.mp4` lives in a Low-IL/AppContainer-ACL staging dir; error/
 cancel paths still wipe it; the record persists NO DEK and NO content ciphertext; file perms least-privilege;
@@ -295,16 +312,26 @@ is fail-closed when set; per-PUT RAM stays one chunk (no whole-file buffering in
 
 **Files:** `crates/client-app/src/upload.rs`, `crates/client-app/src/commands/upload.rs`, `state.rs`.
 
-- [ ] **Step 1 (failing e2e-lite / unit):** A test driving `run_pipeline` against an in-memory/loopback
-  sink that asserts: content is uploaded by streaming from the on-disk `out.mp4` (pass-2 seal-by-index ==
-  the manifest digest), only O(one-chunk) buffers are held, progress callbacks report `{done,total,
-  bytes_per_s}`, and finalize is called once. (Use a small `out.mp4` fixture.)
-- [ ] **Step 2:** Implement: `stage_upload` runs **pass 1** (`ContentStreamSealer` over `out.mp4` → content
-  digest+count), builds `UploadRecords` (Task 2), persists the staging record (Task 5), returns the preview
-  — NO network. `confirm_upload` → `POST /v1/files` (Task-2 records) → PUT small streams → **pass 2**
-  (re-open `out.mp4`, `seal(index, chunk)` → PUT, retry-per-chunk, persist `progress` after each) →
-  finalize → delete staging dir+record. Emit `UploadPhase`/progress with **MB/s** (rolling ~2s window).
-- [ ] **Step 3:** `cargo test -p maxsecu-client-app --lib` + `cargo build` → PASS.
+This task REPLACES the Task-5 bridge (`build_upload` full-bundle-in-RAM for video) with the true streaming
+passes, and WIRES the `StagingRecord` module (Task 5) into stage/confirm (persisting it + moving `out.mp4` into
+the app staging area so Task 8 can resume). Images/blogs keep the existing `build_upload`+`run_pipeline` path.
+
+- [ ] **Step 1 (failing unit/e2e-lite):** A test driving the streaming confirm against an in-memory/loopback
+  sink that asserts: content is uploaded by streaming from the on-disk `out.mp4` via
+  `ContentStreamSealer::seal_from_reader` (the emitted per-index ciphertext PUT == what the manifest digest
+  committed), only O(one-chunk) buffers are held (no `content: Vec<u8>` of the whole file), progress callbacks
+  report `{done,total,bytes_per_s}`, and finalize is called once. (Use a small `out.mp4` fixture.)
+- [ ] **Step 2:** Implement: `stage_upload` (video) runs **pass 1** — a `StreamingUploadBuilder` (Task 2);
+  `builder.content_sealer(&params).seal_from_reader(File(out.mp4), |_,_| Ok(()))` → `(content_chunk_count,
+  content_digest)`; seal the small streams into `SmallStreams`; `builder.finish(...)` → `UploadRecords`;
+  persist the `StagingRecord` (Task 5) + move `out.mp4` into the app staging area; hold the file-backed preview
+  — NO network. `confirm_upload` (video) → `POST /v1/files` (from `UploadRecords`) → PUT the small
+  `SealedStreamOut` chunks → **pass 2**: `resume_content_sealer`/the builder's sealer re-opens `out.mp4` and
+  `seal_from_reader(file, emit)` where `emit(index, ct)` PUTs the chunk (retry-per-chunk, idempotent) and
+  SKIPS indices `< progress`, persisting `progress` after each successful PUT → `finalize` → delete the staging
+  record + `out.mp4` + staging dir. Emit `UploadPhase`/progress with **MB/s** (rolling ~2s window). Keep the
+  DEK inside client-core (only ciphertext chunks cross). Images/blogs stay on the old path.
+- [ ] **Step 3:** `cargo test -p maxsecu-client-app --lib` + `cargo build -p maxsecu-client-app` → PASS.
 - [ ] **Step 4:** Commit: `feat(video): streaming stage/confirm — pass-1 digest + pass-2 seal-and-PUT from disk, O(one-chunk) RAM, MB/s progress`.
 
 **Security pass:** the DEK stays in client-core across both passes; only ciphertext chunks + sliced-plaintext
@@ -319,27 +346,24 @@ preview cross the seam; progress persistence writes no secret; retry is idempote
   >24h since last progress is swept (local deleted + server discard called); (c) cancel deletes local +
   calls discard.
 - [ ] **Step 2:** Implement: `resume_uploads` command — on launch, `list_pending`; for each unfinalized
-  record <24h prompt-to-resume (UI, Task 11) then resume (recover DEK, continue pass 2, finalize, clean up);
-  for each >24h, sweep (delete local + best-effort server `DELETE`). Wire the launch scan in `main.rs`
-  (surface pending to the UI, do not auto-run). `cancel_upload` deletes local + discards server.
+  record <24h prompt-to-resume (UI, Task 11) then resume via `client-core::resume_content_sealer(owner,
+  self_wrap, ctx, suite, file_id, version, chunk_size)` (Task 2 — recovers the DEK IN-CRATE, returns a sealer)
+  → `seal_from_reader(File(out.mp4), emit)` with `emit` skipping indices `< progress` and PUTting the rest →
+  finalize → clean up. For each record >24h since `last_progress_ms`, sweep (delete local staging + best-effort
+  server `DELETE /v1/files/{id}`). Wire the launch scan in `main.rs` (surface pending to the UI, do not
+  auto-run). `cancel_upload` deletes local staging + discards the server orphan.
 - [ ] **Step 3:** `cargo test -p maxsecu-client-app --lib` → PASS.
 - [ ] **Step 4:** Commit: `feat(video): resume interrupted uploads (prompt, DEK-from-self-wrap) + 24h sweep + cancel/abandon with server discard`.
 
 **Security pass:** DEK recovery requires the unlocked identity; sweep/cancel reliably remove the plaintext
 `out.mp4`; server discard only targets the caller's own unfinalized upload.
 
-## Task 9: preview-from-disk (serve_preview_range over the on-disk `out.mp4`) **[two-stage review]**
+## Task 9: preview-from-disk — **ABSORBED INTO TASK 5**
 
-**Files:** `crates/client-app/src/commands/video.rs`, `crates/client-app/src/jobs.rs`.
-
-- [ ] **Step 1 (failing test):** Unit-test a `preview_slice_file(path, first, last)` (or adapt
-  `serve_preview_range`) that reads the requested byte range directly from a file, over a temp fixture:
-  bounded range == the file bytes, open-ended caps to `MAX_RANGE_BODY`, `first==len` ⇒ None(416). Bounded
-  read buffers (seek+read the slice, not the whole file).
-- [ ] **Step 2:** Implement: `serve_preview_range` looks up the file-backed `StagedVideoPreview`
-  (`out_mp4_path`, Task 5) and serves the range from disk (seek+read), NO in-RAM `cmaf`, NO decrypt.
-- [ ] **Step 3:** `cargo test -p maxsecu-client-app --lib` → PASS; `npm run typecheck` (no UI change expected).
-- [ ] **Step 4:** Commit: `feat(video): author preview served by range from the on-disk transcode (no in-RAM buffer)`.
+The file-backed `StagedVideoPreview` change forces `serve_preview_range` to read from `out_mp4_path` on disk in
+the SAME commit it loses `cmaf` (otherwise preview breaks between commits). So this landed in **Task 5 Step 1b**
+(serve range from disk, bounded reads, `first==len ⇒ 416`, legacy confined path lazy-reads the file). Nothing
+to do here — verified at the Task 13 smoke ("preview plays from disk").
 
 **Security pass:** only the author's own plaintext range crosses; bounded reads; unknown job ⇒ 404; path is
 the staged one (no traversal from client input).
@@ -448,7 +472,7 @@ Fix before proceeding on any failure (invoke **superpowers:systematic-debugging*
 - Staging record (no DEK/ct at rest) + file-backed preview → Task 5. ✓
 - Server body limit + discard + quota (4 GB-frugal) → Task 6. ✓
 - Streaming stage/confirm + MB/s → Task 7. ✓  Resume + 24h sweep + cancel/discard → Task 8. ✓
-- Preview-from-disk → Task 9. ✓  6 MiB view tuning → Task 10. ✓  UI MB/s + resume prompt → Task 11. ✓
+- Preview-from-disk → **absorbed into Task 5** (Task 9 is a no-op checkpoint). ✓  6 MiB view tuning → Task 10. ✓  UI MB/s + resume prompt → Task 11. ✓
 - Quick-settings left-edge rainbow RAM gauge (user request) → Task 11b. ✓ (verified at the Task 13 smoke)
 - e2e (upload/resume/sweep) → Task 12. ✓  GUI smoke → Task 13. ✓  Security sign-off → Task 14. ✓
 - No client cap / configurable server quota default-off → Tasks 4 (no cap) + 6 (quota). ✓
