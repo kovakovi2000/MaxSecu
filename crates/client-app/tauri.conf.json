@@ -6,7 +6,10 @@
   "build": { "frontendDist": "ui/dist" },
   "app": {
     "windows": [{ "title": "MaxSecu", "width": 1100, "height": 720, "resizable": true, "maximized": true }],
-    "security": { "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; media-src 'self' stream: http://stream.localhost https://stream.localhost" }
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; media-src 'self' stream: http://stream.localhost https://stream.localhost",
+      "dangerousDisableAssetCspModification": ["style-src"]
+    }
   },
   "bundle": { "active": true, "targets": ["nsis"] }
 }
