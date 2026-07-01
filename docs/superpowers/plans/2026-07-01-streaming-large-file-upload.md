@@ -308,34 +308,67 @@ load fails closed on a corrupt record.
 **Security pass:** discard cannot touch a finalized/immutable version or its genesis; owner-only; the quota
 is fail-closed when set; per-PUT RAM stays one chunk (no whole-file buffering introduced).
 
-## Task 7: client-app streaming stage/confirm pipeline + MB/s **[two-stage review]**
+## Task 7a: client-core enabler — `ContentStreamSealer::seal_chunk` + re-export streaming API **[two-stage review]**
 
-**Files:** `crates/client-app/src/upload.rs`, `crates/client-app/src/commands/upload.rs`, `state.rs`.
+`seal_from_reader`'s `emit` is SYNCHRONOUS, so it cannot drive async chunk PUTs. Since confirm knows
+`content_chunk_count` (from the record), add a random-access per-index seal so confirm can loop with async PUTs
+and resume from a saved index. Also fix the missing crate-root re-exports of the Task-2 streaming API.
 
-This task REPLACES the Task-5 bridge (`build_upload` full-bundle-in-RAM for video) with the true streaming
-passes, and WIRES the `StagingRecord` module (Task 5) into stage/confirm (persisting it + moving `out.mp4` into
-the app staging area so Task 8 can resume). Images/blogs keep the existing `build_upload`+`run_pipeline` path.
+- [ ] Add `ContentStreamSealer::seal_chunk(&self, index: u64, plaintext: &[u8], is_last: bool) -> Vec<u8>`
+  delegating to `maxsecu_crypto::seal_chunk(&self.subkey, &ChunkAad{file_id,version,stream_type,chunk_index:
+  index,is_last}, plaintext)` — BYTE-IDENTICAL to `seal_from_reader`/`seal_stream` for the same index (parity
+  test required). Extend `client-core/src/lib.rs` `pub use upload::{…}` to export `ContentStreamSealer,
+  SmallStreams, StreamingUploadBuilder, UploadRecords, resume_content_sealer`.
+- [ ] Commit: `feat(core): ContentStreamSealer::seal_chunk (random-access per-index seal for async streaming PUT) + re-export streaming upload API`.
 
-- [ ] **Step 1 (failing unit/e2e-lite):** A test driving the streaming confirm against an in-memory/loopback
-  sink that asserts: content is uploaded by streaming from the on-disk `out.mp4` via
-  `ContentStreamSealer::seal_from_reader` (the emitted per-index ciphertext PUT == what the manifest digest
-  committed), only O(one-chunk) buffers are held (no `content: Vec<u8>` of the whole file), progress callbacks
-  report `{done,total,bytes_per_s}`, and finalize is called once. (Use a small `out.mp4` fixture.)
-- [ ] **Step 2:** Implement: `stage_upload` (video) runs **pass 1** — a `StreamingUploadBuilder` (Task 2);
-  `builder.content_sealer(&params).seal_from_reader(File(out.mp4), |_,_| Ok(()))` → `(content_chunk_count,
-  content_digest)`; seal the small streams into `SmallStreams`; `builder.finish(...)` → `UploadRecords`;
-  persist the `StagingRecord` (Task 5) + move `out.mp4` into the app staging area; hold the file-backed preview
-  — NO network. `confirm_upload` (video) → `POST /v1/files` (from `UploadRecords`) → PUT the small
-  `SealedStreamOut` chunks → **pass 2**: `resume_content_sealer`/the builder's sealer re-opens `out.mp4` and
-  `seal_from_reader(file, emit)` where `emit(index, ct)` PUTs the chunk (retry-per-chunk, idempotent) and
-  SKIPS indices `< progress`, persisting `progress` after each successful PUT → `finalize` → delete the staging
-  record + `out.mp4` + staging dir. Emit `UploadPhase`/progress with **MB/s** (rolling ~2s window). Keep the
-  DEK inside client-core (only ciphertext chunks cross). Images/blogs stay on the old path.
-- [ ] **Step 3:** `cargo test -p maxsecu-client-app --lib` + `cargo build -p maxsecu-client-app` → PASS.
-- [ ] **Step 4:** Commit: `feat(video): streaming stage/confirm — pass-1 digest + pass-2 seal-and-PUT from disk, O(one-chunk) RAM, MB/s progress`.
+**Security pass:** `seal_chunk` reuses the tested `crypto::seal_chunk` with the exact `seal_stream` AAD/nonce
+framing (parity-tested); the subkey stays private; no digest recompute needed (already committed at pass 1).
 
-**Security pass:** the DEK stays in client-core across both passes; only ciphertext chunks + sliced-plaintext
-preview cross the seam; progress persistence writes no secret; retry is idempotent by index.
+## Task 7b: client-app streaming stage/confirm pipeline + MB/s **[two-stage review]**
+
+**Files:** `crates/client-app/src/{upload.rs,commands/upload.rs,jobs.rs,layout.rs}`.
+
+REPLACES the Task-5a bridge (`build_upload` full-bundle-in-RAM for video) with the true streaming passes, and
+WIRES the `StagingRecord` (Task 5b) into stage/confirm. Images/blogs keep the existing `build_upload` +
+`run_pipeline` path unchanged.
+
+- [ ] **Enablers:** add `staging` to `layout::ensure_portable_layout` (the staging root is `<appdir>/staging`).
+  Change `StagedUpload` to hold `content: StagedContent` where `enum StagedContent { InRam(UploadBundle) /*image,
+  blog*/, Streaming(StagingRecord) /*video*/ }` (update `confirm_inner`, `cancel_upload`, `upload_jobs`,
+  `bundle_file_type_str`, and the `staged()` test helper accordingly). `job_dir` for video is now the staging
+  dir.
+- [ ] **Step 1 (failing unit):** A test that seals a small on-disk fixture the streaming way and asserts the
+  per-index `seal_chunk` ciphertext matches `open_stream`-decrypt back to the original bytes; and a MB/s
+  `throughput(bytes, elapsed)` helper (pure) round-trips.
+- [ ] **Step 2 — stage (NO network):** `stage_upload` (video): after `prepare` → `PreparedVideo`, resolve
+  recipients + build `UploadParams` (as today). **Pass 1 (off the session lock, DEK-only):**
+  `let builder = StreamingUploadBuilder::new(); let sealer = builder.content_sealer(&params);
+  let (count, digest) = sealer.seal_from_reader(&mut File::open(out_mp4)?, |_,_| Ok(()))?;`. Build
+  `SmallStreams { metadata: Some(prepared.metadata), thumbnail: Some(prepared.thumbnail), preview:
+  Some(prepared.preview) }`. **Under the session lock** (identity borrowed, for signing/self-wrap):
+  `let records = builder.finish(&params, &small, digest, count)?;`. Build a `StagingRecord` from `records`
+  (encode manifest/genesis via `maxsecu_encoding::encode`, wraps→`StagedWrap` wire, small `SealedStreamOut`→
+  `StagedSmallStream`, `chunk_size`, `content_chunk_count = count`, `progress: 0`, timestamps). **Move**
+  `out.mp4` into `StagingStore::dir_for(file_id)` and set the record's `out_mp4_path` there; `persist` the
+  record; delete the now-empty temp job dir. File-backed preview points at the moved `out.mp4`. Store
+  `StagedUpload{ content: Streaming(record), job_dir: Some(staging_dir), preview, … }`. NO network.
+- [ ] **Step 3 — confirm (streaming, async):** `confirm_inner` branches on `StagedContent`. For `Streaming(rec)`:
+  reauth → `POST /v1/files` with a body built FROM THE RECORD (manifest/genesis/wraps/small-stream metadata —
+  a `stage_body_from_record`) → PUT each small stream's chunks (from `rec.small_streams`) → **pass 2:** recover
+  the sealer via `resume_content_sealer(identity, self_wrap_from_record, ctx, suite_from_decoded_manifest,
+  file_id, 1, rec.chunk_size)`; open `out.mp4`; for `i in rec.progress..rec.content_chunk_count`: `seek(i*
+  chunk_size)`, read ≤`chunk_size` bytes, `let ct = sealer.seal_chunk(i, &buf, i == count-1);` PUT
+  `content` chunk `i` (retry-per-chunk, idempotent) → set `rec.progress = i+1; rec.last_progress_ms = now;`
+  `store.persist(&rec)` → emit `{done,total,bytes_per_s}` (MB/s rolling ~2s) → `finalize` → `store.remove` +
+  delete the staging dir/`out.mp4`. On failure, retain the record (retry). Keep the DEK in client-core (only
+  ciphertext chunks cross). `total = content_chunk_count + Σ small chunk_count`.
+- [ ] **Step 4:** `cargo test -p maxsecu-client-app --lib` + `cargo build -p maxsecu-client-app` → PASS.
+- [ ] **Step 5:** Commit: `feat(video): streaming stage/confirm — pass-1 digest + pass-2 per-index seal-and-PUT from disk, O(one-chunk) RAM, MB/s progress`.
+
+**Security pass:** the DEK is recovered IN client-core (`resume_content_sealer`) and never crosses the seam;
+only ciphertext chunks cross; O(one 6 MiB chunk) RAM in pass 2 (seek+read one chunk at a time); progress
+persistence writes no secret; retry idempotent by index; the moved `out.mp4` sits in the app staging dir
+(swept by Task 8).
 
 ## Task 8: resume-on-launch + 24h sweep + cancel/abandon + server discard **[two-stage review]**
 
