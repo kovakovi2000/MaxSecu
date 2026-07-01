@@ -188,7 +188,7 @@ git commit -m "feat(player): no autoplay — playback starts only on explicit pl
 
 ---
 
-## Task 3: Position + duration tracking
+## Task 3: Position + duration tracking, and correct playback origin
 
 **Files:**
 - Modify: `crates/client-app/ui/src/core/player.ts`
@@ -196,10 +196,14 @@ git commit -m "feat(player): no autoplay — playback starts only on explicit pl
 
 Expose the live play **position** (from the clock, not the last drawn frame) and a settable **duration**, so the timer shows `0:23 / 0:59` instead of sticking at `0:00`.
 
-- [ ] **Step 1: Write the failing test**
+**Also fix the playback origin under no-autoplay (introduced by Task 2).** Today the origin (`playbackStart`) is captured on the first *frame/audio arrival* via `ensurePlaybackStart()`. With no autoplay, a user who buffers a poster and waits before pressing Play would get a stale origin — the whole buffer would read as "due" and skip. The origin must be captured at **`play()`**, and the `AudioContext` must start **suspended** so the clock is frozen and any pre-play audio chunks stay silent until Play.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add both tests at the end of `player.test.ts`:
 
 ```typescript
-test("positionMs tracks the clock; duration is settable", () => {
+test("positionMs tracks the clock from play(); duration is settable", () => {
   const bus = makeBus();
   const audio = new FakeAudio();
   let clock = 0;
@@ -212,28 +216,64 @@ test("positionMs tracks the clock; duration is settable", () => {
   });
   player.setDuration(59000);
   assert.strictEqual(player.durationMs(), 59000);
-  player.play();
-  bus.emit(EVT_VIDEO_FRAME, frameDto(0)); // establishes playbackStart at clock=0
+  player.play(); // clock=0 -> playbackStart captured at 0
   clock = 2.5; // 2.5 s elapsed
   assert.strictEqual(player.positionMs(), 2500, "position follows the clock");
   player.dispose();
 });
+
+test("origin is captured at play(), not at frame arrival (wait-then-play does not skip)", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0)); // buffered as a poster; origin NOT set yet
+  assert.strictEqual(player.positionMs(), 0, "no origin before play()");
+  clock = 5; // the user stares at the poster for 5 s
+  player.play(); // origin captured NOW (at clock=5)
+  assert.strictEqual(player.positionMs(), 0, "elapsed is 0 at play, not 5000 — no skip");
+  player.dispose();
+});
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [ ] **Step 2: Run to verify they fail**
 
 Run: `cd crates/client-app/ui && npm test`
-Expected: FAIL — `player.setDuration`/`positionMs`/`durationMs` are not functions.
+Expected: FAIL — `player.setDuration`/`positionMs`/`durationMs` not functions; and (once those exist) the wait-then-play test fails because the origin is still captured on frame arrival.
 
-- [ ] **Step 3: Implement position + duration**
+- [ ] **Step 3: Implement position/duration + the origin fix**
 
-In `player.ts`, add state near the other `let` declarations:
+In `player.ts`:
+
+(a) Add duration state near the other `let` declarations:
 
 ```typescript
   let durationMs = Math.max(0, opts.durationMs ?? 0);
 ```
 
-Add a helper (near `tick`):
+(b) **Suspend the context at init** — add this right after `gain.gain.value = volume;` in `createPlayer`:
+
+```typescript
+  // No autoplay: start suspended so the audio clock is frozen and any pre-play audio
+  // chunks stay silent until the user presses Play (which resume()s the context).
+  void audio.suspend?.();
+```
+
+(c) **Capture the origin at play()** — in `play()`, after `void audio.resume?.();`, add:
+
+```typescript
+    if (playbackStart === null) playbackStart = audioClock();
+```
+
+(d) **Stop capturing the origin on arrival** — remove the `ensurePlaybackStart();` call from the top of `onFrame` AND from the top of `onAudio`, and delete the now-unused `ensurePlaybackStart` function. (The `tick()` fallback `if (playbackStart === null) playbackStart = audioClock();` remains, so after a `seek()` — which sets `playbackStart = null` while still playing — the next tick re-captures the origin.)
+
+(e) Add the `positionMs` helper (near `tick`):
 
 ```typescript
   // Current play position in ms: elapsed since playbackStart, or 0 before it is set.
@@ -243,14 +283,14 @@ Add a helper (near `tick`):
   }
 ```
 
-Add to `PlayerOptions`:
+(f) Add to `PlayerOptions`:
 
 ```typescript
   // Total clip duration in ms (from the fragment index). May be set later via setDuration().
   durationMs?: number;
 ```
 
-Add to the `Player` interface:
+(g) Add to the `Player` interface:
 
 ```typescript
   positionMs(): number;
@@ -258,7 +298,7 @@ Add to the `Player` interface:
   setDuration(ms: number): void;
 ```
 
-Add to the returned object:
+(h) Add to the returned object:
 
 ```typescript
     positionMs,
@@ -268,16 +308,30 @@ Add to the returned object:
     },
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [ ] **Step 4: Update the Task-1 test for the init-suspend, then run**
 
-Run: `cd crates/client-app/ui && npm test`
-Expected: PASS.
+`createPlayer` now calls `audio.suspend?.()` once at construction, so the Task-1 test `"pause() suspends the audio context; play() resumes it"` (which asserts absolute counts of `1`) must become delta-based. Rewrite its assertions to capture baselines after construction:
+
+```typescript
+  const s0 = audio.suspended, r0 = audio.resumed;
+  player.play();
+  assert.strictEqual(audio.resumed, r0 + 1, "play() resumes the context");
+  player.pause();
+  assert.strictEqual(audio.suspended, s0 + 1, "pause() suspends the context");
+  player.play();
+  assert.strictEqual(audio.resumed, r0 + 2, "play() resumes again");
+```
+
+Then check the whole suite. Some existing A/V-sync tests emit frames/audio and `tick()` — they call `player.play()` before relying on timing, so the origin is now captured at that `play()`. If any pre-existing test emitted frames/audio and asserted drawing/scheduling **without** calling `play()` first (relying on origin-at-arrival), fix it minimally by calling `player.play()` at the right point (do NOT weaken assertions). Report exactly which tests you touched.
+
+Run: `cd crates/client-app/ui && npm test && npm run typecheck`
+Expected: PASS + clean typecheck.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/client-app/ui/src/core/player.ts crates/client-app/ui/src/core/player.test.ts
-git commit -m "feat(player): expose live positionMs() + settable duration for the timer"
+git commit -m "feat(player): live positionMs()/duration + capture the clock origin at play() (no-autoplay-safe)"
 ```
 
 ---
