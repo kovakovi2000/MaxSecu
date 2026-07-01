@@ -1,5 +1,6 @@
 import "media-chrome";
 import { call, on } from "../core/rpc.ts";
+import { streamSrc } from "./video-src.ts";
 import { serial } from "../core/serial.ts";
 import {
   createYuvRenderer,
@@ -314,7 +315,7 @@ export class VideoPlayer extends HTMLElement {
       await serial(() => call<void>("open_video", { fileId: this.reqId }));
       // Point the native element at the stream:// range protocol; the browser
       // owns demux/decode/seek/buffer/sync.
-      video.src = `stream://media/${this.reqId}`;
+      video.src = streamSrc(this.reqId);
     } catch (x) {
       const s = this.querySelector("#vp-status") as HTMLElement | null;
       if (s) {
