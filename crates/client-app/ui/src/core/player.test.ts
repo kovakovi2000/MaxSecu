@@ -428,9 +428,9 @@ test("ring is bounded, evicts oldest, and scrubTo draws the nearest frame", () =
   assert.strictEqual(drawn[1].pts_ms, 200);
 });
 
-// ---- bounded pending queue (D-7) -----------------------------------------
+// ---- bounded pending buffer (D-7, byte-capped) ---------------------------
 
-test("bounds the pending queue: a burst beyond the cap drops the oldest", () => {
+test("bounds the pending buffer: a burst beyond the byte cap drops the oldest", () => {
   const bus = makeBus();
   const audio = new FakeAudio();
   const drawn: YuvFrame[] = [];
@@ -440,14 +440,16 @@ test("bounds the pending queue: a burst beyond the cap drops the oldest", () => 
     renderer: (f) => drawn.push(f),
     subscribe: bus.subscribe,
     reducedMotion: true, // no autoplay/tick drain — isolate the bound
-    pendingCapacity: 4,
+    // Each 2x2 frame is y(4)+u(1)+v(1)=6 bytes; 4 frames * 6 = 24 byte cap.
+    maxBufferBytes: 24,
     audioClock: () => clock,
   });
 
   // A burst of 10 frames at increasing window-relative pts. reducedMotion holds the
-  // tick loop, so they all land in pending and the cap must shed the 6 oldest.
+  // tick loop, so they all land in pending and the byte cap must shed the 6 oldest.
   for (let i = 0; i < 10; i++) bus.emit(EVT_VIDEO_FRAME, frameDto(i * 10));
-  assert.strictEqual(player.stats().dropped, 6, "6 oldest dropped to keep the newest 4");
+  assert.strictEqual(player.stats().dropped, 6, "6 oldest dropped to stay within 24 bytes");
+  assert.ok(player.bufferedBytes() <= 24, `buffered ${player.bufferedBytes()} <= 24 bytes`);
 
   // Drain far in the future: only the latest DUE frame is drawn (catch-up), the other 3
   // retained are dropped as stale — the queue never grew unbounded.
@@ -457,9 +459,10 @@ test("bounds the pending queue: a burst beyond the cap drops the oldest", () => 
   assert.strictEqual(drawn.length, 1, "one frame drawn after catch-up");
   assert.strictEqual(drawn[0].pts_ms, 90, "the NEWEST retained frame survives");
   assert.strictEqual(player.stats().dropped, 9, "6 over-cap + 3 stale = 9 dropped");
+  assert.strictEqual(player.bufferedBytes(), 0, "buffer empty after tick drains pending");
 });
 
-test("under the pending cap nothing is dropped and sync is intact", () => {
+test("under the byte cap nothing is dropped and sync is intact", () => {
   const bus = makeBus();
   const audio = new FakeAudio();
   const drawn: YuvFrame[] = [];
@@ -469,19 +472,22 @@ test("under the pending cap nothing is dropped and sync is intact", () => {
     renderer: (f) => drawn.push(f),
     subscribe: bus.subscribe,
     reducedMotion: false,
-    pendingCapacity: 8,
+    // Each 2x2 frame is 6 bytes; 8 frames * 6 = 48 byte cap — well above 2 frames.
+    maxBufferBytes: 48,
     audioClock: () => clock,
   });
   player.play();
   bus.emit(EVT_VIDEO_FRAME, frameDto(0));
   bus.emit(EVT_VIDEO_FRAME, frameDto(100));
+  assert.strictEqual(player.bufferedBytes(), 12, "2 frames * 6 bytes each");
   clock = 0;
   player.tick();
   assert.strictEqual(drawn.length, 1, "pts=0 due, pts=100 held");
   clock = 0.1;
   player.tick();
   assert.strictEqual(drawn.length, 2, "pts=100 releases in sync");
-  assert.strictEqual(player.stats().dropped, 0, "nothing dropped under the cap");
+  assert.strictEqual(player.stats().dropped, 0, "nothing dropped under the byte cap");
+  assert.strictEqual(player.bufferedBytes(), 0, "buffer drained after both frames drawn");
 });
 
 // ---- seek ----------------------------------------------------------------
@@ -644,5 +650,25 @@ test("origin is captured at play(), not at frame arrival (wait-then-play does no
   clock = 5; // the user stares at the poster for 5 s
   player.play(); // origin captured NOW (at clock=5)
   assert.strictEqual(player.positionMs(), 0, "elapsed is 0 at play, not 5000 — no skip");
+  player.dispose();
+});
+
+test("evicts decoded frames by BYTE budget, not a fixed count", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+    // Each 2x2 frame is y(4)+u(1)+v(1) = 6 bytes; cap at 18 bytes => at most 3 frames buffered.
+    maxBufferBytes: 18,
+  });
+  player.play();
+  for (let i = 0; i < 10; i++) bus.emit(EVT_VIDEO_FRAME, frameDto(i * 1000));
+  // Buffer is byte-bounded: far more than 3 arrived, but only ~3 frames' worth is retained.
+  assert.ok(player.bufferedBytes() <= 18, `buffered ${player.bufferedBytes()} <= 18`);
   player.dispose();
 });

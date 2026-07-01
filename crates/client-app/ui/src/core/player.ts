@@ -107,17 +107,11 @@ export interface PlayerOptions {
   reducedMotion: boolean;
   // Max decoded frames retained for instant local scrub (default 16).
   ringCapacity?: number;
-  // Max decoded frames held in the pending (awaiting-pts) queue (default 96). A whole
-  // window's frames arrive together (a burst); this BOUNDS the WebView's decoded-frame
-  // memory so an extreme (4K+) clip can't accumulate unbounded I420 planes. Over the cap
-  // the OLDEST pending frame is dropped (counted toward dropped) — the same catch-up
-  // posture tick() already uses for stale frames.
-  // A COUNT cap (not bytes) is safe here because the upstream client-app already enforces
-  // a BYTE cap (MAX_FRAME_BUF_BYTES = 64 MiB) before frames cross the seam: at 8K only
-  // ~1 frame per fragment survives, ~5 at 4K, so `pending` only ever approaches this count
-  // at lower resolutions where each frame's absolute footprint (and thus 96 frames) is
-  // modest. The two caps compose to bound the total decoded-frame footprint end to end.
-  pendingCapacity?: number;
+  // Byte ceiling on the decoded-frame buffer (default 192 MiB). Decoded I420 frames are
+  // ~1.4 MB each, so this bounds WebView RAM regardless of clip length. Over the cap the
+  // OLDEST frame is dropped (counted). A byte cap (not a frame count) is correct because a
+  // 4K frame is ~12 MB and a 1080p frame ~3 MB.
+  maxBufferBytes?: number;
   // Total clip duration in ms (from the fragment index). May be set later via setDuration().
   durationMs?: number;
   // Master clock in SECONDS; defaults to audio.currentTime. Injectable so tests
@@ -163,6 +157,8 @@ export interface Player {
   durationMs(): number;
   // Update the clip duration (from the fragment index, available after headers are parsed).
   setDuration(ms: number): void;
+  // Total bytes currently held in the decoded-frame pending buffer.
+  bufferedBytes(): number;
 }
 
 // ---- portable base64 (atob may be absent under node) ---------------------
@@ -212,7 +208,9 @@ export function createPlayer(opts: PlayerOptions): Player {
   const audio = opts.audio;
   const subscribe: Subscribe = opts.subscribe ?? on;
   const ringCapacity = Math.max(1, opts.ringCapacity ?? 16);
-  const pendingCapacity = Math.max(1, opts.pendingCapacity ?? 96);
+  const maxBufferBytes = Math.max(1, opts.maxBufferBytes ?? 192 * 1024 * 1024);
+  // Retain a little played history for tiny back-scrubs before re-decoding from Tier-1.
+  const KEEP_BEHIND_MS = 1500;
   const maxGain = opts.maxGain ?? 1;
   const toleranceSec = (opts.toleranceMs ?? 8) / 1000;
   const audioClock = opts.audioClock ?? (() => audio.currentTime);
@@ -247,6 +245,11 @@ export function createPlayer(opts: PlayerOptions): Player {
   // new window). null until play() establishes the origin.
   let playbackStart: number | null = null;
   let durationMs = Math.max(0, opts.durationMs ?? 0);
+  let bufferedBytes = 0;
+
+  function frameBytes(f: YuvFrame): number {
+    return f.y.length + f.u.length + f.v.length;
+  }
 
   gain.gain.value = volume;
   // No autoplay: start suspended so the audio clock is frozen and any pre-play audio
@@ -290,15 +293,8 @@ export function createPlayer(opts: PlayerOptions): Player {
       v: decodeBase64(dto.v_b64),
     };
     pending.push(frame);
-    // Bound the pending queue: a window's frames arrive together (a burst), so without a
-    // cap the WebView could accumulate unbounded decoded I420 planes for an extreme (4K+)
-    // clip. Over the cap, drop the OLDEST pending frame (count it) — the catch-up posture
-    // tick() uses for stale frames. The client-app already bounds frames-per-fragment
-    // before they cross the seam; this is the WebView-side backstop (D-7).
-    while (pending.length > pendingCapacity) {
-      pending.shift();
-      droppedCount++;
-    }
+    bufferedBytes += frameBytes(frame);
+    evictBuffer();
     pushRing(frame);
   }
 
@@ -349,6 +345,21 @@ export function createPlayer(opts: PlayerOptions): Player {
     return Math.max(0, Math.round((audioClock() - playbackStart) * 1000));
   }
 
+  // Keep the decoded buffer bounded: first drop frames well behind the playhead
+  // (a back-scrub re-decodes from the Tier-1 cache), then enforce the byte ceiling
+  // by dropping the oldest. Always keep at least one frame so tick() has something.
+  function evictBuffer(): void {
+    const floor = positionMs() - KEEP_BEHIND_MS;
+    while (pending.length > 1 && pending[0].pts_ms < floor) {
+      bufferedBytes -= frameBytes(pending.shift() as YuvFrame);
+      droppedCount++;
+    }
+    while (pending.length > 1 && bufferedBytes > maxBufferBytes) {
+      bufferedBytes -= frameBytes(pending.shift() as YuvFrame);
+      droppedCount++;
+    }
+  }
+
   // ---- A/V sync scheduler ----
   // Audio is master. Walk the pending queue: future frames (pts beyond clock +
   // tolerance) are HELD; among consecutive DUE frames only the latest is drawn
@@ -365,10 +376,11 @@ export function createPlayer(opts: PlayerOptions): Player {
       const head = pending[0];
       const ptsSec = head.pts_ms / 1000;
       if (ptsSec > now + toleranceSec) break; // future: hold
-      if (toDraw !== null) droppedCount++; // previous due frame is stale
+      if (toDraw !== null) { droppedCount++; bufferedBytes -= frameBytes(toDraw); } // previous due frame is stale
       toDraw = pending.shift() as YuvFrame;
     }
     if (toDraw) {
+      bufferedBytes -= frameBytes(toDraw);
       drawnCount++;
       drawFrame(toDraw);
     }
@@ -394,6 +406,7 @@ export function createPlayer(opts: PlayerOptions): Player {
     // Drop the local window; the component will request a fresh one. Stop any
     // already-scheduled audio so it doesn't bleed over the new window.
     pending.length = 0;
+    bufferedBytes = 0;
     ring.length = 0;
     nextAudioTime = 0;
     // A new window restarts the timeline: re-establish the playback origin from the
@@ -451,6 +464,7 @@ export function createPlayer(opts: PlayerOptions): Player {
     for (const un of unlisteners) un();
     unlisteners.length = 0;
     pending.length = 0;
+    bufferedBytes = 0;
     ring.length = 0;
   }
 
@@ -476,6 +490,7 @@ export function createPlayer(opts: PlayerOptions): Player {
     setDuration: (ms: number) => {
       durationMs = Math.max(0, ms);
     },
+    bufferedBytes: () => bufferedBytes,
   };
 }
 
