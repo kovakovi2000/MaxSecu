@@ -53,7 +53,7 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT,
+    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
@@ -819,7 +819,7 @@ fn setup_confined_child(
             ptr::null(),
             ptr::null(),
             1, // inherit handles (the child pipe ends)
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
             ptr::null(),
             ptr::null(),
             &si as *const STARTUPINFOEXW as *const STARTUPINFOW,
@@ -1286,7 +1286,7 @@ fn setup_confined_exe_child(
             ptr::null(),
             ptr::null(),
             1, // inherit handles (the child NUL stdio + the child stderr write end)
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
             ptr::null(),
             ptr::null(),
             &si as *const STARTUPINFOEXW as *const STARTUPINFOW,
