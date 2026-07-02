@@ -156,13 +156,17 @@ allow = [
     # CDLA-Permissive-2.0 — the Community Data License Agreement, Permissive
     # variant: a permissive *data* license (attribution/no-copyleft, commercial
     # use and redistribution allowed), used because `webpki-roots`' payload is
-    # data (the Mozilla CA root-cert bundle), not code. Required by exactly one
-    # crate: `webpki-roots` (`crates/server`, `dropbox_tier` — the real Dropbox
+    # data (the Mozilla CA root-cert bundle), not code. Required by two crates:
+    # `webpki-roots` in `crates/server` (`dropbox_tier` — the real Dropbox
     # cold-tier adapter needs the public WebPKI root set to verify
     # api.dropboxapi.com / content.dropboxapi.com, unlike the sink/app-server
-    # transports which pin a private cert). `cargo tree -i webpki-roots` shows
-    # only `rustls-pki-types` beneath it — no C, no `ring`. Remove if the server
-    # drops direct Dropbox egress or switches to `rustls-native-certs`.
+    # transports which pin a private cert) and `webpki-roots` in `crates/client-app`
+    # (`direct_link` — the client's direct-link download route fetches the
+    # server-brokered cloud URL, e.g. Dropbox's public `dl.dropboxusercontent.com`,
+    # which likewise needs the public root set rather than the pinned server cert).
+    # `cargo tree -i webpki-roots` shows only `rustls-pki-types` beneath it — no C,
+    # no `ring`. Remove if both drop direct cloud egress or switch to
+    # `rustls-native-certs`.
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9

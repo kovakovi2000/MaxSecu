@@ -155,6 +155,19 @@ impl FragmentCache {
         }
     }
 
+    /// Explicitly drop `(file_id_hex, seq)` if present (no-op otherwise, never an
+    /// error). Used by the direct-link download route: `feed_fragment` writes a
+    /// fragment's ciphertext to the cache BEFORE the AEAD check that would catch a
+    /// tampered direct-sourced chunk, so a caller that retries a failed range via
+    /// the server proxy must evict the (possibly poisoned) cache entry first —
+    /// otherwise the retry would read the same bad bytes back as a cache "hit"
+    /// and never actually re-fetch.
+    pub fn evict(&mut self, file_id_hex: &str, seq: u32) {
+        if let Ok(key) = validated_key(file_id_hex) {
+            self.remove_entry(&(key, seq));
+        }
+    }
+
     /// Evict the single least-recently-used entry. Returns `false` if empty.
     fn evict_one(&mut self) -> bool {
         let victim = self
@@ -357,6 +370,22 @@ mod tests {
         // The stale index entry was dropped (fail-closed).
         assert!(!c.contains("ab", 0));
         assert_eq!(c.total_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evict_drops_a_present_entry_and_is_a_noop_otherwise() {
+        let dir = tmp_dir("evict");
+        let mut c = FragmentCache::open(&dir, 1024).unwrap();
+        c.put("aa", 0, b"ciphertext").unwrap();
+        assert!(c.contains("aa", 0));
+        c.evict("aa", 0);
+        assert!(!c.contains("aa", 0));
+        assert_eq!(c.get("aa", 0), None);
+        assert_eq!(c.total_bytes(), 0);
+        // Evicting an absent key, or a malformed/traversal key, never panics/errors.
+        c.evict("aa", 0);
+        c.evict("../evil", 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

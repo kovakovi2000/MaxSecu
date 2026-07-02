@@ -2380,6 +2380,7 @@ dependencies = [
 name = "maxsecu-client-app"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "http",
  "http-body-util",
@@ -2401,6 +2402,7 @@ dependencies = [
  "tauri-build",
  "tokio",
  "tokio-rustls",
+ "webpki-roots",
  "zeroize",
 ]
 

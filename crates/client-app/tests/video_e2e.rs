@@ -415,11 +415,21 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
     .await
     .unwrap();
 
-    // (c) Header (small streams only — no content fetched here).
-    let header: StreamHeader =
-        build_stream_header(&mut c.sender, "localhost", &token, &fid_hex, &view)
-            .await
-            .unwrap();
+    // (c) Header (small streams only — no content fetched here). PreferServer +
+    // no direct-link transport: this e2e proves the range-streaming plumbing,
+    // not the direct-link route (that's `direct_link.rs`'s own mock-HTTP unit
+    // tests + the coarse retry wired into `commands/video.rs`).
+    let (header, _used_direct): (StreamHeader, bool) = build_stream_header(
+        &mut c.sender,
+        "localhost",
+        &token,
+        &fid_hex,
+        &view,
+        maxsecu_client_app::config::RouteMode::PreferServer,
+        None,
+    )
+    .await
+    .unwrap();
 
     // (d) TCB header ladder: verify, parse authenticated fragment index, derive decryptor.
     let ctx = VerifyContext {
@@ -486,6 +496,7 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
             chunk_size: 4096u64,
             total_len: content_len as u64,
             channel: Some(channel),
+            route_mode: maxsecu_client_app::config::RouteMode::PreferServer,
         },
     );
 

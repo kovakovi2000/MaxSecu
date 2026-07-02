@@ -39,6 +39,7 @@ async fn dev_server_boots_and_client_bootstraps() {
         cold_tier: ColdTierCfg::Off,
         cache_capacity_bytes: 200_000_000_000,
         offload_idle_days: 30,
+        direct_links_enabled: false,
     };
 
     // Boot.

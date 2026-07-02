@@ -38,6 +38,11 @@ pub struct LauncherConfig {
     /// Not-requested-for span after which a chunk is offloaded by the background
     /// idle sweep, in whole days.
     pub offload_idle_days: u64,
+    /// Whether the `POST .../direct-link` endpoint (`server::http::direct_link`)
+    /// brokers short-lived cloud-tier links at all. Off by default (server-proxy
+    /// only) — `MAXSECU_DIRECT_LINKS=1`/`true` turns it on. Wired verbatim into
+    /// `AppState.direct_links_enabled` in both profile branches (`run.rs`).
+    pub direct_links_enabled: bool,
 }
 
 /// Default port for the portable server.
@@ -102,6 +107,12 @@ impl LauncherConfig {
             .filter(|&n| n > 0)
             .unwrap_or(DEFAULT_OFFLOAD_IDLE_DAYS);
 
+        // Direct-link downloads: off unless explicitly turned on. Any other value
+        // (absent, empty, typo) fails closed to Off, mirroring the cold-tier rule
+        // above (never silently enable a feature that skips the server proxy).
+        let direct_links_enabled =
+            matches!(env("MAXSECU_DIRECT_LINKS").as_deref(), Some("1") | Some("true"));
+
         LauncherConfig {
             data_dir,
             port,
@@ -110,6 +121,7 @@ impl LauncherConfig {
             cold_tier,
             cache_capacity_bytes,
             offload_idle_days,
+            direct_links_enabled,
         }
     }
 
@@ -200,5 +212,28 @@ mod tests {
         ]));
         assert_eq!(c.cold_tier, ColdTierCfg::Off);
         assert_eq!(c.cache_capacity_bytes, 200_000_000_000); // 0 rejected → default
+    }
+
+    #[test]
+    fn direct_links_default_off_and_only_explicit_1_or_true_turn_it_on() {
+        // Default (env absent) — off.
+        assert!(!LauncherConfig::from_parts(env(&[])).direct_links_enabled);
+        // Explicit "1" and "true" — on.
+        assert!(
+            LauncherConfig::from_parts(env(&[("MAXSECU_DIRECT_LINKS", "1")]))
+                .direct_links_enabled
+        );
+        assert!(
+            LauncherConfig::from_parts(env(&[("MAXSECU_DIRECT_LINKS", "true")]))
+                .direct_links_enabled
+        );
+        // Anything else (typo, "0", "false", empty) fails closed to off.
+        for v in ["0", "false", "yes", "TRUE", ""] {
+            assert!(
+                !LauncherConfig::from_parts(env(&[("MAXSECU_DIRECT_LINKS", v)]))
+                    .direct_links_enabled,
+                "value {v:?} must not enable direct links"
+            );
+        }
     }
 }
