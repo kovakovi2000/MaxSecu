@@ -47,12 +47,12 @@ use base64::Engine;
 
 use maxsecu_ceremony_harness::Ceremony;
 use maxsecu_client_app::directory::resolve_recovery_recipient;
-use maxsecu_client_app::upload::{prepare_video_streams, run_pipeline};
+use maxsecu_client_app::upload::{prepare_video_streams, run_pipeline, VIDEO_CHUNK_SIZE};
 use maxsecu_client_app::video::parse_fragment_index;
 use maxsecu_client_core::video::{validate_i420, ClientMsg, VideoBounds, WorkerMsg};
 use maxsecu_client_core::{
     build_upload, verify_and_open, DirectoryVerifier, DownloadBundle, Identity, MemoryTrustStore,
-    StreamChunks, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
+    PlaintextStreams, StreamChunks, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_crypto::{sha256, EncPublicKey, WrappedDek};
 use maxsecu_encoding::labels;
@@ -65,7 +65,7 @@ use maxsecu_server::{
 const VOUCHER: &str = "in-person-code-001";
 const VOUCHER2: &str = "in-person-code-002";
 const TS: u64 = 1_719_500_000_000;
-const CHUNK: usize = 4096; // == upload chunk_size == TRANSCODE_CHUNK_SIZE
+const CHUNK: usize = VIDEO_CHUNK_SIZE as usize; // == upload chunk_size == video fragment-index unit (6 MiB)
 
 // ---- worker-binary discovery (workspace target dir) -----------------------
 
@@ -464,7 +464,7 @@ async fn phase7_video_upload_over_real_tls() {
     // only AFTER this gate). The two confined spawns (ffmpeg, then the re-mux worker)
     // each run with no net/keys/children; `prepare_video_streams`'s signature is the
     // hard guarantee.
-    let (streams, fragments) = prepare_video_streams(
+    let prepared = prepare_video_streams(
         &source_path,
         &ffmpeg,
         &TranscodeOptions::default(),
@@ -476,14 +476,26 @@ async fn phase7_video_upload_over_real_tls() {
     )
     .expect("GATE T: the confined ffmpeg + re-mux produced canonical streams");
     let _ = std::fs::remove_dir_all(&src_dir);
+    // The handle keeps the transcoded fMP4 on DISK (content is not in RAM). Reconstruct
+    // the in-memory `PlaintextStreams`/`fragments` the round-trip gates work against.
+    let content = std::fs::read(&prepared.out_mp4_path).expect("read transcoded fMP4");
+    let fragments = prepared.fragments.clone();
+    let streams = PlaintextStreams {
+        content,
+        metadata: Some(prepared.metadata.clone()),
+        thumbnail: Some(prepared.thumbnail.clone()),
+        preview: Some(prepared.preview.clone()),
+    };
+    // `prepare_video_streams` no longer deletes its temp dir on success — the test owns it.
+    let _ = std::fs::remove_dir_all(&prepared.job_dir);
     assert!(
         !fragments.is_empty(),
         "GATE T: the re-mux produced at least one canonical fragment"
     );
     let canonical = streams.content.clone();
     assert!(
-        !canonical.is_empty() && canonical.len() % CHUNK == 0,
-        "GATE T: canonical content is whole 4096-byte chunks"
+        !canonical.is_empty(),
+        "GATE T: canonical content is non-empty (the fMP4 is not chunk-aligned)"
     );
     // The thumbnail + preview are DERIVED from ffmpeg's first-frame PNG via the
     // pure-Rust image codec (this key-holding process stays codec-free).
@@ -508,12 +520,15 @@ async fn phase7_video_upload_over_real_tls() {
             "GATE M: parsed fragment matches the transcode output"
         );
     }
-    // The index tiles the canonical content exactly in 4096-byte chunks.
+    // The index tiles the canonical content in VIDEO_CHUNK_SIZE chunks; the LAST chunk
+    // is short (the fMP4 is not a whole multiple of the chunk size), so coverage is
+    // asserted in chunk COUNT rather than byte length.
     let last = parsed.last().unwrap();
+    let total_chunks = (canonical.len() as u64).div_ceil(CHUNK as u64);
     assert_eq!(
-        (last.chunk_start + last.chunk_len) as usize * CHUNK,
-        canonical.len(),
-        "GATE M: fragment ranges cover the cmaf exactly"
+        last.chunk_start + last.chunk_len,
+        total_chunks,
+        "GATE M: fragment ranges cover the content's chunk count exactly"
     );
 
     // ---- GATE D: the STAGED canonical content decodes to source dims in the
@@ -524,7 +539,8 @@ async fn phase7_video_upload_over_real_tls() {
         }];
         for fr in &parsed {
             let start = fr.chunk_start as usize * CHUNK;
-            let end = (fr.chunk_start + fr.chunk_len) as usize * CHUNK;
+            // The last chunk is short (the fMP4 is not chunk-aligned) — clamp to len.
+            let end = ((fr.chunk_start + fr.chunk_len) as usize * CHUNK).min(canonical.len());
             script.push(ClientMsg::Fragment {
                 seq: fr.seq,
                 bytes: canonical[start..end].to_vec(),
@@ -614,7 +630,7 @@ async fn phase7_video_upload_over_real_tls() {
     .await
     .unwrap();
 
-    // ---- GATE P: build_upload(Video, chunk_size 4096) + run_pipeline → round-trip ----
+    // ---- GATE P: build_upload(Video, chunk_size VIDEO_CHUNK_SIZE) + run_pipeline → round-trip ----
     let file_id = Id(maxsecu_crypto::random_array::<16>());
     let fid_hex = hex(&file_id.0);
     let bundle = build_upload(
@@ -624,7 +640,7 @@ async fn phase7_video_upload_over_real_tls() {
             owner_key_version: 1,
             file_id,
             file_type: FileType::Video,
-            chunk_size: 4096,
+            chunk_size: VIDEO_CHUNK_SIZE,
             recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
             recovery_mlkem_pub: rr.mlkem_pub,
             created_at: Timestamp(TS),
