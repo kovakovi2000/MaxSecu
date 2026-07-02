@@ -72,6 +72,19 @@ pub async fn get_bytes(
     Ok((status, bytes))
 }
 
+/// DELETE a resource and return `(status, json)`. `bearer` adds the channel-bound
+/// `Authorization: MaxSecu-Session <hex>` header when `Some`. `host` is the connect
+/// host threaded into the `Host` header. Used for best-effort server-orphan cleanup
+/// on cancel / dismiss / 24 h sweep (ignoring 404/409 as normal outcomes).
+pub async fn delete_req(
+    sender: &mut SendRequest<Full<Bytes>>,
+    uri: &str,
+    bearer: Option<&str>,
+    host: &str,
+) -> Result<(StatusCode, serde_json::Value), UiError> {
+    send(sender, "DELETE", uri, None, bearer, host).await
+}
+
 /// PUT a raw `application/octet-stream` body (a ciphertext chunk); return the
 /// status. `host` threaded into the Host header; `bearer` for the channel-bound
 /// session. (Idempotent by index server-side → safe to retry / resume.)

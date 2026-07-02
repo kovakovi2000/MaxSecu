@@ -252,3 +252,14 @@ pub struct UploadJobView {
     pub file_type: String,
     pub total_chunks: u64,
 }
+
+/// One pending (interrupted) upload returned by `list_pending_uploads` for the
+/// cross-restart resume prompt. No bundle, no key material — only the information
+/// the UI needs to label the entry and show a progress fraction.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PendingUploadView {
+    pub file_id_hex: String,
+    pub title: String,
+    pub progress: u64,
+    pub total: u64,
+}

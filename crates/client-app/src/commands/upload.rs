@@ -32,12 +32,12 @@ use crate::commands::connection::{open_conn, reauth, server_of};
 use crate::config::{load_directory_pub, recovery_recipient_username};
 use crate::directory::{resolve_my_binding, resolve_recovery_recipient};
 use crate::dto::{
-    CancelUploadRequest, ConfirmUploadRequest, StageUploadRequest, UploadJobView, UploadKind,
-    UploadPreview,
+    CancelUploadRequest, ConfirmUploadRequest, PendingUploadView, StageUploadRequest, UploadJobView,
+    UploadKind, UploadPreview,
 };
 use crate::error::UiError;
 use crate::ffmpeg_bin::ensure_ffmpeg;
-use crate::http_client::post_json;
+use crate::http_client::{delete_req, post_json};
 use crate::jobs::{StagedContent, StagedUpload, StagedVideoPreview, UploadJobs, VideoPrepareCancel};
 use crate::state::{PreparePhase, UploadPhase, EVT_UPLOAD, EVT_VIDEO_PREPARE};
 use crate::upload::{
@@ -705,30 +705,43 @@ async fn streaming_confirm(
 ) -> Result<(), UiError> {
     use maxsecu_encoding::structs::Manifest;
 
-    // ── Step 1: POST /v1/files ────────────────────────────────────────────────
-    let body = stage_body_from_record(rec);
-    let (st, _) = post_json(sender, "/v1/files", &body, Some(token), host).await?;
-    if st != hyper::StatusCode::CREATED {
-        return Err(UiError::new("stage_failed", "Could not start the upload."));
-    }
-
-    // ── Step 2: PUT small-stream chunks ──────────────────────────────────────
+    // ── Steps 1+2: POST /v1/files + small-stream PUT (skipped on resume) ─────
+    //
+    // Guard: if `progress > 0` the file-version is already staged on the server
+    // and its small streams are already uploaded.  Re-POSTing `/v1/files` would
+    // trigger a `DELETE FROM file_versions WHERE finalized=false` cascade on the
+    // server, silently wiping all content chunks `0..progress`.  Skip directly to
+    // the content pass-2 loop in that case; the finalize step is unchanged.
+    //
+    // When `progress == 0` (fresh confirm OR a resume that failed before any chunk
+    // was PUT), the POST+small run harmlessly re-stages any partial server state.
     let small_done: u64 = rec.small_streams.iter().map(|s| s.chunk_count).sum();
     let mut done: u64 = 0;
-    for s in &rec.small_streams {
-        let stype = stream_type_from_u8(s.stream_type).ok_or_else(|| {
-            UiError::new("upload_chunk_failed", "Bad stream type in staging record.")
-        })?;
-        for (i, chunk) in s.chunks.iter().enumerate() {
-            put_chunk_retried(sender, host, token, file_id_hex, stype, i as u64, chunk)
-                .await?;
-            done += 1;
-            emit(UploadPhase::Uploading {
-                job_id: job_id.to_owned(),
-                done,
-                total: total_for_progress,
-                bytes_per_s: 0,
-            });
+
+    if rec.progress == 0 {
+        // ── Step 1: POST /v1/files ────────────────────────────────────────────
+        let body = stage_body_from_record(rec);
+        let (st, _) = post_json(sender, "/v1/files", &body, Some(token), host).await?;
+        if st != hyper::StatusCode::CREATED {
+            return Err(UiError::new("stage_failed", "Could not start the upload."));
+        }
+
+        // ── Step 2: PUT small-stream chunks ──────────────────────────────────
+        for s in &rec.small_streams {
+            let stype = stream_type_from_u8(s.stream_type).ok_or_else(|| {
+                UiError::new("upload_chunk_failed", "Bad stream type in staging record.")
+            })?;
+            for (i, chunk) in s.chunks.iter().enumerate() {
+                put_chunk_retried(sender, host, token, file_id_hex, stype, i as u64, chunk)
+                    .await?;
+                done += 1;
+                emit(UploadPhase::Uploading {
+                    job_id: job_id.to_owned(),
+                    done,
+                    total: total_for_progress,
+                    bytes_per_s: 0,
+                });
+            }
         }
     }
 
@@ -878,15 +891,27 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usiz
 
 /// `cancel_upload` — drop a staged (pre-confirm or retained-after-failure) job.
 /// Also deletes the per-job dir (video staging dir or None for image/blog) so no
-/// artifacts linger on disk.
+/// artifacts linger on disk.  For streaming (video) jobs, additionally issues a
+/// best-effort server DELETE so the orphaned unfinalized file-version is cleaned up
+/// (server returns 204/404/409; all are silently ignored).  InRam (image/blog) jobs
+/// have no server state at cancel time — nothing was ever POSTed during stage.
 #[tauri::command]
 pub async fn cancel_upload(
     req: CancelUploadRequest,
     jobs: State<'_, UploadJobs>,
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
 ) -> Result<(), UiError> {
     if let Some(s) = jobs.0.lock().await.remove(&req.job_id) {
-        if let Some(d) = s.job_dir {
-            let _ = std::fs::remove_dir_all(&d);
+        if let Some(d) = &s.job_dir {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        // Best-effort server DELETE for streaming jobs (the file may or may not have
+        // been staged yet; 404 from the server is silently ignored).
+        if let StagedContent::Streaming(rec) = &s.content {
+            let fid_hex: String = rec.file_id.iter().map(|b| format!("{b:02x}")).collect();
+            discard_server_orphan(&dir.0, &session, &connect_lock, &fid_hex).await;
         }
     }
     Ok(())
@@ -919,6 +944,184 @@ pub async fn upload_jobs(jobs: State<'_, UploadJobs>) -> Result<Vec<UploadJobVie
 }
 
 // ---------------------------------------------------------------------------
+// Resume / sweep / dismiss helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a 32-char lowercase hex string into a 16-byte file id.
+fn parse_file_id_hex(hex: &str) -> Result<[u8; 16], UiError> {
+    if hex.len() != 32 {
+        return Err(UiError::new("bad_request", "Invalid file id."));
+    }
+    let mut bytes = [0u8; 16];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| UiError::new("bad_request", "Invalid file id."))?;
+    }
+    Ok(bytes)
+}
+
+/// Returns `true` when a staged upload has had no progress for more than 24 hours
+/// and should be swept (local dir removed + server orphan discarded).
+fn should_sweep(now_ms: u64, last_progress_ms: u64) -> bool {
+    now_ms.saturating_sub(last_progress_ms) > 24 * 60 * 60 * 1000
+}
+
+/// Best-effort server DELETE for an unfinalized file-version.  Opens a fresh
+/// authenticated channel, sends `DELETE /v1/files/<file_id_hex>`, and ignores all
+/// errors (204 / 404 / 409 / network failure are all silent).
+async fn discard_server_orphan(
+    dir: &std::path::Path,
+    session: &Session,
+    connect_lock: &ConnectLock,
+    file_id_hex: &str,
+) {
+    let server = match server_of(dir) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let (mut sender, host, token) =
+        match reauth(dir, &server, session, connect_lock).await {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+    let uri = format!("/v1/files/{file_id_hex}");
+    let _ = delete_req(&mut sender, &uri, Some(&token), &host).await;
+}
+
+// ---------------------------------------------------------------------------
+// resume_upload / list_pending_uploads / dismiss_pending_upload
+// ---------------------------------------------------------------------------
+
+/// `resume_upload` — resume an interrupted video upload from the last persisted
+/// checkpoint.  Calls `streaming_confirm` which skips the POST+small-stream phase
+/// (because `rec.progress > 0` after any chunk was PUT) and continues from
+/// `rec.progress`.  On success the staging dir is removed and `file_id_hex` is
+/// returned.  On failure the record is already checkpointed on disk with the
+/// advanced `progress`; return the error so the UI can offer another retry later.
+#[tauri::command]
+pub async fn resume_upload(
+    file_id_hex: String,
+    app: tauri::AppHandle,
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
+) -> Result<String, UiError> {
+    let file_id = parse_file_id_hex(&file_id_hex)?;
+    let store = StagingStore::new(dir.0.join("staging"));
+    let mut rec = store
+        .load(&file_id)
+        .map_err(|_| UiError::new("no_such_job", "No staged upload to resume."))?;
+
+    // Already finalized (edge case: previous run succeeded but cleanup failed).
+    if rec.finalized {
+        let _ = store.remove(&file_id);
+        return Ok(file_id_hex);
+    }
+
+    let server = server_of(&dir.0)?;
+    let (mut sender, host, token) = reauth(&dir.0, &server, &session, &connect_lock).await?;
+
+    let total: u64 = rec.content_chunk_count
+        + rec.small_streams.iter().map(|s| s.chunk_count).sum::<u64>();
+
+    // Use file_id_hex as both job_id and file_id_hex for progress events so the
+    // UI can key the tray entry by it — mirrors confirm_upload's pattern.
+    let job_id = file_id_hex.clone();
+    let emit = |p: UploadPhase| {
+        let _ = app.emit(EVT_UPLOAD, p);
+    };
+
+    emit(UploadPhase::Staging { job_id: job_id.clone() });
+
+    let result = streaming_confirm(
+        &mut rec,
+        &job_id,
+        &file_id_hex,
+        &dir.0,
+        &session,
+        &mut sender,
+        &host,
+        &token,
+        total,
+        &emit,
+    )
+    .await;
+
+    match result {
+        Ok(()) => {
+            emit(UploadPhase::Done {
+                job_id: job_id.clone(),
+                file_id: file_id_hex.clone(),
+            });
+            Ok(file_id_hex)
+        }
+        Err(e) => {
+            // The staging record already has the advanced progress on disk — a
+            // later retry (via resume_upload again) will continue from there.
+            emit(UploadPhase::Failed {
+                job_id: job_id.clone(),
+                code: e.code.clone(),
+            });
+            Err(e)
+        }
+    }
+}
+
+/// `list_pending_uploads` — scan the staging store for incomplete video uploads
+/// from previous sessions.  Any upload whose `last_progress_ms` is more than 24 h
+/// ago is SWEPT (local dir deleted + best-effort server DELETE).  The rest are
+/// returned as `PendingUploadView` for the UI's resume prompt.
+#[tauri::command]
+pub async fn list_pending_uploads(
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
+) -> Result<Vec<PendingUploadView>, UiError> {
+    let store = StagingStore::new(dir.0.join("staging"));
+    let now = now_ms();
+    let mut result = Vec::new();
+
+    for rec in store.list_pending() {
+        if should_sweep(now, rec.last_progress_ms) {
+            // Remove local staging dir (record.json + out.mp4).
+            let _ = store.remove(&rec.file_id);
+            // Best-effort server DELETE — 404 if never staged, ignored either way.
+            let fid_hex: String = rec.file_id.iter().map(|b| format!("{b:02x}")).collect();
+            discard_server_orphan(&dir.0, &session, &connect_lock, &fid_hex).await;
+        } else {
+            let total = rec.content_chunk_count
+                + rec.small_streams.iter().map(|s| s.chunk_count).sum::<u64>();
+            let fid_hex: String = rec.file_id.iter().map(|b| format!("{b:02x}")).collect();
+            result.push(PendingUploadView {
+                file_id_hex: fid_hex,
+                title: rec.title.clone(),
+                progress: rec.progress,
+                total,
+            });
+        }
+    }
+
+    Ok(result)
+}
+
+/// `dismiss_pending_upload` — the user explicitly dismisses a pending (interrupted)
+/// upload from the resume prompt.  Removes the local staging dir and issues a
+/// best-effort server DELETE.
+#[tauri::command]
+pub async fn dismiss_pending_upload(
+    file_id_hex: String,
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
+) -> Result<(), UiError> {
+    let file_id = parse_file_id_hex(&file_id_hex)?;
+    let store = StagingStore::new(dir.0.join("staging"));
+    let _ = store.remove(&file_id);
+    discard_server_orphan(&dir.0, &session, &connect_lock, &file_id_hex).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -928,6 +1131,66 @@ mod tests {
     use crate::upload_staging::{StagedSmallStream, StagedWrap, StagingRecord};
     use std::io::Cursor;
     use std::path::PathBuf;
+
+    // ── should_sweep unit tests ───────────────────────────────────────────────
+
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+
+    #[test]
+    fn should_sweep_more_than_24h_returns_true() {
+        let now = 1_700_000_000_000u64;
+        assert!(should_sweep(now, now - DAY_MS - 1));
+    }
+
+    #[test]
+    fn should_sweep_exactly_24h_returns_false() {
+        // The boundary is STRICTLY greater-than; exactly 24 h is not swept.
+        let now = 1_700_000_000_000u64;
+        assert!(!should_sweep(now, now - DAY_MS));
+    }
+
+    #[test]
+    fn should_sweep_less_than_24h_returns_false() {
+        let now = 1_700_000_000_000u64;
+        assert!(!should_sweep(now, now - HOUR_MS));
+    }
+
+    #[test]
+    fn should_sweep_future_last_progress_saturates_to_false() {
+        // last_progress_ms > now_ms (e.g. clock skew): saturating_sub → 0 → false.
+        let now = 1_700_000_000_000u64;
+        assert!(!should_sweep(now, now + 1));
+    }
+
+    #[test]
+    fn should_sweep_zero_last_progress_far_future_now_is_true() {
+        // A record that was persisted at epoch 0 is always swept once now > 24 h.
+        let now = DAY_MS + 1;
+        assert!(should_sweep(now, 0));
+    }
+
+    // ── parse_file_id_hex unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_file_id_hex_roundtrips() {
+        let id = [0xf1u8; 16];
+        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        let parsed = parse_file_id_hex(&hex).unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn parse_file_id_hex_rejects_short() {
+        assert!(parse_file_id_hex("abc").is_err());
+    }
+
+    #[test]
+    fn parse_file_id_hex_rejects_non_hex() {
+        assert!(parse_file_id_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+    }
+
+    // ── bytes_per_s tests (unchanged) ─────────────────────────────────────────
 
     #[test]
     fn bytes_per_s_computes_correctly() {
