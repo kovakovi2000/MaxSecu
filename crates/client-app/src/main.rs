@@ -60,6 +60,7 @@ fn main() {
             maxsecu_client_app::commands::admin::issue_voucher,
             maxsecu_client_app::commands::admin::request_approval,
             maxsecu_client_app::commands::recovery_custody::split_recovery_key,
+            maxsecu_client_app::commands::recovery_custody::add_recovery_share,
             maxsecu_client_app::commands::upload::stage_upload,
             maxsecu_client_app::commands::upload::confirm_upload,
             maxsecu_client_app::commands::upload::cancel_upload,
