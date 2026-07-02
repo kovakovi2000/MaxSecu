@@ -22,6 +22,7 @@ pub mod layout;
 pub mod ram;
 pub mod session;
 pub mod state;
+pub mod tor;
 pub mod transport;
 pub mod upload;
 pub mod upload_staging;

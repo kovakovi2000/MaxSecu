@@ -123,6 +123,10 @@ pub enum PlayerPhase {
 pub enum ConnectionState {
     Idle,
     Resolving,
+    /// Bootstrapping the in-process Tor client (TorOnly route, first connect only —
+    /// the client is then reused). Slow; the UI shows a distinct "connecting to Tor"
+    /// state. Emitted before TlsHandshake when the route is TorOnly.
+    TorBootstrapping,
     TlsHandshake,
     ChannelBinding,
     Connected,

@@ -80,7 +80,9 @@ webpki-roots = "1"
 # server's sqlx 0.30 in one lockfile. `rustls` (not native-tls) keeps the TLS stack
 # aligned with the pinned aws-lc-rs transport; onion-service-client is not needed
 # (we reach a normal host:port via a Tor exit). See deny.toml for the arti tree.
-arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls"] }
+# `static-sqlite` builds arti's dir-cache SQLite from source (rusqlite/bundled) so
+# the link needs no system sqlite3.lib — required on Windows where none is present.
+arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls", "static-sqlite"] }
 tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"] }
 
 [dev-dependencies]
