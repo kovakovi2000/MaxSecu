@@ -53,10 +53,8 @@
 **Goal:** remove `user_roles` from the `Store` trait + `pg`/`store`/memory/faulty impls + any callers/tests (confirm truly unused first).
 **Acceptance:** `cargo build --workspace --tests` + server tests green.
 
-## Task 7 — zstd encoder (P3.10) [two-stage]  ⚠ DECISION REQUIRED
-**Goal:** implement the `Compression::Zstd` path (encode on upload, decode on download) so `download.rs`'s `compression != None` branches are exercised.
-**⚠ Blocking sub-decision the controller MUST surface to the user before coding:** the project is deliberately **no-C** in the crypto/TCB. The mainstream `zstd` crate is a C binding; a pure-Rust encoder option is limited. Options: (a) accept a C `zstd` dep as an app-layer (non-TCB) codec; (b) use a pure-Rust zstd (decode `ruzstd` + a pure-Rust encoder if acceptable); (c) DEFER zstd and drop this task. Do not pick silently.
-**Acceptance (if built):** round-trip test (compress→upload→download→decompress == original); `cargo deny`/`audit` reviewed for the new dep. **Security pass:** decompression is bounds-capped (no zip-bomb), runs outside the DEK path.
+## Task 7 — zstd encoder (P3.10) — ⛔ DROPPED (user decision 2026-07-02)
+**DECISION (user):** **Defer & drop this task.** `Compression::Zstd` (wire tag `0x01`) stays RESERVED-but-unimplemented; `download.rs` keeps failing closed with `CompressionUnsupported` and `upload.rs` keeps emitting `Compression::None`. **Rationale:** (1) the only mature zstd codec is a **C** binding, which conflicts with the project's deliberate no-C posture (aws-lc-rs is the sole sanctioned C carve-out; ring/openssl banned) and would place a C decompressor inside `client-core` adjacent to plaintext/DEK; (2) there is no production-grade **pure-Rust zstd encoder** (`ruzstd` is decode-only), so a pure-Rust path can't satisfy "encode on upload"; (3) the content stream is already-compressed AV1/transcoded-image data, so zstd's real-world benefit here is marginal, not worth a new C dep + a zip-bomb/decompression surface. The reserved wire tag remains honest (a future increment can revisit if a vetted pure-Rust encoder emerges). No code change; this section documents the drop. **STATUS: DONE (no-op, documented).**
 
 ## Task 8 — Media Chrome Stage 2 chrome
 **Goal:** overlaid controls / fullscreen / keyboard shortcuts / auto-hide (+ buffered bar) on the native `<video>` via Media Chrome, replacing the bespoke transport controls where Media Chrome covers them. UI-only, outside the TCB.
