@@ -4,9 +4,8 @@
 //! In the chosen "two confined spawns" topology these options shape **only the
 //! ffmpeg argv** (the next task builds the argv from them) on the author side —
 //! resolution + bitrate. They cross the Tauri seam (UI → client-app) and feed the
-//! ffmpeg-argv builder; they do **not** travel the worker wire protocol (the
-//! re-mux worker already gets ffmpeg's canonical output bytes + bounds via
-//! `client-core::media::TranscodeRequest`, which this type never touches). They
+//! ffmpeg-argv builder; they never cross a worker wire protocol of their own —
+//! the re-mux worker gets ffmpeg's canonical output bytes directly. They
 //! therefore live in this **codec-free** launcher crate (which owns the ffmpeg
 //! spawn), keeping client-core's TCB and client-app codec-free.
 //!
