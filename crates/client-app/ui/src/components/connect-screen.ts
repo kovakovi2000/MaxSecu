@@ -1,6 +1,6 @@
 import { call } from "../core/rpc.ts";
 import { setUsername } from "../core/session.ts";
-import type { AccountStateMsg } from "../core/types.ts";
+import type { AccountStateMsg, Settings } from "../core/types.ts";
 
 export class ConnectScreen extends HTMLElement {
   connectedCallback() {
@@ -51,6 +51,17 @@ export class ConnectScreen extends HTMLElement {
       </main>`;
     (this.querySelector("#main") as HTMLElement).focus();
     const f = this.querySelector("#f") as HTMLFormElement;
+
+    // Initialize the "Route through Tor" checkbox from the persisted route setting
+    // (checked iff route_mode is "tor-only"). Ticking it at connect persists
+    // TorOnly back to Settings — the login⇄setting coupling lives in the `connect`
+    // command. Best-effort; on failure the box just starts unchecked.
+    call<Settings>("get_settings")
+      .then((s) => {
+        const torBox = f.querySelector('input[name="tor"]') as HTMLInputElement | null;
+        if (torBox) torBox.checked = s.connection.route_mode === "tor-only";
+      })
+      .catch(() => { /* keep default (unchecked) */ });
     const stage = this.querySelector(".connect-stage") as HTMLElement;
     const err = this.querySelector("#err") as HTMLElement;
     const status = this.querySelector("#cn-status") as HTMLElement;

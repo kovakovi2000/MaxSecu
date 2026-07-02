@@ -12,7 +12,7 @@ const DEFAULTS: Settings = {
   a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
   behavior: { confirm_destructive: false },
   performance: { ram_cache_cap_mb: 256 },
-  connection: { use_tor: false },
+  connection: { route_mode: "prefer-server" },
   appearance: { theme: "dark" },
 };
 
@@ -63,8 +63,13 @@ export class SettingsScreen extends HTMLElement {
 
           <fieldset>
             <legend>Connection</legend>
-            <label><input type="checkbox" name="use_tor" disabled /> Route over Tor
-              <span> (arrives in a later phase)</span></label>
+            <label>Download route
+              <select name="route_mode">
+                <option value="prefer-server">Prefer server (default)</option>
+                <option value="prefer-dropbox">Prefer Dropbox offload</option>
+                <option value="tor-only">Tor only</option>
+              </select></label>
+            <p class="hint">Prefer server proxies all media through the server. Prefer Dropbox downloads offloaded media directly from cloud storage when available (still verified locally). Tor only routes everything over Tor and fails closed.</p>
           </fieldset>
         </form>
 
@@ -151,6 +156,7 @@ export class SettingsScreen extends HTMLElement {
       },
       performance: { ram_cache_cap_mb: Number.isFinite(ram) ? ram : DEFAULTS.performance.ram_cache_cap_mb },
       behavior: { confirm_destructive: this.input("confirm_destructive").checked },
+      connection: { route_mode: this.sel("route_mode").value as Settings["connection"]["route_mode"] },
     };
     try {
       await updateSettings(patch);
@@ -168,7 +174,7 @@ export class SettingsScreen extends HTMLElement {
     this.input("ram_cache_cap_mb").value = String(s.performance.ram_cache_cap_mb);
     this.input("ram_range").value = String(s.performance.ram_cache_cap_mb);
     this.input("confirm_destructive").checked = s.behavior.confirm_destructive;
-    this.input("use_tor").checked = s.connection.use_tor;
+    this.sel("route_mode").value = s.connection.route_mode;
   }
 
   private async onChangePassword() {

@@ -42,12 +42,28 @@ pub async fn connect(
         .try_lock()
         .map_err(|_| UiError::new("busy", "A connection attempt is already in progress."))?;
 
-    // Honest failure: Phase 1 has no Tor; a direct TcpStream cannot route through
-    // it, so refuse rather than silently connecting in the clear.
-    if req.use_tor {
+    // Login ⇄ route-setting coupling: the connect-screen "Route through Tor"
+    // checkbox is the boolean face of the 3-way route setting. Ticking it SELECTS
+    // and PERSISTS TorOnly (so Settings reflects it); the effective mode for THIS
+    // connect is TorOnly when ticked, else the persisted route_mode.
+    let mut settings = crate::config::SettingsConfig::load(&dir.0);
+    let mode = if req.use_tor {
+        if settings.connection.route_mode != crate::config::RouteMode::TorOnly {
+            settings.connection.route_mode = crate::config::RouteMode::TorOnly;
+            let _ = settings.save(&dir.0);
+        }
+        crate::config::RouteMode::TorOnly
+    } else {
+        settings.connection.route_mode
+    };
+
+    // TorOnly fails closed until the Tor transport lands (never a clearnet
+    // fallback — that would leak the client IP). PreferServer/PreferDropbox both
+    // dial direct here; the PreferDropbox difference is in the download path.
+    if mode == crate::config::RouteMode::TorOnly {
         return Err(UiError::new(
-            "not_implemented",
-            "Tor support arrives in a later phase.",
+            "tor_unavailable",
+            "Tor routing is selected but not available yet.",
         ));
     }
 

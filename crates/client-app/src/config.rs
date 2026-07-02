@@ -109,8 +109,36 @@ impl Default for PerformanceSettings {
     }
 }
 
+/// The download/transport **route** the client uses (3-way, spec
+/// `2026-07-02-download-route-setting`). The connect-screen "Route through Tor"
+/// checkbox is the boolean face of this: ticking it selects (and persists)
+/// [`RouteMode::TorOnly`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteMode {
+    /// Route ALL traffic over Tor; fail closed (never a clearnet fallback). Forces
+    /// server-proxy (direct-Dropbox links are disabled under Tor).
+    TorOnly,
+    /// The server proxies every blob (default — today's behavior).
+    #[default]
+    PreferServer,
+    /// Download an offloaded blob's ciphertext DIRECTLY from Dropbox via a
+    /// server-brokered short-lived link when available; else the server proxies.
+    /// Every fetched byte is still AEAD/manifest-verified, so a tampering link is
+    /// caught (the link source is untrusted).
+    PreferDropbox,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ConnectionSettings {
+    /// The authoritative route selection.
+    #[serde(default)]
+    pub route_mode: RouteMode,
+    /// Legacy pre-3-way boolean. Kept only for back-compat read/write of older
+    /// `settings.json`; `route_mode` is authoritative. `normalized()` migrates a
+    /// legacy `use_tor=true` (with no explicit `route_mode`) into `TorOnly`, and
+    /// keeps this field in sync with `route_mode` on every save.
+    #[serde(default)]
     pub use_tor: bool,
 }
 
@@ -180,6 +208,15 @@ impl SettingsConfig {
         if !matches!(s.appearance.theme.as_str(), "dark" | "light") {
             s.appearance.theme = "dark".into();
         }
+        // Route-mode ⇄ legacy `use_tor` reconciliation: migrate a legacy file that
+        // set only `use_tor=true` (route_mode defaulted to PreferServer) into
+        // TorOnly, then keep `use_tor` synced to route_mode so older readers stay
+        // consistent. (`use_tor` can only be true when route_mode is TorOnly after a
+        // save, so this migration fires only on genuinely pre-route_mode files.)
+        if s.connection.route_mode == RouteMode::PreferServer && s.connection.use_tor {
+            s.connection.route_mode = RouteMode::TorOnly;
+        }
+        s.connection.use_tor = s.connection.route_mode == RouteMode::TorOnly;
         s
     }
 }
@@ -280,6 +317,35 @@ mod tests {
         let mut bad = SettingsConfig::default();
         bad.appearance.theme = "neon".into();
         assert_eq!(bad.normalized().appearance.theme, "dark");
+    }
+
+    #[test]
+    fn route_mode_defaults_migrates_legacy_use_tor_and_stays_synced() {
+        // Default = prefer-server, use_tor false.
+        let d = SettingsConfig::default().normalized();
+        assert_eq!(d.connection.route_mode, RouteMode::PreferServer);
+        assert!(!d.connection.use_tor);
+
+        // A legacy file with only `use_tor: true` (no route_mode) migrates to TorOnly.
+        let legacy: SettingsConfig =
+            serde_json::from_str(r#"{"connection":{"use_tor":true}}"#).unwrap();
+        let m = legacy.normalized();
+        assert_eq!(m.connection.route_mode, RouteMode::TorOnly);
+        assert!(m.connection.use_tor); // kept synced
+
+        // Explicit route_mode round-trips and drives use_tor.
+        let dir = std::env::temp_dir().join(format!("mxroute-{}", n()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = SettingsConfig::default();
+        s.connection.route_mode = RouteMode::PreferDropbox;
+        s.save(&dir).unwrap();
+        let back = SettingsConfig::load(&dir);
+        assert_eq!(back.connection.route_mode, RouteMode::PreferDropbox);
+        assert!(!back.connection.use_tor); // only TorOnly sets it
+        // kebab-case on the wire.
+        let json = serde_json::to_string(&s.connection).unwrap();
+        assert!(json.contains("prefer-dropbox"), "kebab-case route_mode: {json}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

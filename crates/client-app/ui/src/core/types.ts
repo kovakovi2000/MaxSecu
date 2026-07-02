@@ -94,11 +94,13 @@ export type PreparePhase =
 
 // --- Phase 5 (settings + a11y) DTO mirror of the Rust SettingsConfig serde shape ---
 // Section objects, snake_case fields — match server/core serde exactly.
+// The 3-way download/transport route (mirrors Rust `RouteMode`, serde kebab-case).
+export type RouteMode = "tor-only" | "prefer-server" | "prefer-dropbox";
 export interface Settings {
   a11y: { reduced_motion: boolean; high_contrast: boolean; text_size: "normal" | "large" | "larger" };
   behavior: { confirm_destructive: boolean };
   performance: { ram_cache_cap_mb: number };
-  connection: { use_tor: boolean };
+  connection: { route_mode: RouteMode };
   appearance: { theme: "dark" | "light" };
 }
 
