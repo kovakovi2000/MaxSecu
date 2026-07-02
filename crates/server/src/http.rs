@@ -2305,8 +2305,9 @@ mod tests {
     ///
     /// Admin authority is conferred the production way (D-K): the pinned D5 key
     /// signs a `{User, Admin}` binding for the admin, which the server verifies on
-    /// every admin-gated request — NOT the advisory `set_roles` table. `bob` has a
-    /// record but no binding, so he is a valid session yet not an admin (→ 403).
+    /// every admin-gated request — the D5-verified `AdminSession` binding is the
+    /// real gate. `bob` has a record but no binding, so he is a valid session yet
+    /// not an admin (→ 403).
     async fn admin_app_audited() -> (
         Router,
         SigningKey,

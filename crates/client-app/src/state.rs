@@ -99,52 +99,18 @@ pub enum PreparePhase {
 
 /// The sandboxed-video player feedback channel (Phase 7, Gate 4) — per-file
 /// playback state for the `<media-viewer>` video surface. Emitted over the Tauri
-/// event bus alongside the decoded frame/PCM DTOs (`EVT_VIDEO_FRAME`/
-/// `EVT_VIDEO_AUDIO`). Non-color-only: each variant carries a stable `phase` code.
+/// event bus. Non-color-only: each variant carries a stable `phase` code.
 pub const EVT_PLAYER: &str = "maxsecu://player-state";
 
-/// Decoded-frame channel: one [`crate::commands::video::I420FrameDto`] per
-/// re-validated frame the confined worker produced (the UI uploads its planes to
-/// a WebGL texture in Gate 5). Carries NO key material — only RAM-only pixels.
-pub const EVT_VIDEO_FRAME: &str = "maxsecu://video-frame";
-
-/// Decoded-audio channel: one [`crate::commands::video::PcmDto`] per re-validated
-/// PCM chunk (the UI feeds it to WebAudio in Gate 5).
-pub const EVT_VIDEO_AUDIO: &str = "maxsecu://video-audio";
-
-/// One-shot per-open metadata for the player UI (scrubber max + timer denominator).
-pub const EVT_VIDEO_INFO: &str = "maxsecu://video-info";
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct VideoInfo {
-    pub duration_ms: u64,
-    pub fragment_count: u32,
-}
-
 /// The video player's state machine (spec §6/§7). Emitted over [`EVT_PLAYER`];
-/// the UI binds a buffering spinner / play state / error banner. `Error` carries a
-/// sanitized code (no decode oracle); `CodecUnavailable` is the honest
-/// player-gated terminal when the confined worker is not present.
+/// the UI binds an error banner. `Error` carries a sanitized code (no decode
+/// oracle).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", tag = "phase")]
 pub enum PlayerPhase {
-    /// Decrypting + decoding the current bounded window before frames flow.
-    Buffering,
-    /// Frames are flowing (the window decoded + re-validated).
-    Playing,
-    /// A BENIGN, non-terminal notice that the per-fragment resilient decode dropped
-    /// `skipped` fragment(s) whose confined worker aborted (the F1 rav1d panic / F2
-    /// stsz-OOM Job-kill): the rest of the window still decoded, so playback is a
-    /// brief gap (the surviving frames pace by their `pts_ms`), not a failure. Carries
-    /// only the COUNT — no decode oracle / per-fragment detail.
-    Gap { skipped: u32 },
-    /// Awaiting the next window / data underrun (non-terminal).
-    Stalled,
     /// Failed with a sanitized code (no oracle). Also the benign terminal for a
     /// user cancel (`code = "cancelled"`).
     Error { code: String },
-    /// The confined video worker is unavailable (player gated, D-B).
-    CodecUnavailable,
 }
 
 // The complete connection-state vocabulary streamed to the UI. `connect` emits
@@ -234,18 +200,6 @@ mod player_phase_tests {
 
     #[test]
     fn player_phase_serializes_kebab_tagged() {
-        assert_eq!(
-            serde_json::to_string(&PlayerPhase::Buffering).unwrap(),
-            "{\"phase\":\"buffering\"}"
-        );
-        assert_eq!(
-            serde_json::to_string(&PlayerPhase::Playing).unwrap(),
-            "{\"phase\":\"playing\"}"
-        );
-        assert_eq!(
-            serde_json::to_string(&PlayerPhase::CodecUnavailable).unwrap(),
-            "{\"phase\":\"codec-unavailable\"}"
-        );
         let e = serde_json::to_string(&PlayerPhase::Error {
             code: "cancelled".into(),
         })
@@ -309,16 +263,5 @@ mod upload_phase_tests {
         })
         .unwrap();
         assert!(d.contains("\"phase\":\"done\"") && d.contains("\"file_id\":\"ab\""));
-    }
-}
-
-#[cfg(test)]
-mod video_info_tests {
-    use super::*;
-    #[test]
-    fn video_info_serializes() {
-        let s = serde_json::to_string(&VideoInfo { duration_ms: 59000, fragment_count: 5 }).unwrap();
-        assert!(s.contains("\"duration_ms\":59000"));
-        assert!(s.contains("\"fragment_count\":5"));
     }
 }

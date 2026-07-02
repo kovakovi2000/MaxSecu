@@ -35,7 +35,6 @@
 //!   (no decode oracle).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::{Emitter, State};
@@ -83,18 +82,6 @@ fn player_err() -> UiError {
 /// The connection for this session dropped; the caller (stream_media_inner) may
 /// reconnect once and retry. Distinct from player_err so the retry is targeted.
 fn channel_dead() -> UiError { UiError::new("channel_dead", "The video connection dropped.") }
-
-/// The confined `media-transcode-worker` binary lives beside the portable exe
-/// (`AppDir`), like the decode `media-worker`. Resolved here so the upload command
-/// (`stage_upload`, video kind) can drive the confined author-side transcode.
-pub(crate) fn transcode_worker_path(app_dir: &Path) -> PathBuf {
-    let name = if cfg!(windows) {
-        "media-transcode-worker.exe"
-    } else {
-        "media-transcode-worker"
-    };
-    app_dir.join(name)
-}
 
 /// SYNCHRONOUS TCB step: from the unlocked `identity` + a D5-VERIFIED `author`,
 /// run the §12.5 header ladder to (a) parse the authenticated fragment index out

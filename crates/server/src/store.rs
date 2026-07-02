@@ -16,7 +16,6 @@ use crate::files::{
 };
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
-use maxsecu_encoding::types::Role;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -427,8 +426,6 @@ struct Inner {
     // The default `[0; 32]` is exactly `GENESIS_HEAD` (encoding-spec §3).
     control_log: Vec<StoredControlRecord>,
     control_head: [u8; 32],
-    // Advisory roles per user_id for the coarse admin gate (default {user}).
-    roles: HashMap<[u8; 16], Vec<Role>>,
     // Phase 3 file records (schema files/file_genesis/file_versions/file_streams/
     // file_key_wraps), keyed by file_id.
     files: HashMap<[u8; 16], FileEntry>,
@@ -480,11 +477,6 @@ impl MemoryStore {
     /// Seed a usable enrollment voucher by its `SHA-256` hash (issued in person).
     pub fn add_voucher(&self, voucher_hash: [u8; 32]) {
         self.inner.lock().unwrap().vouchers.insert(voucher_hash);
-    }
-
-    /// Seed a user's advisory roles (test/dev) — drives the coarse admin gate.
-    pub fn set_roles(&self, user_id: [u8; 16], roles: Vec<Role>) {
-        self.inner.lock().unwrap().roles.insert(user_id, roles);
     }
 
     /// Override a user's recorded creation time (tests only — `add_user`/
