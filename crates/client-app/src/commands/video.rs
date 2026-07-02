@@ -496,59 +496,21 @@ pub async fn stream_media(
     path: &str,
     range_header: Option<&str>,
 ) -> http::Response<Vec<u8>> {
-    // TEMP DIAGNOSTIC (remove after the stream:// host-form is pinned): log the
-    // request path + range + outcome status to <appdir>/logs/stream.log. Non-secret
-    // metadata only (no plaintext). Confirms whether WebView2 reaches the handler.
-    stream_log(app, &format!("REQ path={path:?} range={range_header:?}"));
     match stream_media_inner(app, path, range_header).await {
-        Ok(r) => {
-            stream_log(
-                app,
-                &format!("OK 206 start={} len={} total={}", r.start, r.len, r.total_len),
-            );
-            http::Response::builder()
-                .status(206)
-                .header(http::header::CONTENT_TYPE, "video/mp4")
-                .header(http::header::ACCEPT_RANGES, "bytes")
-                .header(
-                    http::header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", r.start, r.start + r.len - 1, r.total_len),
-                )
-                .header(http::header::CONTENT_LENGTH, r.len.to_string())
-                .body(r.body)
-                .unwrap_or_else(|_| http::Response::builder().status(500).body(Vec::new()).unwrap())
-        }
+        Ok(r) => http::Response::builder()
+            .status(206)
+            .header(http::header::CONTENT_TYPE, "video/mp4")
+            .header(http::header::ACCEPT_RANGES, "bytes")
+            .header(
+                http::header::CONTENT_RANGE,
+                format!("bytes {}-{}/{}", r.start, r.start + r.len - 1, r.total_len),
+            )
+            .header(http::header::CONTENT_LENGTH, r.len.to_string())
+            .body(r.body)
+            .unwrap_or_else(|_| http::Response::builder().status(500).body(Vec::new()).unwrap()),
         Err(code) => {
             let status = if code == 416 { 416 } else { 500 };
-            stream_log(app, &format!("ERR status={status}"));
             http::Response::builder().status(status).body(Vec::new()).unwrap()
-        }
-    }
-}
-
-/// TEMP DIAGNOSTIC command: let the UI append a line to `<appdir>/logs/stream.log`
-/// (so we can see, without devtools, whether the native player mounted, whether
-/// open_video succeeded, the exact `src` URL, video error codes, and CSP
-/// violations). Non-secret metadata only. Remove once the path is verified.
-#[tauri::command]
-pub async fn stream_debug_log(msg: String, app: tauri::AppHandle) {
-    stream_log(&app, &format!("UI {msg}"));
-}
-
-/// TEMP DIAGNOSTIC: append one line to `<appdir>/logs/stream.log`. Best-effort;
-/// non-secret metadata only. Remove once the stream:// path is verified in the GUI.
-fn stream_log(app: &tauri::AppHandle, msg: &str) {
-    use tauri::Manager;
-    if let Some(dir) = app.try_state::<AppDir>() {
-        let logs = dir.0.join("logs");
-        let _ = std::fs::create_dir_all(&logs);
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(logs.join("stream.log"))
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "{msg}");
         }
     }
 }
