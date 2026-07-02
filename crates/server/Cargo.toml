@@ -36,6 +36,16 @@ http-body-util = "0.1" # build/drain the sink publish request/response bodies
 # feature — the server↔Postgres link is loopback/private (secret-free server).
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "time"] }
 time = "0.3"
+# The real Dropbox cold-tier adapter (`dropbox_tier`) dials PUBLIC Dropbox hosts
+# (api.dropboxapi.com / content.dropboxapi.com), so it needs the public WebPKI
+# root set rather than a pinned self-signed cert. `webpki-roots` is pure-Rust
+# data (no C, no `ring`; `cargo tree -i webpki-roots` shows only
+# `rustls-pki-types`, already in the graph) — license justified in deny.toml.
+webpki-roots = "1"
+# Redact the Dropbox OAuth token from Debug and best-effort scrub it on drop
+# (dropbox_tier). Already resolved in the lockfile at this version via rustls —
+# no new supply-chain node, just promoted to a direct dep.
+zeroize = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] } # oneshot for in-process handler tests
