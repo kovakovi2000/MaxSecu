@@ -27,6 +27,9 @@ pub struct VerifiedAuthor {
     /// owner's `owner_key_version` from this so `genesis_sig` verifies against the
     /// right binding.
     pub key_version: u64,
+    /// The author's published ML-KEM key, if enrolled for PQ (mirrors
+    /// `RecoveryRecipient::mlkem_pub`). `None` for a classical (V1) binding.
+    pub mlkem_pub: Option<[u8; 1184]>,
 }
 
 /// Verify an already-fetched `(binding_bytes, signature)` under the pinned D5 and
@@ -50,6 +53,7 @@ pub fn verify_author_binding(
         enc_pub: v.enc_pub,
         fingerprint: v.fingerprint,
         key_version: v.key_version,
+        mlkem_pub: v.mlkem_pub,
     })
 }
 
@@ -201,7 +205,7 @@ mod tests {
     use maxsecu_encoding::encode;
     use maxsecu_encoding::labels;
     use maxsecu_encoding::structs::DirBinding;
-    use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
+    use maxsecu_encoding::types::{Bytes32, Id, MlKemPub, Role, RoleSet, Text, Timestamp};
 
     const NOW: u64 = 1_719_500_000_000;
 
@@ -216,6 +220,25 @@ mod tests {
             not_before: Timestamp(0),
             not_after: Timestamp(4_102_444_800_000),
             mlkem_pub: None,
+        };
+        let sig = d5.sign_canonical(labels::DIRBINDING, &b);
+        (encode(&b), sig)
+    }
+
+    /// Same as `signed_binding` but with a PQ (ML-KEM) key published on the
+    /// binding — mirrors `verified_binding_exposes_mlkem` in client-core's
+    /// `directory.rs` tests.
+    fn signed_binding_with_mlkem(d5: &SigningKey, mlkem_pub: [u8; 1184]) -> (Vec<u8>, [u8; 64]) {
+        let b = DirBinding {
+            username: Text::new("alice").unwrap(),
+            user_id: Id([0x0A; 16]),
+            enc_pub: Bytes32([0xE1; 32]),
+            sig_pub: Bytes32([0x51; 32]),
+            key_version: 1,
+            roles: RoleSet::new([Role::User]),
+            not_before: Timestamp(0),
+            not_after: Timestamp(4_102_444_800_000),
+            mlkem_pub: Some(MlKemPub(mlkem_pub)),
         };
         let sig = d5.sign_canonical(labels::DIRBINDING, &b);
         (encode(&b), sig)
@@ -260,6 +283,26 @@ mod tests {
         assert_eq!(a.sig_pub, [0x51; 32]);
         assert_eq!(a.enc_pub, [0xE1; 32]);
         assert_eq!(a.key_version, 1);
+    }
+
+    #[test]
+    fn verified_author_exposes_mlkem_pub_when_published() {
+        let d5 = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+        let mut trust = MemoryTrustStore::new();
+        let (bytes, sig) = signed_binding_with_mlkem(&d5, [0x9C; 1184]);
+        let a = verify_author_binding(&verifier, &mut trust, &bytes, &sig, NOW).unwrap();
+        assert_eq!(a.mlkem_pub, Some([0x9C; 1184]));
+    }
+
+    #[test]
+    fn verified_author_mlkem_pub_is_none_for_classical_binding() {
+        let d5 = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+        let mut trust = MemoryTrustStore::new();
+        let (bytes, sig) = signed_binding(&d5); // no mlkem_pub on this binding
+        let a = verify_author_binding(&verifier, &mut trust, &bytes, &sig, NOW).unwrap();
+        assert_eq!(a.mlkem_pub, None);
     }
 
     #[test]
