@@ -1,0 +1,37 @@
+[package]
+name = "maxsecu-client-e2e"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Client↔server end-to-end tests. Links the server WITHOUT the postgres/sqlx feature so it coexists with arti-client (client-app) in this workspace's lockfile."
+# This crate sits outside the client-workspace root dir (crates/client-app), so it
+# must name its owning workspace explicitly — otherwise Cargo's ancestor walk binds
+# it to the top-level (server) workspace.
+workspace = "../client-app"
+
+[dependencies]
+
+[dev-dependencies]
+maxsecu-client-app = { path = "../client-app" }
+maxsecu-client-core = { path = "../client-core", features = ["net"] }
+maxsecu-crypto = { path = "../crypto" }
+maxsecu-encoding = { path = "../encoding" }
+maxsecu-media-launcher = { path = "../media-launcher" }
+maxsecu-ceremony-harness = { path = "../../tools/ceremony-harness" }
+# CRITICAL: default-features = false → no `postgres` → no `sqlx` → no
+# libsqlite3-sys 0.30, so the server links cleanly alongside arti-client's 0.37 in
+# this (client) workspace lock. The e2e tests only ever use MemoryStore.
+maxsecu-server = { path = "../server", default-features = false }
+base64 = "0.22"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[lints.rust]
+unsafe_code = "forbid"
