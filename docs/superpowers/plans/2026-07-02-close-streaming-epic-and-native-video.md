@@ -71,8 +71,19 @@
 **USER SMOKE (final gate):** full run — upload (streaming, MB/s, resume), native playback + seek + Media Chrome, RAM gauge read-out.
 **Acceptance:** all green; user confirms the final smoke.
 
+## Task 11 — Retire the dormant confined-codec worker suite [two-stage] (user-added post-review, 2026-07-02)
+**Why:** the holistic review + controller tracing confirmed the confined pure-Rust codec-worker infrastructure is a **dormant test-only island** validating NO shipping code path: the viewer decodes via native `<video>` (media-worker decode retired); the author transcode uses the embedded ffmpeg directly (`prepare_video_streams` = `(input_path, ffmpeg_path, options, bounds, title, tags, on_phase, cancel)` → `FfmpegLauncher::new(ffmpeg_path).run(...)` → stores `out.mp4` fMP4 directly + thumb via `RustImageCodec`; **no `worker_path`, no re-mux worker**). `media-transcode-worker` ↔ `media-worker` ↔ `media-launcher::TranscodeLauncher` only test each other. User chose (AskUserQuestion, 2026-07-02): **retire the whole suite** (cleanest tree; discards the pure-Rust confined-codec reference impl — recoverable from git history).
+**REMOVE:**
+- Whole crate `crates/media-transcode-worker/` (lib+bin+tests) + its workspace member.
+- Whole crate `crates/media-worker/` (lib+bin+session.rs+all tests) + its workspace member.
+- In `crates/media-launcher/src/lib.rs`: `TranscodeLauncher` + `parse_framed_result` + the framed-transcode encode/decode helpers + `SessionError` (if only used by these); the `framing` mod; the image-decode sandbox `proto` mod + `run_decode` + `SubprocessDecoder` + `AppContainerDecoder` (+ `DecodedImage`/`DecodeError` if local) + `DEFAULT_WORKER_MEMORY_CAP_BYTES`. In `win32.rs`: `spawn_confined`, `spawn_confined_cancellable`, and any private helper used ONLY by the above (COMPILER-GUIDED: remove lib-level items first, then delete win32 items the `cargo build -p maxsecu-media-launcher` dead_code warnings flag, iterating — NEVER remove anything `spawn_confined_exe`/`FfmpegLauncher` transitively needs).
+- `packaging/package.{ps1,sh}`: stop staging `media-transcode-worker.exe` (media-worker.exe staging already gone).
+- `crates/client-app/tests/video_upload_e2e.rs`: fix GATE T — drop the `find_worker("media-transcode-worker")` gate + the stale "worker_path"/"two confined spawns" comments; GATE T drives the embedded ffmpeg (source via the client-app embedded-ffmpeg materialize / `ensure_ffmpeg`, or skip-guard on ffmpeg availability). KEEP GATE M (metadata round-trip) + GATE P (confirm pipeline).
+**KEEP (live — used by client-app author transcode):** `media-launcher::{ffmpeg_args::build_ffmpeg_args, transcode_opts::{Bitrate,Resolution,TranscodeOptions}, FfmpegLauncher, FfmpegOutcome, FfmpegProgress}` + win32 `{spawn_confined_exe, setup_confined_exe_child, grant_path_to_appcontainer, appcontainer_sid_string, PathGrant, GrantAccess, SpawnError, ConfinedExeOutput}` + the ffmpeg mem-cap/timeout consts (`DEFAULT_FFMPEG_MEMORY_CAP_BYTES`, `FFMPEG_STALL_TIMEOUT_MS`, `FFMPEG_MAX_TOTAL_MS`). `crates/client-core/src/sandbox.rs` (`SandboxedDecoder`/`InProcessFakeDecoder`/`decode_rgba_bounded`) is TCB — LEAVE it; if fully unused post-removal, flag as a separate follow-up (do NOT modify client-core here).
+**Acceptance:** `cargo build --workspace --tests` clean (no dangling refs); `cargo test -p maxsecu-client-app --lib` + video/streaming/upload e2e green; `cargo build -p maxsecu-client-app --release` succeeds (embedded-ffmpeg author transcode intact). **Security pass:** the LIVE `FfmpegLauncher` confinement (AppContainer+Job, no net/keys/children, path-grant RAII, mem cap, stall watchdog) is byte-unchanged; `ffmpeg_confine_windows.rs` + `file_acl_windows.rs` containment tests still pass; no confinement helper the ffmpeg path needs was removed.
+
 ## Notes
-- Update memory (`streaming-upload-epic`, `video-native-decode-decision`, `media-app-plan`, MEMORY.md) as tasks land.
+- Update memory (`close-streaming-native-video`, `streaming-upload-epic`, `media-app-plan`, MEMORY.md) as tasks land.
 - Keep commits scoped per task; conventional-commit messages with the Co-Authored-By + Claude-Session trailers.
 
 ---
