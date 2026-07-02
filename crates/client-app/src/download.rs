@@ -9,9 +9,12 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::client::conn::http1::SendRequest;
 
-use maxsecu_client_core::{DownloadBundle, StreamChunks, StreamHeader};
-use maxsecu_crypto::WrappedDek;
-use maxsecu_encoding::types::StreamType;
+use maxsecu_client_core::{DownloadBundle, Identity, StreamChunks, StreamHeader};
+use maxsecu_crypto::{
+    deserialize_hybrid_wrap, unwrap_dek, unwrap_dek_hybrid, Dek, HybridEncSecretKey, WrappedDek,
+};
+use maxsecu_encoding::structs::{Manifest, WrapContext};
+use maxsecu_encoding::types::{Id, StreamType, Suite};
 
 use crate::config::RouteMode;
 use crate::direct_link::DirectLinkHttp;
@@ -280,6 +283,91 @@ pub async fn build_download_bundle(
     ))
 }
 
+/// Recover the caller's OWN Data Encryption Key from a served §8.5 file view,
+/// outside the download/viewer path (which unwraps the DEK internally and then
+/// discards it — `OpenedFile`/`OpenedHeader` deliberately never expose it). The
+/// reshare flow (a later task) needs the raw `Dek` to call `build_reshare`; this
+/// helper is the ONLY place it is handed back to the caller.
+///
+/// **Security boundary — "any wrap-holder, in practice."** `my_id` MUST be the
+/// AUTHENTICATED session's own user id (the caller sources it from `Session`),
+/// never a client-supplied arbitrary id: it is the `recipient_id` the served
+/// self-wrap is cryptographically bound to, so recovery only succeeds for a
+/// caller who genuinely holds a wrap addressed to `Id(my_id)`. A caller with no
+/// such wrap fails closed at the HPKE/hybrid unwrap — no wrap ⇒ no DEK. This is
+/// what confines the reshare command to a holder of their own wrap (the owner
+/// always is, from their upload self-wrap).
+///
+/// `file_id` is the REQUESTED id (caller-supplied, trusted — parsed from the URL
+/// the caller asked for), NOT the served `manifest.file_id`. Binding the
+/// `WrapContext` to the requested id means a server that substitutes a different
+/// file's view (a wrap the caller can open for some OTHER file) fails the context
+/// binding and errors out, rather than silently yielding the wrong file's DEK —
+/// the same content-substitution defense the download ladder applies (P3).
+///
+/// **Borrow discipline.** This function is deliberately SYNCHRONOUS: the caller
+/// performs the async `GET /v1/files/{id}?version=latest` + [`parse_file_view`]
+/// FIRST, then invokes this with the already-parsed view and a briefly-borrowed
+/// `identity`. Because nothing here `.await`s, the non-`Clone` identity borrow
+/// cannot span an await point — the borrow-across-await hazard is prevented
+/// structurally, not merely by convention (mirrors `streaming_confirm`'s and
+/// `verify_header`'s unwrap-under-a-tight-scope pattern).
+///
+/// The returned [`Dek`] is an INTERNAL, in-process value: consume it immediately
+/// (derive/re-wrap) and let it drop (it zeroizes). It MUST NEVER cross the Tauri
+/// seam or appear in a DTO.
+pub(crate) fn recover_own_dek(
+    view: &ParsedView,
+    file_id: [u8; 16],
+    identity: &Identity,
+    my_id: [u8; 16],
+) -> Result<Dek, UiError> {
+    let manifest: Manifest = maxsecu_encoding::decode(&view.manifest_bytes).map_err(|_| bad())?;
+
+    // Bind the unwrap to the REQUESTED file id + this version + the authenticated
+    // caller's own id. The served self-wrap opens only if it was genuinely made
+    // for exactly this (file, version, recipient) — otherwise the AEAD `info`
+    // differs and open fails.
+    let ctx = WrapContext {
+        file_id: Id(file_id),
+        version: manifest.version,
+        recipient_id: Id(my_id),
+    };
+    let dek = match manifest.alg {
+        Suite::V1 => unwrap_dek(identity.enc_secret(), &view.wrapped_dek, &ctx)
+            .map_err(|_| verify_failed())?,
+        Suite::V2 => {
+            let seed = identity.mlkem_seed().ok_or_else(verify_failed)?;
+            // Reassemble the fixed 1168-byte hybrid wire from the `enc ‖ ct`
+            // byte-carrier, mirroring `client-core::upload::unpack_hybrid_wrap`.
+            let mut wire = Vec::with_capacity(32 + view.wrapped_dek.ct.len());
+            wire.extend_from_slice(&view.wrapped_dek.enc);
+            wire.extend_from_slice(&view.wrapped_dek.ct);
+            let hybrid = deserialize_hybrid_wrap(&wire).map_err(|_| verify_failed())?;
+            let hsk =
+                HybridEncSecretKey::from_components(identity.enc_secret().expose_bytes(), seed);
+            unwrap_dek_hybrid(&hsk, &hybrid, &ctx).map_err(|_| verify_failed())?
+        }
+    };
+
+    // Self-validate against the manifest commitment (exactly as `verify_header`
+    // does); a mismatch is fail-closed, never a silent proceed.
+    if dek.commit() != manifest.dek_commit.0 {
+        return Err(verify_failed());
+    }
+    Ok(dek)
+}
+
+/// Sanitized fail-closed error for a DEK-recovery failure (unopenable wrap,
+/// malformed hybrid wire, missing PQ key, or a commitment mismatch) — no detail
+/// leak, mirroring [`bad`].
+fn verify_failed() -> UiError {
+    UiError::new(
+        "verify_failed",
+        "Could not recover the file key from your own wrap.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +427,150 @@ mod tests {
             .find(|s| s.stream_type == StreamType::Content)
             .unwrap();
         assert_eq!(content.chunk_size, 4096);
+    }
+
+    // ── recover_own_dek (T4 step 6) ─────────────────────────────────────────
+    //
+    // These exercise the DEK-recovery seam the reshare command (a later task)
+    // needs: recover the caller's OWN DEK from the served self-wrap, fail-closed
+    // for anyone who does not hold a wrap addressed to them.
+
+    use maxsecu_client_core::Identity;
+    use maxsecu_crypto::{
+        serialize_hybrid_wrap, wrap_dek, wrap_dek_hybrid, Dek, EncPublicKey, HybridEncPublicKey,
+    };
+    use maxsecu_encoding::structs::{Manifest, WrapContext};
+    use maxsecu_encoding::types::{Bytes32, FileType, Id, Suite, Timestamp};
+
+    /// A `ParsedView` carrying only the fields `recover_own_dek` reads (the
+    /// served self-wrap + the signed manifest bytes); the rest are inert.
+    fn view_with(wrapped_dek: WrappedDek, manifest_bytes: Vec<u8>, version: u64) -> ParsedView {
+        ParsedView {
+            version,
+            manifest_bytes,
+            manifest_sig: [0u8; 64],
+            genesis_bytes: Vec::new(),
+            genesis_sig: [0u8; 64],
+            wrapped_dek,
+            grant_bytes: Vec::new(),
+            grant_sig: [0u8; 64],
+            ancestor_grants: Vec::new(),
+            recovery_grant_bytes: Vec::new(),
+            recovery_grant_sig: [0u8; 64],
+            streams: Vec::new(),
+        }
+    }
+
+    /// Encode a minimal signed-manifest body — only `alg`, `version`, and
+    /// `dek_commit` are consulted by `recover_own_dek`.
+    fn manifest_bytes(
+        file_id: [u8; 16],
+        version: u64,
+        alg: Suite,
+        dek_commit: [u8; 32],
+    ) -> Vec<u8> {
+        maxsecu_encoding::encode(&Manifest {
+            file_id: Id(file_id),
+            version,
+            file_type: FileType::Video,
+            alg,
+            chunk_size: 4096,
+            dek_commit: Bytes32(dek_commit),
+            streams: Vec::new(),
+            recovery_present: false,
+            author_id: Id([0u8; 16]),
+            created_at: Timestamp(0),
+        })
+    }
+
+    #[test]
+    fn recovers_own_v1_self_wrap() {
+        let me = Identity::generate();
+        let my_id = [7u8; 16];
+        let file_id = [3u8; 16];
+        let version = 5u64;
+        let dek = Dek::from_bytes([0x11; 32]);
+        let ctx = WrapContext {
+            file_id: Id(file_id),
+            version,
+            recipient_id: Id(my_id),
+        };
+        let wrapped = wrap_dek(&EncPublicKey::from_bytes(me.enc_pub_bytes()), &dek, &ctx).unwrap();
+        let mb = manifest_bytes(file_id, version, Suite::V1, dek.commit());
+        let view = view_with(wrapped, mb, version);
+
+        let out = recover_own_dek(&view, file_id, &me, my_id).expect("own V1 wrap opens");
+        assert_eq!(
+            out.commit(),
+            dek.commit(),
+            "recovered DEK matches the commitment"
+        );
+    }
+
+    #[test]
+    fn no_matching_wrap_fails_closed() {
+        // The served self-wrap is addressed to a STRANGER (a different key +
+        // recipient_id). A caller who holds no wrap for themselves cannot open
+        // it — this is the "any wrap-holder, in practice" boundary.
+        let me = Identity::generate();
+        let stranger = Identity::generate();
+        let my_id = [7u8; 16];
+        let stranger_id = [8u8; 16];
+        let file_id = [3u8; 16];
+        let version = 5u64;
+        let dek = Dek::from_bytes([0x11; 32]);
+        let stranger_ctx = WrapContext {
+            file_id: Id(file_id),
+            version,
+            recipient_id: Id(stranger_id),
+        };
+        let wrapped = wrap_dek(
+            &EncPublicKey::from_bytes(stranger.enc_pub_bytes()),
+            &dek,
+            &stranger_ctx,
+        )
+        .unwrap();
+        let mb = manifest_bytes(file_id, version, Suite::V1, dek.commit());
+        let view = view_with(wrapped, mb, version);
+
+        match recover_own_dek(&view, file_id, &me, my_id) {
+            Ok(_) => panic!("a non-holder must NOT recover the DEK"),
+            Err(e) => assert_eq!(e.code, "verify_failed", "no wrap for me ⇒ fail closed"),
+        }
+    }
+
+    #[test]
+    fn recovers_own_v2_hybrid_self_wrap() {
+        let me = Identity::generate();
+        let my_id = [7u8; 16];
+        let file_id = [3u8; 16];
+        let version = 2u64;
+        let dek = Dek::from_bytes([0x22; 32]);
+        let ctx = WrapContext {
+            file_id: Id(file_id),
+            version,
+            recipient_id: Id(my_id),
+        };
+        let pk = HybridEncPublicKey {
+            x25519: me.enc_pub_bytes(),
+            mlkem: me.mlkem_pub_bytes().expect("fresh identity is PQ-capable"),
+        };
+        let h = wrap_dek_hybrid(&pk, &dek, &ctx).unwrap();
+        // Store form is the 1168-byte hybrid wire split enc(32) ‖ ct, exactly as
+        // `client-core::upload::pack_hybrid_wrap` produces it.
+        let wire = serialize_hybrid_wrap(&h);
+        let wrapped = WrappedDek {
+            enc: wire[..32].try_into().unwrap(),
+            ct: wire[32..].to_vec(),
+        };
+        let mb = manifest_bytes(file_id, version, Suite::V2, dek.commit());
+        let view = view_with(wrapped, mb, version);
+
+        let out = recover_own_dek(&view, file_id, &me, my_id).expect("own V2 wrap opens");
+        assert_eq!(
+            out.commit(),
+            dek.commit(),
+            "recovered hybrid DEK matches commitment"
+        );
     }
 }
