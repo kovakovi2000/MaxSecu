@@ -1,16 +1,17 @@
-//! Phase-7 Gate-6 exit-gate end-to-end test (author-side video ingest) — the
-//! confined transcode + the Phase-4 pipeline over REAL loopback TLS.
+//! Author-side video ingest end-to-end test — the confined ffmpeg transcode + the
+//! Phase-4 upload pipeline over REAL loopback TLS.
 //!
 //! Drives the **real** `client-app` video upload modules end to end:
 //!
 //! - GATE T (confined ingest, NO network): `upload::prepare_video_streams` runs the
-//!   TWO confined spawns — the embedded ffmpeg decodes a small real `.y4m` source to
-//!   AV1/AAC `out.mp4` + a first-frame `thumb.png`, then the
-//!   AppContainer/subprocess-confined `media-transcode-worker` re-muxes `out.mp4` to
-//!   canonical AV1/CMAF streams + the fragment seek index (thumbnail/preview derived
-//!   from `thumb.png` via the pure-Rust image codec). This step makes NO server call
-//!   (no `Conn`/TLS is even created before it) — it is the preview-before-upload
-//!   transcode.
+//!   embedded, AppContainer/Job-Object-confined `ffmpeg.exe` directly on a small
+//!   real `.y4m` source, producing canonical AV1/AAC fMP4 `out.mp4` + a first-frame
+//!   `thumb.png` (thumbnail/preview derived from it via the pure-Rust image codec).
+//!   This step makes NO server call (no `Conn`/TLS is even created before it) — it
+//!   is the preview-before-upload transcode. There is no separate re-mux worker
+//!   spawn: `prepare_video_streams` stores the confined ffmpeg's fMP4 output
+//!   directly (`(input_path, ffmpeg_path, options, bounds, title, tags, on_phase,
+//!   cancel)` — no `worker_path` parameter).
 //! - GATE M (metadata round-trip): `parse_fragment_index` over the staged metadata
 //!   returns the SAME fragments the transcode produced (the author→view contract).
 //! - GATE P (confirm pipeline): `build_upload` (FileType::Video, chunk_size 4096) +
@@ -18,20 +19,15 @@
 //!   content byte-exactly through the full `verify_and_open` ladder, and the
 //!   fragment index survives inside the authenticated metadata stream.
 //!
-//! GATE T requires the built `media-transcode-worker` binary; when absent (e.g. a
-//! bare `-p maxsecu-client-app` run that did not build the sibling bins) the test
-//! SKIPS with a note. The `--workspace` gate builds it first, so it exercises the
-//! real spawn. Run isolated single-threaded.
+//! GATE T requires the vendored `ffmpeg.exe` (gitignored, fetched by
+//! `scripts/fetch-ffmpeg.ps1`); when absent the test SKIPS with a note. GATE M and
+//! GATE P need no ffmpeg and always run. Run isolated single-threaded.
 //!
 //! The old GATE D (confined-decode-session verification of the staged canonical
-//! content, via `media-launcher`'s client-side `VideoSubprocessSession`/
-//! `media-worker --video-session`) was removed with that client-side decode-session
-//! driver once native `<video>` became the shipping viewer — see the Task-2
-//! cleanup. Equivalent (more thorough) coverage — that the transcode output decodes
-//! back to the correct source dimensions, including odd-dimension/SAR coercion —
-//! already lives in `media-transcode-worker/tests/ingest_remux.rs`, which drives
-//! the SAME `maxsecu_media_worker::VideoSession` in-process as a dev-only decode
-//! oracle.
+//! content) and the confined re-mux worker (`media-transcode-worker`) were retired
+//! once native `<video>` became the shipping viewer and the author-side transcode
+//! was simplified to drive the embedded ffmpeg directly — see the dormant-worker
+//! retirement cleanup.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,27 +66,6 @@ const VOUCHER: &str = "in-person-code-001";
 const VOUCHER2: &str = "in-person-code-002";
 const TS: u64 = 1_719_500_000_000;
 const CHUNK: usize = VIDEO_CHUNK_SIZE as usize; // == upload chunk_size == video fragment-index unit (6 MiB)
-
-// ---- worker-binary discovery (workspace target dir) -----------------------
-
-/// Locate a built workspace binary (`media-transcode-worker` / `media-worker`) in
-/// the same profile dir this test binary lives in. The integration-test exe is at
-/// `target/<profile>/deps/<test>`, so the sibling bins are at `target/<profile>/`.
-fn find_worker(name: &str) -> Option<PathBuf> {
-    let exe = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_owned()
-    };
-    let test_exe = std::env::current_exe().ok()?;
-    // .../target/<profile>/deps/<test>  ->  .../target/<profile>
-    let profile_dir = test_exe.parent()?.parent()?;
-    let candidate = profile_dir.join(&exe);
-    if candidate.is_file() {
-        return Some(candidate);
-    }
-    None
-}
 
 // ---- real source video synthesis (Y4M; ffmpeg always reads it, no codec dep) ----
 
@@ -428,16 +403,7 @@ async fn download_bundle(c: &mut Conn, token: &str, fid_hex: &str) -> DownloadBu
 
 #[tokio::test]
 async fn phase7_video_upload_over_real_tls() {
-    // ---- worker binaries + vendored ffmpeg (skip the spawn gates if absent) ----
-    let transcode_worker = find_worker("media-transcode-worker");
-    let Some(_transcode_worker) = transcode_worker else {
-        eprintln!(
-            "SKIP phase7_video_upload_over_real_tls: media-transcode-worker binary not found in \
-             the target dir (build it, e.g. `cargo test --workspace`, to exercise the confined \
-             transcode)."
-        );
-        return;
-    };
+    // ---- vendored ffmpeg (skip GATE T's spawn if absent) ----
     let Some(ffmpeg) = vendored_ffmpeg() else {
         eprintln!(
             "SKIP phase7_video_upload_over_real_tls: vendored ffmpeg \

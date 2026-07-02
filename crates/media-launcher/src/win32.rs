@@ -1,10 +1,11 @@
-//! Windows **AppContainer + Job Object** confinement for the decode worker
-//! (DESIGN §8.1/D30, media-sandbox §2) — the OS isolation that makes a decoder
-//! 0-day non-exfiltrating.
+//! Windows **AppContainer + Job Object** confinement for the author-side pinned
+//! `ffmpeg.exe` ingest (DESIGN §8.1/D30, media-sandbox §2, Task 2.2/D-2) — the OS
+//! isolation that makes ffmpeg's decode of arbitrary attacker-authored source
+//! media non-exfiltrating.
 //!
 //! This is the **only** module in the workspace that uses `unsafe`: raw Win32 FFI
 //! via `windows-sys` (OS-API bindings, not a vendored C library). It launches the
-//! `media-worker` binary in:
+//! confined binary in:
 //! * an **AppContainer** with **no capabilities** — no `internetClient`, so the
 //!   process **cannot reach the network by capability** (not just firewall), and
 //!   a low-privilege token that cannot read the user's files / key blob; and
@@ -13,8 +14,8 @@
 //!   decompression bomb is killed, not hung).
 //!
 //! Pipe I/O uses `std::fs::File` over the parent handle ends, so only the spawn
-//! itself is FFI. The worker output is still validated (`validate_decoded`) — OS
-//! isolation does not make the bytes trusted.
+//! itself is FFI. ffmpeg's stderr diagnostics are still treated as untrusted
+//! (bounded capture only) — OS isolation does not make them trusted.
 #![allow(unsafe_code)]
 
 use std::ffi::{OsStr, OsString};
@@ -83,13 +84,6 @@ impl std::fmt::Display for SpawnError {
 }
 
 impl std::error::Error for SpawnError {}
-
-/// The result of a confined run: the worker's exit code and the bytes it wrote on
-/// stdout.
-pub struct ConfinedOutput {
-    pub exit_code: u32,
-    pub stdout: Vec<u8>,
-}
 
 /// The result of a confined **arbitrary-exe** run ([`spawn_confined_exe`], Task
 /// 2.2): the program's exit code and a BOUNDED tail of its stderr (diagnostics
@@ -338,9 +332,8 @@ fn free_sid(sid: PSID) {
 /// outlive every step that references it — the `SECURITY_CAPABILITIES` consumed by
 /// `CreateProcessW` borrow it — so [`setup_confined_exe_child`] keeps this guard
 /// alive across the whole spawn and frees the SID on EVERY exit path (success or
-/// any early-error return), unlike the older [`setup_confined_child`] which leaves
-/// the SID's lifetime to the process. Declared first in that function so it drops
-/// LAST (after `caps` / the attribute list are done with it).
+/// any early-error return). Declared first in that function so it drops LAST
+/// (after `caps` / the attribute list are done with it).
 struct SidGuard(PSID);
 
 impl Drop for SidGuard {
@@ -634,16 +627,6 @@ fn make_pipe(
     Ok((child_end, parent_end))
 }
 
-/// Generous bounded wait for the confined worker to exit (Important #2): long
-/// enough never to trip a legitimate decode in the tests, short enough to bound a
-/// worker that closes stdout then **spins** within the memory cap (a plain
-/// `INFINITE` wait would let such a worker hang the trusted launcher thread, and
-/// kill-on-close cannot engage until the wait returns). On timeout the worker is
-/// actively terminated — the active backstop — rather than waited on forever.
-/// Responsive user-initiated cancel is Gate 4's concern; this is only the safety
-/// net so a runaway can't hang the launcher or survive.
-const WORKER_WAIT_TIMEOUT_MS: u32 = 120_000;
-
 /// Brief grace wait after a forced `TerminateProcess` so the kill takes effect
 /// before the exit code is read and the handles are released.
 const WORKER_KILL_GRACE_MS: u32 = 5_000;
@@ -654,21 +637,14 @@ const WORKER_KILL_GRACE_MS: u32 = 5_000;
 /// absolute backstop. 150 ms is responsive to a user cancel without busy-waiting.
 const CONFINED_POLL_INTERVAL_MS: u32 = 150;
 
-/// A never-set cancel flag for the confined spawns that have no user-cancel channel
-/// (the decode worker + the duplex session). Passing it keeps ONE cancellable wait
-/// implementation ([`finish_confined_watchdog`]) without a second, near-identical
-/// non-cancellable copy — the flag simply never becomes true, so the behavior is the
-/// prior bounded-wait-then-kill.
-static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
-
 /// **RAII owner** of the kill-on-close Job Object + the child's process/thread
 /// handles (Important #1). While `armed`, `Drop` terminates the worker (if still
 /// running) and closes `job`/`pi.hThread`/`pi.hProcess` exactly once — so an
 /// unwind anywhere in a driver (a panicking `drive` closure, the read loop, a
 /// failed `thread::spawn`) cannot leak the job and leave the confined worker
 /// alive until the long-lived parent exits. The success path calls
-/// [`finish_confined`], which [`disarm`](JobGuard::disarm)s the guard and performs
-/// the explicit teardown, so the handles are never double-closed.
+/// [`finish_confined_watchdog`], which [`disarm`](JobGuard::disarm)s the guard and
+/// performs the explicit teardown, so the handles are never double-closed.
 struct JobGuard {
     job: HANDLE,
     pi: PROCESS_INFORMATION,
@@ -677,8 +653,8 @@ struct JobGuard {
 
 impl JobGuard {
     /// Disarm and surrender the owned handles to the success-path teardown
-    /// ([`finish_confined`]). After this the guard's `Drop` is a no-op, so the
-    /// returned `job`/`pi` are closed exactly once by the explicit teardown.
+    /// ([`finish_confined_watchdog`]). After this the guard's `Drop` is a no-op, so
+    /// the returned `job`/`pi` are closed exactly once by the explicit teardown.
     fn disarm(mut self) -> (HANDLE, PROCESS_INFORMATION) {
         self.armed = false;
         // `HANDLE` and `PROCESS_INFORMATION` are `Copy`; copying them out leaves
@@ -705,241 +681,9 @@ impl Drop for JobGuard {
     }
 }
 
-/// A live confined child after the full AppContainer + Job Object + pipe
-/// [`setup_confined_child`]: a [`JobGuard`] RAII-owning the kill-on-close Job +
-/// the process/thread handles, plus the parent ends of the two stdio pipes. The
-/// child is already assigned to the job and **resumed**. [`spawn_confined`]
-/// (serial) obtains this from the one setup site, so the confinement FFI lives in
-/// exactly one place. Teardown is via [`finish_confined`] (success, disarms the
-/// guard) or [`JobGuard::drop`] (unwind); the two parent ends are wrapped in
-/// `std::fs::File`s and closed by those.
-struct ConfinedChild {
-    guard: JobGuard,
-    parent_stdin_write: HANDLE,
-    parent_stdout_read: HANDLE,
-}
-
-/// Full AppContainer + Job Object + pipe **setup** shared by both confined drivers
-/// (DESIGN §8.1/D30): create the capability-free AppContainer SID + security
-/// capabilities, the two AppContainer-granted stdio pipes, the proc-thread
-/// attribute list, then `CreateProcessW` (suspended), assign the child to a
-/// no-children / memory-capped / kill-on-close Job Object, and resume it. The
-/// confinement is identical regardless of how the caller drives the pipes — this
-/// change is purely about I/O concurrency, not privilege. On ANY error every
-/// handle created here is closed (and a created-but-unresumed child terminated)
-/// before returning: no leak, no double-close.
-fn setup_confined_child(
-    worker_path: &Path,
-    extra_args: &[&str],
-    memory_cap_bytes: u64,
-) -> Result<ConfinedChild, SpawnError> {
-    let sid = appcontainer_sid()?;
-
-    // Capability-free security capabilities → no network, low-privilege token.
-    let mut caps: SECURITY_CAPABILITIES = unsafe { core::mem::zeroed() };
-    caps.AppContainerSid = sid;
-    caps.Capabilities = ptr::null_mut();
-    caps.CapabilityCount = 0;
-
-    // stdin: worker reads (child gets read end); stdout: worker writes. Both
-    // pipes grant the AppContainer access via the shared security descriptor.
-    let pipe_sd = appcontainer_pipe_security(sid)?;
-    let pipes = (|| {
-        // stdin: the PARENT writes the request, the worker reads → parent keeps
-        // the write end. stdout: the parent reads the response → parent keeps the
-        // read end.
-        let stdin = make_pipe(true, pipe_sd)?;
-        let stdout = make_pipe(false, pipe_sd)?;
-        Ok((stdin, stdout))
-    })();
-    // The descriptor is only consulted during CreatePipe; free it now.
-    // SAFETY: `pipe_sd` came from ConvertStringSecurityDescriptor (LocalAlloc'd).
-    unsafe { LocalFree(pipe_sd) };
-    let ((child_stdin, parent_stdin_write), (child_stdout, parent_stdout_read)) = pipes?;
-
-    // Build the proc-thread attribute list holding the security capabilities.
-    let mut attr_size: usize = 0;
-    // SAFETY: first call computes the required size (returns FALSE).
-    unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut attr_size) };
-    let mut attr_buf = vec![0u8; attr_size];
-    let attr_list = attr_buf.as_mut_ptr() as *mut core::ffi::c_void;
-    // SAFETY: buffer is sized exactly as requested above.
-    if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) } == 0 {
-        let e = SpawnError::last("InitializeProcThreadAttributeList");
-        close_all(&[child_stdin, parent_stdin_write, child_stdout, parent_stdout_read]);
-        return Err(e);
-    }
-    // SAFETY: `caps` outlives CreateProcessW below; the attribute references it.
-    let upd = unsafe {
-        UpdateProcThreadAttribute(
-            attr_list,
-            0,
-            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-            &caps as *const _ as *const core::ffi::c_void,
-            core::mem::size_of::<SECURITY_CAPABILITIES>(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    if upd == 0 {
-        let e = SpawnError::last("UpdateProcThreadAttribute");
-        unsafe { DeleteProcThreadAttributeList(attr_list) };
-        close_all(&[child_stdin, parent_stdin_write, child_stdout, parent_stdout_read]);
-        return Err(e);
-    }
-
-    let mut si: STARTUPINFOEXW = unsafe { core::mem::zeroed() };
-    si.StartupInfo.cb = core::mem::size_of::<STARTUPINFOEXW>() as u32;
-    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    si.StartupInfo.hStdInput = child_stdin;
-    si.StartupInfo.hStdOutput = child_stdout;
-    // stderr is DELIBERATELY NOT the stdout pipe: stdout carries the length-prefixed
-    // FRAME protocol (one-shot proto response / duplex `WorkerMsg` stream), and a
-    // dying worker's diagnostics (a Rust panic message, the alloc-error handler's
-    // "memory allocation of N bytes failed" before `abort`) must NEVER be merged onto
-    // it. Merging them previously corrupted the frame stream on abort: the diagnostic
-    // text's leading bytes parsed as an over-ceiling frame length, so the launcher
-    // read a worker DEATH as a parent-side `Protective` cutoff (over-ceiling frame) and
-    // the resilient driver refused to respawn — a confined-worker abort (F1 rav1d panic
-    // / F2 stsz-OOM Job-kill) lost the rest of the window instead of skipping just the
-    // culprit fragment. With stderr routed to NULL (the worker has STARTF_USESTDHANDLES
-    // set, so this is a real "no stderr device", not console inheritance), an abort now
-    // surfaces on the FRAME pipe as a clean truncation/EOF which — combined with the
-    // non-zero/killed process exit code — classifies as `WorkerGone` (resumable), so
-    // the per-fragment skip+respawn works. This does NOT weaken any confinement (the
-    // worker simply has nowhere to write diagnostics) and does NOT touch the
-    // over-ceiling→`Protective` defense against a LIVE worker streaming a bomb-frame on
-    // the real frame pipe.
-    si.StartupInfo.hStdError = ptr::null_mut();
-    si.lpAttributeList = attr_list;
-
-    let app = wide(&worker_path.to_string_lossy());
-    let mut cmdline = {
-        let mut s = String::new();
-        s.push('"');
-        s.push_str(&worker_path.to_string_lossy());
-        s.push('"');
-        for a in extra_args {
-            s.push(' ');
-            s.push('"');
-            s.push_str(a); // selftest flags/paths contain no embedded quotes
-            s.push('"');
-        }
-        wide(&s)
-    };
-
-    let mut pi: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
-    // SAFETY: all buffers (app, cmdline, si, attr_buf, caps, sid) live across the
-    // call; handles are valid; flags request an extended, suspended start.
-    let created = unsafe {
-        CreateProcessW(
-            app.as_ptr(),
-            cmdline.as_mut_ptr(),
-            ptr::null(),
-            ptr::null(),
-            1, // inherit handles (the child pipe ends)
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
-            ptr::null(),
-            ptr::null(),
-            &si as *const STARTUPINFOEXW as *const STARTUPINFOW,
-            &mut pi,
-        )
-    };
-    unsafe { DeleteProcThreadAttributeList(attr_list) };
-    // The child has inherited its pipe ends; the parent no longer needs them.
-    close_all(&[child_stdin, child_stdout]);
-    if created == 0 {
-        let e = SpawnError::last("CreateProcessW");
-        close_all(&[parent_stdin_write, parent_stdout_read]);
-        return Err(e);
-    }
-
-    // Job Object: one process only (no children), memory-capped, kill-on-close. On
-    // any job-setup failure the child is created-but-suspended (never resumed):
-    // terminate + close it and the parent pipe ends so nothing leaks.
-    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-    if job.is_null() {
-        let e = SpawnError::last("CreateJobObject");
-        teardown_unstarted(&pi, &[parent_stdin_write, parent_stdout_read]);
-        return Err(e);
-    }
-    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { core::mem::zeroed() };
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-    info.BasicLimitInformation.ActiveProcessLimit = 1;
-    info.ProcessMemoryLimit = memory_cap_bytes as usize;
-    let set = unsafe {
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const core::ffi::c_void,
-            core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-    };
-    if set == 0 {
-        let e = SpawnError::last("SetInformationJobObject");
-        unsafe { CloseHandle(job) };
-        teardown_unstarted(&pi, &[parent_stdin_write, parent_stdout_read]);
-        return Err(e);
-    }
-    if unsafe { AssignProcessToJobObject(job, pi.hProcess) } == 0 {
-        let e = SpawnError::last("AssignProcessToJobObject");
-        unsafe { CloseHandle(job) };
-        teardown_unstarted(&pi, &[parent_stdin_write, parent_stdout_read]);
-        return Err(e);
-    }
-    // Now that confinement is in place, let the worker run.
-    unsafe { ResumeThread(pi.hThread) };
-
-    // From here on the job + child are owned by an armed RAII guard, so any later
-    // unwind in a driver terminates the worker and closes the handles (Important #1).
-    Ok(ConfinedChild {
-        guard: JobGuard {
-            job,
-            pi,
-            armed: true,
-        },
-        parent_stdin_write,
-        parent_stdout_read,
-    })
-}
-
-/// Success-path teardown: disarm the [`JobGuard`], wait (bounded, cancellable) for
-/// the confined child to exit, read its exit code, then close the job (kill-on-close
-/// — a no-op once the process already exited, but releases the job) and the `pi`
-/// handles. Closes `job`/`pi.hThread`/`pi.hProcess` exactly once (the guard is
-/// disarmed, so there is no double-close).
-///
-/// The wait is **bounded** ([`WORKER_WAIT_TIMEOUT_MS`], Important #2): a compromised
-/// worker that closes stdout then spins (within the memory cap, never exiting)
-/// would block the trusted launcher thread forever under a plain `INFINITE` wait,
-/// and kill-on-close cannot engage until the wait returns. On timeout the worker is
-/// actively terminated (then briefly waited on) rather than relied upon to exit
-/// voluntarily. `cancel` is additionally polled (Task C) so a user cancel / app
-/// shutdown tears the re-mux worker down promptly; the decode/session paths pass
-/// [`NEVER_CANCEL`] to keep the prior behavior.
-fn finish_confined(guard: JobGuard, cancel: &AtomicBool) -> u32 {
-    // A never-advancing progress clock ⇒ the "stall" bound collapses to a plain
-    // bounded wait of `WORKER_WAIT_TIMEOUT_MS`, matching the worker path's prior
-    // fixed wait, while still polling `cancel`.
-    let last_advance = AtomicU64::new(0);
-    let start = Instant::now();
-    finish_confined_watchdog(
-        guard,
-        &last_advance,
-        start,
-        WORKER_WAIT_TIMEOUT_MS,
-        WORKER_WAIT_TIMEOUT_MS,
-        cancel,
-    )
-    .0
-}
-
-/// Cancellable, progress-aware teardown poll loop (Task B/C) shared by the worker
-/// path ([`finish_confined`], via a never-advancing clock) and the ffmpeg ingest
-/// path ([`spawn_confined_exe`], with a live `-progress` clock). Disarms the guard,
-/// then loops on a bounded `WaitForSingleObject`:
+/// Cancellable, progress-aware teardown poll loop (Task B/C) for the ffmpeg
+/// ingest path ([`spawn_confined_exe`], with a live `-progress` clock). Disarms
+/// the guard, then loops on a bounded `WaitForSingleObject`:
 /// * child exited → done;
 /// * `cancel` set → `TerminateProcess` + return `cancelled = true` (a DISTINCT,
 ///   benign outcome);
@@ -1019,75 +763,6 @@ fn teardown_unstarted(pi: &PROCESS_INFORMATION, parent_ends: &[HANDLE]) {
         CloseHandle(pi.hProcess);
     }
     close_all(parent_ends);
-}
-
-/// Spawn a confined worker binary at `worker_path` with `extra_args`, confined to
-/// an AppContainer (no network/key access) + a Job Object (no child processes,
-/// memory-capped, kill-on-close). `stdin_data` is written to the worker's stdin;
-/// its stdout is captured. **Serial** I/O (write-all-then-read-all) — for the
-/// one-shot request/response worker.
-pub fn spawn_confined(
-    worker_path: &Path,
-    extra_args: &[&str],
-    stdin_data: &[u8],
-    memory_cap_bytes: u64,
-) -> Result<ConfinedOutput, SpawnError> {
-    spawn_confined_inner(worker_path, extra_args, stdin_data, memory_cap_bytes, &NEVER_CANCEL)
-}
-
-/// Like [`spawn_confined`] but with a caller-owned `cancel` flag polled during the
-/// bounded exit wait (Task C): the author-side re-mux worker
-/// ([`crate::TranscodeLauncher`]) passes the same cancel token as the ffmpeg step so
-/// a user cancel / app shutdown tears a slow re-mux down promptly instead of waiting
-/// out the full bound. Confinement is byte-identical to [`spawn_confined`] — only
-/// the wait observes `cancel`.
-pub fn spawn_confined_cancellable(
-    worker_path: &Path,
-    extra_args: &[&str],
-    stdin_data: &[u8],
-    memory_cap_bytes: u64,
-    cancel: &AtomicBool,
-) -> Result<ConfinedOutput, SpawnError> {
-    spawn_confined_inner(worker_path, extra_args, stdin_data, memory_cap_bytes, cancel)
-}
-
-fn spawn_confined_inner(
-    worker_path: &Path,
-    extra_args: &[&str],
-    stdin_data: &[u8],
-    memory_cap_bytes: u64,
-    cancel: &AtomicBool,
-) -> Result<ConfinedOutput, SpawnError> {
-    let ConfinedChild {
-        guard,
-        parent_stdin_write,
-        parent_stdout_read,
-    } = setup_confined_child(worker_path, extra_args, memory_cap_bytes)?;
-
-    // `guard` RAII-owns the job + child until `finish_confined` disarms it: if the
-    // serial I/O below unwinds, the worker is terminated and the handles closed.
-    // Stream stdin then EOF, capture stdout — via std::fs::File over the
-    // parent handle ends so the I/O itself isn't FFI.
-    {
-        use std::io::Write;
-        // SAFETY: we own parent_stdin_write; File takes ownership and closes it.
-        let mut w = unsafe { std::fs::File::from_raw_handle(parent_stdin_write as _) };
-        let _ = w.write_all(stdin_data);
-        // drop(w) closes the pipe → worker sees EOF.
-    }
-    let mut out = Vec::new();
-    {
-        use std::io::Read;
-        // SAFETY: we own parent_stdout_read; File takes ownership and closes it.
-        let mut r = unsafe { std::fs::File::from_raw_handle(parent_stdout_read as _) };
-        let _ = r.read_to_end(&mut out);
-    }
-
-    let exit_code = finish_confined(guard, cancel);
-    Ok(ConfinedOutput {
-        exit_code,
-        stdout: out,
-    })
 }
 
 fn close_all(handles: &[HANDLE]) {
@@ -1334,13 +1009,13 @@ struct ConfinedExeChild {
 }
 
 /// AppContainer + Job Object + NUL-stdio + stderr-capture setup for a confined
-/// arbitrary exe (the ffmpeg sibling of [`setup_confined_child`]): same
-/// capability-free SID + `SECURITY_CAPABILITIES` + proc-thread attribute list +
-/// no-children / memory-capped / kill-on-close Job, but stdin = NUL, stdout = NUL,
-/// stderr = an AppContainer-granted capture pipe (ffmpeg has no framed protocol to
-/// corrupt — only diagnostics — so unlike the worker its stderr IS captured). On
-/// ANY error every handle made here is closed (and a created-but-unresumed child
-/// terminated) and the SID freed before returning: no leak, no double-close.
+/// arbitrary exe: the capability-free SID + `SECURITY_CAPABILITIES` +
+/// proc-thread attribute list + no-children / memory-capped / kill-on-close Job,
+/// with stdin = NUL, stdout = NUL, stderr = an AppContainer-granted capture pipe
+/// (ffmpeg has no framed protocol to corrupt — only diagnostics — so its stderr
+/// IS captured). On ANY error every handle made here is closed (and a
+/// created-but-unresumed child terminated) and the SID freed before returning:
+/// no leak, no double-close.
 fn setup_confined_exe_child(
     program: &Path,
     args: &[OsString],

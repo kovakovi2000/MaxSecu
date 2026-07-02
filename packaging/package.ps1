@@ -13,15 +13,6 @@ cargo build --release -p maxsecu-portable-server
 if ($LASTEXITCODE -ne 0) { throw "cargo build (portable-server) failed" }
 cargo build --release -p maxsecu-client-app
 if ($LASTEXITCODE -ne 0) { throw "cargo build (client-app) failed" }
-# The confined author-side re-mux worker binary. The client spawns this BESIDE its
-# own exe (see client-app video::transcode_worker_path). Without it staged next to
-# the client, image posts work (in-process) but every VIDEO upload fails with
-# "That video could not be processed." (transcode worker not found). `media-worker`
-# (the retired confined VIEW decoder) is no longer a shipped binary — native
-# <video> is the viewer now; `media-worker` survives only as a dev-only
-# decode-verification lib for media-transcode-worker's own tests.
-cargo build --release -p maxsecu-media-transcode-worker
-if ($LASTEXITCODE -ne 0) { throw "cargo build (media-transcode-worker) failed" }
 
 Write-Host "==> Laying out the portable SERVER folder ($Out\MaxSecuServer)"
 $Server = Join-Path $Out "MaxSecuServer"
@@ -34,10 +25,9 @@ Write-Host "==> Laying out the portable CLIENT folder ($Out\MaxSecuClient)"
 $Client = Join-Path $Out "MaxSecuClient"
 foreach ($d in @("config", "keystore", "index", "cache", "logs")) { New-Item -ItemType Directory -Force -Path (Join-Path $Client $d) | Out-Null }
 Copy-Item (Join-Path $Root "target\release\maxsecu-client-app.exe") $Client -Force
-# The confined transcode worker binary MUST sit BESIDE the client exe — the client
-# resolves it relative to its own AppDir. (ffmpeg itself is embedded in the client
-# via include_bytes! + materialized at runtime, so it needs no staging here.)
-Copy-Item (Join-Path $Root "target\release\media-transcode-worker.exe") $Client -Force
+# ffmpeg (the confined author-side transcode) is embedded in the client via
+# include_bytes! + materialized at runtime, so it needs no separate staging here.
+# The viewer is native <video> — no decode worker binary ships either.
 # Embedded UI assets (the WebView loads these).
 $UiDist = Join-Path $Root "crates\client-app\ui\dist"
 if (Test-Path $UiDist) {
