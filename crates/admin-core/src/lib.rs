@@ -17,6 +17,7 @@
 mod control;
 mod directory;
 mod recovery;
+pub mod recovery_seal;
 mod subtree;
 pub mod sweep;
 
