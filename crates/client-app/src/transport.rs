@@ -3,11 +3,50 @@
 //! the RFC 5705 exporter and feeds it to the login proof (api.md §1.5/§2).
 
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
 use crate::error::UiError;
+
+/// Object-safe union of the stream traits a TLS session needs, so the direct
+/// (`TcpStream`) and Tor (`arti_client::DataStream`) transports can be unified
+/// behind one boxed type and share the SAME pinned-TLS + RFC 5705 exporter code.
+pub trait ConnStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ConnStream for T {}
+
+/// A dialed transport-layer byte stream: a plain TCP socket for the direct route,
+/// or a Tor circuit stream for `TorOnly`. TLS is layered on top either way.
+pub type BoxedStream = Box<dyn ConnStream>;
+
+/// Run the pinned TLS 1.3 handshake over an already-dialed boxed stream and derive
+/// the 32-byte RFC 5705 channel-binding exporter. Identical for the direct and Tor
+/// routes — only the dialing differs — so channel binding and the zero-knowledge
+/// server contract are preserved regardless of the underlying transport.
+pub async fn tls_over(
+    tls: Arc<ClientConfig>,
+    server_name: ServerName<'static>,
+    stream: BoxedStream,
+) -> Result<
+    (
+        tokio_rustls::client::TlsStream<BoxedStream>,
+        [u8; EXPORTER_LEN],
+    ),
+    UiError,
+> {
+    let connector = TlsConnector::from(tls);
+    let tls = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|_| UiError::new("tls", "Secure connection failed."))?;
+    let mut exporter = [0u8; EXPORTER_LEN];
+    tls.get_ref()
+        .1
+        .export_keying_material(&mut exporter, EXPORTER_LABEL, None)
+        .map_err(|_| UiError::new("tls", "Channel binding failed."))?;
+    Ok((tls, exporter))
+}
 
 /// TLS 1.3-only client config that pins exactly `server_cert` as the sole root.
 /// Restricting to TLS 1.3 (the server is 1.3-only) prevents a downgrade that
@@ -51,30 +90,17 @@ impl Transport {
         }
     }
 
-    /// Connect, returning the live stream + the 32-byte channel-binding exporter.
+    /// Dial the server over a plain TCP socket (the direct route), then run the
+    /// pinned TLS handshake + channel binding via [`tls_over`]. Returns the live
+    /// stream + the 32-byte exporter. The Tor route dials a circuit stream instead
+    /// (see `crate::tor`) and feeds the SAME `tls_over`.
     pub async fn connect(
         &self,
-    ) -> Result<
-        (
-            tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-            [u8; EXPORTER_LEN],
-        ),
-        UiError,
-    > {
+    ) -> Result<(tokio_rustls::client::TlsStream<BoxedStream>, [u8; EXPORTER_LEN]), UiError> {
         let tcp = tokio::net::TcpStream::connect(&self.addr)
             .await
             .map_err(|_| UiError::new("offline", "Could not reach the server."))?;
-        let connector = TlsConnector::from(self.tls.clone());
-        let tls = connector
-            .connect(self.server_name.clone(), tcp)
-            .await
-            .map_err(|_| UiError::new("tls", "Secure connection failed."))?;
-        let mut exporter = [0u8; EXPORTER_LEN];
-        tls.get_ref()
-            .1
-            .export_keying_material(&mut exporter, EXPORTER_LABEL, None)
-            .map_err(|_| UiError::new("tls", "Channel binding failed."))?;
-        Ok((tls, exporter))
+        tls_over(self.tls.clone(), self.server_name.clone(), Box::new(tcp)).await
     }
 }
 

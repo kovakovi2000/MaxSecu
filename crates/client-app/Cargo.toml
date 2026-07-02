@@ -74,6 +74,14 @@ async-trait = "0.1"
 # pinned cert (mirrors `server::dropbox_tier::HyperDropboxHttp`; CDLA-Permissive-2.0
 # data license already allowed in `deny.toml`).
 webpki-roots = "1"
+# In-process Tor client for the TorOnly download route (Part C). This is the whole
+# reason client-app is its own workspace: arti pulls a transport-only bundled-C
+# SQLite (tor-dirmgr → rusqlite) whose libsqlite3-sys 0.37 cannot coexist with the
+# server's sqlx 0.30 in one lockfile. `rustls` (not native-tls) keeps the TLS stack
+# aligned with the pinned aws-lc-rs transport; onion-service-client is not needed
+# (we reach a normal host:port via a Tor exit). See deny.toml for the arti tree.
+arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls"] }
+tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"] }
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
