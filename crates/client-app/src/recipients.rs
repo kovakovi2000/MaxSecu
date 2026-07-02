@@ -167,7 +167,8 @@ mod tests {
     async fn malformed_body_degrades_to_empty() {
         // A 200 with a body that isn't the expected {"recipients": [...]} shape
         // (e.g. a proxy/misconfiguration) must not panic or bubble an error.
-        let addr = spawn_stub(hyper::StatusCode::OK, serde_json::json!({ "unexpected": true })).await;
+        let addr =
+            spawn_stub(hyper::StatusCode::OK, serde_json::json!({ "unexpected": true })).await;
         let mut sender = connect(&addr).await;
 
         let rows = list_recipients(&mut sender, &"ff".repeat(16), "tok", "localhost").await;

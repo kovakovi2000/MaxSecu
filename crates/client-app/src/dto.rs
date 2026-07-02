@@ -280,6 +280,11 @@ pub struct ResolvedRecipientDto {
     pub already_shared: bool, // cross-checked against list_recipients
 }
 
+/// A request to share an already-uploaded file with more recipients. Carries
+/// only the requested usernames; the command re-resolves and re-verifies each
+/// one under the pinned D5 at share-time rather than trusting the picker's
+/// earlier resolve — this closes a TOCTOU window where a binding could be
+/// re-signed/rotated between picker-open and Share-click.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReshareRequest {
     pub file_id: String,
