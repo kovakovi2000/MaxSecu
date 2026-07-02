@@ -1,8 +1,38 @@
 # Shamir K-of-N Recovery-Key UI — Design
 
-**Status:** Draft design, grounded in shipped code. Not yet brainstormed with the user in a live session —
-several product choices are called out as open questions (§13) rather than decided here. Ready for review
-before an implementation plan.
+**Status:** APPROVED — brainstormed and all open questions resolved (2026-07-02), ready for implementation.
+
+## 0. Locked decisions (2026-07-02) — these OVERRIDE any hedging in later sections
+
+- **D-A — Ceremony UI = Tauri GUI screens** inside `client-app` (§3's choice), offline-only:
+  the split/reconstruct commands perform ZERO network I/O (grep-checkable: no
+  `hyper`/`http_client` import in the new module). CLI alternative rejected for a11y/DTO
+  consistency. The larger-TCB trade-off on the air-gapped device is accepted and documented.
+- **D-B — Pre-split secret load = NEW SEALED-FILE FORMAT.** The existing recovery private
+  key is loaded from a new **Argon2id + AEAD sealed file** (a small companion mirroring
+  `keyblob::seal`), NOT a bare 32-byte scalar on disk. This is a companion piece to build
+  as part of this feature: a `seal_recovery_secret`/`open_recovery_secret` pair (passphrase
+  → Argon2id KDF → AEAD over the `EncSecretKey` bytes). `SplitRecoveryKeyRequest` therefore
+  carries `recovery_secret_path` + a passphrase (Zeroizing, loaded/zeroized inside the
+  command). The bytes-on-disk are never a plaintext scalar.
+- **D-C — Scope = CLASSICAL X25519 ONLY for v1.** Split/reconstruct only the 32-byte
+  X25519 scalar that `admin-core::recovery::{split,reconstruct}_recovery_key` already
+  supports. The ML-KEM (PQ) half is explicitly DEFERRED (flagged follow-up). Zero new
+  cryptography beyond the sealed-file companion (D-B).
+- **D-D — Share transport = TEXT + SAVE-TO-FILE, NO QR.** The `MSHARE1` string is shown
+  copyable and can be written to a file. No QR code (avoids a new webview JS dependency on
+  the air-gapped device). QR is a possible later addition.
+- **D-E — `k`/`n` guidance:** advisory floor `n ≥ 3` (warn, do not hard-block) + a hard
+  `k ≤ n` / `k ≥ 1` / `n ≥ 1` validation (client-side AND command-side, since
+  `split_recovery_key` fails closed on `BadThreshold` anyway). Suggest (not force) `k` = a
+  strict majority of `n`.
+- **D-F — Same-key re-split:** DISCOURAGE as a distinct flow. Re-splitting invalidates all
+  prior shares and must be paired with a full D6 key rotation (§9); the UI states this and
+  does not present "re-split, same key" as a lightweight custodian-swap option.
+- **D-G — Ceremony logging:** include a MINIMAL non-secret local ceremony log (who/when,
+  `k`/`n`, which custodian indices were issued, the label — NEVER share bytes), written
+  only on explicit completion, mirroring the non-secret summary in §4 step 5.
+
 **Relationship to Phase 7:** the cryptographic core this UI sits on top of **already shipped** in Phase 7
 (P7.6 `crypto::shamir`, P7.7 `admin-core::recovery::{split_recovery_key, reconstruct_recovery_key}` —
 see `docs/security-review-phase7.md`, PASS, no Critical/High/Medium). This spec adds **zero new
@@ -599,7 +629,14 @@ Properties a reviewer should confirm before this ships (mirrors the checklist sh
   5. Split → reconstruct with all `n` shares (not just `k`) → still succeeds (mirrors `k_equals_n`-adjacent
      coverage already in `shamir.rs`, confirms the DTO layer doesn't accidentally hardcode "exactly k").
 
-## 13. Open questions / deferred (need a user decision)
+## 13. Open questions / deferred — ALL RESOLVED, see §0
+
+> **Resolved 2026-07-02 (see §0 for the binding decisions):** default k/n & floor → D-E
+> (advisory n≥3, hard k≤n, suggest majority); transport format → D-D (text+file, no QR);
+> pre-split secret on-disk format → D-B (new Argon2id+AEAD sealed file); same-key re-split
+> → D-F (discouraged, distinct from D6 rotation); ML-KEM half → D-C (deferred, classical
+> only); CLI vs GUI → D-A (Tauri GUI); ceremony logging → D-G (minimal non-secret local
+> log). The original analysis is retained below for context.
 
 - **Default `k`/`n` values / whether to force a minimum `n`.** §4 suggests "majority of `n`" as guidance
   text, not an enforced default — confirm whether the product wants a hard floor (e.g. refuse `n < 3`) or

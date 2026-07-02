@@ -1,7 +1,35 @@
 # Post-Upload Multi-Recipient Sharing — UI Design
 
-**Status:** Design (ready for an implementation plan). No code in this document.
+**Status:** APPROVED — all open questions resolved (2026-07-02), ready for implementation. No code in this document.
 **Branch context:** local `main` (unpushed). Additive to the media-app UI stack (Phases 1–7, all merged).
+
+## 0. Locked decisions (2026-07-02) — these OVERRIDE any hedging in later sections
+
+- **D-OQ1 — Revocation anchor = SECURE SINK ANCHOR.** The reshare command sources the
+  anchored control-log head from the out-of-band sink via the Phase-7
+  `HttpSinkClient::fetch_control_pos` client (a client-app→sink call that bypasses the
+  untrusted app server for the anchor), NOT the server's advisory `chain_head`. This
+  makes reshare the **first real authenticated-`TombstoneSet` path in client-app** —
+  today the viewer ships `tombstones: None` (§2.4.4). The `TombstoneSet` MUST be built
+  via `TombstoneSet::verify_authenticated` against that sink-anchored head. (Retrofitting
+  the viewer's `tombstones: None` is a *possible follow-up*, not required by this feature.)
+- **D-OQ3 — Share surface = ANY WRAP-HOLDER, not owner-only.** The Share affordance is
+  shown to anyone who can open the file (i.e. holds a wrap), matching `build_reshare`'s
+  generic `granter`. Consequence: **the `mine`-gating in §2.4.6 / §3 is NO LONGER a
+  restriction** — Share is available to any viewer, and the DEK is recovered from the
+  *caller's own* served wrap (`recipient_id == Id(my_id)`), which any wrap-holder has.
+  Gap 6 (`OpenedContentDto.mine`) is downgraded to optional display metadata, not a gate.
+  The sharing-DAG UX (a non-owner reshare produces a normal `GrantAction::Reshare` edge
+  whose `granted_by` is the resharer, already subtree-walk-visible per §7) needs no new
+  plumbing.
+- **D-OQ5 — No batch-size cap.** `recipient_usernames.len()` is unbounded; large batches
+  are sequential idempotent POSTs on one connection (slow, not unsafe). Revisit only if
+  usage justifies it.
+- **D-OQ2 — UI chrome:** build a NEW `<share-dialog>` (modal picker + immediate results)
+  AND a NEW `<share-tray>` (passive `EVT_RESHARE` surface). Do not overload `<upload-tray>`.
+- **D-OQ4 — `VerifiedAuthor.mlkem_pub`:** add the field to the shared `VerifiedAuthor`
+  struct (forwarding the `v.mlkem_pub` the verifier already returns) as its OWN small,
+  independently-reviewable step landed before the reshare command.
 
 ## 1. Goal & scope
 
@@ -593,7 +621,12 @@ directory ceremony, real control-log, no mocked crypto. New `reshare_e2e.rs`:
    dependency-free `node:test` pattern (no new axe/jsdom dependency, consistent
    with the P5 sign-off's stated deferral of full axe-in-jsdom).
 
-## 11. Open questions / deferred (need a user decision)
+## 11. Open questions / deferred — ALL RESOLVED, see §0
+
+> **Resolved 2026-07-02 (see §0 for the binding decisions):** OQ-1 → secure sink anchor
+> (D-OQ1); OQ-2 → new `<share-dialog>` + `<share-tray>` (D-OQ2); OQ-3 → any wrap-holder,
+> not owner-only (D-OQ3); OQ-4 → extend `VerifiedAuthor` as its own step (D-OQ4); OQ-5 →
+> no batch cap (D-OQ5). The original analysis is retained below for context.
 
 - **OQ-1 — Where does the reshare command source the anchored control-log head?**
   The Phase-7 R27 add-on already built `HttpSinkClient::fetch_control_pos` /
