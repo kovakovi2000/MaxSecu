@@ -274,10 +274,6 @@ pub trait Store: Send + Sync {
     async fn control_records(&self) -> Result<Vec<StoredControlRecord>, StoreError>;
     /// The current chain head (`GENESIS_HEAD` if empty).
     async fn control_head(&self) -> Result<[u8; 32], StoreError>;
-    /// The caller's advisory roles, for the **coarse** admin gate on control-log
-    /// writes (§10.1). Not the security boundary — the client re-verifies every
-    /// tombstone's authenticity independently.
-    async fn user_roles(&self, user_id: &[u8; 16]) -> Result<Vec<Role>, StoreError>;
 
     // ---- Phase 3: file records (DESIGN §11.2/§11.7/§12.2, api.md §8) ----
 
@@ -718,17 +714,6 @@ impl Store for MemoryStore {
 
     async fn control_head(&self) -> Result<[u8; 32], StoreError> {
         Ok(self.inner.lock().unwrap().control_head)
-    }
-
-    async fn user_roles(&self, user_id: &[u8; 16]) -> Result<Vec<Role>, StoreError> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .roles
-            .get(user_id)
-            .cloned()
-            .unwrap_or_else(|| vec![Role::User]))
     }
 
     async fn stage_version(&self, parsed: ParsedStage, now_ms: u64) -> Result<u64, StageError> {
@@ -1210,9 +1195,6 @@ impl Store for FaultyStore {
     }
     async fn control_head(&self) -> Result<[u8; 32], StoreError> {
         Err(Self::fault("control_head"))
-    }
-    async fn user_roles(&self, _user_id: &[u8; 16]) -> Result<Vec<Role>, StoreError> {
-        Err(Self::fault("user_roles"))
     }
     async fn stage_version(&self, _parsed: ParsedStage, _now_ms: u64) -> Result<u64, StageError> {
         Err(StageError::Store(Self::fault("stage_version")))

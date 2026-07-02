@@ -176,9 +176,6 @@ impl Store for FaultyStore {
     async fn control_head(&self) -> Result<[u8; 32], StoreError> {
         Err(bait("control_head"))
     }
-    async fn user_roles(&self, _u: &[u8; 16]) -> Result<Vec<Role>, StoreError> {
-        Err(bait("user_roles"))
-    }
     async fn stage_version(&self, _p: ParsedStage, _n: u64) -> Result<u64, StageError> {
         Err(StageError::Store(bait("stage_version")))
     }
@@ -311,9 +308,6 @@ impl Store for FileFaultyStore {
     }
     async fn control_head(&self) -> Result<[u8; 32], StoreError> {
         self.inner.control_head().await
-    }
-    async fn user_roles(&self, u: &[u8; 16]) -> Result<Vec<Role>, StoreError> {
-        self.inner.user_roles(u).await
     }
     // --- faulted file-record methods (→ handler internal_error → bare 500) ---
     async fn append_control(

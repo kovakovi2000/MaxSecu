@@ -113,12 +113,3 @@ pub(crate) fn role_text(r: &Role) -> String {
         Role::Admin => "admin".to_owned(),
     }
 }
-
-/// Parse a role from its projection text (unknown text is ignored by the caller).
-pub(crate) fn role_from_text(s: &str) -> Option<Role> {
-    match s {
-        "user" => Some(Role::User),
-        "admin" => Some(Role::Admin),
-        _ => None,
-    }
-}

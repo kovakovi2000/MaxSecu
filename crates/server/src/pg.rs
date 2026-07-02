@@ -23,13 +23,12 @@ use async_trait::async_trait;
 use maxsecu_crypto::random_array;
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::DirBinding;
-use maxsecu_encoding::types::Role;
 use maxsecu_encoding::GENESIS_HEAD;
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::Row;
 use time::OffsetDateTime;
 
-use crate::control::{decode_control, role_from_text, role_text};
+use crate::control::{decode_control, role_text};
 use crate::error::{ControlAppendError, StoreError};
 use crate::files::{
     AddWrapError, DeleteWrapError, DiscardError, FinalizeError, ListFilter, ParsedStage, StageError,
@@ -468,17 +467,6 @@ impl Store for PgStore {
             Some(row) => col_fixed(&row, "control_head", "head"),
             None => Ok(GENESIS_HEAD.0),
         }
-    }
-
-    async fn user_roles(&self, user_id: &[u8; 16]) -> Result<Vec<Role>, StoreError> {
-        let row = sqlx::query("SELECT roles FROM users WHERE user_id = $1")
-            .bind(&user_id[..])
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(store_err("user_roles"))?;
-        let Some(row) = row else { return Ok(Vec::new()) };
-        let roles: Vec<String> = row.try_get("roles").map_err(store_err("user_roles"))?;
-        Ok(roles.iter().filter_map(|s| role_from_text(s)).collect())
     }
 
     async fn stage_version(&self, parsed: ParsedStage, _now_ms: u64) -> Result<u64, StageError> {
