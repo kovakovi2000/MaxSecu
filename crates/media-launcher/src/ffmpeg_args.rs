@@ -36,9 +36,18 @@ use maxsecu_client_core::video::VideoBounds;
 use crate::transcode_opts::{Bitrate, Resolution, TranscodeOptions};
 
 /// Default SVT-AV1 `-preset` (speed/quality trade-off; lower = slower/better).
-/// `8` is a balanced default; it does NOT affect the canonical fragment layout
-/// (ratification §2) and is freely tunable per deployment.
-pub const DEFAULT_PRESET: u32 = 8;
+/// `6` favours quality (a step slower than the old `8`); it does NOT affect the
+/// canonical fragment layout (ratification §2) and is freely tunable per deployment.
+pub const DEFAULT_PRESET: u32 = 6;
+
+/// Default SVT-AV1 constant-quality `-crf` used when the caller leaves the bitrate
+/// at [`Bitrate::Original`] (the default path). SVT-AV1's own fallback rate control
+/// (~CRF 35) is visibly lossy at 1080p; `22` is a high-quality, near-transparent
+/// target that keeps files roughly comparable to a typical H.264 source. An explicit
+/// [`Bitrate::Kbps`] instead switches to bitrate-targeted `-b:v` (below). This is a
+/// pure quality knob — it does NOT change the canonical AV1/AAC fragment layout the
+/// viewer decodes, so it is freely tunable.
+pub const DEFAULT_CRF: u32 = 22;
 
 /// Default closed-GOP keyframe interval (`-g` / SVT-AV1 `keyint`). This is the
 /// **fragment granularity**: one closed GOP per canonical fragment, so the
@@ -121,11 +130,20 @@ pub fn build_ffmpeg_args(
     arg!("-svtav1-params");
     arg!(format!("keyint={DEFAULT_GOP}:pred-struct=1"));
 
-    // D-4: emit -b:v ONLY for an explicit target; Original leaves libsvtav1's
-    // default (quality-preserving) rate control alone.
-    if let Bitrate::Kbps(n) = opts.bitrate {
-        arg!("-b:v");
-        arg!(format!("{n}k"));
+    // Rate control (mutually exclusive):
+    //   * Bitrate::Kbps(n)   → bitrate-targeted `-b:v {n}k` (explicit user target).
+    //   * Bitrate::Original  → constant-quality `-crf DEFAULT_CRF`. SVT-AV1's own
+    //     fallback (no -b:v, no -crf) is ~CRF 35 and visibly lossy at 1080p, so we
+    //     pin an explicit high-quality CRF instead of leaving it to the encoder.
+    match opts.bitrate {
+        Bitrate::Kbps(n) => {
+            arg!("-b:v");
+            arg!(format!("{n}k"));
+        }
+        Bitrate::Original => {
+            arg!("-crf");
+            arg!(DEFAULT_CRF.to_string());
+        }
     }
 
     arg!("-c:a");
@@ -233,10 +251,16 @@ mod tests {
         };
         let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds());
 
-        // D-4: Original bitrate ⇒ NO -b:v.
+        // D-4: Original bitrate ⇒ NO -b:v, but an explicit high-quality -crf instead
+        // of SVT-AV1's lossy default rate control.
         assert!(
             !contains(&args, "-b:v"),
             "Original bitrate must not emit -b:v"
+        );
+        assert_eq!(
+            value_after(&args, "-crf"),
+            DEFAULT_CRF.to_string(),
+            "Original bitrate must pin an explicit high-quality -crf"
         );
 
         // The SAR-aware even-guard scale filter: width resampled by the input SAR to
@@ -297,6 +321,11 @@ mod tests {
         assert_eq!(value_after(&args, "-vf"), "scale='trunc(720*dar/2)*2':720,setsar=1");
         assert!(contains(&args, "-b:v"), "Kbps must emit -b:v");
         assert_eq!(value_after(&args, "-b:v"), "4000k");
+        // Explicit bitrate uses -b:v rate control, NOT constant-quality -crf.
+        assert!(
+            !contains(&args, "-crf"),
+            "explicit Kbps must not also emit -crf"
+        );
     }
 
     #[test]
