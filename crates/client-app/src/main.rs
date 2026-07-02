@@ -68,6 +68,7 @@ fn main() {
             maxsecu_client_app::commands::settings::change_password,
             maxsecu_client_app::commands::settings::export_keystore,
             maxsecu_client_app::ram::ram_limits,
+            maxsecu_client_app::ram::memory_stats,
             maxsecu_client_app::commands::video::open_video,
             maxsecu_client_app::commands::video::video_seek,
             maxsecu_client_app::commands::video::video_set_volume,

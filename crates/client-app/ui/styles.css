@@ -590,6 +590,29 @@ settings-screen main > fieldset { max-width: 760px; }
 #ram-hint, #exp-warn { margin-top: 0.5rem; font-size: var(--mx-fs-1); }
 
 /* ---------- Quick settings + upload tray + toasts ---------- */
+
+/* RAM-usage rainbow gauge bar — pinned to the left edge of the quick-settings
+   popover. The fill div rises from the bottom; its height is set in JS to
+   fillFraction × 100%. Static fill, no shimmer (respects reduced-motion). */
+.qs-ram-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  border-radius: var(--mx-radius-lg) 0 0 var(--mx-radius-lg);
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+}
+.qs-ram-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: linear-gradient(to top, red, orange, yellow, green, blue, violet);
+  /* height set inline by JS — no CSS transition so reduced-motion is respected */
+}
+
 .qs { position: relative; }
 .qs #qs-btn {
   width: 2.7rem;
