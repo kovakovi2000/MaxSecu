@@ -591,26 +591,32 @@ settings-screen main > fieldset { max-width: 760px; }
 
 /* ---------- Quick settings + upload tray + toasts ---------- */
 
-/* RAM-usage rainbow gauge bar — a thin vertical bar sitting to the LEFT of the ⚡
+/* RAM-usage rainbow gauge bar — a horizontal bar sitting to the LEFT of the ⚡
    quick-settings button (always visible, not inside the popover). The fill div
-   rises from the bottom; its height is set in JS to fillFraction × 100% of the
-   RAM cache cap. Static fill, no shimmer (respects reduced-motion). */
+   grows left→right; its width is set in JS to fillFraction × 100% of the RAM
+   cache cap. The rainbow gradient is sized to the FULL track (background-size),
+   so growing the fill REVEALS successive colours (red at empty → violet at full)
+   rather than compressing the whole spectrum into the filled portion. Static
+   fill, no shimmer (respects reduced-motion). */
 .qs-ram-bar {
   position: relative;
   flex: 0 0 auto;
-  width: 6px;
-  height: 2.4rem;
-  border-radius: 3px;
+  width: 120px;
+  height: 16px;
+  border-radius: 8px;
   overflow: hidden;
   background: rgba(255, 255, 255, 0.1);
 }
 .qs-ram-fill {
   position: absolute;
-  bottom: 0;
   left: 0;
-  right: 0;
-  background: linear-gradient(to top, red, orange, yellow, green, blue, violet);
-  /* height set inline by JS — no CSS transition so reduced-motion is respected */
+  top: 0;
+  bottom: 0;
+  background: linear-gradient(to right, red, orange, yellow, green, blue, violet);
+  background-size: 120px 100%; /* full-track spectrum; revealed as the fill grows */
+  background-repeat: no-repeat;
+  background-position: left center;
+  /* width set inline by JS — no CSS transition so reduced-motion is respected */
 }
 
 .qs { position: relative; display: flex; align-items: center; gap: 0.4rem; }

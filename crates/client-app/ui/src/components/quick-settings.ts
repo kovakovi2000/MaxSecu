@@ -88,7 +88,7 @@ export class QuickSettings extends HTMLElement {
     bar.setAttribute("aria-valuenow", String(g.pct));
     bar.setAttribute("aria-label", g.label);
     const fill = bar.querySelector<HTMLElement>(".qs-ram-fill");
-    if (fill) fill.style.height = `${g.fillFraction * 100}%`;
+    if (fill) fill.style.width = `${g.fillFraction * 100}%`;
   }
 
   private async toggle() {
