@@ -82,8 +82,11 @@ struct SinkEndpointFile {
 }
 
 /// Build a client TLS config that trusts ONLY the pinned sink root cert (raw
-/// DER). Uses the same `aws_lc_rs` provider as the rest of the client transport.
-/// Exposed for the sink test harness (a loopback sink presents a runtime cert).
+/// DER). TLS 1.3-only + `aws_lc_rs`, matching the app-server pinned-channel
+/// precedent (`transport::pinned_client_config`): restricting to 1.3 avoids a
+/// downgrade to a weaker suite against the pinned sink. No public-CA roots are
+/// added — the pinned cert is the only accepted sink identity. Exposed for the
+/// sink test harness (a loopback sink presents a runtime cert).
 pub fn client_config_for_pinned_root(root_der: &[u8]) -> Result<Arc<ClientConfig>, UiError> {
     use tokio_rustls::rustls::pki_types::CertificateDer;
     let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
@@ -92,10 +95,8 @@ pub fn client_config_for_pinned_root(root_der: &[u8]) -> Result<Arc<ClientConfig
         .add(CertificateDer::from(root_der.to_vec()))
         .map_err(|_| UiError::new("sink_unpinned", "The sink's TLS root is not pinned."))?;
     let cfg = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|_| {
-            UiError::new("sink_unpinned", "Could not initialize the pinned sink transport.")
-        })?
+        .with_protocol_versions(&[&tokio_rustls::rustls::version::TLS13])
+        .map_err(|_| UiError::new("sink_tls", "The pinned sink transport failed to init."))?
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(Arc::new(cfg))
@@ -112,7 +113,7 @@ fn read_pinned_keys(path: &Path, required: bool) -> Result<Vec<[u8; 32]>, UiErro
         Err(_) => {
             return Err(UiError::new(
                 "sink_unpinned",
-                "The sink custodian allowlist is not pinned.",
+                "The sink allowlist is not pinned.",
             ))
         }
     };
@@ -120,7 +121,7 @@ fn read_pinned_keys(path: &Path, required: bool) -> Result<Vec<[u8; 32]>, UiErro
         return if required {
             Err(UiError::new(
                 "sink_unpinned",
-                "The sink custodian allowlist is empty.",
+                "The pinned sink allowlist is empty.",
             ))
         } else {
             Ok(Vec::new())
@@ -516,7 +517,7 @@ mod tests {
 
         // Pin the endpoint + a runtime self-signed root + one custodian key.
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-        std::fs::write(cfg.join("sink_root.der"), cert.cert.der().to_vec()).unwrap();
+        std::fs::write(cfg.join("sink_root.der"), cert.cert.der()).unwrap();
         std::fs::write(
             cfg.join("sink.json"),
             br#"{"addr":"127.0.0.1:9443","server_name":"localhost"}"#,
