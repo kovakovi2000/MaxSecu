@@ -276,7 +276,7 @@ app-shell { display: block; min-height: 100vh; }
   background: color-mix(in srgb, var(--mx-surface-2) 72%, transparent);
 }
 upload-tray { grid-area: tray; justify-self: end; }
-.ram-gauge[hidden] { display: none !important; }
+.ram-gauge-wrap[hidden] { display: none !important; }
 #outlet { position: relative; z-index: 1; }
 
 /* ---------- Routed screens ---------- */
@@ -597,8 +597,20 @@ settings-screen main > fieldset { max-width: 760px; }
    the fill REVEALS successive colours (red at empty → violet at full) rather than
    compressing the whole spectrum into the filled portion. Static fill, no shimmer
    (respects reduced-motion). */
+.ram-gauge-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.ram-gauge-text {
+  font-size: var(--mx-fs-1);
+  opacity: 0.8;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 .ram-gauge {
   position: relative;
+  flex: 0 0 auto;
   width: 120px;
   height: 16px;
   border-radius: 8px;

@@ -17,8 +17,13 @@ export class RamGauge extends HTMLElement {
   private _unsubSettings: (() => void) | null = null;
 
   connectedCallback() {
+    // Bar + a visible read-out: "<used> / <total> MB (<pct>%)". The bar is the
+    // accessible meter (aria-*); the text is aria-hidden to avoid double SR output.
     this.innerHTML = `
-      <div class="ram-gauge" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="RAM usage unavailable" hidden><div class="ram-gauge-fill"></div></div>`;
+      <div class="ram-gauge-wrap" hidden>
+        <div class="ram-gauge" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="RAM usage unavailable"><div class="ram-gauge-fill"></div></div>
+        <span class="ram-gauge-text" aria-hidden="true"></span>
+      </div>`;
     // Recompute whenever the cap changes (denominator is the cache cap).
     this._unsubSettings = settingsStore.subscribe(() => this._recompute());
     // Start polling (immediately + every 1500 ms).
@@ -56,19 +61,22 @@ export class RamGauge extends HTMLElement {
   }
 
   private _paint(): void {
+    const wrap = this.querySelector<HTMLElement>(".ram-gauge-wrap");
     const bar = this.querySelector<HTMLElement>(".ram-gauge");
-    if (!bar) return;
+    if (!wrap || !bar) return;
     const g = this._lastGauge;
     if (!g || g.hidden) {
-      bar.hidden = true;
+      wrap.hidden = true;
       return;
     }
-    bar.hidden = false;
+    wrap.hidden = false;
+    wrap.title = g.label;
     bar.setAttribute("aria-valuenow", String(g.pct));
     bar.setAttribute("aria-label", g.label);
-    bar.title = g.label;
     const fill = bar.querySelector<HTMLElement>(".ram-gauge-fill");
     if (fill) fill.style.width = `${g.fillFraction * 100}%`;
+    const text = this.querySelector<HTMLElement>(".ram-gauge-text");
+    if (text) text.textContent = g.label;
   }
 }
 
