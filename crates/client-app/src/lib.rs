@@ -4,6 +4,7 @@
 //! modules directly.
 pub mod admin;
 pub mod bootstrap;
+pub mod ceremony;
 pub mod commands;
 pub mod config;
 pub mod content_cache;

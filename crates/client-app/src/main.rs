@@ -42,6 +42,7 @@ fn main() {
         .manage(maxsecu_client_app::jobs::VideoJobs::new())
         .manage(maxsecu_client_app::jobs::VideoPrepareCancel::default())
         .manage(ContentCache::new(cap_bytes))
+        .manage(maxsecu_client_app::ceremony::CeremonySession::new())
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
             maxsecu_client_app::commands::auth::unlock_keystore,
