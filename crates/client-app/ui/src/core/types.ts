@@ -67,10 +67,19 @@ export interface UploadPreview {
 export type UploadMsg =
   | { phase: "encrypting"; job_id: string }
   | { phase: "staging"; job_id: string }
-  | { phase: "uploading"; job_id: string; done: number; total: number }
+  | { phase: "uploading"; job_id: string; done: number; total: number; bytes_per_s: number }
   | { phase: "finalizing"; job_id: string }
   | { phase: "done"; job_id: string; file_id: string }
   | { phase: "failed"; job_id: string; code: string };
+
+// Returned by list_pending_uploads() — one entry per interrupted upload that is
+// still within the 24-hour retention window.
+export interface PendingUploadView {
+  file_id_hex: string;
+  title: string;
+  progress: number;
+  total: number;
+}
 
 // --- Universal video ingest: transcode lifecycle events (maxsecu://video-prepare) ---
 // kebab-tagged on "phase". `transcoding.percent` is null (indeterminate) until

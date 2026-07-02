@@ -1,28 +1,45 @@
 import { call, on } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import { toast } from "../core/toast.ts";
-import type { UploadMsg } from "../core/types.ts";
+import { formatRate, pendingPromptText } from "../core/format.ts";
+import type { ConnState, PendingUploadView, UploadMsg } from "../core/types.ts";
 import "./progress-meter.ts";
 import "./state-badge.ts";
 
 // Active-uploads tray (spec §5/§6): subscribes to EVT_UPLOAD and shows per-job
 // progress (meter + %), phase (non-color-only badge), and a Retry on failure.
-// A done row auto-clears. ARIA: a labelled region with an aria-live status.
+// A done row auto-clears. Also shows resume prompts for interrupted uploads on
+// each "connected" signal. ARIA: a labelled region with aria-live status.
 export class UploadTray extends HTMLElement {
-  private unlisten: (() => void) | null = null;
+  private unlisteners: Array<() => void> = [];
   private starts = new Map<string, number>(); // job_id -> first-seen ms (for ETA)
+  private pendingList: HTMLUListElement | null = null;
 
   async connectedCallback() {
     this.innerHTML = `
       <section class="upload-tray" aria-label="Active uploads" hidden>
         <h2 class="ut-title">Uploads</h2>
+        <ul id="ut-pending" aria-live="polite" aria-label="Interrupted uploads"></ul>
         <ul id="ut-list" aria-live="polite"></ul>
       </section>`;
-    this.unlisten = await on<UploadMsg>("maxsecu://upload-state", (m) => this.onMsg(m));
+    this.pendingList = this.querySelector("#ut-pending") as HTMLUListElement;
+
+    const ul = await on<UploadMsg>("maxsecu://upload-state", (m) => this.onMsg(m));
+    this.unlisteners.push(ul);
+
+    // Best-effort on mount (will fail if not yet authed — silently ignored).
+    void this.checkPending();
+
+    // Re-check on each "connected" signal to catch post-auth resumables.
+    const cl = await on<ConnState>("maxsecu://connection-state", (s) => {
+      if (s.state === "connected") void this.checkPending();
+    });
+    this.unlisteners.push(cl);
   }
 
   disconnectedCallback() {
-    this.unlisten?.();
+    for (const ul of this.unlisteners) ul();
+    this.unlisteners = [];
   }
 
   private row(jobId: string): HTMLLIElement {
@@ -58,7 +75,11 @@ export class UploadTray extends HTMLElement {
       meter.hidden = false;
       meter.setAttribute("value", String(m.done));
       meter.setAttribute("max", String(m.total));
-      meter.setAttribute("detail", this.eta(m.job_id, m.done, m.total));
+      // Build detail: ETA + MB/s rate (rate omitted when bytes_per_s is 0).
+      const eta = this.eta(m.job_id, m.done, m.total);
+      const rate = formatRate(m.bytes_per_s);
+      const detail = [eta, rate].filter(Boolean).join(" · ");
+      meter.setAttribute("detail", detail);
     } else if (m.phase === "done") {
       meter.hidden = true;
       this.starts.delete(m.job_id);
@@ -103,16 +124,90 @@ export class UploadTray extends HTMLElement {
     window.setTimeout(() => {
       const li = this.querySelector(`li[data-job="${cssEscape(jobId)}"]`);
       li?.remove();
-      const list = this.querySelector("#ut-list") as HTMLUListElement | null;
-      if (list && list.children.length === 0) {
-        (this.querySelector(".upload-tray") as HTMLElement | null)?.setAttribute("hidden", "");
-      }
+      this.maybeHideTray();
     }, 4000);
+  }
+
+  // --- Pending (interrupted) upload resume prompts ---
+
+  private async checkPending() {
+    try {
+      const pending = await call<PendingUploadView[]>("list_pending_uploads");
+      for (const p of pending) this.renderPendingPrompt(p);
+    } catch {
+      // Best-effort: silently tolerate errors (e.g. not yet authed on first call).
+    }
+  }
+
+  private renderPendingPrompt(p: PendingUploadView) {
+    if (!this.pendingList) return;
+    // Guard against duplicates if list_pending_uploads fires multiple times.
+    if (this.pendingList.querySelector(`[data-pending-id="${cssEscape(p.file_id_hex)}"]`)) return;
+
+    (this.querySelector(".upload-tray") as HTMLElement | null)?.removeAttribute("hidden");
+
+    const li = document.createElement("li");
+    li.className = "ut-pending-prompt";
+    li.setAttribute("data-pending-id", p.file_id_hex);
+
+    const text = document.createElement("span");
+    text.textContent = pendingPromptText(p);
+
+    const resumeBtn = document.createElement("button");
+    resumeBtn.className = "ut-resume";
+    resumeBtn.textContent = "Resume";
+    resumeBtn.setAttribute("aria-label", `Resume upload of ${p.title}`);
+
+    const discardBtn = document.createElement("button");
+    discardBtn.className = "ut-discard";
+    discardBtn.textContent = "Discard";
+    discardBtn.setAttribute("aria-label", `Discard upload of ${p.title}`);
+
+    resumeBtn.addEventListener("click", async () => {
+      resumeBtn.disabled = true;
+      discardBtn.disabled = true;
+      try {
+        // resume_upload re-runs the upload pipeline and emits normal upload-state
+        // events; the active-uploads list takes over from here.
+        await serial(() => call<void>("resume_upload", { fileIdHex: p.file_id_hex }));
+        li.remove();
+        this.maybeHideTray();
+      } catch {
+        resumeBtn.disabled = false;
+        discardBtn.disabled = false;
+      }
+    });
+
+    discardBtn.addEventListener("click", async () => {
+      resumeBtn.disabled = true;
+      discardBtn.disabled = true;
+      try {
+        await call<void>("dismiss_pending_upload", { fileIdHex: p.file_id_hex });
+      } catch {
+        // Best-effort: remove the prompt regardless so the user is not stuck.
+      }
+      li.remove();
+      this.maybeHideTray();
+    });
+
+    li.append(text, resumeBtn, discardBtn);
+    this.pendingList.appendChild(li);
+  }
+
+  private maybeHideTray() {
+    const list = this.querySelector("#ut-list") as HTMLUListElement | null;
+    if (
+      (!list || list.children.length === 0) &&
+      (!this.pendingList || this.pendingList.children.length === 0)
+    ) {
+      (this.querySelector(".upload-tray") as HTMLElement | null)?.setAttribute("hidden", "");
+    }
   }
 }
 
 function cssEscape(s: string): string {
-  // job_id is server-side hex, but escape defensively for the attribute selector.
+  // job_id / file_id_hex are server-side hex, but escape defensively for the
+  // attribute selector.
   return s.replace(/["\\\]]/g, "\\$&");
 }
 
