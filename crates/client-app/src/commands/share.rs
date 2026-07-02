@@ -14,10 +14,13 @@
 //!
 //! **Per-recipient fail isolation (spec §5).** Every entered username yields
 //! EXACTLY ONE [`ReshareOutcomeDto`] (never a dropped row); one recipient failing
-//! (unresolvable → "untrusted", revoked → "revoked", missing PQ key →
-//! "pq_key_missing", transient POST error) never aborts the batch or rolls back
-//! the others. Re-sharing is idempotent server-side (`Store::add_wrap` replaces
-//! the row), so retrying just the failed rows is always safe.
+//! never aborts the batch or rolls back the others. The sanitized per-recipient
+//! failure codes are: "untrusted" (unresolvable / bad binding), "revoked",
+//! "pq_key_missing", "verify_failed" (DEK-commitment mismatch), "recovery_recipient",
+//! "wrap_failed", "share_failed" (a non-201 POST), "locked" (the identity was
+//! momentarily absent mid-batch — see [`run_reshare_batch`]), or a transport error
+//! code. Re-sharing is idempotent server-side (`Store::add_wrap` replaces the row),
+//! so retrying just the failed rows is always safe.
 //!
 //! **Identity-borrow discipline (spec §9).** The non-`Clone` `Identity` is borrowed
 //! ONLY for the synchronous `recover_own_dek` and each synchronous `build_reshare`
@@ -284,6 +287,10 @@ async fn run_reshare_batch(
                     build_reshare(&params, dek, tombstones)
                         .map_err(|e| reshare_error_code(&e).to_owned())
                 }
+                // The session mutex is released between recipients, so a concurrent
+                // logout / lock mid-batch can make the identity momentarily absent
+                // here. Fail closed for THIS recipient (no wrap produced, row still
+                // recorded) rather than aborting the whole batch.
                 None => Err("locked".to_owned()),
             }
         }; // guard drops here — identity no longer borrowed, safe to await
@@ -635,6 +642,139 @@ mod tests {
         assert_eq!(outcomes[1].username, "alice");
         assert!(outcomes[1].ok, "the valid recipient still succeeds");
         assert!(outcomes[1].code.is_none(), "success carries no code");
+    }
+
+    /// An in-process HTTP/1.1 stub that serves a fixed `alice` binding for ANY
+    /// `GET /v1/directory/*` and, for the `/wraps` POST, returns the FIRST status in
+    /// `wrap_statuses` on the first hit, the second on the next, etc. (a
+    /// per-`/wraps`-POST sequence). Lets one batch drive a POST failure for one
+    /// recipient and a success for the next.
+    async fn spawn_seq_wrap_stub(
+        binding_body: String,
+        wrap_statuses: Vec<hyper::StatusCode>,
+    ) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let binding_body = Arc::new(binding_body);
+        let statuses = Arc::new(wrap_statuses);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let binding_body = binding_body.clone();
+                let statuses = statuses.clone();
+                let hits = hits.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let binding_body = binding_body.clone();
+                        let statuses = statuses.clone();
+                        let hits = hits.clone();
+                        async move {
+                            let path = req.uri().path().to_owned();
+                            let _ = req.into_body().collect().await;
+                            let resp = if path.ends_with("/wraps") {
+                                let n = hits.fetch_add(1, Ordering::SeqCst);
+                                let st = statuses
+                                    .get(n)
+                                    .copied()
+                                    .unwrap_or(hyper::StatusCode::CREATED);
+                                Response::builder()
+                                    .status(st)
+                                    .body(Full::<Bytes>::from("{}"))
+                                    .unwrap()
+                            } else if path.starts_with("/v1/directory/") {
+                                Response::builder()
+                                    .status(hyper::StatusCode::OK)
+                                    .body(Full::<Bytes>::from((*binding_body).clone()))
+                                    .unwrap()
+                            } else {
+                                Response::builder()
+                                    .status(hyper::StatusCode::NOT_FOUND)
+                                    .body(Full::<Bytes>::new(Bytes::new()))
+                                    .unwrap()
+                            };
+                            Ok::<_, Infallible>(resp)
+                        }
+                    });
+                    let _ = server_http1::Builder::new()
+                        .serve_connection(TokioIo::new(socket), svc)
+                        .await;
+                });
+            }
+        });
+        format!("127.0.0.1:{}", addr.port())
+    }
+
+    /// The POST-failure isolation branch (spec §5): in ONE batch, a recipient whose
+    /// `/wraps` POST the server rejects (a non-201 — here `500`) fails closed with
+    /// `code:"share_failed"`, and this does NOT abort the batch — a SUBSEQUENT
+    /// recipient whose POST succeeds still gets `ok:true`. Every input username
+    /// yields exactly one row, in order.
+    #[tokio::test]
+    async fn post_failure_is_isolated_from_a_succeeding_recipient_in_one_batch() {
+        let d5 = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+        let mut trust = MemoryTrustStore::new();
+
+        let (_alice_sk, alice_pk) = generate_enc_keypair();
+        let dek = Dek::generate();
+        let tombstones = empty_tombstones();
+        let session = session_with_identity();
+
+        let file_id_hex: String = FILE_ID.iter().map(|b| format!("{b:02x}")).collect();
+
+        // Both usernames resolve to a valid binding (the stub serves the same
+        // `alice` binding for any /v1/directory/*); they differ only in the /wraps
+        // POST outcome: the FIRST POST → 500, the SECOND → 201.
+        let addr = spawn_seq_wrap_stub(
+            alice_binding(&d5, alice_pk.to_bytes()),
+            vec![
+                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                hyper::StatusCode::CREATED,
+            ],
+        )
+        .await;
+        let mut sender = connect(&addr).await;
+
+        // "rfail" is resolved+wrapped first (its POST → 500), then "rok" (POST → 201)
+        // in the SAME batch — proving the first failure did not abort the batch.
+        let recipients = vec!["rfail".to_owned(), "rok".to_owned()];
+        let outcomes = run_reshare_batch(
+            &mut sender,
+            "localhost",
+            "tok",
+            &file_id_hex,
+            FILE_ID,
+            1,
+            dek.commit(),
+            Suite::V1,
+            GRANTER_ID,
+            &dek,
+            &tombstones,
+            &session,
+            &recipients,
+            &verifier,
+            &mut trust,
+            NOW,
+            &|_| {},
+        )
+        .await;
+
+        // Exactly one row per input username, in order — never a dropped row.
+        assert_eq!(outcomes.len(), 2, "one outcome per entered username");
+        assert_eq!(outcomes[0].username, "rfail");
+        assert!(!outcomes[0].ok, "a non-201 POST fails this recipient");
+        assert_eq!(outcomes[0].code.as_deref(), Some("share_failed"));
+        assert_eq!(outcomes[1].username, "rok");
+        assert!(
+            outcomes[1].ok,
+            "the batch was not aborted: the next recipient still succeeds"
+        );
+        assert!(outcomes[1].code.is_none());
     }
 
     #[test]
