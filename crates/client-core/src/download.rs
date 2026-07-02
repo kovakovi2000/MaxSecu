@@ -590,6 +590,62 @@ pub struct OpenedHeader {
     pub small_streams: Vec<OpenedStream>,
 }
 
+/// Decode + digest-verify every non-content (small) stream declared in the
+/// manifest, and locate + bounds-check the content stream's manifest entry.
+/// Shared by [`verify_and_stream_content`] and [`verify_and_open_headers`] — both
+/// run this identical §12.5 small-stream ladder right after [`verify_header`].
+/// Returns the opened small streams and the content stream's manifest entry (for
+/// the caller to stream or just report). Error order preserved exactly (no oracle
+/// change): compression check, then content-skip, then presence/framing/digest/
+/// decrypt for each small stream, then the content-declared/addressable-size checks.
+fn open_small_streams<'m>(
+    ctx: &VerifyContext,
+    manifest: &'m Manifest,
+    dek: &Dek,
+    small_streams: &[StreamChunks],
+) -> Result<(Vec<OpenedStream>, &'m maxsecu_encoding::structs::Stream), DownloadError> {
+    use DownloadError::*;
+
+    // Small streams (everything except content) decode whole, fully digest-checked.
+    let mut small = Vec::new();
+    let mut content_ms: Option<&maxsecu_encoding::structs::Stream> = None;
+    for ms in &manifest.streams {
+        if ms.compression != Compression::None {
+            return Err(CompressionUnsupported);
+        }
+        if ms.stream_type == StreamType::Content {
+            content_ms = Some(ms);
+            continue;
+        }
+        let provided = small_streams
+            .iter()
+            .find(|s| s.stream_type == ms.stream_type)
+            .ok_or(StreamMissing(ms.stream_type))?;
+        if provided.chunks.len() as u64 != ms.chunk_count {
+            return Err(FramingBoundsExceeded("chunk_count mismatch"));
+        }
+        if stream_digest(&provided.chunks) != ms.digest.0 {
+            return Err(StreamDigestMismatch(ms.stream_type));
+        }
+        let ck = dek.stream_subkey(ms.stream_type);
+        let plaintext = open_stream(&ck, ctx.file_id, manifest.version, ms.stream_type, &provided.chunks)
+            .map_err(|_| StreamFraming(ms.stream_type))?;
+        small.push(OpenedStream {
+            stream_type: ms.stream_type,
+            plaintext,
+        });
+    }
+
+    // The content stream must be declared in the manifest (DESIGN §12.3).
+    let content_ms = content_ms.ok_or(StreamMissing(StreamType::Content))?;
+    match content_ms.chunk_count.checked_mul(manifest.chunk_size as u64) {
+        Some(b) if b <= MAX_ADDRESSABLE_BYTES => {}
+        _ => return Err(FramingBoundsExceeded("addressable size")),
+    }
+
+    Ok((small, content_ms))
+}
+
 /// Run the §12.5 ladder, then **stream** the `content` stream chunk-at-a-time to
 /// `sink` while decoding the small streams whole (DESIGN §8.1 line 360–361).
 ///
@@ -627,43 +683,8 @@ where
         &header.wrapped_dek,
     )?;
 
-    // Small streams (everything except content) decode whole, fully digest-checked.
-    let mut small = Vec::new();
-    let mut content_ms: Option<&maxsecu_encoding::structs::Stream> = None;
-    for ms in &manifest.streams {
-        if ms.compression != Compression::None {
-            return Err(CompressionUnsupported);
-        }
-        if ms.stream_type == StreamType::Content {
-            content_ms = Some(ms);
-            continue;
-        }
-        let provided = header
-            .small_streams
-            .iter()
-            .find(|s| s.stream_type == ms.stream_type)
-            .ok_or(StreamMissing(ms.stream_type))?;
-        if provided.chunks.len() as u64 != ms.chunk_count {
-            return Err(FramingBoundsExceeded("chunk_count mismatch"));
-        }
-        if stream_digest(&provided.chunks) != ms.digest.0 {
-            return Err(StreamDigestMismatch(ms.stream_type));
-        }
-        let ck = dek.stream_subkey(ms.stream_type);
-        let plaintext = open_stream(&ck, ctx.file_id, manifest.version, ms.stream_type, &provided.chunks)
-            .map_err(|_| StreamFraming(ms.stream_type))?;
-        small.push(OpenedStream {
-            stream_type: ms.stream_type,
-            plaintext,
-        });
-    }
+    let (small, content_ms) = open_small_streams(ctx, &manifest, &dek, &header.small_streams)?;
 
-    // The content stream must be declared in the manifest (DESIGN §12.3).
-    let content_ms = content_ms.ok_or(StreamMissing(StreamType::Content))?;
-    match content_ms.chunk_count.checked_mul(manifest.chunk_size as u64) {
-        Some(b) if b <= MAX_ADDRESSABLE_BYTES => {}
-        _ => return Err(FramingBoundsExceeded("addressable size")),
-    }
     let ck = dek.stream_subkey(StreamType::Content);
     // Bridge the caller's DownloadError fetch/sink into the crypto layer's
     // CryptoError closures: stash any caller error in a cell and surface a
@@ -716,8 +737,6 @@ pub fn verify_and_open_headers(
     ctx: &VerifyContext,
     header: &StreamHeader,
 ) -> Result<OpenedHeader, DownloadError> {
-    use DownloadError::*;
-
     let (manifest, dek, recovery_grant_ok) = verify_header(
         ctx,
         &header.manifest_bytes,
@@ -732,43 +751,10 @@ pub fn verify_and_open_headers(
         &header.wrapped_dek,
     )?;
 
-    let mut small = Vec::new();
-    let mut content_ms: Option<&maxsecu_encoding::structs::Stream> = None;
-    for ms in &manifest.streams {
-        if ms.compression != Compression::None {
-            return Err(CompressionUnsupported);
-        }
-        if ms.stream_type == StreamType::Content {
-            content_ms = Some(ms);
-            continue;
-        }
-        let provided = header
-            .small_streams
-            .iter()
-            .find(|s| s.stream_type == ms.stream_type)
-            .ok_or(StreamMissing(ms.stream_type))?;
-        if provided.chunks.len() as u64 != ms.chunk_count {
-            return Err(FramingBoundsExceeded("chunk_count mismatch"));
-        }
-        if stream_digest(&provided.chunks) != ms.digest.0 {
-            return Err(StreamDigestMismatch(ms.stream_type));
-        }
-        let ck = dek.stream_subkey(ms.stream_type);
-        let plaintext = open_stream(&ck, ctx.file_id, manifest.version, ms.stream_type, &provided.chunks)
-            .map_err(|_| StreamFraming(ms.stream_type))?;
-        small.push(OpenedStream {
-            stream_type: ms.stream_type,
-            plaintext,
-        });
-    }
-
-    // The content stream must be declared in the manifest (DESIGN §12.3), even
-    // though we do not fetch it here — its framing count is reported back.
-    let content_ms = content_ms.ok_or(StreamMissing(StreamType::Content))?;
-    match content_ms.chunk_count.checked_mul(manifest.chunk_size as u64) {
-        Some(b) if b <= MAX_ADDRESSABLE_BYTES => {}
-        _ => return Err(FramingBoundsExceeded("addressable size")),
-    }
+    // Same §12.5 small-stream ladder as verify_and_stream_content; the content
+    // stream must be declared in the manifest (DESIGN §12.3) even though we do
+    // not fetch it here — its framing count is reported back.
+    let (small, content_ms) = open_small_streams(ctx, &manifest, &dek, &header.small_streams)?;
 
     Ok(OpenedHeader {
         version: manifest.version,
