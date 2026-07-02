@@ -22,6 +22,7 @@ pub mod layout;
 pub mod ram;
 pub mod recipients;
 pub mod session;
+pub mod sink;
 pub mod state;
 pub mod tor;
 pub mod transport;
