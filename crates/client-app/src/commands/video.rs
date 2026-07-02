@@ -34,7 +34,7 @@
 //! * **Fail-closed everywhere** with a sanitized [`PlayerPhase::Error`]/`UiError`
 //!   (no decode oracle).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tauri::{Emitter, State};
@@ -50,12 +50,12 @@ use maxsecu_encoding::types::{Id, RecipientType, StreamType};
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
 use crate::commands::feed::{hex, hex16, now_ms};
-use crate::config::{load_directory_pub, SettingsConfig};
+use crate::config::{load_directory_pub, RouteMode, SettingsConfig};
 use crate::directory::{resolve_and_verify_author, resolve_my_user_id, VerifiedAuthor};
 use crate::download::{build_stream_header, parse_file_view};
 use crate::error::UiError;
 use crate::fragment_cache::FragmentCache;
-use crate::http_client::{get_bytes, get_json};
+use crate::http_client::get_json;
 use crate::jobs::{AuthedChannel, UploadJobs, VideoJob, VideoJobs};
 use crate::state::{PlayerPhase, EVT_PLAYER};
 use crate::video::{chunks_for_fragment, FragmentEntry};
@@ -183,13 +183,22 @@ fn read_u32_le(blob: &[u8], pos: &mut usize) -> Option<u32> {
 }
 
 /// Probe the total plaintext content length by decrypting the LAST chunk once
-/// over the real server (fetch its ciphertext, then `open_range`), caching the
-/// ciphertext as a side effect. Returns `(n-1)*chunk_size + last_chunk_plaintext`.
-/// Uses the job's stored `AuthedChannel` (no per-call reauth).
+/// over the real server (fetch its ciphertext, then `open_range`). Returns
+/// `(n-1)*chunk_size + last_chunk_plaintext`. Uses the job's stored
+/// `AuthedChannel` (no per-call reauth).
+///
+/// Prefers the direct-link download route (`crate::direct_link`) under
+/// [`RouteMode::PreferDropbox`]; on ANY problem — link off/absent/mis-fetched, or
+/// (checked here, since this fetch bypasses the on-disk fragment cache entirely,
+/// so there is no poisoned-cache concern to clean up) an AEAD failure on the
+/// decrypt below — it falls back to the ordinary server-proxied GET and retries
+/// the decrypt exactly once. `route_mode == TorOnly` never attempts direct
+/// (`direct_link::direct_allowed`).
 async fn probe_total_len(
     jobs: &VideoJobs,
     file_id_hex: &str,
     chunk_size: u64,
+    route_mode: RouteMode,
 ) -> Result<u64, UiError> {
     // Phase 1 (global lock): read n, last_idx, version, and clone the channel Arc.
     let (n, last_idx, version, channel) = {
@@ -202,29 +211,63 @@ async fn probe_total_len(
         let channel = job.channel.clone().ok_or_else(player_err)?;
         (n, n - 1, job.version, channel)
     };
-    // Phase 2 (channel lock, no global lock): fetch the last ciphertext chunk.
-    let ct = {
+    let direct_http = crate::direct_link::shared_direct_http();
+
+    // Phase 2 (channel lock, no global lock): fetch the last ciphertext chunk,
+    // preferring the direct route. No immediate per-chunk verify is threaded in
+    // here (the decryptor lives behind the global lock, which must never be held
+    // across this network await) — `accept = |_| true`; the real AEAD check is
+    // Phase 3 below, with a targeted forced-proxy retry on failure.
+    let (mut ct, mut used_direct) = {
         let mut ch = channel.lock().await;
         let AuthedChannel { sender, host, token } = &mut *ch;
-        let uri = format!(
-            "/v1/files/{file_id_hex}/versions/{version}/streams/content/chunks/{last_idx}"
-        );
-        let (status, ct) = get_bytes(sender, &uri, Some(token.as_str()), host.as_str()).await?;
-        if status != hyper::StatusCode::OK {
-            return Err(player_err());
+        crate::direct_link::fetch_chunk_routed(
+            sender,
+            host.as_str(),
+            token.as_str(),
+            file_id_hex,
+            version,
+            "content",
+            last_idx,
+            route_mode,
+            direct_http,
+            |_| true,
+        )
+        .await?
+    };
+
+    // Phase 3 (global lock): decrypt just that chunk to learn its plaintext
+    // length. A direct-sourced chunk that fails AEAD is refetched via the
+    // server proxy and retried exactly once (fail-closed: a bad direct byte
+    // never denies playback, it falls back).
+    loop {
+        let attempt = {
+            let guard = jobs.0.lock().await;
+            let job = guard.get(file_id_hex).ok_or_else(player_err)?;
+            job.decryptor
+                .open_range(last_idx, std::slice::from_ref(&ct))
+                .map(|pt| pt.len() as u64)
+        };
+        match attempt {
+            Ok(last_len) => return crate::stream::total_len(n, chunk_size, last_len),
+            Err(_) if used_direct => {
+                let mut ch = channel.lock().await;
+                let AuthedChannel { sender, host, token } = &mut *ch;
+                ct = crate::direct_link::fetch_chunk_proxy(
+                    sender,
+                    host.as_str(),
+                    token.as_str(),
+                    file_id_hex,
+                    version,
+                    "content",
+                    last_idx,
+                )
+                .await?;
+                used_direct = false; // exactly one retry
+            }
+            Err(_) => return Err(player_err()),
         }
-        ct
-    };
-    // Phase 3 (global lock): decrypt just that chunk to learn its plaintext length.
-    let last_len = {
-        let guard = jobs.0.lock().await;
-        let job = guard.get(file_id_hex).ok_or_else(player_err)?;
-        job.decryptor
-            .open_range(last_idx, &[ct])
-            .map_err(|_| player_err())?
-            .len() as u64
-    };
-    crate::stream::total_len(n, chunk_size, last_len)
+    }
 }
 
 /// `open_video` — open + verify a video and register its decrypt-while-stream
@@ -270,6 +313,13 @@ async fn open_video_inner(
     // cache + jobs-registry key.
     let file_id = hex16(file_id_str)?;
     let file_id_hex = hex(&file_id);
+    // The route setting is read once here and reused for every network fetch
+    // this session makes (the header below, the total-length probe, and every
+    // `serve_range`) — a mid-session settings edit takes effect on the NEXT
+    // `open_video`, not retroactively.
+    let settings = SettingsConfig::load(&dir.0);
+    let route_mode = settings.connection.route_mode;
+    let direct_http = crate::direct_link::shared_direct_http();
     let pinned = load_directory_pub(&dir.0)?;
     let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
@@ -311,19 +361,55 @@ async fn open_video_inner(
     let my_id =
         resolve_my_user_id(&mut sender, &host, &username, &verifier, &mut trust, now).await?;
 
-    // Header (small streams only — no content fetched here).
-    let header = build_stream_header(&mut sender, &host, &token, &file_id_hex, &view).await?;
+    // Header (small streams only — no content fetched here). Prefers the
+    // direct-link route per the effective `route_mode`.
+    let (header, header_used_direct) = build_stream_header(
+        &mut sender,
+        &host,
+        &token,
+        &file_id_hex,
+        &view,
+        route_mode,
+        direct_http,
+    )
+    .await?;
 
     // TCB: build the decryptor + fragment index under the session lock (sync verify;
-    // the identity borrow never spans an await).
-    let (decryptor, index) = {
+    // the identity borrow never spans an await). If a direct-sourced header chunk
+    // failed the header's AEAD/digest verification, refetch the WHOLE header
+    // forced-proxy and retry exactly once — fail-closed: a tampered/substituted
+    // direct link never denies playback, it falls back (the link source is
+    // untrusted; a genuinely-invalid record still fails on the retry, same as
+    // today).
+    let (decryptor, index) = match {
         let guard = session.0.lock().await;
         let identity = guard
             .identity
             .as_ref()
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
         open_video_job_core(identity, file_id, &author, my_id, &header)
-    }?;
+    } {
+        Ok(opened) => opened,
+        Err(e) if header_used_direct => {
+            let (header, _) = build_stream_header(
+                &mut sender,
+                &host,
+                &token,
+                &file_id_hex,
+                &view,
+                RouteMode::PreferServer,
+                None,
+            )
+            .await?;
+            let guard = session.0.lock().await;
+            let identity = guard
+                .identity
+                .as_ref()
+                .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+            open_video_job_core(identity, file_id, &author, my_id, &header).map_err(|_| e)?
+        }
+        Err(e) => return Err(e),
+    };
     let version = decryptor.version();
 
     // Content chunk size from the (authenticated-envelope) view — the byte↔chunk
@@ -336,9 +422,10 @@ async fn open_video_inner(
         .ok_or_else(player_err)?;
 
     // Register the session first (so the fragment cache exists), then probe the
-    // total plaintext length by decrypting ONLY the last fragment once — its
-    // ciphertext is cached as a side effect (a back-seek to the end is warm).
-    let cap = SettingsConfig::load(&dir.0).performance.ram_cache_cap_mb as u64 * 1024 * 1024;
+    // total plaintext length by decrypting ONLY the last fragment once
+    // (`settings`/`route_mode` were already loaded above, at the top of this
+    // function, and reused for every network fetch in the session).
+    let cap = settings.performance.ram_cache_cap_mb as u64 * 1024 * 1024;
     let cache = FragmentCache::open(&dir.0, cap).map_err(|_| player_err())?;
 
     // Move the open-time authed connection into a persistent channel for all range
@@ -359,12 +446,13 @@ async fn open_video_inner(
             chunk_size,
             total_len: 0, // set below
             channel: Some(channel),
+            route_mode,
         },
     );
 
     // Probe total_len via the last fragment (uses the job's persistent channel —
     // no extra reauth needed).
-    let total = probe_total_len(jobs, &file_id_hex, chunk_size).await?;
+    let total = probe_total_len(jobs, &file_id_hex, chunk_size, route_mode).await?;
     if let Some(job) = jobs.0.lock().await.get_mut(&file_id_hex) {
         job.total_len = total;
     }
@@ -400,14 +488,31 @@ pub async fn cancel_video(
 // 500 (everything else), empty bodies.
 // ===========================================================================
 
+/// Map a routed/proxy fetch error to the caller's two outcomes: `"offline"`
+/// (a real transport failure — the persistent channel is dead, so the caller
+/// reconnects once and retries) becomes [`channel_dead`]; anything else (a
+/// non-OK status, a malformed response) becomes the generic [`player_err`] (the
+/// server actively refused/errored — not a dead channel).
+fn map_fetch_err(e: UiError) -> UiError {
+    if e.code == "offline" {
+        channel_dead()
+    } else {
+        player_err()
+    }
+}
+
 /// Serve one plaintext byte range for an OPEN video session over the real server:
 /// (A) plan the covering fragment span + which ciphertext chunks are missing, under
 /// the jobs lock; (B) prefetch the missing ciphertext under the JOB's persistent
-/// `AuthedChannel` lock (no global jobs lock held, no per-range reauth); (C) assemble
-/// + slice under the jobs lock. Fail-closed. The content key never leaves this process;
-/// only the sliced plaintext is returned. `first`/`last_inclusive` are the parsed
-/// HTTP byte-range bounds. Returns `channel_dead` on a transport error so the caller
-/// can reconnect once and retry.
+/// `AuthedChannel` lock (no global jobs lock held, no per-range reauth), preferring
+/// the direct-link download route (`crate::direct_link`) per the job's captured
+/// [`RouteMode`]; (C) assemble + slice under the jobs lock. If a direct-sourced
+/// chunk fails the fragment's AEAD check, (D) refetch precisely those indices via
+/// the forced server proxy and retry the assemble exactly once — fail-closed: a
+/// tampered/substituted direct link never denies playback, it falls back. The
+/// content key never leaves this process; only the sliced plaintext is returned.
+/// `first`/`last_inclusive` are the parsed HTTP byte-range bounds. Returns
+/// `channel_dead` on a transport error so the caller can reconnect once and retry.
 ///
 /// Public: the stream:// protocol core (carries no secret across the seam — only sliced
 /// plaintext the protocol already exposes).
@@ -421,7 +526,7 @@ pub async fn serve_range(
 
     // Phase A — resolve the request + plan the fragment span + fetch list, under the lock.
     // Also clone the channel Arc (a cheap ref-count bump) before dropping the guard.
-    let (req, plan, total_len, version, fetch_indices, channel) = {
+    let (req, plan, total_len, version, fetch_indices, channel, route_mode) = {
         let mut guard = jobs.0.lock().await;
         let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
         let req = resolve_range(first, last_inclusive, job.total_len, MAX_RANGE_BODY)
@@ -436,39 +541,97 @@ pub async fn serve_range(
             }
         }
         let channel = job.channel.clone().ok_or_else(player_err)?;
-        (req, plan, job.total_len, job.version, fetch_indices, channel)
+        (req, plan, job.total_len, job.version, fetch_indices, channel, job.route_mode)
     };
 
     // Phase B — prefetch missing ciphertext under the channel lock (no global jobs lock
     // held). Overlapping range requests serialize here over the single HTTP/1.1 connection
-    // instead of contending the ConnectLock with concurrent reauths.
+    // instead of contending the ConnectLock with concurrent reauths. Prefers the
+    // direct-link route; `direct_used` tracks which indices came from it (untrusted
+    // source) so a later AEAD failure can be retried precisely against those.
+    let direct_http = crate::direct_link::shared_direct_http();
     let mut prefetched: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut direct_used: HashSet<u64> = HashSet::new();
     {
         let mut ch = channel.lock().await;
         let AuthedChannel { sender, host, token } = &mut *ch;
         for i in fetch_indices {
-            let uri = format!(
-                "/v1/files/{file_id_hex}/versions/{version}/streams/content/chunks/{i}"
-            );
-            match get_bytes(sender, &uri, Some(token.as_str()), host.as_str()).await {
-                Ok((status, bytes)) if status == hyper::StatusCode::OK => {
-                    prefetched.insert(i, bytes);
-                }
-                Ok(_) => return Err(player_err()),    // server refused → not a dead channel
-                Err(_) => return Err(channel_dead()), // transport error → reconnectable
+            let (bytes, used_direct) = crate::direct_link::fetch_chunk_routed(
+                sender,
+                host.as_str(),
+                token.as_str(),
+                file_id_hex,
+                version,
+                "content",
+                i,
+                route_mode,
+                direct_http,
+                |_| true, // no immediate per-chunk verify here — see Phase D below
+            )
+            .await
+            .map_err(map_fetch_err)?;
+            prefetched.insert(i, bytes);
+            if used_direct {
+                direct_used.insert(i);
             }
         }
     }
 
-    // Phase C — assemble + slice under the lock (sync decrypt in the TCB).
-    let body = {
+    // Phase C — assemble + slice under the lock (sync decrypt in the TCB). `work`
+    // is a throwaway clone so `prefetched` survives intact for a Phase-D retry
+    // (`assemble_range`'s fetch closure destructively removes from whatever map
+    // it is given).
+    let attempt = {
         let mut guard = jobs.0.lock().await;
         let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
+        let mut work = prefetched.clone();
         // Split borrows: index/decryptor are read-only, cache is &mut.
         let VideoJob { index, cache, decryptor, file_id_hex: fid, .. } = &mut *job;
         assemble_range(index, cache, decryptor, fid, &plan, &req, |i| {
-            prefetched.remove(&i).ok_or_else(player_err)
-        })?
+            work.remove(&i).ok_or_else(player_err)
+        })
+    };
+
+    let body = match attempt {
+        Ok(b) => b,
+        Err(_) if !direct_used.is_empty() => {
+            // Phase D — a direct-sourced chunk failed AEAD (the link source is
+            // untrusted). Refetch exactly those indices via the forced proxy...
+            {
+                let mut ch = channel.lock().await;
+                let AuthedChannel { sender, host, token } = &mut *ch;
+                for i in &direct_used {
+                    let bytes = crate::direct_link::fetch_chunk_proxy(
+                        sender,
+                        host.as_str(),
+                        token.as_str(),
+                        file_id_hex,
+                        version,
+                        "content",
+                        *i,
+                    )
+                    .await
+                    .map_err(map_fetch_err)?;
+                    prefetched.insert(*i, bytes);
+                }
+            }
+            // ...evict every fragment in the plan span first: `feed_fragment` writes
+            // a fragment's ciphertext to the on-disk cache BEFORE the AEAD check
+            // that just failed, so the failed attempt may have poisoned the cache
+            // with the tampered bytes — without evicting, the retry would read
+            // those same bad bytes back as a cache "hit" and never see the fresh
+            // (now-proxied) ones.
+            let mut guard = jobs.0.lock().await;
+            let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
+            for seq in plan.f0..=plan.f1 {
+                job.cache.evict(&job.file_id_hex, seq);
+            }
+            let VideoJob { index, cache, decryptor, file_id_hex: fid, .. } = &mut *job;
+            assemble_range(index, cache, decryptor, fid, &plan, &req, |i| {
+                prefetched.remove(&i).ok_or_else(player_err)
+            })?
+        }
+        Err(e) => return Err(e),
     };
 
     Ok(RangeResponse { start: req.start, len: req.len, total_len, body })
@@ -765,6 +928,7 @@ mod tests {
             chunk_size: 4096,
             total_len: 0,
             channel: None, // unit tests never serve ranges
+            route_mode: RouteMode::PreferServer,
         };
         (job, chunks)
     }

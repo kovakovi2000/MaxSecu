@@ -13,8 +13,9 @@ use maxsecu_client_core::{DownloadBundle, StreamChunks, StreamHeader};
 use maxsecu_crypto::WrappedDek;
 use maxsecu_encoding::types::StreamType;
 
+use crate::config::RouteMode;
+use crate::direct_link::DirectLinkHttp;
 use crate::error::UiError;
-use crate::http_client::get_bytes;
 
 /// One stream's wire descriptor from a §8.5 file view (no values).
 #[derive(Debug)]
@@ -126,8 +127,17 @@ fn stream_name(st: StreamType) -> &'static str {
     }
 }
 
-/// GET every ciphertext chunk of one stream (authed) for `file_id_hex`/`version`.
-/// `host` is threaded into the Host header (see http_client::get_bytes).
+/// GET every ciphertext chunk of one stream (authed) for `file_id_hex`/`version`,
+/// preferring the direct-link download route (`crate::direct_link`) under
+/// [`RouteMode::PreferDropbox`] and falling back to the server-proxied GET on ANY
+/// problem (link off/absent/mis-fetched — `TorOnly` never even attempts direct).
+/// `host` is threaded into the Host header (see http_client::get_bytes). Returns
+/// whether ANY chunk in this stream was direct-sourced, so a caller whose OWN
+/// downstream verification covers this stream (`open_stream`'s whole-stream
+/// digest+AEAD, run later in `client-core` — no immediate per-chunk check is
+/// available at this layer for a non-`content` stream) can retry the WHOLE
+/// fetch forced-proxy if that verification fails; see `build_stream_header`/
+/// `build_download_bundle`.
 pub async fn fetch_stream_chunks(
     sender: &mut SendRequest<Full<Bytes>>,
     host: &str,
@@ -135,91 +145,139 @@ pub async fn fetch_stream_chunks(
     file_id_hex: &str,
     version: u64,
     spec: &StreamSpec,
-) -> Result<StreamChunks, UiError> {
+    route_mode: RouteMode,
+    direct_http: Option<&dyn DirectLinkHttp>,
+) -> Result<(StreamChunks, bool), UiError> {
     // No eager capacity hint: `chunk_count` is the UNSIGNED §8.5 listing value
     // (attacker-controlled, read before verification) — a huge value would panic
     // (capacity overflow) or OOM. The loop self-bounds: the first out-of-range
     // chunk GET returns non-OK and errors out.
     let mut chunks = Vec::new();
+    let mut used_direct = false;
     for i in 0..spec.chunk_count {
-        let uri = format!(
-            "/v1/files/{file_id_hex}/versions/{version}/streams/{}/chunks/{i}",
-            stream_name(spec.stream_type)
-        );
-        let (status, bytes) = get_bytes(sender, &uri, Some(token), host).await?;
-        if status != hyper::StatusCode::OK {
-            return Err(UiError::new(
-                "fetch_failed",
-                "A content chunk could not be fetched.",
-            ));
-        }
+        let (bytes, direct) = crate::direct_link::fetch_chunk_routed(
+            sender,
+            host,
+            token,
+            file_id_hex,
+            version,
+            stream_name(spec.stream_type),
+            i,
+            route_mode,
+            direct_http,
+            |_| true, // no immediate per-chunk verify available for a non-content
+                      // stream at this layer; see the doc comment above.
+        )
+        .await?;
+        used_direct |= direct;
         chunks.push(bytes);
     }
-    Ok(StreamChunks {
-        stream_type: spec.stream_type,
-        chunks,
-    })
+    Ok((
+        StreamChunks {
+            stream_type: spec.stream_type,
+            chunks,
+        },
+        used_direct,
+    ))
 }
 
 /// Build a header-only `StreamHeader` (NON-content streams only) from a parsed
 /// view — for `decrypt_card`. Fetches only `metadata`/`thumbnail`/`preview`.
+/// Returns whether ANY chunk across ALL fetched streams was direct-sourced (OR
+/// across streams) — see [`fetch_stream_chunks`].
 pub async fn build_stream_header(
     sender: &mut SendRequest<Full<Bytes>>,
     host: &str,
     token: &str,
     file_id_hex: &str,
     view: &ParsedView,
-) -> Result<StreamHeader, UiError> {
+    route_mode: RouteMode,
+    direct_http: Option<&dyn DirectLinkHttp>,
+) -> Result<(StreamHeader, bool), UiError> {
     let mut small = Vec::new();
+    let mut used_direct = false;
     for spec in view
         .streams
         .iter()
         .filter(|s| s.stream_type != StreamType::Content)
     {
-        small
-            .push(fetch_stream_chunks(sender, host, token, file_id_hex, view.version, spec).await?);
+        let (chunks, direct) = fetch_stream_chunks(
+            sender,
+            host,
+            token,
+            file_id_hex,
+            view.version,
+            spec,
+            route_mode,
+            direct_http,
+        )
+        .await?;
+        used_direct |= direct;
+        small.push(chunks);
     }
-    Ok(StreamHeader {
-        manifest_bytes: view.manifest_bytes.clone(),
-        manifest_sig: view.manifest_sig,
-        genesis_bytes: view.genesis_bytes.clone(),
-        genesis_sig: view.genesis_sig,
-        wrapped_dek: view.wrapped_dek.clone(),
-        grant_bytes: view.grant_bytes.clone(),
-        grant_sig: view.grant_sig,
-        ancestor_grants: view.ancestor_grants.clone(),
-        recovery_grant_bytes: view.recovery_grant_bytes.clone(),
-        recovery_grant_sig: view.recovery_grant_sig,
-        small_streams: small,
-    })
+    Ok((
+        StreamHeader {
+            manifest_bytes: view.manifest_bytes.clone(),
+            manifest_sig: view.manifest_sig,
+            genesis_bytes: view.genesis_bytes.clone(),
+            genesis_sig: view.genesis_sig,
+            wrapped_dek: view.wrapped_dek.clone(),
+            grant_bytes: view.grant_bytes.clone(),
+            grant_sig: view.grant_sig,
+            ancestor_grants: view.ancestor_grants.clone(),
+            recovery_grant_bytes: view.recovery_grant_bytes.clone(),
+            recovery_grant_sig: view.recovery_grant_sig,
+            small_streams: small,
+        },
+        used_direct,
+    ))
 }
 
-/// Build a full `DownloadBundle` (ALL streams) from a parsed view — for the viewer.
+/// Build a full `DownloadBundle` (ALL streams) from a parsed view — for the
+/// viewer. Returns whether ANY chunk across ALL streams was direct-sourced —
+/// see [`fetch_stream_chunks`].
 pub async fn build_download_bundle(
     sender: &mut SendRequest<Full<Bytes>>,
     host: &str,
     token: &str,
     file_id_hex: &str,
     view: &ParsedView,
-) -> Result<DownloadBundle, UiError> {
+    route_mode: RouteMode,
+    direct_http: Option<&dyn DirectLinkHttp>,
+) -> Result<(DownloadBundle, bool), UiError> {
     let mut streams = Vec::new();
+    let mut used_direct = false;
     for spec in &view.streams {
-        streams
-            .push(fetch_stream_chunks(sender, host, token, file_id_hex, view.version, spec).await?);
+        let (chunks, direct) = fetch_stream_chunks(
+            sender,
+            host,
+            token,
+            file_id_hex,
+            view.version,
+            spec,
+            route_mode,
+            direct_http,
+        )
+        .await?;
+        used_direct |= direct;
+        streams.push(chunks);
     }
-    Ok(DownloadBundle {
-        manifest_bytes: view.manifest_bytes.clone(),
-        manifest_sig: view.manifest_sig,
-        genesis_bytes: view.genesis_bytes.clone(),
-        genesis_sig: view.genesis_sig,
-        wrapped_dek: view.wrapped_dek.clone(),
-        grant_bytes: view.grant_bytes.clone(),
-        grant_sig: view.grant_sig,
-        ancestor_grants: view.ancestor_grants.clone(),
-        recovery_grant_bytes: view.recovery_grant_bytes.clone(),
-        recovery_grant_sig: view.recovery_grant_sig,
-        streams,
-    })
+    Ok((
+        DownloadBundle {
+            manifest_bytes: view.manifest_bytes.clone(),
+            manifest_sig: view.manifest_sig,
+            genesis_bytes: view.genesis_bytes.clone(),
+            genesis_sig: view.genesis_sig,
+            wrapped_dek: view.wrapped_dek.clone(),
+            grant_bytes: view.grant_bytes.clone(),
+            grant_sig: view.grant_sig,
+            ancestor_grants: view.ancestor_grants.clone(),
+            recovery_grant_bytes: view.recovery_grant_bytes.clone(),
+            recovery_grant_sig: view.recovery_grant_sig,
+            streams,
+        },
+        used_direct,
+    ))
 }
 
 #[cfg(test)]

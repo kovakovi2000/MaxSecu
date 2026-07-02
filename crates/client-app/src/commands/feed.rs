@@ -247,23 +247,59 @@ pub async fn decrypt_card(
     )
     .await?;
 
-    // Header-only fetch (metadata/thumbnail/preview — never content).
-    let header =
-        crate::download::build_stream_header(&mut sender, &host, &token, &req.file_id, &view)
-            .await?;
+    // Header-only fetch (metadata/thumbnail/preview — never content). Prefers
+    // the direct-link download route (`crate::direct_link`) per the effective
+    // route setting.
+    let route_mode = crate::config::SettingsConfig::load(&dir.0).connection.route_mode;
+    let direct_http = crate::direct_link::shared_direct_http();
+    let (header, header_used_direct) = crate::download::build_stream_header(
+        &mut sender,
+        &host,
+        &token,
+        &req.file_id,
+        &view,
+        route_mode,
+        direct_http,
+    )
+    .await?;
 
     // Borrow the unlocked identity UNDER the lock to unwrap MY wrap. The guard is
     // held only across `open_my_header`, which is SYNCHRONOUS (no await), so this
     // never takes the identity out (no transient `None` window for a concurrent
-    // command to observe) and is panic-safe (nothing to restore).
-    let opened = {
+    // command to observe) and is panic-safe (nothing to restore). If a direct-
+    // sourced header chunk failed verification, refetch the WHOLE header
+    // forced-proxy and retry exactly once — fail-closed: a tampered/substituted
+    // direct link never denies browsing, it falls back (the link source is
+    // untrusted; a genuinely-invalid record still fails on the retry).
+    let opened = match {
         let guard = session.0.lock().await;
         let identity = guard
             .identity
             .as_ref()
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
         open_my_header(identity, file_id, &author, my_id, &header)
-    }?;
+    } {
+        Ok(opened) => opened,
+        Err(e) if header_used_direct => {
+            let (header, _) = crate::download::build_stream_header(
+                &mut sender,
+                &host,
+                &token,
+                &req.file_id,
+                &view,
+                crate::config::RouteMode::PreferServer,
+                None,
+            )
+            .await?;
+            let guard = session.0.lock().await;
+            let identity = guard
+                .identity
+                .as_ref()
+                .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+            open_my_header(identity, file_id, &author, my_id, &header).map_err(|_| e)?
+        }
+        Err(e) => return Err(e),
+    };
 
     let (title, tags) = opened
         .small_streams

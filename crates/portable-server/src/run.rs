@@ -102,7 +102,7 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
                 auth: Arc::new(AuthService::new(MemoryStore::new(), auth_cfg)),
                 blobs,
                 audit: Arc::new(NullAuditSink),
-                direct_links_enabled: false,
+                direct_links_enabled: cfg.direct_links_enabled,
                 max_file_bytes: None,
             };
             router(state)
@@ -121,7 +121,7 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
                 auth: Arc::new(AuthService::new(PgStore::new(pool), auth_cfg)),
                 blobs,
                 audit: Arc::new(NullAuditSink),
-                direct_links_enabled: false,
+                direct_links_enabled: cfg.direct_links_enabled,
                 max_file_bytes: None,
             };
             router(state)
@@ -173,6 +173,10 @@ pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
     eprintln!(
         "  cold-tier offload: {tier_label} (cache cap {} bytes, idle {} days)",
         cfg.cache_capacity_bytes, cfg.offload_idle_days
+    );
+    eprintln!(
+        "  direct-link downloads: {}",
+        if cfg.direct_links_enabled { "on" } else { "off" }
     );
     eprintln!(
         "  pinned D5 (DEV ONLY — replace with the offline ceremony key in production): {}",

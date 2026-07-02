@@ -217,39 +217,71 @@ async fn open_content_inner(
     )
     .await?;
 
+    // The download route setting, read once and reused for every fetch below.
+    let route_mode = crate::config::SettingsConfig::load(&dir.0).connection.route_mode;
+    let direct_http = crate::direct_link::shared_direct_http();
+
     // VIDEO: return metadata via a HEADER-ONLY open (no whole-file download, no
     // gate error) so the viewer mounts the native <video-player>, which streams the
     // content itself via open_video + the stream:// Range protocol. Image/blog keep
     // the full verify+decrypt path below.
     if manifest.file_type == FileType::Video {
-        let header = build_stream_header(&mut sender, &host, &token, &req.file_id, &view).await?;
+        let (header, header_used_direct) = build_stream_header(
+            &mut sender,
+            &host,
+            &token,
+            &req.file_id,
+            &view,
+            route_mode,
+            direct_http,
+        )
+        .await?;
         emit(FetchPhase::Verifying {
             file_id: req.file_id.clone(),
         });
         // Borrow the unlocked identity UNDER the lock across the SYNCHRONOUS header
-        // verify (no await), mirroring run_open — no transient None window.
-        let opened = {
+        // verify (no await), mirroring run_open — no transient None window. If a
+        // direct-sourced header chunk failed verification, refetch the WHOLE
+        // header forced-proxy and retry exactly once (fail-closed: never denies
+        // the view, just falls back — the link source is untrusted).
+        let attempt = {
             let guard = session.0.lock().await;
             let identity = guard
                 .identity
                 .as_ref()
                 .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-            let ctx = VerifyContext {
-                file_id: Id(file_id),
-                author_sig_pub: author.sig_pub,
-                owner_sig_pub: author.sig_pub,
-                recipient_id: Id(my_id),
-                recipient_type: RecipientType::User,
-                recipient_secret: identity.enc_secret(),
-                recipient_mlkem_seed: None,
-                seen_max_version: None,
-                granter_sig_pub: &NO_GRANTERS,
-                admin_sig_pub: &NO_ADMINS,
-                tombstones: None,
-                compromise: None,
-            };
-            verify_and_open_headers(&ctx, &header)
+            verify_and_open_headers(&video_verify_ctx(file_id, &author, my_id, identity), &header)
+        };
+        let opened = match attempt {
+            Ok(o) => o,
+            Err(_) if header_used_direct => {
+                let (header, _) = build_stream_header(
+                    &mut sender,
+                    &host,
+                    &token,
+                    &req.file_id,
+                    &view,
+                    crate::config::RouteMode::PreferServer,
+                    None,
+                )
+                .await?;
+                let guard = session.0.lock().await;
+                let identity = guard
+                    .identity
+                    .as_ref()
+                    .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+                verify_and_open_headers(
+                    &video_verify_ctx(file_id, &author, my_id, identity),
+                    &header,
+                )
                 .map_err(|_| UiError::new("verify_failed", "This item failed verification."))?
+            }
+            Err(_) => {
+                return Err(UiError::new(
+                    "verify_failed",
+                    "This item failed verification.",
+                ))
+            }
         };
         let (title, tags) = opened
             .small_streams
@@ -273,7 +305,16 @@ async fn open_content_inner(
         });
     }
 
-    let bundle = build_download_bundle(&mut sender, &host, &token, &req.file_id, &view).await?;
+    let (bundle, bundle_used_direct) = build_download_bundle(
+        &mut sender,
+        &host,
+        &token,
+        &req.file_id,
+        &view,
+        route_mode,
+        direct_http,
+    )
+    .await?;
 
     emit(FetchPhase::Verifying {
         file_id: req.file_id.clone(),
@@ -281,15 +322,40 @@ async fn open_content_inner(
     // Borrow the unlocked identity UNDER the lock across the SYNCHRONOUS verify
     // (`run_open` has no await), so the borrow never spans an await and the
     // identity is never taken out — no transient `None` window for a concurrent
-    // command to observe, and nothing to restore on any path.
-    let opened = {
+    // command to observe, and nothing to restore on any path. If a direct-
+    // sourced chunk failed verification, refetch the WHOLE bundle forced-proxy
+    // and retry exactly once (fail-closed: never denies the view, just falls
+    // back — the link source is untrusted).
+    let attempt = {
         let guard = session.0.lock().await;
         let identity = guard
             .identity
             .as_ref()
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
         run_open(identity, file_id, &author, my_id, &bundle)
-    }?;
+    };
+    let opened = match attempt {
+        Ok(o) => o,
+        Err(e) if bundle_used_direct => {
+            let (bundle, _) = build_download_bundle(
+                &mut sender,
+                &host,
+                &token,
+                &req.file_id,
+                &view,
+                crate::config::RouteMode::PreferServer,
+                None,
+            )
+            .await?;
+            let guard = session.0.lock().await;
+            let identity = guard
+                .identity
+                .as_ref()
+                .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+            run_open(identity, file_id, &author, my_id, &bundle).map_err(|_| e)?
+        }
+        Err(e) => return Err(e),
+    };
 
     emit(FetchPhase::Decrypting {
         file_id: req.file_id.clone(),
@@ -348,6 +414,33 @@ async fn open_content_inner(
         author_fp: hex(&author.fingerprint[..8]),
         recovery_ok: opened.recovery_grant_ok,
     })
+}
+
+/// Build the header-only `VerifyContext` for the VIDEO branch (metadata-only
+/// open — no content fetched here). A free `fn` (not a closure) so its return
+/// type's lifetime is provably tied to `identity`'s borrow (a closure here
+/// fails lifetime inference: the compiler cannot generalize a closure's return
+/// type over an implicit higher-ranked input lifetime the way a `fn` can).
+fn video_verify_ctx<'a>(
+    file_id: [u8; 16],
+    author: &crate::directory::VerifiedAuthor,
+    my_id: [u8; 16],
+    identity: &'a Identity,
+) -> VerifyContext<'a> {
+    VerifyContext {
+        file_id: Id(file_id),
+        author_sig_pub: author.sig_pub,
+        owner_sig_pub: author.sig_pub,
+        recipient_id: Id(my_id),
+        recipient_type: RecipientType::User,
+        recipient_secret: identity.enc_secret(),
+        recipient_mlkem_seed: None,
+        seen_max_version: None,
+        granter_sig_pub: &NO_GRANTERS,
+        admin_sig_pub: &NO_ADMINS,
+        tombstones: None,
+        compromise: None,
+    }
 }
 
 /// Build the VerifyContext and run the whole-buffer verify+decrypt. Synchronous —

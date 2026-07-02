@@ -105,6 +105,14 @@ pub struct VideoJob {
     /// `None`; the real open path + the e2e always populate `Some`. Behind an `Arc<Mutex>`
     /// so overlapping range requests serialize over the one HTTP/1.1 connection.
     pub channel: Option<Arc<tokio::sync::Mutex<AuthedChannel>>>,
+    /// The download route (`crate::config::RouteMode`) captured once when
+    /// `open_video` registered this session — reused by every `serve_range` call
+    /// for the session's lifetime (a mid-session settings edit takes effect on the
+    /// NEXT `open_video`, not retroactively). Drives the direct-link download
+    /// route (`crate::direct_link`): `PreferDropbox` prefers a server-brokered
+    /// direct cloud fetch for `content` chunks, falling back to the proxy on any
+    /// problem; `TorOnly` never attempts direct.
+    pub route_mode: crate::config::RouteMode,
 }
 
 /// Managed state: `file_id_hex -> VideoJob`. Async mutex (commands are async).

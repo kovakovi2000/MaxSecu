@@ -478,12 +478,14 @@ async fn phase3_browse_view_over_real_tls() {
     );
     assert_eq!(author.enc_pub, owner.enc_pub_bytes());
 
-    let header = build_stream_header(
+    let (header, _used_direct) = build_stream_header(
         &mut c.sender,
         "localhost",
         &token,
         &image_fid_hex,
         &img_view,
+        maxsecu_client_app::config::RouteMode::PreferServer,
+        None,
     )
     .await
     .unwrap();
@@ -530,12 +532,14 @@ async fn phase3_browse_view_over_real_tls() {
     .await;
     assert_eq!(st, StatusCode::OK, "blog file view");
     let blog_view = parse_file_view(&blog_view_json).unwrap();
-    let bundle = build_download_bundle(
+    let (bundle, _used_direct) = build_download_bundle(
         &mut c.sender,
         "localhost",
         &token,
         &blog_fid_hex,
         &blog_view,
+        maxsecu_client_app::config::RouteMode::PreferServer,
+        None,
     )
     .await
     .unwrap();

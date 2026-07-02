@@ -50,12 +50,28 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 # bytes cross the dialog. default-features off keeps it lean (the Win32 file-dialog
 # backend is cfg(windows) and always compiled; no GTK/portal pull-in).
 rfd = { version = "0.15", default-features = false }
+# The direct-link download route (`direct_link.rs`): the transport seam trait
+# needs an async fn in a dyn-friendly-shaped trait, mirroring
+# `server::dropbox_tier::DropboxHttp` (same crate, same version).
+async-trait = "0.1"
+# Public WebPKI root set for the direct-link fetcher: a brokered link points at a
+# PUBLIC cloud host (e.g. Dropbox's `dl.dropboxusercontent.com`), not the pinned
+# self-signed app-server cert, so it needs the Mozilla root bundle rather than the
+# pinned cert (mirrors `server::dropbox_tier::HyperDropboxHttp`; CDLA-Permissive-2.0
+# data license already allowed in `deny.toml`).
+webpki-roots = "1"
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 maxsecu-server = { path = "../server" }
 maxsecu-ceremony-harness = { path = "../../tools/ceremony-harness" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Test-only: `direct_link`'s unit tests stand up a tiny in-process HTTP/1.1 stub
+# server (the pinned-server side of the seam) so the broker POST + proxy GET are
+# genuinely round-tripped over the wire, not just asserted against a hand-built
+# request. Additive feature unification means `server` is compiled in only for
+# `--tests`/dev builds, never the shipped binary (no listener code in `main`).
+hyper = { version = "1", features = ["server"] }
 
 [lints.rust]
 unsafe_code = "forbid"

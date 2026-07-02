@@ -755,4 +755,85 @@ mod tests {
         assert_eq!(err.code, "video_failed");
         assert_eq!(sink_calls, 0, "no plaintext released on an AEAD failure");
     }
+
+    /// The direct-link download route's Phase-D retry (`commands::video::serve_range`)
+    /// depends on a specific mechanism this pins directly, without any network: a
+    /// failed `feed_fragment` (tampered ciphertext) still writes that TAMPERED blob
+    /// to the cache — `cache.put` happens BEFORE the AEAD check — so a naive retry
+    /// that just re-supplies genuine bytes to `feed_fragment` would read the
+    /// poisoned cache entry back as a "hit" and fail again FOREVER. Evicting the
+    /// entry first (`FragmentCache::evict`, what `serve_range` does before its
+    /// forced-proxy retry) breaks that trap: the next `feed_fragment` call is a
+    /// genuine miss, re-fetches (here: the caller now supplies genuine bytes,
+    /// standing in for the forced-proxy refetch), and succeeds.
+    #[test]
+    fn evicting_a_poisoned_cache_entry_lets_a_retry_with_genuine_bytes_succeed() {
+        let (owner, bundle, content) = build_large();
+        let (header, mut chunks) = split(&bundle);
+        let genuine = chunks.clone();
+        chunks[0][0] ^= 0x01; // tamper the bytes the FIRST feed will return
+        let dec = open_content_decryptor(&ctx(&owner), &header).expect("decryptor");
+        let index = two_fragment_index(chunks.len() as u64);
+        let id_hex = file_id_hex();
+        let dir = tmp_dir("poison-then-evict");
+        let mut cache = FragmentCache::open(&dir, 1 << 20).unwrap();
+
+        // First feed: tampered bytes. Fails AEAD, but the cache was already
+        // written with the tampered blob (the trap this test pins).
+        let err = feed_fragment(
+            &index,
+            &mut cache,
+            &dec,
+            &id_hex,
+            0,
+            |i| Ok(chunks[i as usize].clone()),
+            |_pt| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "video_failed");
+        assert!(cache.contains(&id_hex, 0), "the failed attempt still poisoned the cache");
+
+        // Without eviction, a retry with GENUINE bytes still fails — the poisoned
+        // cache is read back as a "hit" and the genuine bytes never get used.
+        let mut fetch_calls = 0u32;
+        let still_fails = feed_fragment(
+            &index,
+            &mut cache,
+            &dec,
+            &id_hex,
+            0,
+            |i| {
+                fetch_calls += 1;
+                Ok(genuine[i as usize].clone())
+            },
+            |_pt| Ok(()),
+        );
+        assert!(still_fails.is_err(), "poisoned cache shadows even genuine bytes");
+        assert_eq!(fetch_calls, 0, "the cache hit prevented any fetch at all");
+
+        // Evict (what serve_range's Phase D does before its forced-proxy retry),
+        // then retry with genuine bytes: now a real miss, refetches, and succeeds.
+        cache.evict(&id_hex, 0);
+        assert!(!cache.contains(&id_hex, 0));
+        let mut fetch_calls2 = 0u32;
+        let mut got: Vec<u8> = Vec::new();
+        feed_fragment(
+            &index,
+            &mut cache,
+            &dec,
+            &id_hex,
+            0,
+            |i| {
+                fetch_calls2 += 1;
+                Ok(genuine[i as usize].clone())
+            },
+            |pt| {
+                got.extend_from_slice(pt);
+                Ok(())
+            },
+        )
+        .expect("succeeds once the poisoned entry is evicted and genuine bytes are supplied");
+        assert_eq!(fetch_calls2, 2, "the eviction forced a real refetch");
+        assert_eq!(got, content[0..2 * 4096], "recovers the exact genuine plaintext");
+    }
 }
