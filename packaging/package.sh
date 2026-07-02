@@ -7,8 +7,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/dist"
 echo "==> Building release binaries"
+# The client is a SEPARATE cargo workspace (crates/client-app) since Part C — its
+# arti (Tor) dependency's bundled SQLite cannot share the server workspace's lock
+# with sqlx. So the server builds from the root workspace and the client builds
+# from its own manifest, each into its own target dir.
 cargo build --release -p maxsecu-portable-server
-cargo build --release -p maxsecu-client-app
+cargo build --release --manifest-path "$ROOT/crates/client-app/Cargo.toml" -p maxsecu-client-app
+CLIENT_TARGET="$ROOT/crates/client-app/target/release"
 
 echo "==> Laying out the portable SERVER folder ($OUT/MaxSecuServer)"
 mkdir -p "$OUT/MaxSecuServer"/{config,logs}
@@ -18,8 +23,8 @@ cp "$ROOT/docs/schema.sql" "$OUT/MaxSecuServer/" || true
 
 echo "==> Laying out the portable CLIENT folder ($OUT/MaxSecuClient)"
 mkdir -p "$OUT/MaxSecuClient"/{config,keystore,index,cache,logs}
-cp "$ROOT/target/release/maxsecu-client-app"* "$OUT/MaxSecuClient/" 2>/dev/null || \
-  cp "$ROOT/target/release/maxsecu-client-app" "$OUT/MaxSecuClient/"
+cp "$CLIENT_TARGET/maxsecu-client-app"* "$OUT/MaxSecuClient/" 2>/dev/null || \
+  cp "$CLIENT_TARGET/maxsecu-client-app" "$OUT/MaxSecuClient/"
 # ffmpeg (the confined author-side transcode) is embedded in the client and
 # materialized at runtime, so it needs no separate staging here. The viewer is
 # native <video> — no decode worker binary ships either.

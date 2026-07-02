@@ -9,10 +9,15 @@ $Root = (Resolve-Path "$PSScriptRoot\..").Path
 $Out  = Join-Path $Root "dist"
 
 Write-Host "==> Building release binaries"
+# The client is a SEPARATE cargo workspace (crates/client-app) since Part C — its
+# arti (Tor) dependency's bundled SQLite cannot share the server workspace's lock
+# with sqlx. The server builds from the root workspace; the client builds from its
+# own manifest, each into its own target dir.
 cargo build --release -p maxsecu-portable-server
 if ($LASTEXITCODE -ne 0) { throw "cargo build (portable-server) failed" }
-cargo build --release -p maxsecu-client-app
+cargo build --release --manifest-path (Join-Path $Root "crates\client-app\Cargo.toml") -p maxsecu-client-app
 if ($LASTEXITCODE -ne 0) { throw "cargo build (client-app) failed" }
+$ClientTarget = Join-Path $Root "crates\client-app\target\release"
 
 Write-Host "==> Laying out the portable SERVER folder ($Out\MaxSecuServer)"
 $Server = Join-Path $Out "MaxSecuServer"
@@ -24,7 +29,7 @@ if (Test-Path $schema) { Copy-Item $schema $Server -Force }
 Write-Host "==> Laying out the portable CLIENT folder ($Out\MaxSecuClient)"
 $Client = Join-Path $Out "MaxSecuClient"
 foreach ($d in @("config", "keystore", "index", "cache", "logs")) { New-Item -ItemType Directory -Force -Path (Join-Path $Client $d) | Out-Null }
-Copy-Item (Join-Path $Root "target\release\maxsecu-client-app.exe") $Client -Force
+Copy-Item (Join-Path $ClientTarget "maxsecu-client-app.exe") $Client -Force
 # ffmpeg (the confined author-side transcode) is embedded in the client via
 # include_bytes! + materialized at runtime, so it needs no separate staging here.
 # The viewer is native <video> — no decode worker binary ships either.
