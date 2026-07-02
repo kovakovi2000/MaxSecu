@@ -75,14 +75,16 @@ export class VideoPlayer extends HTMLElement {
     this.innerHTML = `
       <section id="vp-region" tabindex="-1" role="region" aria-label="Video player">
         <p id="vp-status" role="status" aria-live="polite" hidden></p>
-        <media-controller style="width:100%;aspect-ratio:16/9;background:#000">
+        <media-controller autohide="2" style="width:100%;aspect-ratio:16/9;background:#000">
           <video slot="media" playsinline preload="metadata"></video>
+          <media-loading-indicator slot="centered-chrome" noautohide></media-loading-indicator>
           <media-control-bar>
             <media-play-button></media-play-button>
             <media-time-range></media-time-range>
             <media-time-display showduration></media-time-display>
             <media-mute-button></media-mute-button>
             <media-volume-range></media-volume-range>
+            <media-playback-rate-button></media-playback-rate-button>
             <media-fullscreen-button></media-fullscreen-button>
           </media-control-bar>
         </media-controller>

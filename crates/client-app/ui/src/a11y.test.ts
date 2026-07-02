@@ -96,10 +96,16 @@ test("screens use a live region for feedback", () => {
       "<media-mute-button",
       "<media-volume-range",
       "<media-time-range",
+      "<media-playback-rate-button",
+      "<media-loading-indicator",
       "<media-fullscreen-button",
     ]) {
       assert.match(vp, new RegExp(el.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `missing ${el} native control`);
     }
+    // Keyboard hotkeys (space/k play-pause, arrows seek, f fullscreen, m mute)
+    // are enabled by default within a focused media-controller — must not be
+    // disabled via the nohotkeys attribute.
+    assert.doesNotMatch(vp, /nohotkeys/, "video-player must not disable Media Chrome keyboard hotkeys");
   });
 
   test(`${vpPath}: non-color-only state text (WCAG 1.4.1)`, () => {
