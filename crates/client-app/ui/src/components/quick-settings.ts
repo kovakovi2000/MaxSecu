@@ -10,19 +10,24 @@ import type { GaugeModel } from "../core/gauge.ts";
 // sync with the full Settings screen and applies live. Accessible: aria-expanded/
 // -controls on the trigger, Esc-dismiss + focus return, all controls labelled.
 //
-// Left-edge rainbow gauge: a thin vertical bar pinned to the left edge of the
-// popover that fills bottom→top proportional to process RSS / RAM budget. Polls
-// the `memory_stats` backend command every 1500 ms (interval cleared on disconnect).
+// Rainbow gauge: a thin vertical bar sitting to the LEFT of the ⚡ button (always
+// visible, outside the popover) that fills bottom→top proportional to process RSS
+// ÷ the RAM cache cap the user set (the "RAM allocated for the app"). RSS is polled
+// from the `memory_stats` backend command every 1500 ms; the denominator comes from
+// the live settings store, so dragging the cap slider moves the bar immediately.
 // `role="meter"` with aria-valuemin/max/now + aria-label (non-colour-only).
 export class QuickSettings extends HTMLElement {
   private open = false;
   private limits: RamLimits | null = null;
   private _ramPollId: number | null = null;
   private _lastGauge: GaugeModel | null = null;
+  private _lastUsed: number | null = null; // process RSS bytes from memory_stats
+  private _unsubSettings: (() => void) | null = null;
 
   connectedCallback() {
     this.innerHTML = `
       <div class="qs">
+        <div class="qs-ram-bar" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="RAM usage unavailable" hidden><div class="qs-ram-fill"></div></div>
         <button id="qs-btn" aria-expanded="false" aria-controls="qs-pop" aria-haspopup="true" title="Quick settings">⚡</button>
         <div id="qs-pop" role="group" aria-label="Quick settings" hidden></div>
       </div>`;
@@ -34,6 +39,8 @@ export class QuickSettings extends HTMLElement {
         btn.focus();
       }
     });
+    // Recompute the bar whenever the cap changes (denominator is the cache cap).
+    this._unsubSettings = settingsStore.subscribe(() => this._recomputeGauge());
     // Start RAM gauge poll (immediately + every 1500 ms).
     void this._pollRam();
     this._ramPollId = window.setInterval(() => { void this._pollRam(); }, 1500);
@@ -44,21 +51,34 @@ export class QuickSettings extends HTMLElement {
       clearInterval(this._ramPollId);
       this._ramPollId = null;
     }
+    if (this._unsubSettings) {
+      this._unsubSettings();
+      this._unsubSettings = null;
+    }
   }
 
   private async _pollRam(): Promise<void> {
     try {
       const stats = await call<MemoryStats>("memory_stats");
-      this._lastGauge = ramGaugeModel(stats.used_bytes, stats.budget_bytes);
+      this._lastUsed = stats.used_bytes;
     } catch {
       // fail-soft: keep the previous value (or null on first poll failure)
     }
+    this._recomputeGauge();
+  }
+
+  // Rebuild the gauge model from the last-seen RSS and the CURRENT cache cap, then
+  // paint. Denominator = ram_cache_cap_mb (the RAM allocated for the app).
+  private _recomputeGauge(): void {
+    const capMb = settingsStore.get().performance.ram_cache_cap_mb;
+    const budgetBytes = capMb * 1024 * 1024;
+    this._lastGauge = ramGaugeModel(this._lastUsed, budgetBytes);
     this._updateRamBar();
   }
 
   private _updateRamBar(): void {
     const bar = this.querySelector<HTMLElement>(".qs-ram-bar");
-    if (!bar) return; // panel is closed, nothing to update
+    if (!bar) return;
     const g = this._lastGauge;
     if (!g || g.hidden) {
       bar.hidden = true;
@@ -95,27 +115,6 @@ export class QuickSettings extends HTMLElement {
     const limits = this.limits!;
     const pop = this.querySelector("#qs-pop") as HTMLElement;
     pop.replaceChildren();
-
-    // --- Rainbow RAM gauge bar (position: absolute, left edge of panel) ---
-    const g = this._lastGauge;
-    const bar = document.createElement("div");
-    bar.className = "qs-ram-bar";
-    bar.setAttribute("role", "meter");
-    bar.setAttribute("aria-valuemin", "0");
-    bar.setAttribute("aria-valuemax", "100");
-    if (g && !g.hidden) {
-      bar.setAttribute("aria-valuenow", String(g.pct));
-      bar.setAttribute("aria-label", g.label);
-    } else {
-      bar.setAttribute("aria-valuenow", "0");
-      bar.setAttribute("aria-label", "RAM usage unavailable");
-      bar.hidden = true;
-    }
-    const fill = document.createElement("div");
-    fill.className = "qs-ram-fill";
-    if (g && !g.hidden) fill.style.height = `${g.fillFraction * 100}%`;
-    bar.appendChild(fill);
-    pop.appendChild(bar);
 
     // Theme toggle.
     const themeLabel = document.createElement("label");

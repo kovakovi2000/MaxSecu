@@ -591,18 +591,18 @@ settings-screen main > fieldset { max-width: 760px; }
 
 /* ---------- Quick settings + upload tray + toasts ---------- */
 
-/* RAM-usage rainbow gauge bar — pinned to the left edge of the quick-settings
-   popover. The fill div rises from the bottom; its height is set in JS to
-   fillFraction × 100%. Static fill, no shimmer (respects reduced-motion). */
+/* RAM-usage rainbow gauge bar — a thin vertical bar sitting to the LEFT of the ⚡
+   quick-settings button (always visible, not inside the popover). The fill div
+   rises from the bottom; its height is set in JS to fillFraction × 100% of the
+   RAM cache cap. Static fill, no shimmer (respects reduced-motion). */
 .qs-ram-bar {
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
+  position: relative;
+  flex: 0 0 auto;
   width: 6px;
-  border-radius: var(--mx-radius-lg) 0 0 var(--mx-radius-lg);
+  height: 2.4rem;
+  border-radius: 3px;
   overflow: hidden;
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.1);
 }
 .qs-ram-fill {
   position: absolute;
@@ -613,7 +613,7 @@ settings-screen main > fieldset { max-width: 760px; }
   /* height set inline by JS — no CSS transition so reduced-motion is respected */
 }
 
-.qs { position: relative; }
+.qs { position: relative; display: flex; align-items: center; gap: 0.4rem; }
 .qs #qs-btn {
   width: 2.7rem;
   min-width: 2.7rem;
