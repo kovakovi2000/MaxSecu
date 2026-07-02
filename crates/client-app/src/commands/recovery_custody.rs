@@ -23,17 +23,20 @@
 
 use crate::ceremony::CeremonySession;
 use crate::dto::{
-    AddShareRequest, AddShareResponse, ReconstructResponse, SplitRecoveryKeyRequest,
-    SplitRecoveryKeyResponse,
+    AddShareRequest, AddShareResponse, ProveRequest, ProveResponse, ReconstructResponse,
+    SplitRecoveryKeyRequest, SplitRecoveryKeyResponse,
 };
 use crate::error::UiError;
 use crate::recovery_share::{parse_and_verify, ShareParseError};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use maxsecu_admin_core::recovery_seal::{open_recovery_secret, RecoverySealError};
 use maxsecu_admin_core::{
     reconstruct_recovery_key as reconstruct_scalar, split_recovery_key as split_scalar,
-    RecoveryError,
+    validate_recovery_wrap, RecoveryError, RecoveryWrapCtx,
 };
 use maxsecu_crypto::Share;
+use maxsecu_encoding::types::Id;
 use tauri::State;
 use zeroize::Zeroize;
 
@@ -119,6 +122,13 @@ fn insufficient_shares_err() -> UiError {
 /// interpolate garbage, or any other variant — collapses to a single
 /// non-oracle `reconstruct_failed`. No secret, share body, or crypto internal
 /// ever reaches the message.
+///
+/// NB: the `_` wildcard here is a DELIBERATE non-oracle collapse (contrast
+/// `map_parse_err`'s exhaustive, `_`-free match): every non-`InsufficientShares`
+/// `RecoveryError` variant is intentionally funneled to the SAME opaque
+/// `reconstruct_failed` code precisely so a caller can't distinguish *why* a bad
+/// share set failed. A future `RecoveryError` variant silently inheriting that
+/// code is the desired behavior, not an oversight.
 fn map_reconstruct_err(e: RecoveryError) -> UiError {
     use maxsecu_crypto::shamir::ShamirError;
     match e {
@@ -131,6 +141,8 @@ fn map_reconstruct_err(e: RecoveryError) -> UiError {
         ),
     }
 }
+
+// ---- split_recovery_key ----
 
 /// `split_recovery_key` — split a sealed recovery secret `k`-of-`n` (spec §8).
 ///
@@ -186,6 +198,8 @@ pub fn split_recovery_key(
         n: req.n,
     })
 }
+
+// ---- add_recovery_share ----
 
 /// `add_recovery_share` — accept one pasted/scanned MSHARE1 share into the
 /// running reconstruct ceremony (spec §6 step 1).
@@ -272,6 +286,8 @@ fn add_share_to_session(
     })
 }
 
+// ---- reconstruct_recovery_key ----
+
 /// `reconstruct_recovery_key` — reassemble the recovery private key from the
 /// shares collected so far in the running ceremony (spec §6 steps 2–3).
 ///
@@ -329,6 +345,104 @@ fn reconstruct_in_session(session: &CeremonySession) -> Result<ReconstructRespon
         ceremony_handle: handle,
         label,
     })
+}
+
+// ---- prove_reconstructed_key ----
+
+/// Parse a fixed-length lowercase/upper hex string into `[u8; N]`, or fail
+/// closed with `(code, message)`. A wrong length OR a non-hex digit is a
+/// plumbing error — an operator/UI mistake, NOT a cryptographic proof result.
+fn parse_hex<const N: usize>(s: &str, code: &str, message: &str) -> Result<[u8; N], UiError> {
+    if s.len() != 2 * N {
+        return Err(UiError::new(code, message));
+    }
+    let mut out = [0u8; N];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16)
+            .map_err(|_| UiError::new(code, message))?;
+    }
+    Ok(out)
+}
+
+/// `prove_reconstructed_key` — the LOAD-BEARING fail-closed proof (spec §6 step
+/// 4 / §2.2): a reconstruction is reported "verified" ONLY after the
+/// reconstructed key opens something REAL — never merely because `combine`
+/// returned `Ok`.
+///
+/// Synchronous, local-only. Looks up the reconstructed [`EncSecretKey`] the
+/// caller named (`ceremony_handle`, minted by `reconstruct_recovery_key`) and
+/// offline-validates the supplied recovery wrap against it with
+/// `admin_core::validate_recovery_wrap` under the RECOVERY_ID-bound
+/// `(file_id, version)` context.
+///
+/// Two DISTINCT failure kinds are kept separate (spec §11):
+/// - **Input/lookup plumbing errors → fail-closed `Err(UiError)`**: an unknown
+///   `ceremony_handle` (`no_reconstruction`), a malformed `file_id_hex`
+///   (`bad_file_id`) or `dek_commit_hex` (`bad_dek_commit`), or a non-base64
+///   `recovery_wrap_b64` (`bad_recovery_wrap`).
+/// - **The cryptographic proof result → `Ok(ProveResponse { verified })`**:
+///   `validate_recovery_wrap` returning `Ok(())` is `verified: true`; it
+///   returning `Err(SweepError::…)` (the key did NOT open the real wrap — a
+///   wrong reconstruction, or a wrap for a different DEK) is `verified: false`.
+///   That `false` is the SUCCESSFUL outcome of a valid proof, NOT a `UiError` —
+///   collapsing it into an `Err` would swallow the exact true/false distinction
+///   the whole feature depends on, and `verified: true` is emitted ONLY from a
+///   real `validate_recovery_wrap` `Ok`.
+#[tauri::command]
+pub fn prove_reconstructed_key(
+    req: ProveRequest,
+    state: State<'_, CeremonySession>,
+) -> Result<ProveResponse, UiError> {
+    prove_in_session(req, &state)
+}
+
+/// The testable logic behind [`prove_reconstructed_key`], decoupled from
+/// `tauri::State` so it can run against a plain [`CeremonySession`] in tests.
+fn prove_in_session(
+    req: ProveRequest,
+    session: &CeremonySession,
+) -> Result<ProveResponse, UiError> {
+    // (Input) Validate the plumbing inputs BEFORE touching the session. A bad
+    // hex/length or non-base64 payload is an operator/UI error → fail-closed
+    // `Err(UiError)`, never a `verified:false` (there is nothing real to prove
+    // against yet).
+    let file_id = parse_hex::<16>(&req.file_id_hex, "bad_file_id", "Malformed file id.")?;
+    let dek_commit = parse_hex::<32>(
+        &req.dek_commit_hex,
+        "bad_dek_commit",
+        "Malformed key commitment.",
+    )?;
+    let wrap = B64.decode(req.recovery_wrap_b64.as_bytes()).map_err(|_| {
+        UiError::new(
+            "bad_recovery_wrap",
+            "The recovery wrap is not valid base64.",
+        )
+    })?;
+
+    let ctx = RecoveryWrapCtx {
+        file_id: Id(file_id),
+        version: req.version,
+    };
+
+    // (Lookup + proof) One lock borrows the reconstructed key for the whole
+    // synchronous proof — `validate_recovery_wrap` is an in-RAM HPKE-open with
+    // no `.await`, so holding the sync mutex across it is correct.
+    let inner = session.0.lock().unwrap();
+    let secret = inner.reconstructed(&req.ceremony_handle).ok_or_else(|| {
+        UiError::new(
+            "no_reconstruction",
+            "No reconstructed recovery key for this ceremony — reconstruct one first.",
+        )
+    })?;
+
+    // THE load-bearing distinction (spec §2.2 / §6 step 4): `verified` is `true`
+    // ONLY when the reconstructed key REALLY opens the committed wrap. A
+    // `validate_recovery_wrap` `Err` (undecryptable or a DEK-commit mismatch) is
+    // mapped to `verified: false` — a valid, successful proof outcome — and
+    // NEVER promoted to a `UiError`, which would erase the true/false result the
+    // whole ceremony hinges on. Nothing here logs or `Debug`s `secret`/the wrap.
+    let verified = validate_recovery_wrap(secret, &wrap, dek_commit, &ctx).is_ok();
+    Ok(ProveResponse { verified })
 }
 
 #[cfg(test)]
@@ -737,5 +851,199 @@ mod reconstruct_tests {
             !json.contains(&secret_hex),
             "reconstructed key bytes leaked into the response"
         );
+    }
+}
+
+#[cfg(test)]
+mod prove_tests {
+    use super::*;
+    use crate::commands::feed::hex;
+    use crate::dto::ProveRequest;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    use maxsecu_crypto::{generate_enc_keypair, wrap_dek, Dek, EncPublicKey, EncSecretKey};
+    use maxsecu_encoding::structs::WrapContext;
+    use maxsecu_encoding::types::Id;
+    use maxsecu_encoding::RECOVERY_ID;
+
+    const FILE_ID: Id = Id([0xF1; 16]);
+    const VERSION: u64 = 7;
+
+    /// Build the wire recovery wrap `enc(32) ‖ ct` EXACTLY as the upload path
+    /// does — `wrap_dek` to the recovery PUBLIC key under the RECOVERY_ID-bound
+    /// context (mirrors `recovery.rs::recovery_wire_wrap`).
+    fn recovery_wire_wrap(rpk: &EncPublicKey, dek: &Dek, file_id: Id, version: u64) -> Vec<u8> {
+        let ctx = WrapContext {
+            file_id,
+            version,
+            recipient_id: RECOVERY_ID,
+        };
+        let w = wrap_dek(rpk, dek, &ctx).expect("wrap");
+        let mut wire = w.enc.to_vec();
+        wire.extend_from_slice(&w.ct);
+        wire
+    }
+
+    /// Split `rsk` 3-of-5, feed a 3-subset into a fresh session, reconstruct it
+    /// INTO the session, and return `(session, handle)` — the reconstructed key
+    /// stored under `handle` IS `rsk`.
+    fn reconstructed_session(rsk: &EncSecretKey, label: &str) -> (CeremonySession, String) {
+        let shares = maxsecu_admin_core::split_recovery_key(rsk, 3, 5).expect("split");
+        let texts: Vec<String> = shares
+            .iter()
+            .map(|s| crate::recovery_share::encode(s, label, 3, 5))
+            .collect();
+        let session = CeremonySession::new();
+        for &i in &[0usize, 2, 4] {
+            add_share_to_session(&texts[i], &session).expect("add share ok");
+        }
+        let resp = reconstruct_in_session(&session).expect("reconstruct");
+        (session, resp.ceremony_handle)
+    }
+
+    #[test]
+    fn correct_wrap_proves_verified_true() {
+        let (rsk, rpk) = generate_enc_keypair();
+        let (session, handle) = reconstructed_session(&rsk, "recovery-2026-07");
+
+        let dek = Dek::generate();
+        let wire = recovery_wire_wrap(&rpk, &dek, FILE_ID, VERSION);
+
+        let req = ProveRequest {
+            ceremony_handle: handle,
+            file_id_hex: hex(&FILE_ID.0),
+            version: VERSION,
+            dek_commit_hex: hex(&dek.commit()),
+            recovery_wrap_b64: B64.encode(&wire),
+        };
+        let resp = prove_in_session(req, &session).expect("prove attempt itself succeeds");
+        assert!(
+            resp.verified,
+            "the reconstructed key opens the real recovery wrap → verified"
+        );
+    }
+
+    #[test]
+    fn wrap_for_a_different_dek_proves_verified_false() {
+        let (rsk, rpk) = generate_enc_keypair();
+        let (session, handle) = reconstructed_session(&rsk, "recovery-2026-07");
+
+        // The manifest commits to `dek`, but the wrap actually carries `other`.
+        // The key opens the wrap (it's a valid HPKE wrap to the recovery key),
+        // but the recovered DEK ≠ committed DEK → validate returns Err → the
+        // proof RESULT is verified:false, which is itself a SUCCESSFUL Ok call.
+        let dek = Dek::generate();
+        let other = Dek::generate();
+        let wrong_wire = recovery_wire_wrap(&rpk, &other, FILE_ID, VERSION);
+
+        let req = ProveRequest {
+            ceremony_handle: handle,
+            file_id_hex: hex(&FILE_ID.0),
+            version: VERSION,
+            dek_commit_hex: hex(&dek.commit()),
+            recovery_wrap_b64: B64.encode(&wrong_wire),
+        };
+        let resp = prove_in_session(req, &session)
+            .expect("a valid proof of a bad wrap is still an Ok(verified:false), NOT a UiError");
+        assert!(
+            !resp.verified,
+            "a wrap for a different DEK must report verified:false, not true"
+        );
+    }
+
+    #[test]
+    fn corrupt_wrap_ciphertext_proves_verified_false() {
+        // A wrap whose ciphertext cannot even HPKE-open (WrapUndecryptable) is
+        // still a valid proof attempt → Ok(verified:false), never a UiError.
+        let (rsk, rpk) = generate_enc_keypair();
+        let (session, handle) = reconstructed_session(&rsk, "recovery-2026-07");
+
+        let dek = Dek::generate();
+        let mut wire = recovery_wire_wrap(&rpk, &dek, FILE_ID, VERSION);
+        let last = wire.len() - 1;
+        wire[last] ^= 0x01;
+
+        let req = ProveRequest {
+            ceremony_handle: handle,
+            file_id_hex: hex(&FILE_ID.0),
+            version: VERSION,
+            dek_commit_hex: hex(&dek.commit()),
+            recovery_wrap_b64: B64.encode(&wire),
+        };
+        let resp = prove_in_session(req, &session).expect("attempt succeeds");
+        assert!(!resp.verified);
+    }
+
+    #[test]
+    fn unknown_handle_is_a_fail_closed_uierror() {
+        // No reconstruction under this handle → a plumbing error (Err), NOT a
+        // verified:false (there is no key to run a real proof against).
+        let (rsk, rpk) = generate_enc_keypair();
+        let (session, _handle) = reconstructed_session(&rsk, "label");
+        let dek = Dek::generate();
+        let wire = recovery_wire_wrap(&rpk, &dek, FILE_ID, VERSION);
+
+        let req = ProveRequest {
+            ceremony_handle: "0".repeat(32), // valid-looking but absent handle
+            file_id_hex: hex(&FILE_ID.0),
+            version: VERSION,
+            dek_commit_hex: hex(&dek.commit()),
+            recovery_wrap_b64: B64.encode(&wire),
+        };
+        let err = prove_in_session(req, &session).expect_err("unknown handle must fail closed");
+        assert_eq!(err.code, "no_reconstruction");
+    }
+
+    #[test]
+    fn malformed_file_id_hex_is_a_uierror_not_a_proof_result() {
+        let (rsk, rpk) = generate_enc_keypair();
+        let (session, handle) = reconstructed_session(&rsk, "label");
+        let dek = Dek::generate();
+        let wire = recovery_wire_wrap(&rpk, &dek, FILE_ID, VERSION);
+
+        let req = ProveRequest {
+            ceremony_handle: handle,
+            file_id_hex: "not-hex".into(), // wrong length + non-hex
+            version: VERSION,
+            dek_commit_hex: hex(&dek.commit()),
+            recovery_wrap_b64: B64.encode(&wire),
+        };
+        let err = prove_in_session(req, &session).expect_err("malformed file id must fail closed");
+        assert_eq!(err.code, "bad_file_id");
+    }
+
+    #[test]
+    fn malformed_dek_commit_hex_is_a_uierror() {
+        let (rsk, rpk) = generate_enc_keypair();
+        let (session, handle) = reconstructed_session(&rsk, "label");
+        let dek = Dek::generate();
+        let wire = recovery_wire_wrap(&rpk, &dek, FILE_ID, VERSION);
+
+        let req = ProveRequest {
+            ceremony_handle: handle,
+            file_id_hex: hex(&FILE_ID.0),
+            version: VERSION,
+            dek_commit_hex: "abcd".into(), // valid hex but wrong length (2 ≠ 32 bytes)
+            recovery_wrap_b64: B64.encode(&wire),
+        };
+        let err = prove_in_session(req, &session).expect_err("malformed dek commit must fail");
+        assert_eq!(err.code, "bad_dek_commit");
+    }
+
+    #[test]
+    fn bad_base64_recovery_wrap_is_a_uierror() {
+        let (rsk, _rpk) = generate_enc_keypair();
+        let (session, handle) = reconstructed_session(&rsk, "label");
+        let dek = Dek::generate();
+
+        let req = ProveRequest {
+            ceremony_handle: handle,
+            file_id_hex: hex(&FILE_ID.0),
+            version: VERSION,
+            dek_commit_hex: hex(&dek.commit()),
+            recovery_wrap_b64: "!!!not-base64!!!".into(),
+        };
+        let err = prove_in_session(req, &session).expect_err("bad base64 must fail closed");
+        assert_eq!(err.code, "bad_recovery_wrap");
     }
 }

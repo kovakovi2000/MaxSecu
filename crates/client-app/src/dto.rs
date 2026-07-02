@@ -403,6 +403,12 @@ pub struct ReconstructResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProveRequest {
+    /// Which in-session reconstruction to prove — the opaque handle minted by
+    /// `reconstruct_recovery_key` (`ReconstructResponse.ceremony_handle`). Spec
+    /// §8's DTO listing omits this, but the proof MUST know WHICH reconstructed
+    /// `EncSecretKey` to test (the session holds a `HashMap<handle, key>`), so
+    /// it is carried here. It is an opaque, non-secret id — plain `Debug` is fine.
+    pub ceremony_handle: String,
     pub file_id_hex: String,
     pub version: u64,
     pub dek_commit_hex: String,
@@ -608,8 +614,9 @@ mod recovery_ceremony_dto_tests {
 
     #[test]
     fn prove_request_roundtrips() {
-        let j = r#"{"file_id_hex":"ab","version":7,"dek_commit_hex":"cd","recovery_wrap_b64":"ZWY"}"#;
+        let j = r#"{"ceremony_handle":"a1b2c3","file_id_hex":"ab","version":7,"dek_commit_hex":"cd","recovery_wrap_b64":"ZWY"}"#;
         let req: ProveRequest = serde_json::from_str(j).unwrap();
+        assert_eq!(req.ceremony_handle, "a1b2c3");
         assert_eq!(req.file_id_hex, "ab");
         assert_eq!(req.version, 7);
         assert_eq!(req.dek_commit_hex, "cd");
