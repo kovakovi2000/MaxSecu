@@ -3225,6 +3225,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "image",
+ "maxsecu-admin-core",
  "maxsecu-ceremony-harness",
  "maxsecu-client-app",
  "maxsecu-client-core",
@@ -3232,6 +3233,7 @@ dependencies = [
  "maxsecu-encoding",
  "maxsecu-media-launcher",
  "maxsecu-server",
+ "maxsecu-sink-server",
  "rcgen",
  "serde_json",
  "tokio",
@@ -3310,6 +3312,22 @@ dependencies = [
  "tokio-rustls",
  "webpki-roots",
  "zeroize",
+]
+
+[[package]]
+name = "maxsecu-sink-server"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "hyper",
+ "hyper-util",
+ "maxsecu-crypto",
+ "maxsecu-encoding",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
