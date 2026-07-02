@@ -11,7 +11,7 @@ import "./media-viewer.ts";
 import "./upload-screen.ts";
 import "./upload-tray.ts";
 import "./settings-screen.ts";
-import "./quick-settings.ts";
+import "./ram-gauge.ts";
 import "./toast-host.ts";
 import "./skeleton-card.ts";
 import { loadAndApplySettings, bindDocumentToSettings } from "../core/settings.ts";
@@ -41,7 +41,7 @@ export class AppShell extends HTMLElement {
         </div>
         <nav role="navigation" aria-label="Primary" class="nav-rail">${links}</nav>
         <div class="header-actions">
-          <quick-settings id="qs"></quick-settings>
+          <ram-gauge id="ram"></ram-gauge>
         </div>
         <div class="status-strip" role="region" aria-label="Status">
           <status-pill id="pill"></status-pill>

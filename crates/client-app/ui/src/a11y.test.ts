@@ -195,15 +195,18 @@ test("screens use a live region for feedback", () => {
     assert.match(up, /status\.textContent\s*=/, "status updates via textContent");
   });
 
-  test("quick-settings + settings expose a labelled Theme + RAM control", () => {
-    const qs = readFileSync("src/components/quick-settings.ts", "utf8");
+  test("settings screen exposes a labelled Theme + RAM control", () => {
     const set = readFileSync("src/components/settings-screen.ts", "utf8");
-    for (const src of [qs, set]) {
-      assert.match(src, /Theme/, "Theme control present");
-      assert.match(src, /aria-label|<label|name="theme"/, "controls labelled");
-    }
-    // quick-settings builds the slider via the DOM API (`range.type = "range"`),
-    // not literal HTML — accept either form.
-    assert.match(qs, /type="range"|\.type\s*=\s*"range"/, "quick-settings RAM uses a range slider");
+    assert.match(set, /Theme/, "Theme control present");
+    assert.match(set, /aria-label|<label|name="theme"/, "controls labelled");
+    // The RAM cache cap uses a range slider (built via DOM API or literal HTML).
+    assert.match(set, /type="range"|\.type\s*=\s*"range"/, "RAM cap uses a range slider");
+  });
+
+  test("ram-gauge is a labelled meter", () => {
+    const rg = readFileSync("src/components/ram-gauge.ts", "utf8");
+    assert.match(rg, /role="meter"/, "RAM gauge is a meter");
+    assert.match(rg, /aria-valuemin|aria-valuenow/, "RAM gauge exposes aria value");
+    assert.match(rg, /aria-label/, "RAM gauge is labelled (non-colour-only)");
   });
 }

@@ -94,7 +94,7 @@ ui/
         ├── upload-screen.ts    # compose + preview + confirm an upload
         ├── upload-tray.ts      # persistent active-uploads tray (progress/retry)
         ├── settings-screen.ts  # full settings (appearance, a11y, account, RAM)
-        ├── quick-settings.ts   # ⚡ popover: Theme + RAM only
+        ├── ram-gauge.ts        # header RAM-usage rainbow meter
         ├── toast-host.ts       # renders toasts (assertive/polite live regions)
         ├── skeleton-card.ts    # shimmer placeholder while loading
         ├── state-badge.ts      # non-color-only status chip

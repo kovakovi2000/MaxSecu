@@ -1,4 +1,4 @@
-// Pure model for the quick-settings RAM-usage rainbow gauge.
+// Pure model for the header RAM-usage rainbow gauge.
 // Keeps all math testable in plain Node (no DOM, no Tauri API).
 
 export interface GaugeModel {

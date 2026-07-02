@@ -10,9 +10,9 @@ const DEFAULTS: Settings = {
   appearance: { theme: "dark" },
 };
 
-// The single shared settings store (spec §7). Settings screen, quick-settings,
-// and the shell theme all read/write THIS instance, so they always agree and
-// apply live.
+// The single shared settings store (spec §7). Settings screen, the header RAM
+// gauge, and the shell theme all read/write THIS instance, so they always agree
+// and apply live.
 export const settingsStore = new SettingsStore(DEFAULTS);
 
 // Apply settings to the document: theme + a11y data-attrs. styles.css keys on
