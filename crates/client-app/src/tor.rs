@@ -13,7 +13,7 @@
 //! reason `client-app` is its own cargo workspace (see the crate Cargo.toml).
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::TorClient;
@@ -22,6 +22,25 @@ use tor_rtcompat::PreferredRuntime;
 
 use crate::error::UiError;
 use crate::transport::BoxedStream;
+
+/// The process-wide Tor state. There is only ever one Tor client (one bootstrap,
+/// one set of circuits), so it lives as a singleton rather than being threaded
+/// through every connection helper. `main` initializes it once; the connection
+/// code reads it only on the `TorOnly` path.
+static GLOBAL: OnceLock<TorState> = OnceLock::new();
+
+/// Initialize the process-wide Tor state with the client config dir (arti state is
+/// confined to its `tor/` subdirectory). Idempotent — first call wins. Call once
+/// from `main`.
+pub fn init(config_dir: PathBuf) {
+    let _ = GLOBAL.set(TorState::new(config_dir));
+}
+
+/// The process-wide Tor state, if [`init`] has run. `None` in tests / non-Tauri
+/// contexts (which never select `TorOnly`, so they never dial Tor).
+pub fn global() -> Option<&'static TorState> {
+    GLOBAL.get()
+}
 
 /// A lazily-bootstrapped, shared Tor client. The `OnceCell` guarantees the slow
 /// first bootstrap runs at most once; a failed bootstrap is NOT cached, so the

@@ -57,14 +57,19 @@ pub async fn connect(
         settings.connection.route_mode
     };
 
-    // TorOnly fails closed until the Tor transport lands (never a clearnet
-    // fallback — that would leak the client IP). PreferServer/PreferDropbox both
-    // dial direct here; the PreferDropbox difference is in the download path.
+    // TorOnly: pre-bootstrap the shared Tor client now, surfacing the (slow) first
+    // bootstrap as a distinct UI state, so the subsequent open_conn dial is fast and
+    // any Tor failure is reported here. NEVER falls back to a clearnet dial — that
+    // would leak the client IP. PreferServer/PreferDropbox dial direct in open_conn;
+    // the PreferDropbox difference is only in the download path.
     if mode == crate::config::RouteMode::TorOnly {
-        return Err(UiError::new(
-            "tor_unavailable",
-            "Tor routing is selected but not available yet.",
-        ));
+        let tor = crate::tor::global()
+            .ok_or_else(|| UiError::new("tor_unavailable", "Tor routing is not available."))?;
+        emit_conn(ConnectionState::TorBootstrapping);
+        if let Err(e) = tor.client(|| {}).await {
+            emit_conn(ConnectionState::Disconnected);
+            return Err(e);
+        }
     }
 
     // Run the flow; on ANY error emit Disconnected before returning.
@@ -101,7 +106,7 @@ pub(crate) async fn open_conn(
     let config = transport::pinned_client_config(cert)?;
 
     // 2) ServerName from the host portion of `server` (host:port). The SNI/cert
-    //    validation uses the host; the port only matters for the TCP dial.
+    //    validation uses the host; the port only matters for the dial.
     //    Phase-1 constraint: `server` must be `hostname:port` (no IPv6 bracket
     //    form, no port-less host — those are not parsed yet), and the host MUST
     //    match a SAN in the pinned cert (e.g. connecting by 127.0.0.1 against a
@@ -109,10 +114,29 @@ pub(crate) async fn open_conn(
     let host = server.rsplit_once(':').map(|(h, _)| h).unwrap_or(server);
     let server_name = ServerName::try_from(host.to_owned())
         .map_err(|_| UiError::new("tls", "Invalid server name."))?;
-    let transport = Transport::new(config, server_name, server.to_owned());
 
-    // 3) TLS handshake + channel binding (same connection used by the caller).
-    let (tls, exporter) = transport.connect().await?;
+    // 3) Route selection + TLS handshake + channel binding (same connection the
+    //    caller uses). The persisted route_mode is authoritative here: `connect`
+    //    has already written the effective mode (the Tor checkbox persists TorOnly
+    //    before opening), so every path — connect, reauth, bootstrap — routes the
+    //    same way. TorOnly dials a Tor circuit and layers the SAME pinned TLS +
+    //    RFC 5705 exporter; it NEVER falls back to a direct dial (that would leak
+    //    the client IP). PreferServer/PreferDropbox dial TCP directly.
+    let mode = crate::config::SettingsConfig::load(dir).connection.route_mode;
+    let (tls, exporter) = if mode == crate::config::RouteMode::TorOnly {
+        let tor = crate::tor::global()
+            .ok_or_else(|| UiError::new("tor_unavailable", "Tor routing is not available."))?;
+        let port = server
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .ok_or_else(|| UiError::new("tls", "Invalid server name."))?;
+        let boxed = tor.dial(host, port, || {}).await?;
+        transport::tls_over(config, server_name, boxed).await?
+    } else {
+        Transport::new(config, server_name, server.to_owned())
+            .connect()
+            .await?
+    };
 
     // 4) hyper http1 over the TLS stream; drive the connection in the background.
     let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
