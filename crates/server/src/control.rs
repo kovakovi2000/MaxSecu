@@ -7,9 +7,15 @@
 use maxsecu_crypto::sha256;
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::{KeyCompromise, Reinstatement, Revocation};
-use maxsecu_encoding::types::{FileScope, Role};
+use maxsecu_encoding::types::FileScope;
+#[cfg(feature = "postgres")]
+use maxsecu_encoding::types::Role;
 
 /// The chain link plus the advisory projections extracted from one record.
+// Several projection fields are read only by the Postgres index writer (`pg.rs`);
+// without the `postgres` feature the store reads just the chain link, so allow the
+// remaining fields to go unread rather than gate each one.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 pub(crate) struct DecodedControl {
     pub kind: i16, // 6=revocation 7=reinstatement 8=key_compromise
     pub prev_head: [u8; 32],
@@ -106,7 +112,8 @@ pub(crate) fn decode_control(bytes: &[u8]) -> Option<DecodedControl> {
 }
 
 /// The lowercase role text in the advisory `users.roles` / `directory_bindings.roles`
-/// TEXT[] projections.
+/// TEXT[] projections. Only the Postgres index writer consumes it.
+#[cfg(feature = "postgres")]
 pub(crate) fn role_text(r: &Role) -> String {
     match r {
         Role::User => "user".to_owned(),

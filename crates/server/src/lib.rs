@@ -20,6 +20,9 @@ pub mod detect;
 pub mod dropbox_tier;
 pub mod files;
 pub mod http;
+// The Postgres Store lives behind the default-on `postgres` feature so the crate
+// can be linked without `sqlx` by the client-side e2e crate (see Cargo.toml).
+#[cfg(feature = "postgres")]
 pub mod pg;
 pub mod ratelimit;
 pub mod serve;
@@ -40,6 +43,7 @@ pub use detect::{
 pub use dropbox_tier::{DropboxTier, HyperDropboxHttp};
 pub use error::{AuthError, ChallengeError, ControlAppendError, ProveError, StoreError};
 pub use http::{router, AppState, AuthedSession, TlsExporter};
+#[cfg(feature = "postgres")]
 pub use pg::PgStore;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use serve::{export_channel_binding, serve, CHANNEL_BINDING_LABEL, CHANNEL_BINDING_LEN};
