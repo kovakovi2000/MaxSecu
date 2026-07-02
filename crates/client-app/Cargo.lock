@@ -3258,6 +3258,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxsecu-demo-seed"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "maxsecu-ceremony-harness",
+ "maxsecu-client-app",
+ "maxsecu-client-core",
+ "maxsecu-crypto",
+ "maxsecu-encoding",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "maxsecu-encoding"
 version = "0.0.0"
 dependencies = [

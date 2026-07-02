@@ -16,14 +16,14 @@ members = [
     "crates/sink-server",
     "crates/portable-server",
     "tools/ceremony-harness",
-    "tools/demo-seed",
 ]
 # The client lives in its OWN workspace (crates/client-app is the root; see its
 # Cargo.toml) so its `arti-client` dependency's `libsqlite3-sys` never has to
-# resolve against this workspace's `sqlx`. `client-e2e` is a member of that client
-# workspace. Both are excluded here so this (server) workspace does not try to own
-# them.
-exclude = ["crates/client-app", "crates/client-e2e"]
+# resolve against this workspace's `sqlx`. `client-e2e` and `demo-seed` are members
+# of that client workspace (demo-seed depends on client-app to drive a client login,
+# so it must live where arti resolves — it never touches the server crate). All
+# three are excluded here so this (server) workspace does not try to own them.
+exclude = ["crates/client-app", "crates/client-e2e", "tools/demo-seed"]
 
 [workspace.package]
 edition = "2021"

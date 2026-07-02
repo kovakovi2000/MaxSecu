@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 description = "DEV/DEMO-ONLY: provision root(admin)+bob(user) against a running portable-server using the on-disk dev D5 seed (scripted offline ceremony). Never a production path."
+# Member of the CLIENT workspace (it depends on client-app, which carries arti and
+# therefore cannot resolve alongside the server's sqlx). It sits outside that
+# workspace's root dir, so it names its workspace explicitly.
+workspace = "../../crates/client-app"
 
 [[bin]]
 name = "maxsecu-demo-seed"
@@ -16,13 +20,15 @@ maxsecu-client-core = { path = "../../crates/client-core" }
 maxsecu-ceremony-harness = { path = "../ceremony-harness" }
 maxsecu-crypto = { path = "../../crates/crypto" }
 maxsecu-encoding = { path = "../../crates/encoding" }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
-tokio-rustls = { workspace = true }
+# Concrete versions (the client workspace root defines no [workspace.dependencies];
+# these match the versions used across the client workspace).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 base64 = "0.22"
-serde_json = { workspace = true }
+serde_json = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
