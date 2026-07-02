@@ -86,37 +86,27 @@ test("screens use a live region for feedback", () => {
     assert.match(vp, /aria-live/, "video-player needs an aria-live status region");
   });
 
-  test(`${vpPath}: transport controls are labeled + keyboard-operable`, () => {
-    // play/pause, volume and mute are labeled (aria-label / <label>); the
-    // scrubber is a native range (keyboard-operable, exposes its value) or
-    // carries aria-valuenow, and shows a played-vs-loaded (buffered) indication.
-    assert.match(vp, /aria-label|<label/, "controls must be labeled (aria-label / <label>)");
-    for (const label of ["Play", "Pause", "Mute", "Volume"]) {
-      assert.match(vp, new RegExp(label), `missing ${label} control text/label`);
+  test(`${vpPath}: native transport controls are present + keyboard-operable`, () => {
+    // Playback goes through a native <video> element driven by Media Chrome;
+    // the library's custom elements are themselves keyboard-operable and
+    // labeled, so this asserts the native transport is actually wired up.
+    for (const el of [
+      "<media-controller",
+      "<media-play-button",
+      "<media-mute-button",
+      "<media-volume-range",
+      "<media-time-range",
+      "<media-fullscreen-button",
+    ]) {
+      assert.match(vp, new RegExp(el.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `missing ${el} native control`);
     }
-    assert.match(
-      vp,
-      /type="range"|aria-valuenow/,
-      "scrubber must be an <input type=range> or carry aria-valuenow",
-    );
-    assert.match(vp, /loaded|buffered/i, "scrubber must show a loaded/buffered indication");
   });
 
-  test(`${vpPath}: non-color-only state text + decode-worker-pending badge`, () => {
-    // State is conveyed by TEXT (not color alone, WCAG 1.4.1): every phase has a
-    // visible label, plus a "decode worker pending" badge.
-    for (const s of ["Buffering", "Playing", "Stalled", "Error", "Codec unavailable"]) {
-      assert.match(vp, new RegExp(s), `state text "${s}" must appear in source`);
-    }
-    assert.match(vp, /Decode worker pending/i, "a 'decode worker pending' badge text must appear");
-  });
-
-  test(`${vpPath}: HW-decode waiver default-off + prominent warning`, () => {
-    // The hardware-decode waiver defaults OFF and carries an unmistakable TEXT
-    // warning that enabling it trades sandbox containment (not recommended).
-    assert.match(vp, /hardware|hw-decode|hwDecode/i, "HW-decode waiver toggle must be present");
-    assert.match(vp, /not recommended/i, "HW-decode waiver must carry a prominent warning");
-    assert.match(vp, /sandbox/i, "warning must explain the sandbox-containment trade-off");
+  test(`${vpPath}: non-color-only state text (WCAG 1.4.1)`, () => {
+    // State is conveyed by TEXT (not color alone): the aria-live status region
+    // exists and carries a visible error message when the native decoder fails.
+    assert.match(vp, /role="status"/, "video-player needs a role=status live region");
+    assert.match(vp, /could not be played/i, "video-player must surface a text error state");
   });
 
   test(`${vpPath}: no unescaped innerHTML interpolation (XSS guard)`, () => {

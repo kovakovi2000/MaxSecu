@@ -108,6 +108,3 @@ export interface RamLimits { default_mb: number; min_mb: number; max_mb: number 
 // Live process + budget memory figures from the `memory_stats` command.
 // `used_bytes` is null when the OS process-RSS query is unavailable (fail-soft).
 export interface MemoryStats { used_bytes: number | null; budget_bytes: number }
-
-// --- Video player: one-shot duration metadata emitted at open (maxsecu://video-info) ---
-export interface VideoInfo { duration_ms: number; fragment_count: number }
