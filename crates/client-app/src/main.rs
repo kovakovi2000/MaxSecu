@@ -61,8 +61,6 @@ fn main() {
             maxsecu_client_app::commands::upload::resume_upload,
             maxsecu_client_app::commands::upload::list_pending_uploads,
             maxsecu_client_app::commands::upload::dismiss_pending_upload,
-            maxsecu_client_app::commands::video::preview_video,
-            maxsecu_client_app::commands::video::preview_seek,
             maxsecu_client_app::commands::settings::get_settings,
             maxsecu_client_app::commands::settings::set_settings,
             maxsecu_client_app::commands::settings::change_password,
@@ -70,8 +68,6 @@ fn main() {
             maxsecu_client_app::ram::ram_limits,
             maxsecu_client_app::ram::memory_stats,
             maxsecu_client_app::commands::video::open_video,
-            maxsecu_client_app::commands::video::video_seek,
-            maxsecu_client_app::commands::video::video_set_volume,
             maxsecu_client_app::commands::video::cancel_video,
             maxsecu_client_app::commands::video::stream_debug_log,
         ])

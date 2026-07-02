@@ -708,12 +708,11 @@ impl Drop for JobGuard {
 /// A live confined child after the full AppContainer + Job Object + pipe
 /// [`setup_confined_child`]: a [`JobGuard`] RAII-owning the kill-on-close Job +
 /// the process/thread handles, plus the parent ends of the two stdio pipes. The
-/// child is already assigned to the job and **resumed**. Both drivers —
-/// [`spawn_confined`] (serial) and [`spawn_confined_session`] (duplex) — obtain
-/// this from the one setup site, so the confinement FFI lives in exactly one
-/// place; they differ only in how they drive the two pipe ends. Teardown is via
-/// [`finish_confined`] (success, disarms the guard) or [`JobGuard::drop`] (unwind);
-/// the two parent ends are wrapped in `std::fs::File`s and closed by those.
+/// child is already assigned to the job and **resumed**. [`spawn_confined`]
+/// (serial) obtains this from the one setup site, so the confinement FFI lives in
+/// exactly one place. Teardown is via [`finish_confined`] (success, disarms the
+/// guard) or [`JobGuard::drop`] (unwind); the two parent ends are wrapped in
+/// `std::fs::File`s and closed by those.
 struct ConfinedChild {
     guard: JobGuard,
     parent_stdin_write: HANDLE,
@@ -1022,12 +1021,11 @@ fn teardown_unstarted(pi: &PROCESS_INFORMATION, parent_ends: &[HANDLE]) {
     close_all(parent_ends);
 }
 
-/// Spawn the `media-worker` binary at `worker_path` with `extra_args`, confined to
+/// Spawn a confined worker binary at `worker_path` with `extra_args`, confined to
 /// an AppContainer (no network/key access) + a Job Object (no child processes,
 /// memory-capped, kill-on-close). `stdin_data` is written to the worker's stdin;
 /// its stdout is captured. **Serial** I/O (write-all-then-read-all) — for the
-/// one-shot request/response worker; the duplex session uses
-/// [`spawn_confined_session`].
+/// one-shot request/response worker.
 pub fn spawn_confined(
     worker_path: &Path,
     extra_args: &[&str],
@@ -1090,45 +1088,6 @@ fn spawn_confined_inner(
         exit_code,
         stdout: out,
     })
-}
-
-/// Like [`spawn_confined`] but drives a **persistent duplex session** over the
-/// SAME AppContainer + Job Object + pipe setup (no weakening of confinement —
-/// only the I/O concurrency differs; `extra_args` selects the worker mode, e.g.
-/// `--video-session` for a real session or a `--selftest-*` probe for the duplex
-/// containment differential). The two parent pipe ends are wrapped in
-/// `std::fs::File`s (so the duplex I/O itself is NOT FFI) and handed to `drive`,
-/// which streams framed requests on a writer thread while concurrently reading
-/// responses — no deadlock. When `drive` returns (both pipe ends dropped → the
-/// worker sees EOF), the worker is waited on (bounded — see [`finish_confined`]),
-/// its exit code read, and the Job Object closed (kill-on-close tears the session
-/// worker down on session end / error). A panic in `drive` unwinds through the
-/// armed [`JobGuard`], which terminates the worker and closes the handles
-/// (Important #1) — the leaked job would otherwise leave it alive. Returns
-/// `drive`'s result paired with the worker exit code.
-pub fn spawn_confined_session<T>(
-    worker_path: &Path,
-    extra_args: &[&str],
-    memory_cap_bytes: u64,
-    drive: impl FnOnce(std::fs::File, std::fs::File) -> T,
-) -> Result<(T, u32), SpawnError> {
-    let ConfinedChild {
-        guard,
-        parent_stdin_write,
-        parent_stdout_read,
-    } = setup_confined_child(worker_path, extra_args, memory_cap_bytes)?;
-
-    // SAFETY: we own both parent ends; each File takes ownership of one and closes
-    // it exactly once (when `drive` drops it). The duplex framing runs inside
-    // `drive` over these Files, so the I/O itself isn't FFI. `guard` stays armed
-    // across `drive`, so an unwind there still tears the worker down.
-    let writer = unsafe { std::fs::File::from_raw_handle(parent_stdin_write as _) };
-    let reader = unsafe { std::fs::File::from_raw_handle(parent_stdout_read as _) };
-
-    let result = drive(writer, reader);
-
-    let exit_code = finish_confined(guard, &NEVER_CANCEL);
-    Ok((result, exit_code))
 }
 
 fn close_all(handles: &[HANDLE]) {

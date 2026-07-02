@@ -100,9 +100,6 @@ pub struct VideoJob {
     pub chunk_size: u64,
     /// Total plaintext content length (bytes) — the `Content-Range` denominator.
     pub total_len: u64,
-    /// UI playback gain preference (0.0..=4.0). Has NO decode effect — the UI
-    /// applies it via WebAudio (Gate 5); stored here so it survives across windows.
-    pub gain: f32,
     /// The persistent authed connection for range serving. `Option` only so pure
     /// `commands::video` unit tests (which never serve ranges) can build a job with
     /// `None`; the real open path + the e2e always populate `Some`. Behind an `Arc<Mutex>`

@@ -36,16 +36,11 @@
 //! and how many fragments to feed. Their absence from this session-level bomb
 //! suite is therefore correct scoping, not a coverage gap.
 //!
-//! Plus a `#[cfg(windows)]` confined case driving a bomb through the OS-isolated
-//! [`AppContainerVideoSession`] (the launcher returns bounded — does not hang —
-//! and no frame escapes the confined boundary) and a cross-platform
-//! [`VideoSubprocessSession`] garbage case over a real process boundary. (Neither
-//! confined case here triggers an actual worker KILL — both inputs are rejected
-//! cleanly and the worker exits 0. The in-decode over-allocation Job-memory-cap
-//! KILL path is the launcher's concern: the Task-3.6 fuzz corpus / `fuzz_replay`
-//! run IN-PROCESS (no Job Object), so they only SURFACE the over-allocation (as a
-//! raw OOM); the actual confined memory-cap kill of the F2 repro is exercised by
-//! `tests/oom_kill_windows.rs::f2_oom_overalloc_killed_confined_no_frame_escapes`.)
+//! (The confined cross-process bomb cases that used to drive these through the
+//! `media-launcher` client-side video-session driver were removed with that
+//! driver once native `<video>` became the shipping viewer — see the Task-2
+//! cleanup. `VideoSession` itself is unaffected: it remains the in-process
+//! decode-verification oracle used here and by `media-transcode-worker`'s tests.)
 
 #[path = "support/mod.rs"]
 mod support;
@@ -406,101 +401,3 @@ fn bomb_fragment_before_open_fails_closed() {
     );
 }
 
-// ===========================================================================
-// Confined / cross-process bombs — prove the OS-isolated launcher rejects a bomb
-// BOUNDED (does not hang) and that NO frame escapes the process boundary. (Both
-// inputs here are rejected cleanly; the worker exits 0, it is not killed. The
-// in-decode over-allocation memory-cap KILL is a separate path — the in-process
-// Task-3.6 fuzz/replay only SURFACE it (no Job Object); the confined kill of the
-// F2 repro is proven in `tests/oom_kill_windows.rs`.)
-// ===========================================================================
-
-/// Absolute path to the built worker binary (cargo provides it for the bin target).
-const WORKER: &str = env!("CARGO_BIN_EXE_media-worker");
-
-/// Cross-platform: drive a garbage bomb through the real worker process over a
-/// framed duplex (`VideoSubprocessSession`). The worker rejects it (a
-/// `WorkerMsg::Error`), no frame crosses the boundary, and the exchange ends
-/// bounded — proving the bomb is contained even across a real address-space split.
-#[test]
-fn bomb_garbage_over_subprocess_session_bounded() {
-    use maxsecu_media_worker::{VideoSessionDecoder, VideoSubprocessSession};
-
-    let out = run_bounded("subprocess-garbage", || {
-        let bounds = VideoBounds::default();
-        let script = vec![
-            ClientMsg::Open { bounds },
-            ClientMsg::Fragment {
-                seq: 0,
-                bytes: lcg_garbage(8192, 0xABCD_1234),
-            },
-            ClientMsg::Close,
-        ];
-        VideoSubprocessSession::new(WORKER).run_session(&script)
-    });
-
-    let msgs = out.expect("the subprocess session must complete (worker rejects, not crashes)");
-    assert_eq!(
-        count_videos(&msgs),
-        0,
-        "no frame may cross the process boundary for a garbage fragment"
-    );
-    assert!(
-        errors(&msgs).contains(&DecodeError::DecodeFailed),
-        "the worker must reject the garbage fragment with DecodeFailed"
-    );
-}
-
-/// Windows-confined: drive the **oversize-dimension** bomb through the
-/// AppContainer + Job Object launcher. The worker decodes a *legitimate* 64×48
-/// frame inside the confinement, the post-decode cap cleanly rejects it
-/// (`OverCap`), and the worker then exits 0 — so what this case proves is: the
-/// confined launcher returns BOUNDED (does not hang) and ZERO frames cross the
-/// AppContainer boundary, re-proving the Task-3.2 post-decode cap ALSO holds
-/// across the OS-isolated worker boundary. This worker is NOT killed (it rejects
-/// and exits cleanly).
-///
-/// NOTE — what this case does NOT exercise: the genuine in-decode over-allocation
-/// KILL path (Job Object memory cap, and the 120s timeout → TerminateProcess
-/// backstop; ratification M-2) is the launcher's responsibility for inputs that
-/// would over-allocate DURING decode. That kill is NOT exercised by the Task-3.6
-/// fuzz corpus / `fuzz_replay` either — those run IN-PROCESS (no Job Object) and
-/// only SURFACE the over-allocation as a raw OOM. The actual confined memory-cap
-/// kill of the F2 repro (`fuzz/crash-repros/oom_stsz_overalloc.bin`) is exercised
-/// by `tests/oom_kill_windows.rs::f2_oom_overalloc_killed_confined_no_frame_escapes`,
-/// not by this case (which only crosses the boundary and hits the post-decode cap).
-#[cfg(windows)]
-#[test]
-fn bomb_oversize_dimension_confined_appcontainer_bounded() {
-    use maxsecu_media_worker::{AppContainerVideoSession, VideoSessionDecoder};
-
-    let out = run_bounded("appcontainer-oversize", || {
-        let bounds = VideoBounds {
-            max_width: 32,
-            ..VideoBounds::default()
-        };
-        let frag = one_fragment(64, 48);
-        let script = vec![
-            ClientMsg::Open { bounds },
-            ClientMsg::Fragment {
-                seq: 0,
-                bytes: frag,
-            },
-            ClientMsg::Close,
-        ];
-        AppContainerVideoSession::new(WORKER).run_session(&script)
-    });
-
-    let msgs = out.expect("the confined session must complete bounded (does not hang)");
-    assert_eq!(
-        count_videos(&msgs),
-        0,
-        "no over-cap frame may escape the confined worker boundary"
-    );
-    assert!(
-        errors(&msgs).contains(&DecodeError::OutputRejected {
-            reason: OutputReject::OverCap,
-        }),
-        "the confined worker must reject the 64×48 frame with the post-decode OverCap cap"
-    );
-}

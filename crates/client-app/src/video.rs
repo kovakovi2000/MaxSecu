@@ -754,26 +754,4 @@ mod tests {
         assert_eq!(err.code, "video_failed");
         assert_eq!(sink_calls, 0, "no plaintext released on an AEAD failure");
     }
-
-    // ---- codec-free media-launcher dependency (Phase 7, Task 4.3a) ----
-
-    /// The key-holding main process depends on the codec-free `media-launcher`
-    /// crate, so it links the SPAWN launcher (`VideoSessionDecoder` +
-    /// `VideoSubprocessSession`) but NOT the in-process decoder (rav1d / symphonia)
-    /// — and, because the launcher crate links no codec at all, Cargo feature
-    /// unification cannot pull them in either. This proves the launcher types are
-    /// importable decoder-free; it constructs the cross-platform session over a
-    /// dummy path and does NOT spawn anything (Task 4.3b wires the real player
-    /// commands).
-    #[test]
-    fn launcher_types_are_importable_decoder_free() {
-        use maxsecu_media_launcher::{VideoSessionDecoder, VideoSubprocessSession};
-
-        // Name the trait so the launcher crate must expose it.
-        fn _assert_trait<T: VideoSessionDecoder>() {}
-        _assert_trait::<VideoSubprocessSession>();
-
-        // Construct the launcher (no spawn): just proves the type compiles here.
-        let _session = VideoSubprocessSession::new(PathBuf::from("media-worker"));
-    }
 }

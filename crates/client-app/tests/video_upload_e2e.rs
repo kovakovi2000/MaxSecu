@@ -1,6 +1,5 @@
 //! Phase-7 Gate-6 exit-gate end-to-end test (author-side video ingest) — the
-//! confined transcode + preview-before-upload + the Phase-4 pipeline over REAL
-//! loopback TLS.
+//! confined transcode + the Phase-4 pipeline over REAL loopback TLS.
 //!
 //! Drives the **real** `client-app` video upload modules end to end:
 //!
@@ -12,10 +11,6 @@
 //!   from `thumb.png` via the pure-Rust image codec). This step makes NO server call
 //!   (no `Conn`/TLS is even created before it) — it is the preview-before-upload
 //!   transcode.
-//! - GATE D (preview decodes to source dims): slicing the STAGED canonical `cmaf`
-//!   by each fragment's chunk range and feeding it to the confined decode session
-//!   (`media-worker --video-session`) decodes back to the source dimensions with
-//!   re-validated I420 frames — the WYSIWYG preview path's contract.
 //! - GATE M (metadata round-trip): `parse_fragment_index` over the staged metadata
 //!   returns the SAME fragments the transcode produced (the author→view contract).
 //! - GATE P (confirm pipeline): `build_upload` (FileType::Video, chunk_size 4096) +
@@ -23,11 +18,20 @@
 //!   content byte-exactly through the full `verify_and_open` ladder, and the
 //!   fragment index survives inside the authenticated metadata stream.
 //!
-//! The two worker-spawning gates (T, D) require the built `media-transcode-worker`
-//! and `media-worker` binaries; when absent (e.g. a bare `-p maxsecu-client-app`
-//! run that did not build the sibling bins) the test SKIPS them with a note. The
-//! `--workspace` gate builds every bin first, so it exercises the real spawn. Run
-//! isolated single-threaded.
+//! GATE T requires the built `media-transcode-worker` binary; when absent (e.g. a
+//! bare `-p maxsecu-client-app` run that did not build the sibling bins) the test
+//! SKIPS with a note. The `--workspace` gate builds it first, so it exercises the
+//! real spawn. Run isolated single-threaded.
+//!
+//! The old GATE D (confined-decode-session verification of the staged canonical
+//! content, via `media-launcher`'s client-side `VideoSubprocessSession`/
+//! `media-worker --video-session`) was removed with that client-side decode-session
+//! driver once native `<video>` became the shipping viewer — see the Task-2
+//! cleanup. Equivalent (more thorough) coverage — that the transcode output decodes
+//! back to the correct source dimensions, including odd-dimension/SAR coercion —
+//! already lives in `media-transcode-worker/tests/ingest_remux.rs`, which drives
+//! the SAME `maxsecu_media_worker::VideoSession` in-process as a dev-only decode
+//! oracle.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,7 +53,7 @@ use maxsecu_ceremony_harness::Ceremony;
 use maxsecu_client_app::directory::resolve_recovery_recipient;
 use maxsecu_client_app::upload::{prepare_video_streams, run_pipeline, VIDEO_CHUNK_SIZE};
 use maxsecu_client_app::video::parse_fragment_index;
-use maxsecu_client_core::video::{validate_i420, ClientMsg, VideoBounds, WorkerMsg};
+use maxsecu_client_core::video::VideoBounds;
 use maxsecu_client_core::{
     build_upload, verify_and_open, DirectoryVerifier, DownloadBundle, Identity, MemoryTrustStore,
     PlaintextStreams, StreamChunks, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
@@ -57,7 +61,7 @@ use maxsecu_client_core::{
 use maxsecu_crypto::{sha256, EncPublicKey, WrappedDek};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::types::{FileType, Id, Role, StreamType, Timestamp};
-use maxsecu_media_launcher::{TranscodeOptions, VideoSubprocessSession};
+use maxsecu_media_launcher::TranscodeOptions;
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuthConfig, AuthService, FsBlobStore, MemoryStore,
 };
@@ -426,7 +430,6 @@ async fn download_bundle(c: &mut Conn, token: &str, fid_hex: &str) -> DownloadBu
 async fn phase7_video_upload_over_real_tls() {
     // ---- worker binaries + vendored ffmpeg (skip the spawn gates if absent) ----
     let transcode_worker = find_worker("media-transcode-worker");
-    let decode_worker = find_worker("media-worker");
     let Some(_transcode_worker) = transcode_worker else {
         eprintln!(
             "SKIP phase7_video_upload_over_real_tls: media-transcode-worker binary not found in \
@@ -530,55 +533,6 @@ async fn phase7_video_upload_over_real_tls() {
         total_chunks,
         "GATE M: fragment ranges cover the content's chunk count exactly"
     );
-
-    // ---- GATE D: the STAGED canonical content decodes to source dims in the
-    //              confined decode session (the preview-before-upload path) ----
-    if let Some(decode_worker) = decode_worker.clone() {
-        let mut script = vec![ClientMsg::Open {
-            bounds: VideoBounds::default(),
-        }];
-        for fr in &parsed {
-            let start = fr.chunk_start as usize * CHUNK;
-            // The last chunk is short (the fMP4 is not chunk-aligned) — clamp to len.
-            let end = ((fr.chunk_start + fr.chunk_len) as usize * CHUNK).min(canonical.len());
-            script.push(ClientMsg::Fragment {
-                seq: fr.seq,
-                bytes: canonical[start..end].to_vec(),
-            });
-        }
-        script.push(ClientMsg::Close);
-
-        let out = VideoSubprocessSession::new(&decode_worker)
-            .run(script)
-            .expect("GATE D: confined decode session over the staged canonical content");
-        let bounds = VideoBounds::default();
-        let mut videos = 0usize;
-        for m in &out {
-            if let WorkerMsg::Video(f) = m {
-                assert_eq!(
-                    (f.width, f.height),
-                    (w, h),
-                    "GATE D: preview decodes to the source dimensions"
-                );
-                // Re-validate every worker frame in this (trusted) process, exactly
-                // as the preview command does before any DTO would cross the seam.
-                validate_i420(f, &bounds).expect("GATE D: decoded frame re-validates");
-                videos += 1;
-            }
-        }
-        // A canonical fragment is now a whole GOP (not a single frame), so the
-        // decoded-frame count is the source frame count, not the fragment count; we
-        // only assert that at least one validated frame decoded back to source dims.
-        assert!(
-            videos >= 1,
-            "GATE D: at least one validated frame decoded from the staged content"
-        );
-    } else {
-        eprintln!(
-            "SKIP GATE D: media-worker (decode) binary not found in the target dir; the \
-             confined transcode (GATE T) + metadata (GATE M) still ran."
-        );
-    }
 
     // ---- Server + pinned ceremony D5 (for the confirm pipeline) ----
     let ceremony = Ceremony::generate();
