@@ -25,7 +25,7 @@
 
 use core::fmt;
 use maxsecu_crypto::{self as crypto, Argon2Params, EncSecretKey};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAGIC: &[u8; 4] = b"MXRS";
 const VERSION_V1: u8 = 1;
@@ -154,7 +154,7 @@ pub fn open_recovery_secret(
     scalar.copy_from_slice(&plaintext);
     // `from_bytes` takes ownership into a Zeroizing store; wipe our stack copy.
     let key = EncSecretKey::from_bytes(scalar);
-    scalar.iter_mut().for_each(|b| *b = 0);
+    scalar.zeroize(); // volatile write defeats dead-store elimination
     Ok(key)
 }
 
