@@ -349,12 +349,27 @@ impl fmt::Debug for SplitRecoveryKeyRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SplitRecoveryKeyResponse {
     pub shares: Vec<String>, // §5 wire-encoded MSHARE1 strings — the interchange unit, not raw Share bytes
     pub label: String,
     pub k: u8,
     pub n: u8,
+}
+
+impl fmt::Debug for SplitRecoveryKeyResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `shares` are MSHARE1 share text — the same sensitive class as
+        // `AddShareRequest.share_text` — so elide them (count only), per the
+        // spec §8 prose rule + §11 checklist ("never derive/implement Debug in
+        // a way that would dump share bytes"). Non-secret label/k/n are shown.
+        f.debug_struct("SplitRecoveryKeyResponse")
+            .field("shares", &format!("<{} shares>", self.shares.len()))
+            .field("label", &self.label)
+            .field("k", &self.k)
+            .field("n", &self.n)
+            .finish()
+    }
 }
 
 /// One MSHARE1 share pasted/loaded by the reconstructing custodian.
@@ -532,6 +547,25 @@ mod recovery_ceremony_dto_tests {
         assert_eq!(v["label"], "label");
         assert_eq!(v["k"], 3);
         assert_eq!(v["n"], 5);
+    }
+
+    #[test]
+    fn split_recovery_key_response_debug_redacts_share_text() {
+        let resp = SplitRecoveryKeyResponse {
+            shares: vec![
+                "MSHARE1:bGFiZWw:3:5:1:c2VjcmV0Ym9keQ:deadbeef".into(),
+                "MSHARE1:bGFiZWw:3:5:2:YW5vdGhlcmJvZHk:cafebabe".into(),
+            ],
+            label: "label".into(),
+            k: 3,
+            n: 5,
+        };
+        let d = format!("{resp:?}");
+        assert!(!d.contains("MSHARE1"), "share text leaked into Debug: {d}");
+        assert!(!d.contains("c2VjcmV0Ym9keQ"), "share body leaked: {d}");
+        assert!(d.contains("<2 shares>"), "got {d}");
+        // Non-secret fields still show up.
+        assert!(d.contains("label"));
     }
 
     #[test]
