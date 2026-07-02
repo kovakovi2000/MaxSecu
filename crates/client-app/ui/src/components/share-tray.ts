@@ -33,6 +33,7 @@ interface FileRow {
   failed: number;
   failures: Array<{ username: string; code: string | null }>;
   done: boolean;
+  clearTimer?: number; // pending auto-clear (success rows) — cancelled on reset.
 }
 
 export class ShareTray extends HTMLElement {
@@ -91,8 +92,21 @@ export class ShareTray extends HTMLElement {
   }
 
   private onMsg(m: SharePhase) {
+    const existing = this.rows.get(m.file_id);
+    if (existing?.done) {
+      // The row was already finalized. A batch always OPENS with `resolving`,
+      // so a fresh `resolving` for this file is a genuinely NEW re-share (e.g.
+      // a retry after a failed/partial row the user hasn't dismissed, or a new
+      // share started before a success row auto-cleared): discard the stale
+      // row + its <li> (cancelling any pending auto-clear so it can't later
+      // delete the NEW row) and fall through to render the new batch fresh.
+      // Any OTHER phase arriving after `done` is a stray late event for the
+      // SAME finalized batch — ignore it.
+      if (m.phase === "resolving") this.discardRow(m.file_id);
+      else return;
+    }
+
     const row = this.rowFor(m.file_id);
-    if (row.done) return; // a stray late event after finalize(); ignore.
     const li = this.li(m.file_id);
     const badge = li.querySelector(".st-badge") as HTMLElement;
     const summary = li.querySelector(".st-summary") as HTMLElement;
@@ -159,9 +173,19 @@ export class ShareTray extends HTMLElement {
     const total = row.shared + row.failed;
     const allFailed = row.shared === 0 && row.failed > 0;
 
-    summary.textContent = total > 0
-      ? `${row.shared} of ${total} shared${row.failed > 0 ? ` · ${row.failed} failed` : ""}`
-      : "Nothing was shared.";
+    if (total === 0) {
+      // Defensive: a `done` with no recipients at all (the dialog requires ≥1
+      // verified recipient, so this should be unreachable). Render ONE coherent
+      // neutral state — never a false "✓ Shared" success — then auto-clear.
+      li.removeAttribute("role");
+      badge.setAttribute("state", "idle");
+      badge.setAttribute("label", "Nothing to share");
+      summary.textContent = "No recipients.";
+      this.clearRowLater(row.fileId);
+      return;
+    }
+
+    summary.textContent = `${row.shared} of ${total} shared${row.failed > 0 ? ` · ${row.failed} failed` : ""}`;
 
     if (allFailed) {
       // Terminal all-failed: the only case that escalates to assertive.
@@ -189,21 +213,27 @@ export class ShareTray extends HTMLElement {
     btn.className = "st-dismiss secondary";
     btn.textContent = "Dismiss";
     btn.setAttribute("aria-label", "Dismiss sharing result");
-    btn.addEventListener("click", () => {
-      this.rows.delete(fileId);
-      li.remove();
-      this.maybeHideTray();
-    });
+    btn.addEventListener("click", () => this.discardRow(fileId));
     li.appendChild(btn);
   }
 
   private clearRowLater(fileId: string) {
-    window.setTimeout(() => {
-      this.rows.delete(fileId);
-      const list = this.querySelector("#st-list") as HTMLUListElement | null;
-      list?.querySelector(`li[data-file="${cssEscape(fileId)}"]`)?.remove();
-      this.maybeHideTray();
-    }, 4000);
+    const row = this.rows.get(fileId);
+    if (!row) return;
+    // Key the timer to THIS row so a same-file re-share that reset the row
+    // (see onMsg) cannot be deleted by an earlier row's pending timer — the
+    // reset cancels this handle before creating the new row.
+    row.clearTimer = window.setTimeout(() => this.discardRow(fileId), 4000);
+  }
+
+  /** Remove a row + its <li> entirely, cancelling any pending auto-clear. */
+  private discardRow(fileId: string) {
+    const row = this.rows.get(fileId);
+    if (row?.clearTimer !== undefined) window.clearTimeout(row.clearTimer);
+    this.rows.delete(fileId);
+    const list = this.querySelector("#st-list") as HTMLUListElement | null;
+    list?.querySelector(`li[data-file="${cssEscape(fileId)}"]`)?.remove();
+    this.maybeHideTray();
   }
 
   private maybeHideTray() {
