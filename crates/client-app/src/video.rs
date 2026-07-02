@@ -160,7 +160,8 @@ pub fn chunks_for_fragment(index: &[FragmentEntry], seq: u32) -> Option<(u64, u6
 ///   index `i`. Injected so the real command supplies a network GET and tests can
 ///   assert it is called on a miss and NOT on a hit.
 /// * `sink(&plaintext)` consumes the decoded canonical-fragment plaintext exactly
-///   once. In Task 4.3 it drives `ClientMsg::Fragment` into the sandboxed worker;
+///   once. The range-serving path (`stream::assemble_range`) appends it into the
+///   buffer returned over `stream://` for the native `<video>` element to play;
 ///   here it is decoder-agnostic.
 ///
 /// The decrypted plaintext is a `Zeroizing` buffer that is dropped (wiped) when
