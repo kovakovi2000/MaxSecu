@@ -36,6 +36,12 @@ tauri-build = { version = "2", features = [] }
 maxsecu-client-core = { path = "../client-core", features = ["net"] }
 maxsecu-crypto = { path = "../crypto" }
 maxsecu-encoding = { path = "../encoding" }
+# Pure-crypto offline ceremony core (encoding + crypto + zeroize only; no I/O, no
+# SQL). Needed by the T6 recovery-custody command for `recovery::split_recovery_key`
+# and `recovery_seal::{open,seal}_recovery_secret`. Already present in this
+# workspace's graph (client-core depends on it), so it adds no new native lib and
+# cannot pull `sqlx` — verified via `cargo tree -p maxsecu-client-app -i sqlx`.
+maxsecu-admin-core = { path = "../admin-core" }
 # The codec-free media-decode launcher: the `VideoSessionDecoder` trait + the
 # AppContainer / subprocess SPAWN launchers. This crate links NO codecs
 # (rav1d / symphonia live only in `media-worker`), so this key-holding process
