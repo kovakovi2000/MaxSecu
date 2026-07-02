@@ -42,12 +42,12 @@ pub const DEFAULT_PRESET: u32 = 6;
 
 /// Default SVT-AV1 constant-quality `-crf` used when the caller leaves the bitrate
 /// at [`Bitrate::Original`] (the default path). SVT-AV1's own fallback rate control
-/// (~CRF 35) is visibly lossy at 1080p; `22` is a high-quality, near-transparent
-/// target that keeps files roughly comparable to a typical H.264 source. An explicit
+/// (~CRF 35) is visibly lossy at 1080p; `18` is a near-lossless, essentially
+/// transparent target (larger files — can exceed the source). An explicit
 /// [`Bitrate::Kbps`] instead switches to bitrate-targeted `-b:v` (below). This is a
 /// pure quality knob — it does NOT change the canonical AV1/AAC fragment layout the
 /// viewer decodes, so it is freely tunable.
-pub const DEFAULT_CRF: u32 = 22;
+pub const DEFAULT_CRF: u32 = 18;
 
 /// Default closed-GOP keyframe interval (`-g` / SVT-AV1 `keyint`). This is the
 /// **fragment granularity**: one closed GOP per canonical fragment, so the
