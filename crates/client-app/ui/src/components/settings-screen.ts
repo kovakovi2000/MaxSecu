@@ -4,7 +4,7 @@ import type { Settings, RamLimits } from "../core/types.ts";
 
 // Settings (spec §5/§7): appearance / accessibility / performance / behavior /
 // connection / account / privacy. Preference controls write through the SHARED
-// settings store (so quick-settings + the shell theme stay in sync and apply
+// settings store (so the header RAM gauge + the shell theme stay in sync and apply
 // live); the RAM control is bounded to the live `ram_limits`. Account actions
 // are explicit submits. Accessible: focused landmark on mount, labelled controls
 // in fieldsets, role=status live regions.
@@ -103,7 +103,7 @@ export class SettingsScreen extends HTMLElement {
     (this.querySelector("#exp-form") as HTMLFormElement)
       .addEventListener("submit", (e) => { e.preventDefault(); this.onExportKeystore(); });
 
-    // Keep the form mirrored to the shared store (so a quick-settings edit shows
+    // Keep the form mirrored to the shared store (so any other store edit shows
     // up here live, and vice-versa).
     this.unsub = settingsStore.subscribe((s) => this.writeControls(s));
 

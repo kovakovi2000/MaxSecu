@@ -58,7 +58,6 @@ export class AppShell extends HTMLElement {
 
     const outlet = this.querySelector("#outlet")!;
     const pill = this.querySelector("#pill") as StatusPill;
-    const qs = this.querySelector("#qs") as HTMLElement;
     const nav = this.querySelector(".nav-rail") as HTMLElement;
 
     // Navigation guard: while a transcode/upload is in flight the nav rail is
@@ -94,7 +93,6 @@ export class AppShell extends HTMLElement {
 
       const showAppChrome = hasSession && r !== "connect" && r !== "bootstrap" && r !== "pending";
       this.toggleAttribute("data-app-chrome", showAppChrome);
-      qs.toggleAttribute("hidden", showAppChrome && r === "settings");
       this.querySelectorAll<HTMLAnchorElement>(".nav-rail a").forEach((a) => {
         const isActive = showAppChrome && (a.getAttribute("data-route") === r
           || (r === "mine" && a.getAttribute("data-route") === "mine"));
