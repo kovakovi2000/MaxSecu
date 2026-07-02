@@ -87,7 +87,9 @@ const PLAY_WINDOW: u32 = 4;
 const MAX_GAIN: f32 = 4.0;
 
 /// Cap on a single range response body (open-ended `bytes=N-` streams in pieces).
-const MAX_RANGE_BODY: u64 = 4 * 1024 * 1024;
+/// Must be ≥ the content chunk size (currently 6 MiB) so a range request can
+/// span a full chunk/fMP4 fragment in one response without being truncated.
+const MAX_RANGE_BODY: u64 = 8 * 1024 * 1024;
 
 /// The body + metadata of one satisfied range response (206). `total_len` is the
 /// Content-Range denominator; `start`/`len` describe the returned slice.

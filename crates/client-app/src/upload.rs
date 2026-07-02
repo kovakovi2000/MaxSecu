@@ -21,8 +21,9 @@ use crate::error::UiError;
 /// fragment to the wrong byte range).
 pub const VIDEO_CHUNK_SIZE: u32 = 6 * 1024 * 1024;
 
-/// Content chunks per fMP4 seek fragment (~256 KiB at 4096-byte chunks).
-const FRAG_CHUNKS: u64 = 64;
+/// Content chunks per fMP4 seek fragment: 1 content chunk (6 MiB) per fMP4
+/// seek fragment, matching the native `<video>` seek granularity for 6 MiB chunks.
+const FRAG_CHUNKS: u64 = 1;
 
 /// Build the canonical metadata blob: JSON `{"title","tags"}` (UTF-8) — exactly
 /// what `commands::feed::parse_title_tags` reads back.
