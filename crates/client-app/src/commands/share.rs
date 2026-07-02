@@ -138,6 +138,14 @@ async fn reshare_inner(
         return Err(UiError::new("fetch_failed", "That item is not available."));
     }
     let view = parse_file_view(&view_json)?;
+    // NOTE: we decode the manifest but do NOT independently re-verify `manifest_sig`
+    // here. That is safe by construction: every manifest field this flow consumes is
+    // cryptographically pinned downstream — `version`/`alg`/`dek_commit` are all bound
+    // into the AEAD-`WrapContext` + `dek.commit()` self-check inside `recover_own_dek`
+    // (a forged manifest cannot open the real self-wrap), and the new grants are signed
+    // over the REQUESTED `file_id` (below), never the served `manifest.file_id`. A
+    // malicious server can therefore only deny service, not redirect the DEK or forge a
+    // grant that survives the recipient's own grant-chain verification on download.
     let manifest: Manifest =
         decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
 
