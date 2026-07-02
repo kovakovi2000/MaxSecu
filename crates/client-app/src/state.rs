@@ -113,6 +113,36 @@ pub enum PlayerPhase {
     Error { code: String },
 }
 
+/// The post-upload multi-recipient reshare feedback channel (spec §6) — per-file,
+/// per-recipient progress for the share UI. Emitted over the Tauri event bus; the
+/// UI binds a progress meter + per-recipient badge. Non-color-only: each variant
+/// carries a stable `phase` code.
+pub const EVT_RESHARE: &str = "maxsecu://reshare-state";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "phase")]
+pub enum SharePhase {
+    /// Resolving a recipient username to a directory binding.
+    Resolving { file_id: String, username: String },
+    /// Verifying the resolved recipient's binding under the pinned D5.
+    Verifying { file_id: String, username: String },
+    /// Wrapping the DEK to the verified recipient's public key.
+    Wrapping { file_id: String, username: String },
+    /// One recipient's outcome — `ok` with a sanitized `code` on failure (no oracle).
+    Recipient {
+        file_id: String,
+        username: String,
+        ok: bool,
+        code: Option<String>,
+    },
+    /// Done — the reshare call has finished; `shared`/`failed` tally the recipients.
+    Done {
+        file_id: String,
+        shared: u32,
+        failed: u32,
+    },
+}
+
 // The complete connection-state vocabulary streamed to the UI. `connect` emits
 // the connect-flow subset (Resolving/TlsHandshake/ChannelBinding/Connected/
 // Disconnected); Idle/Reconnecting/Degraded are emitted by the reconnect +
@@ -267,5 +297,63 @@ mod upload_phase_tests {
         })
         .unwrap();
         assert!(d.contains("\"phase\":\"done\"") && d.contains("\"file_id\":\"ab\""));
+    }
+}
+
+#[cfg(test)]
+mod share_phase_tests {
+    use super::*;
+
+    #[test]
+    fn share_phase_serializes_kebab_tagged() {
+        let s = serde_json::to_string(&SharePhase::Resolving {
+            file_id: "ab".into(),
+            username: "bob".into(),
+        })
+        .unwrap();
+        assert!(s.contains("\"phase\":\"resolving\""), "got {s}");
+        assert!(s.contains("\"file_id\":\"ab\"") && s.contains("\"username\":\"bob\""));
+
+        let s = serde_json::to_string(&SharePhase::Verifying {
+            file_id: "ab".into(),
+            username: "bob".into(),
+        })
+        .unwrap();
+        assert!(s.contains("\"phase\":\"verifying\""), "got {s}");
+
+        let s = serde_json::to_string(&SharePhase::Wrapping {
+            file_id: "ab".into(),
+            username: "bob".into(),
+        })
+        .unwrap();
+        assert!(s.contains("\"phase\":\"wrapping\""), "got {s}");
+
+        let ok = serde_json::to_string(&SharePhase::Recipient {
+            file_id: "ab".into(),
+            username: "bob".into(),
+            ok: true,
+            code: None,
+        })
+        .unwrap();
+        assert!(ok.contains("\"phase\":\"recipient\""), "got {ok}");
+        assert!(ok.contains("\"ok\":true") && ok.contains("\"code\":null"));
+
+        let failed = serde_json::to_string(&SharePhase::Recipient {
+            file_id: "ab".into(),
+            username: "carol".into(),
+            ok: false,
+            code: Some("not_found".into()),
+        })
+        .unwrap();
+        assert!(failed.contains("\"ok\":false") && failed.contains("\"code\":\"not_found\""));
+
+        let d = serde_json::to_string(&SharePhase::Done {
+            file_id: "ab".into(),
+            shared: 2,
+            failed: 1,
+        })
+        .unwrap();
+        assert!(d.contains("\"phase\":\"done\""), "got {d}");
+        assert!(d.contains("\"shared\":2") && d.contains("\"failed\":1"));
     }
 }

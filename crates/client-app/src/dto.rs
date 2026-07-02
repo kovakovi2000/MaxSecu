@@ -174,6 +174,13 @@ pub struct OpenedContentDto {
     pub blog_text: Option<String>,
     pub author_fp: String,
     pub recovery_ok: bool,
+    /// Display metadata for the Share affordance (T4, D-OQ3): `true` whenever
+    /// this open succeeded, i.e. the caller holds a wrap for this item. Per the
+    /// locked decision, Share is available to ANY wrap-holder who can open the
+    /// content — NOT gated on `my_id == author.user_id` (ownership). This is
+    /// therefore always `true` on a successful `OpenedContentDto`; there is no
+    /// partial-open path that would set it `false`.
+    pub can_share: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -262,4 +269,129 @@ pub struct PendingUploadView {
     pub title: String,
     pub progress: u64,
     pub total: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveRecipientRequest {
+    pub username: String,
+}
+
+/// A resolved potential share recipient — display-only, no key material. The
+/// UI shows `fingerprint` as a non-secret verification tick and disables the
+/// "add" affordance when `already_shared` is true.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ResolvedRecipientDto {
+    pub username: String,
+    pub user_id: String,      // hex16, opaque to the UI
+    pub fingerprint: String,  // first 8 bytes hex, display-only
+    pub already_shared: bool, // cross-checked against list_recipients
+}
+
+/// A request to share an already-uploaded file with more recipients. Carries
+/// only the requested usernames; the command re-resolves and re-verifies each
+/// one under the pinned D5 at share-time rather than trusting the picker's
+/// earlier resolve — this closes a TOCTOU window where a binding could be
+/// re-signed/rotated between picker-open and Share-click.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReshareRequest {
+    pub file_id: String,
+    pub recipient_usernames: Vec<String>,
+}
+
+/// The per-recipient outcome of a `reshare` call — one entry per requested
+/// username, in request order. No key material; `code` is a sanitized failure
+/// code (no oracle), `None` on success.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReshareOutcomeDto {
+    pub username: String,
+    pub ok: bool,
+    pub code: Option<String>, // sanitized failure code, None on success
+}
+
+#[cfg(test)]
+mod reshare_dto_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_recipient_request_roundtrips() {
+        let j = r#"{"username":"bob"}"#;
+        let req: ResolveRecipientRequest = serde_json::from_str(j).unwrap();
+        assert_eq!(req.username, "bob");
+    }
+
+    #[test]
+    fn resolved_recipient_dto_serializes_all_fields() {
+        let dto = ResolvedRecipientDto {
+            username: "bob".into(),
+            user_id: "ab".repeat(8),
+            fingerprint: "deadbeefcafebabe".into(),
+            already_shared: false,
+        };
+        let s = serde_json::to_string(&dto).unwrap();
+        // Round-trip through serde_json::Value since the DTO is UI-bound
+        // (Serialize-only, like its CardDto/FeedEntryDto siblings).
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["username"], "bob");
+        assert_eq!(v["user_id"], "ab".repeat(8));
+        assert_eq!(v["fingerprint"], "deadbeefcafebabe");
+        assert_eq!(v["already_shared"], false);
+    }
+
+    #[test]
+    fn opened_content_dto_can_share_is_not_ownership_gated() {
+        // Per D-OQ3: `can_share` is set on ANY successful open (the caller holds
+        // a wrap), regardless of `mine`/ownership — there is no separate
+        // ownership field on this DTO at all, so a `true` value here must not be
+        // read as "I am the author". This test just pins the serialized shape.
+        let dto = OpenedContentDto {
+            file_id: "ab".repeat(8),
+            file_type: "blog".into(),
+            version: 1,
+            title: "hello".into(),
+            tags: vec![],
+            image_png_b64: None,
+            blog_text: Some("hi".into()),
+            author_fp: "deadbeef".into(),
+            recovery_ok: true,
+            can_share: true,
+        };
+        let s = serde_json::to_string(&dto).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["can_share"], true);
+    }
+
+    #[test]
+    fn reshare_request_roundtrips() {
+        let j = r#"{"file_id":"ab","recipient_usernames":["bob","carol"]}"#;
+        let req: ReshareRequest = serde_json::from_str(j).unwrap();
+        assert_eq!(req.file_id, "ab");
+        assert_eq!(req.recipient_usernames, vec!["bob", "carol"]);
+    }
+
+    #[test]
+    fn reshare_outcome_dto_serializes_all_fields() {
+        let ok = ReshareOutcomeDto {
+            username: "bob".into(),
+            ok: true,
+            code: None,
+        };
+        let s = serde_json::to_string(&ok).unwrap();
+        assert!(s.contains("\"code\":null"), "got {s}");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["username"], "bob");
+        assert_eq!(v["ok"], true);
+        assert!(v["code"].is_null());
+
+        let failed = ReshareOutcomeDto {
+            username: "carol".into(),
+            ok: false,
+            code: Some("not_found".into()),
+        };
+        let s = serde_json::to_string(&failed).unwrap();
+        assert!(s.contains("\"code\":\"not_found\""), "got {s}");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["username"], "carol");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["code"], "not_found");
+    }
 }

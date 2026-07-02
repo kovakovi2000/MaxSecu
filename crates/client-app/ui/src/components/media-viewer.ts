@@ -6,6 +6,8 @@ import "./progress-meter.ts";
 import "./skeleton-card.ts";
 import "./video-player.ts";
 import type { VideoPlayer } from "./video-player.ts";
+import "./share-dialog.ts";
+import type { ShareDialog } from "./share-dialog.ts";
 import { toast } from "../core/toast.ts";
 
 // Viewer (spec §5): renders one decrypted post. Image → data: URL <img>; blog →
@@ -30,14 +32,24 @@ export class MediaViewer extends HTMLElement {
           <div class="viewer-head">
             <p class="eyebrow">decrypted payload</p>
             <h1 id="vw-h">Loading…</h1>
+            <button id="vw-share-btn" type="button" class="secondary" hidden>Share…</button>
             <p id="vw-status" role="status" aria-live="polite"></p>
             <progress-meter id="vw-meter" hidden></progress-meter>
           </div>
           <div id="vw-body" class="viewer-body"></div>
           <dl id="vw-meta" class="viewer-meta"></dl>
         </section>
-      </main>`;
+      </main>
+      <share-dialog id="vw-share-dialog"></share-dialog>`;
     (this.querySelector("#main") as HTMLElement).focus();
+
+    // The Share… action (T4, D-OQ3): shown on ANY successful open (any current
+    // wrap-holder can share — not ownership-gated), per OpenedContent.can_share.
+    const shareBtn = this.querySelector("#vw-share-btn") as HTMLButtonElement;
+    shareBtn.addEventListener("click", () => {
+      const dialog = this.querySelector("#vw-share-dialog") as ShareDialog;
+      dialog.openFor(this.reqId, shareBtn);
+    });
 
     const status = this.querySelector("#vw-status")!;
     const meter = this.querySelector("#vw-meter") as HTMLElement;
@@ -92,6 +104,7 @@ export class MediaViewer extends HTMLElement {
 
   private render(c: OpenedContent) {
     (this.querySelector("#vw-h") as HTMLElement).textContent = c.title || "(untitled)";
+    (this.querySelector("#vw-share-btn") as HTMLButtonElement).hidden = !c.can_share;
     const body = this.querySelector("#vw-body") as HTMLElement;
     body.replaceChildren();
 

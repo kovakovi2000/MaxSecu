@@ -13,7 +13,15 @@ workspace = "../client-app"
 [dependencies]
 
 [dev-dependencies]
-maxsecu-client-app = { path = "../client-app" }
+# `default-features = false` turns OFF client-app's default `embed-ffmpeg`, whose
+# `include_bytes!(vendor/ffmpeg/ffmpeg.exe)` cannot compile without the gitignored
+# vendored binary. None of these client↔server e2e tests need the embedded codec;
+# `ensure_ffmpeg` fail-closes at runtime when the binary is absent. The `-p
+# maxsecu-client-app --no-default-features` CLI form the runbook mentions only
+# applies when client-app is the crate under test — for the client-e2e binaries
+# the flag must live on this dependency edge (a transitive default is not
+# disabled by a CLI `--no-default-features` on the e2e package).
+maxsecu-client-app = { path = "../client-app", default-features = false }
 maxsecu-client-core = { path = "../client-core", features = ["net"] }
 maxsecu-crypto = { path = "../crypto" }
 maxsecu-encoding = { path = "../encoding" }
@@ -23,6 +31,13 @@ maxsecu-ceremony-harness = { path = "../../tools/ceremony-harness" }
 # libsqlite3-sys 0.30, so the server links cleanly alongside arti-client's 0.37 in
 # this (client) workspace lock. The e2e tests only ever use MemoryStore.
 maxsecu-server = { path = "../server", default-features = false }
+# T4 reshare e2e (`reshare_e2e.rs`): the reshare revocation anchor is fetched from
+# a REAL out-of-band sink (spec §0 D-OQ1), advanced by REAL dual-controlled
+# control-log records. `sink-server`/`admin-core` are sqlx-free (encoding+crypto
+# only, sink-server adds client-core "net"), so they coexist with arti-client in
+# this (client) workspace lock exactly like the server does.
+maxsecu-sink-server = { path = "../sink-server" }
+maxsecu-admin-core = { path = "../admin-core" }
 base64 = "0.22"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }

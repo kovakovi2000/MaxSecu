@@ -302,6 +302,10 @@ async fn open_content_inner(
             blog_text: None,
             author_fp: hex(&author.fingerprint[..8]),
             recovery_ok: opened.recovery_grant_ok,
+            // Display metadata only (D-OQ3): this open succeeded, so the caller
+            // holds a wrap — Share is available to ANY wrap-holder, not just the
+            // author/owner. NOT gated on `my_id == author.user_id`.
+            can_share: true,
         });
     }
 
@@ -413,6 +417,10 @@ async fn open_content_inner(
         blog_text,
         author_fp: hex(&author.fingerprint[..8]),
         recovery_ok: opened.recovery_grant_ok,
+        // Display metadata only (D-OQ3): this open succeeded, so the caller
+        // holds a wrap — Share is available to ANY wrap-holder, not just the
+        // author/owner. NOT gated on `my_id == author.user_id`.
+        can_share: true,
     })
 }
 

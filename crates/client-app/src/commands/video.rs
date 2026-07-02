@@ -904,6 +904,7 @@ mod tests {
             enc_pub: [0u8; 32],
             fingerprint: [0u8; 32],
             key_version: 1,
+            mlkem_pub: None,
         }
     }
 
@@ -959,6 +960,7 @@ mod tests {
             enc_pub: [0u8; 32],
             fingerprint: [0u8; 32],
             key_version: 1,
+            mlkem_pub: None,
         };
         // `ContentDecryptor` is not `Debug`, so the `Ok` arm can't go through
         // `unwrap_err`; match the error directly.

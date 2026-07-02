@@ -206,3 +206,129 @@ test("screens use a live region for feedback", () => {
     assert.match(rg, /aria-label/, "RAM gauge is labelled (non-colour-only)");
   });
 }
+
+// --- T4 multi-recipient sharing: <share-dialog> / <share-tray> -------------
+// Neither is a full routed screen (share-dialog is a modal opened from
+// media-viewer/feed-screen; share-tray is a background tray like
+// upload-tray), so — matching how <video-player> and <ram-gauge> above get
+// their own dedicated per-component blocks rather than joining `screens` —
+// each gets its own structural-lint block here.
+{
+  const sdPath = "src/components/share-dialog.ts";
+  const sd = readFileSync(sdPath, "utf8");
+
+  test(`${sdPath}: labelled modal dialog`, () => {
+    // The picker panel must be a properly labelled modal dialog (WCAG 4.1.2 /
+    // 2.4.6): role="dialog", aria-modal="true", and an aria-labelledby
+    // pointing at a real heading id.
+    assert.match(sd, /role="dialog"/, "share-dialog panel needs role=\"dialog\"");
+    assert.match(sd, /aria-modal="true"/, "share-dialog panel needs aria-modal=\"true\"");
+    assert.match(sd, /aria-labelledby="sd-h"/, "share-dialog panel needs aria-labelledby");
+    assert.match(sd, /id="sd-h"/, "the aria-labelledby target heading must exist");
+  });
+
+  test(`${sdPath}: focus trap + focus return on close`, () => {
+    // A modal must trap Tab/Shift+Tab within itself (WCAG 2.4.3) and return
+    // focus to the control that opened it once it closes.
+    assert.match(sd, /e\.key === "Tab"/, "share-dialog must intercept Tab for its focus trap");
+    assert.match(sd, /e\.shiftKey/, "share-dialog's trap must branch on Shift+Tab");
+    assert.match(sd, /trapTab/, "share-dialog must have a dedicated trap-tab handler");
+    assert.match(sd, /invoker\??\.focus\(\)/, "share-dialog must return focus to the invoker on close");
+  });
+
+  test(`${sdPath}: Escape closes the dialog`, () => {
+    assert.match(sd, /e\.key === "Escape"/, "share-dialog must handle Escape to close");
+  });
+
+  test(`${sdPath}: recipient status is not color-only (state-badge + text label)`, () => {
+    // Every row's status goes through <state-badge> with an explicit text
+    // label (badgeFor() returns a `label` alongside `state`), never color
+    // alone (WCAG 1.4.1).
+    assert.match(sd, /createElement\("state-badge"\)/, "recipient rows must render a <state-badge>");
+    assert.match(
+      sd,
+      /badge\.setAttribute\("label",\s*label\)/,
+      "the state-badge must be given a text label, not just a state/colour",
+    );
+  });
+
+  test(`${sdPath}: interactive controls are real focusable elements`, () => {
+    // Add/Share/Retry/Remove/Close must be actual <button>/<input> elements
+    // (keyboard- and AT-reachable by default), not click-only <div>/<span>.
+    assert.match(sd, /id="sd-close"/, "Close must be a real button");
+    assert.match(sd, /type="submit"/, "Add must submit a real <form> (keyboard-activatable)");
+    assert.match(sd, /id="sd-username"/, "the username field must be a real <input>");
+    assert.match(sd, /id="sd-share-btn"/, "Share must be a real button");
+    assert.match(sd, /retry\.type\s*=\s*"button"/, "Retry rows must create a real <button>");
+    assert.match(sd, /remove\.type\s*=\s*"button"/, "Remove rows must create a real <button>");
+    // Guard against a regression to click-only divs: no element built via
+    // createElement("div"/"span") should carry its own click listener in this
+    // file (all actions above go through button/form elements instead).
+    assert.doesNotMatch(
+      sd,
+      /createElement\("(div|span)"\)[\s\S]{0,200}addEventListener\("click"/,
+      "share-dialog must not wire click handlers onto non-interactive div/span elements",
+    );
+  });
+
+  test(`${sdPath}: no unescaped innerHTML interpolation (XSS guard)`, () => {
+    assert.doesNotMatch(
+      sd,
+      /\.innerHTML\s*=\s*`[^`]*\$\{(?!esc\()/,
+      "share-dialog must not interpolate unescaped dynamic data into innerHTML",
+    );
+  });
+
+  const stPath = "src/components/share-tray.ts";
+  const st = readFileSync(stPath, "utf8");
+
+  test(`${stPath}: aria-live region for background progress`, () => {
+    // The row list is a polite live region (background progress must not
+    // require focus to be discovered) — mirrors upload-tray's pattern.
+    assert.match(st, /id="st-list"\s+aria-live="polite"/, "share-tray list must be an aria-live=\"polite\" region");
+  });
+
+  test(`${stPath}: role="alert" is used ONLY for the terminal all-failed case`, () => {
+    // A fully or partially successful outcome must stay polite (role removed
+    // or absent); only shared==0 && failed>0 escalates to assertive. Assert
+    // both branches exist: the escalation on allFailed, and an explicit
+    // removeAttribute("role") on the partial/success branches so "alert" is
+    // never left on from a prior render.
+    assert.match(
+      st,
+      /allFailed[\s\S]{0,120}li\.setAttribute\("role",\s*"alert"\)/,
+      "role=\"alert\" must be set only inside the allFailed branch",
+    );
+    const roleAlertCount = (st.match(/setAttribute\("role",\s*"alert"\)/g) ?? []).length;
+    assert.equal(roleAlertCount, 1, "role=\"alert\" must be set from exactly one place (the allFailed branch)");
+    const removeRoleCount = (st.match(/removeAttribute\("role"\)/g) ?? []).length;
+    assert.ok(
+      removeRoleCount >= 2,
+      "the partial-success and full-success branches must both clear role=\"alert\" (no stale assertive state)",
+    );
+  });
+
+  test(`${stPath}: status is not color-only (state-badge + text label)`, () => {
+    assert.match(st, /createElement\("state-badge"\)/, "share-tray rows must render a <state-badge>");
+    assert.match(
+      st,
+      /badge\.setAttribute\("label",/,
+      "the state-badge must be given a text label, not just a state/colour",
+    );
+  });
+
+  test(`${stPath}: Dismiss is a real keyboard-reachable button`, () => {
+    assert.match(st, /createElement\("button"\)/, "Dismiss must be a real <button> element");
+    assert.match(st, /btn\.type\s*=\s*"button"/, "Dismiss button must have type=\"button\"");
+    assert.match(st, /"Dismiss"/, "Dismiss must carry a visible text label");
+    assert.match(st, /aria-label",\s*"Dismiss sharing result"/, "Dismiss must have an accessible name");
+  });
+
+  test(`${stPath}: no unescaped innerHTML interpolation (XSS guard)`, () => {
+    assert.doesNotMatch(
+      st,
+      /\.innerHTML\s*=\s*`[^`]*\$\{(?!esc\()/,
+      "share-tray must not interpolate unescaped dynamic data into innerHTML",
+    );
+  });
+}
