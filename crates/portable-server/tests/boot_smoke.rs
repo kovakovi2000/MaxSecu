@@ -37,7 +37,7 @@ async fn dev_server_boots_and_client_bootstraps() {
         profile: Profile::Dev,
         database_url: None,
         cold_tier: ColdTierCfg::Off,
-        cache_capacity_bytes: 250_000_000_000,
+        cache_capacity_bytes: 200_000_000_000,
         offload_idle_days: 30,
     };
 

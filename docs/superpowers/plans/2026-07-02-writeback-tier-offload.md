@@ -52,6 +52,12 @@
 ## Acceptance
 - `cargo build --workspace --tests` 0 warnings; `cargo test -p maxsecu-server --lib` (incl. new writeback tests) + `-p maxsecu-portable-server` green; existing `tier.rs` write-through tests untouched/green; `MAXSECU_PG_OPTIONAL=1 cargo test --workspace --lib` green; `boot_smoke` still passes. `cargo deny check bans licenses sources` ok (no new deps expected). Self-review: no index lock across `.await`; offload/rehydrate preserve local-XOR-cold; cold failure never loses data; no token logged.
 
+## Refinements (user, 2026-07-02 — folded into the implementation)
+- **The cold tier is PERMANENT.** A chunk is deleted from Dropbox ONLY on a user file-delete. Offload uploads it; a read-miss **rehydrates a COPY** back to local (keeps the cold original); re-evicting an already-offloaded (re-cached) chunk just drops the local copy (no re-upload). ⇒ residency states local-only / cold-only / **both**; `chunk_count = local + cold − overlap` (overlap = `in_cold` index entries; zero at the finalize caller). This also closes the durability gap after the first offload (only a *never-offloaded* fresh chunk lacks redundancy).
+- **Capacity default = 200 GB** (was 250) — leaves disk headroom for everything else.
+- **Thumbnail/Preview streams are pinned local** — never offloaded (skipped by capacity eviction AND the idle sweep) but **counted** toward the cap. Detected via the `stream_type` segment of `blob_ref` (`Thumbnail=3`, `Preview=4`, `files::blob_ref`).
+- `chunk_count`'s only production caller is `http::finalize` (`http.rs:962`), which runs pre-rehydrate ⇒ overlap 0 there; the subtraction keeps it correct for the re-finalize-after-rehydrate edge too.
+
 ## Deferred / open (surface to user)
 - Durability caveat of write-back (re-confirm vs write-through).
 - Client-side direct-link download + Tor-forces-proxy (T4/T5 spec track).

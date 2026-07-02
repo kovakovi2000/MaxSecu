@@ -44,8 +44,9 @@ pub struct LauncherConfig {
 const DEFAULT_PORT: u16 = 8443;
 /// Default data directory (relative to the launcher's working dir).
 const DEFAULT_DATA_DIR: &str = "./maxsecu-server-data";
-/// Default local hot-store capacity (250 GB) before offload kicks in.
-const DEFAULT_CACHE_CAPACITY_BYTES: u64 = 250_000_000_000;
+/// Default local hot-store capacity (200 GB) before offload kicks in — leaves
+/// headroom on the deployment disk for everything else.
+const DEFAULT_CACHE_CAPACITY_BYTES: u64 = 200_000_000_000;
 /// Default idle span (30 days) before a cold chunk is offloaded.
 const DEFAULT_OFFLOAD_IDLE_DAYS: u64 = 30;
 
@@ -154,7 +155,7 @@ mod tests {
     fn cold_tier_defaults_off_with_sane_capacity_and_idle() {
         let c = LauncherConfig::from_parts(env(&[]));
         assert_eq!(c.cold_tier, ColdTierCfg::Off);
-        assert_eq!(c.cache_capacity_bytes, 250_000_000_000);
+        assert_eq!(c.cache_capacity_bytes, 200_000_000_000);
         assert_eq!(c.offload_idle_days, 30);
     }
 
@@ -198,6 +199,6 @@ mod tests {
             ("MAXSECU_CACHE_CAPACITY_BYTES", "0"),
         ]));
         assert_eq!(c.cold_tier, ColdTierCfg::Off);
-        assert_eq!(c.cache_capacity_bytes, 250_000_000_000); // 0 rejected → default
+        assert_eq!(c.cache_capacity_bytes, 200_000_000_000); // 0 rejected → default
     }
 }
