@@ -29,6 +29,11 @@ fn main() {
         * 1024
         * 1024;
 
+    // Initialize the process-wide Tor state (arti state under <app-dir>/config/tor).
+    // Lazily bootstrapped on the first TorOnly connect; read only by the connection
+    // helpers on the TorOnly path.
+    maxsecu_client_app::tor::init(app_dir.join("config"));
+
     let app = tauri::Builder::default()
         .manage(AppDir(app_dir))
         .manage(Session::new())

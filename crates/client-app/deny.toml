@@ -1,0 +1,199 @@
+# cargo-deny configuration for the CLIENT workspace (stack.md §1.3 "pin and audit";
+# DESIGN §8 supply chain). Run from crates/client-app: cargo deny check
+#
+# The client is its own cargo workspace (split out so arti-client's libsqlite3-sys
+# never resolves against the server's sqlx). This policy mirrors the server
+# workspace's deny.toml and extends it for the arti (Tor) dependency tree.
+#
+# The crypto/encoding crates are the system's TCB, so the dependency graph is
+# held to a tight, audited set. Tighten — never loosen — without review.
+
+[graph]
+# The client is a shipped BINARY with ONE real feature configuration, so deny is
+# evaluated against that actual build rather than the union of all features. This
+# matters for the `ring` ban: arti pulls `rustls-webpki`, which lists `ring` as an
+# OPTIONAL feature alongside `aws-lc-rs`. Our transport forces the aws-lc-rs rustls
+# provider, so the real build never enables/links `ring` (`cargo tree -i ring`
+# prints nothing) — ring is only a dormant lock candidate. With `all-features=true`
+# deny would force-enable webpki's `ring` feature and falsely flag the ban; with the
+# real feature set the ban stays meaningful (it WOULD catch ring if it were actually
+# built) without tripping on a never-compiled edge.
+all-features = false
+
+[advisories]
+# Fail on any RUSTSEC advisory for a dependency we actually use.
+version = 2
+yanked = "deny"
+# Only ever add an advisory id here with a written justification.
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" RSA PKCS#1v1.5 decryption timing
+    # sidechannel (medium, NO upstream fix exists). In THIS (client) workspace `rsa`
+    # is pulled by the Tor stack: `ssh-key-fork-arti → tor-key-forge → tor-hscrypto
+    # → tor-keymgr → arti-client` (arti's key formats). It IS compiled into the
+    # client. The Marvin attack requires an attacker-observable timing oracle on RSA
+    # PKCS#1v1.5 *decryption* of chosen ciphertexts; arti's usage here is relay/onion
+    # key handling (parse/verify/store), not a network-exposed RSA decryption oracle,
+    # so the client presents no such oracle. (See the Part C security review for the
+    # explicit assessment.) Re-audit when arti drops `rsa` or a fixed `rsa` ships.
+    "RUSTSEC-2023-0071",
+
+    # ---- Tauri desktop-client tree (added for crates/client-app) ----
+    # All entries below are `unmaintained`/`unsound` advisories (NOT exploitable
+    # vulnerabilities) on transitive deps of `tauri`. `cargo deny` errors on these
+    # by default; `cargo audit` only warns. None is a security vuln in our path.
+    #
+    # (a) gtk-rs GTK3 stack — the *Linux* GUI backend pulled via muda/tao/wry.
+    # Our production target is Windows MSVC only (rust-toolchain.toml
+    # `targets = ["x86_64-pc-windows-msvc"]`); these crates are cfg'd to unix and
+    # are NOT compiled into the shipped client — `cargo tree -i <crate> -e normal`
+    # prints "nothing to print" on the host target (they appear only under
+    # `--target all`). Unmaintained gtk-rs bindings; remove if/when Tauri moves
+    # off GTK3 or we drop the Linux target.
+    "RUSTSEC-2024-0413", # atk
+    "RUSTSEC-2024-0416", # atk-sys
+    "RUSTSEC-2024-0412", # gdk
+    "RUSTSEC-2024-0418", # gdk-sys
+    "RUSTSEC-2024-0411", # gdkwayland-sys
+    "RUSTSEC-2024-0417", # gdkx11
+    "RUSTSEC-2024-0414", # gdkx11-sys
+    "RUSTSEC-2024-0415", # gtk
+    "RUSTSEC-2024-0420", # gtk-sys
+    "RUSTSEC-2024-0419", # gtk3-macros
+    # (RUSTSEC-2024-0429 glib — dropped: the client's resolved glib is past the
+    # affected range, so deny reports it as unmatched. Re-add if it reappears.)
+    # proc-macro-error (unmaintained) — build-time proc-macro, reached ONLY via
+    # glib-macros (the same Linux GTK tree); not in any runtime/attack surface and
+    # not on the Windows target. Remove with the GTK3 stack above.
+    "RUSTSEC-2024-0370", # proc-macro-error
+    #
+    # (b) unic-* (unmaintained) — Unicode property/range data tables pulled via
+    # urlpattern → tauri-utils → tauri. Cross-platform (these DO compile into the
+    # Windows client) but they are pure const Unicode lookup tables: no I/O, no
+    # unsafe security surface — "unmaintained", not vulnerable. Remove if Tauri's
+    # urlpattern drops the unic-* tree (e.g. moves to icu).
+    "RUSTSEC-2025-0081", # unic-char-property
+    "RUSTSEC-2025-0075", # unic-char-range
+    "RUSTSEC-2025-0080", # unic-common
+    "RUSTSEC-2025-0100", # unic-ucd-ident
+    "RUSTSEC-2025-0098", # unic-ucd-version
+    #
+    # ---- arti (Tor) tree — added for Part C ----
+    # `paste` (unmaintained, RUSTSEC-2024-0436) — author archived the repo; "no
+    # longer maintained", NOT a vulnerability, no safe upgrade. In the client it is a
+    # compile-time proc-macro pulled by arti: `pwd-grp → fs-mistrust → arti-client`
+    # (`cargo tree -i paste` shows only that path). Build-time only — no runtime /
+    # I/O / unsafe surface. Remove if arti's fs-mistrust drops `paste`.
+    "RUSTSEC-2024-0436", # paste (in-graph via arti fs-mistrust)
+    #
+    # ---- Tauri plist/XML tree (quick-xml) — pre-existing, surfaced by the split ----
+    # quick-xml 0.39.4 DoS advisories: RUSTSEC-2026-0194 (quadratic duplicate-attr
+    # check) and RUSTSEC-2026-0195 (unbounded NsReader namespace-declaration
+    # allocation → OOM). Both are memory/CPU DoS when parsing UNTRUSTED XML. In the
+    # client quick-xml is reached only via `plist → tauri`/`tauri-utils`/
+    # `tauri-codegen` (Apple `.plist`/bundle metadata, build- and macOS-oriented);
+    # the client parses NO attacker-controlled XML at runtime (its network wire is
+    # JSON + AEAD ciphertext, never XML), so neither DoS path is reachable. Not from
+    # arti — pre-existing in the Tauri tree; remove when Tauri's plist pulls
+    # quick-xml >= 0.41.0.
+    "RUSTSEC-2026-0194", # quick-xml quadratic duplicate-attribute check
+    "RUSTSEC-2026-0195", # quick-xml unbounded namespace-declaration allocation
+]
+
+[bans]
+multiple-versions = "warn" # transitive duplicates are noise, not yet a hard fail
+wildcards = "deny"
+# Internal `{ path = "../…" }` deps carry no version and read as wildcards; allow
+# those (they are first-party), while still denying wildcard *registry* deps.
+allow-wildcard-paths = true
+# Disallow pulling in a second crypto stack by accident. The app-layer TCB is
+# RustCrypto + dalek (stack.md §1.3). The ONE sanctioned non-RustCrypto crypto
+# crate is `aws-lc-rs`, admitted deliberately as the rustls TLS provider only
+# (transport, not the zero-knowledge boundary — see stack.md §1.3 provider note);
+# it is intentionally NOT listed below. `ring`/`openssl` remain banned so a
+# *second* such stack cannot slip in unnoticed (e.g. via a backend default —
+# rcgen must use its `aws_lc_rs` feature, not `ring`).
+# Phase 7 note: the codec view-path (rav1d/rav1e/symphonia) is pure Rust (zero C).
+# The sole NEW C link is `ac-ffmpeg` (+ build helpers `ac-ffmpeg-build` /
+# `ac-ffmpeg-features`), the author-side ingest carve-out — NOT a crypto stack, so
+# it is not (and need not be) listed here. It is confined to ONE crate: reachable
+# only via the `ffmpeg` feature (OFF by default) of `crates/media-transcode-worker`,
+# the sole C carve-out leaf (`cargo tree -i ac-ffmpeg` reaches only that crate, and
+# only under the feature; it is absent from the default build graph entirely).
+# `aws-lc-rs` stays the only sanctioned crypto C; `ring`/`openssl` remain banned and
+# absent from the lockfile.
+deny = [
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "ring" },
+]
+
+[licenses]
+version = 2
+# Our own crates are publish=false and carry no license field yet — skip them
+# (set a license before any crate is ever published).
+private = { ignore = true }
+# Permissive licenses only; the dependency set is RustCrypto + dalek + std-ish.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    # MPL-2.0 — weak, file-level copyleft (per-file, not viral like GPL). Admitted
+    # only for the Tauri desktop-client tree, where it appears solely in transitive,
+    # dynamically-used deps that never touch the zero-knowledge crypto boundary:
+    #   - cssparser, cssparser-macros, dtoa-short, selectors  (CSS parsing, pulled
+    #     via dom_query → tauri-utils / wry webview)
+    #   - option-ext                                          (via dirs-sys → dirs)
+    # MPL only obligates sharing modifications to the MPL files themselves; we ship
+    # them unmodified, so no source-disclosure burden on our code. Remove if the
+    # client drops Tauri/dirs or these crates relicense.
+    "MPL-2.0",
+    # NCSA (University of Illinois/NCSA Open Source License) — permissive, OSI-approved
+    # and FSF-free (a BSD/MIT-style notice license, no copyleft). Required by exactly
+    # one crate: `libfuzzer-sys` (license "(MIT OR Apache-2.0) AND NCSA"), a transitive
+    # dep of the AV1 encoder `rav1e`. libfuzzer-sys is gated behind `cfg(fuzzing)` in
+    # rav1e, so it is NEVER compiled into our build (`cargo tree -i libfuzzer-sys
+    # -e all` prints nothing on any real target — it appears only under `--target all`,
+    # which is how `cargo deny` surfaces it). Admitted solely to satisfy the license
+    # gate for this never-linked fuzz harness; remove if rav1e drops libfuzzer-sys.
+    # ACTIVE: `rav1e 0.8.1` is now an in-graph normal dep of `crates/media-transcode-worker`
+    # (Gate 6; also a media-worker dev-dep), so libfuzzer-sys/NCSA is reachable again
+    # (still only under `cfg(fuzzing)` / `--target all`, never linked into a real build).
+    # KEPT to satisfy the license gate for that never-linked harness.
+    "NCSA",
+    # CDLA-Permissive-2.0 — the Community Data License Agreement, Permissive
+    # variant: a permissive *data* license (attribution/no-copyleft, commercial
+    # use and redistribution allowed), used because `webpki-roots`' payload is
+    # data (the Mozilla CA root-cert bundle), not code. Required by two crates:
+    # `webpki-roots` in `crates/server` (`dropbox_tier` — the real Dropbox
+    # cold-tier adapter needs the public WebPKI root set to verify
+    # api.dropboxapi.com / content.dropboxapi.com, unlike the sink/app-server
+    # transports which pin a private cert) and `webpki-roots` in `crates/client-app`
+    # (`direct_link` — the client's direct-link download route fetches the
+    # server-brokered cloud URL, e.g. Dropbox's public `dl.dropboxusercontent.com`,
+    # which likewise needs the public root set rather than the pinned server cert).
+    # `cargo tree -i webpki-roots` shows only `rustls-pki-types` beneath it — no C,
+    # no `ring`. Remove if both drop direct cloud egress or switch to
+    # `rustls-native-certs`.
+    "CDLA-Permissive-2.0",
+    # Unlicense — a permissive public-domain-equivalent dedication (OSI-approved,
+    # FSF Free/Libre, no attribution/copyleft burden). Required by exactly one crate:
+    # `async_executors` (via `tor-rtcompat` → arti-client, the Part C Tor transport).
+    # `cargo tree -i async_executors` reaches only the arti runtime-compat tree; it is
+    # a pure-Rust executor-abstraction shim, not a crypto/data crate. Remove if arti's
+    # tor-rtcompat drops async_executors or it relicenses.
+    "Unlicense",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Only crates.io. No git or alternate-registry dependencies in the TCB.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

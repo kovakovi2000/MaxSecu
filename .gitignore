@@ -1,5 +1,8 @@
 # Rust build artifacts
 /target
+# The client lives in its own cargo workspace (crates/client-app) with its own
+# target dir; ignore it too (the root `/target` only covers the server workspace).
+/crates/client-app/target
 **/*.rs.bk
 
 # Local demo staging (built .exe binaries + demo data) — not source, never committed

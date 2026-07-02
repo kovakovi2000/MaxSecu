@@ -6,6 +6,16 @@ rust-version.workspace = true
 publish.workspace = true
 description = "MaxSecu secret-free app server (DESIGN §4.1, Phase 1: auth core)."
 
+[features]
+default = ["postgres"]
+# The production Postgres Store (`pg::PgStore`) + its `sqlx`/`time` deps. Default-on
+# so the real server and `portable-server` build unchanged. Turned OFF by the
+# client-side e2e crate (`maxsecu-client-e2e`) so the server can be linked WITHOUT
+# `sqlx` — that lets it coexist in the CLIENT workspace's lockfile with `arti-client`
+# (whose `libsqlite3-sys 0.37` collides with sqlx's `0.30` under Cargo's `links`
+# rule). The e2e tests only ever use `MemoryStore`, so they need no Postgres.
+postgres = ["dep:sqlx", "dep:time"]
+
 [dependencies]
 maxsecu-encoding = { path = "../encoding" }
 maxsecu-crypto = { path = "../crypto" }
@@ -34,8 +44,8 @@ http-body-util = "0.1" # build/drain the sink publish request/response bodies
 # query API only (no compile-time `query!` macros) so the crate builds with no
 # DATABASE_URL / no DB. `time` for the u64-ms ↔ TIMESTAMPTZ mapping. No sqlx TLS
 # feature — the server↔Postgres link is loopback/private (secret-free server).
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "time"] }
-time = "0.3"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "time"], optional = true }
+time = { version = "0.3", optional = true }
 # The real Dropbox cold-tier adapter (`dropbox_tier`) dials PUBLIC Dropbox hosts
 # (api.dropboxapi.com / content.dropboxapi.com), so it needs the public WebPKI
 # root set rather than a pinned self-signed cert. `webpki-roots` is pure-Rust

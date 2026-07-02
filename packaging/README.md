@@ -6,6 +6,13 @@ scripts are twins:
 - `package.ps1` — **primary** (Windows host).
 - `package.sh` — POSIX/bash twin.
 
+> **Two workspaces:** since Part C (in-process Tor), the client is a **separate
+> cargo workspace** (`crates/client-app`, its own `Cargo.lock` + `target/`) so
+> arti's bundled SQLite never collides with the server's `sqlx`. The scripts build
+> the server from the root workspace and the client via
+> `--manifest-path crates/client-app/Cargo.toml`, collecting the client binary from
+> `crates/client-app/target/release/`.
+
 Both run `cargo build --release` for the two binaries
 (`maxsecu-portable-server`, `maxsecu-client-app`), lay out the two portable
 folders under `dist/`, and then run three **GUARDED** deferred-ops steps that

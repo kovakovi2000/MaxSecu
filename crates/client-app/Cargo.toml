@@ -1,3 +1,17 @@
+# The CLIENT workspace root. Split out of the top-level (server) workspace so this
+# graph's `arti-client` → `libsqlite3-sys 0.37` never has to resolve against the
+# server's `sqlx` → `0.30` under Cargo's `links = "sqlite3"` uniqueness rule. The
+# client has no SQL of its own, so isolating its lockfile removes the collision
+# with zero cost to correctness. `client-e2e` (the relocated client↔server e2e
+# suites) is a member here; it links the server WITHOUT the postgres feature.
+[workspace]
+resolver = "2"
+members = [".", "../client-e2e", "../../tools/demo-seed"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.96"
+
 [package]
 name = "maxsecu-client-app"
 version = "0.0.0"
@@ -60,12 +74,27 @@ async-trait = "0.1"
 # pinned cert (mirrors `server::dropbox_tier::HyperDropboxHttp`; CDLA-Permissive-2.0
 # data license already allowed in `deny.toml`).
 webpki-roots = "1"
+# In-process Tor client for the TorOnly download route (Part C). This is the whole
+# reason client-app is its own workspace: arti pulls a transport-only bundled-C
+# SQLite (tor-dirmgr → rusqlite) whose libsqlite3-sys 0.37 cannot coexist with the
+# server's sqlx 0.30 in one lockfile. `rustls` (not native-tls) keeps the TLS stack
+# aligned with the pinned aws-lc-rs transport; onion-service-client is not needed
+# (we reach a normal host:port via a Tor exit). See deny.toml for the arti tree.
+# `static-sqlite` builds arti's dir-cache SQLite from source (rusqlite/bundled) so
+# the link needs no system sqlite3.lib — required on Windows where none is present.
+arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls", "static-sqlite"] }
+tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"] }
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
-maxsecu-server = { path = "../server" }
-maxsecu-ceremony-harness = { path = "../../tools/ceremony-harness" }
+# Pure-Rust png/jpeg for a client-app unit test that synthesizes a source image
+# (src/upload.rs). Kept here for the lib's own tests; the e2e crate depends on it
+# separately.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# NOTE: the client↔server e2e tests (which need `maxsecu-server` +
+# `maxsecu-ceremony-harness`) now live in the sibling `maxsecu-client-e2e` crate,
+# which links the server WITHOUT its postgres feature so it stays sqlx-free and can
+# share this workspace's lockfile with `arti-client`.
 # Test-only: `direct_link`'s unit tests stand up a tiny in-process HTTP/1.1 stub
 # server (the pinned-server side of the seam) so the broker POST + proxy GET are
 # genuinely round-tripped over the wire, not just asserted against a hand-built
