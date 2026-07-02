@@ -174,6 +174,13 @@ pub struct OpenedContentDto {
     pub blog_text: Option<String>,
     pub author_fp: String,
     pub recovery_ok: bool,
+    /// Display metadata for the Share affordance (T4, D-OQ3): `true` whenever
+    /// this open succeeded, i.e. the caller holds a wrap for this item. Per the
+    /// locked decision, Share is available to ANY wrap-holder who can open the
+    /// content — NOT gated on `my_id == author.user_id` (ownership). This is
+    /// therefore always `true` on a successful `OpenedContentDto`; there is no
+    /// partial-open path that would set it `false`.
+    pub can_share: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -328,6 +335,29 @@ mod reshare_dto_tests {
         assert_eq!(v["user_id"], "ab".repeat(8));
         assert_eq!(v["fingerprint"], "deadbeefcafebabe");
         assert_eq!(v["already_shared"], false);
+    }
+
+    #[test]
+    fn opened_content_dto_can_share_is_not_ownership_gated() {
+        // Per D-OQ3: `can_share` is set on ANY successful open (the caller holds
+        // a wrap), regardless of `mine`/ownership — there is no separate
+        // ownership field on this DTO at all, so a `true` value here must not be
+        // read as "I am the author". This test just pins the serialized shape.
+        let dto = OpenedContentDto {
+            file_id: "ab".repeat(8),
+            file_type: "blog".into(),
+            version: 1,
+            title: "hello".into(),
+            tags: vec![],
+            image_png_b64: None,
+            blog_text: Some("hi".into()),
+            author_fp: "deadbeef".into(),
+            recovery_ok: true,
+            can_share: true,
+        };
+        let s = serde_json::to_string(&dto).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["can_share"], true);
     }
 
     #[test]

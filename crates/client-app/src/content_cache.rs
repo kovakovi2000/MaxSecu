@@ -140,6 +140,10 @@ impl ContentCache {
             blog_text,
             author_fp: e.meta.author_fp.clone(),
             recovery_ok: e.meta.recovery_ok,
+            // A cache hit only exists because THIS wrap-holder already opened the
+            // item successfully once (see `put_content`'s callers) — same D-OQ3
+            // display-metadata semantics as a fresh open, not ownership-gated.
+            can_share: true,
         })
     }
 
