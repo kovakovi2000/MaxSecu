@@ -34,6 +34,10 @@ A 3-way **download/transport route** in client Settings:
 - Tests: SOCKS5-stub e2e proving TLS + exporter survive the tunnel (T5 §9); fail-closed test; `#[ignore]` real-bootstrap smoke.
 - **Security pass:** channel-binding/pinning survive the tunnel; no verifier bypass; fail-closed; deny/audit clean or justified.
 
+## Part C — BLOCKED (2026-07-02) → DEFERRED pending user decision
+`arti-client` **cannot resolve** in this workspace: `arti-client → tor-dirmgr → rusqlite → libsqlite3-sys ^0.34` collides with the workspace's `sqlx-sqlite → libsqlite3-sys ^0.30` under Cargo's `links = "sqlite3"` uniqueness rule — even though `sqlx`'s SQLite feature is never enabled, `sqlx-sqlite` is still a resolution candidate in the single shared `Cargo.lock` (confirmed: both are in the lockfile though never compiled). No code was written; worktree left clean.
+**Options (need the user):** (1) bump the server's `sqlx` 0.8→0.9 (its SQLite range overlaps arti's → resolves; but a semver-major bump of the server DB adapter — verify first whether arti can drop its SQLite dir-store to avoid this entirely); (2) **DEFER Tor** (chosen default while user away): ship A+B, `TorOnly` stays fail-closed/selectable; (3) `tokio-socks` + external tor daemon (avoids the conflict, no server change, but needs a local tor + changes the trust surface — design preferred arti). `pinned_client_config` + the RFC5705 exporter remain UNCHANGED.
+
 ## Sequencing & review
 A first (controller-built, defines the shared `RouteMode` contract + coupling). Then B and C in parallel (subagent-driven, each its own worktree), each two-stage reviewed (spec then security). Merge each; final workspace verification (build 0-warn, workspace lib, e2e, UI checks, cargo deny); then a holistic pass. Update memory.
 
