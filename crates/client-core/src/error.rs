@@ -71,9 +71,8 @@ pub enum TranscodeError {
     TooLarge { width: u32, height: u32 },
     /// Re-encoding to the canonical format failed.
     EncodeFailed,
-    /// No transcoder is wired for this media class yet — the ffmpeg video path is
-    /// a deferred C carve-out behind the [`Transcoder`](crate::media::Transcoder)
-    /// trait (Phase 4b decision).
+    /// No [`Transcoder`](crate::media::Transcoder) impl is wired for this media
+    /// class.
     CodecUnavailable,
 }
 
