@@ -17,6 +17,7 @@ pub mod audit;
 pub mod auth;
 pub mod blob;
 pub mod detect;
+pub mod dropbox_tier;
 pub mod files;
 pub mod http;
 pub mod pg;
@@ -35,6 +36,7 @@ pub use blob::{
 pub use detect::{
     analyze, Alert, AlertSink, AuditEvent, MemoryAlertSink, NullAlertSink, Thresholds,
 };
+pub use dropbox_tier::{DropboxTier, HyperDropboxHttp};
 pub use error::{AuthError, ChallengeError, ControlAppendError, ProveError, StoreError};
 pub use http::{router, AppState, AuthedSession, TlsExporter};
 pub use pg::PgStore;

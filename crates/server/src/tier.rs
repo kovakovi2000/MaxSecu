@@ -13,8 +13,10 @@
 //!   (evict least-recently-used) — the "cache eviction respects access recency"
 //!   Phase-4b exit gate. (LFU is the documented future variant; not built.)
 //! * [`ColdTier`] — the durable backing-tier seam, with in-memory / filesystem
-//!   fakes for tests. The real Dropbox adapter is a deferred plug-in behind this
-//!   trait; no HTTP/cloud dependency is pulled in this run.
+//!   fakes for tests. The real Dropbox adapter, [`crate::dropbox_tier::DropboxTier`],
+//!   now implements this trait over Dropbox's API v2 (ciphertext-only egress,
+//!   OAuth token from runtime env/config, mock-tested + one `#[ignore]`d live
+//!   test gated on `DROPBOX_TEST_TOKEN` — see that module's doc).
 //!
 //! [`TieredBlobStore`] (next increment) composes a hot [`BlobStore`] cache, a
 //! [`ColdTier`], and a [`CacheIndex`] into a single `BlobStore`.
