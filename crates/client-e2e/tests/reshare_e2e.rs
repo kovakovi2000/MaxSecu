@@ -76,6 +76,7 @@ use maxsecu_server::{
 
 const TS: u64 = 1_719_500_000_000;
 const FAR_FUTURE_MS: u64 = 4_102_444_800_000;
+/// Test-only loopback bearer authorizing appends to the in-process sink (§6.1).
 const SINK_TOKEN: &str = "sink-admin-secret";
 
 // ============================================================================
@@ -1204,7 +1205,7 @@ async fn scenario5_batch_partial_failure_then_targeted_retry() {
     let dek = fx.recover_owner_dek(file_id).await;
     let tombstones = TombstoneSet::verify(&[], fx.anchored_head().await).unwrap();
 
-    let (_carol, carol_id, _ct) = enroll(
+    let (carol, carol_id, carol_token) = enroll(
         &mut fx.conn,
         &fx.dir_signer,
         &mut fx.ctr,
@@ -1298,6 +1299,8 @@ async fn scenario5_batch_partial_failure_then_targeted_retry() {
     let recips = fx.recipients_of(file_id).await;
     assert_eq!(recips.iter().filter(|r| **r == carol_id).count(), 1);
     assert!(recips.contains(&dave_id));
+    fx.assert_recipient_opens(file_id, carol_id, &carol, &carol_token, &content)
+        .await;
     fx.assert_recipient_opens(file_id, dave_id, &dave, &dave_token, &content)
         .await;
     fx.cleanup();
@@ -1329,7 +1332,7 @@ async fn scenario6_v2_hybrid_roundtrip_and_pq_key_missing() {
         true,
     )
     .await;
-    let (_classical, _classical_id, _ct) = enroll(
+    let (_classical, classical_id, _ct) = enroll(
         &mut fx.conn,
         &fx.dir_signer,
         &mut fx.ctr,
@@ -1364,8 +1367,14 @@ async fn scenario6_v2_hybrid_roundtrip_and_pq_key_missing() {
     assert!(!out[1].ok);
     assert_eq!(out[1].code.as_deref(), Some("pq_key_missing"));
 
-    // GATE: the PQ recipient opens the V2 hybrid wrap; the classical one has no row.
-    assert!(fx.recipients_of(file_id).await.contains(&pqr_id));
+    // GATE: the PQ recipient opens the V2 hybrid wrap; the classical one has no row
+    // (a `pq_key_missing` fail-close leaves NO wrap — never a silent downgrade side-effect).
+    let recips = fx.recipients_of(file_id).await;
+    assert!(recips.contains(&pqr_id));
+    assert!(
+        !recips.contains(&classical_id),
+        "V2→classical pq_key_missing must leave no wrap row for the classical recipient"
+    );
     fx.assert_recipient_opens(file_id, pqr_id, &pqr, &pqr_token, &content)
         .await;
     fx.cleanup();
