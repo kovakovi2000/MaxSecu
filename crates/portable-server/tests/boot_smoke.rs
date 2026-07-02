@@ -16,7 +16,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
-use maxsecu_portable_server::config::{LauncherConfig, Profile};
+use maxsecu_portable_server::config::{ColdTierCfg, LauncherConfig, Profile};
 use maxsecu_portable_server::layout::Layout;
 use maxsecu_portable_server::run::prepare;
 
@@ -36,6 +36,9 @@ async fn dev_server_boots_and_client_bootstraps() {
         port: 0,
         profile: Profile::Dev,
         database_url: None,
+        cold_tier: ColdTierCfg::Off,
+        cache_capacity_bytes: 250_000_000_000,
+        offload_idle_days: 30,
     };
 
     // Boot.

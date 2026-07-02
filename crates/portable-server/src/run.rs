@@ -9,14 +9,55 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::rustls::ServerConfig;
 
+use std::time::Duration;
+
 use maxsecu_server::{
-    router, serve, AppState, AuthConfig, AuthService, FsBlobStore, MemoryStore, NullAuditSink,
-    PgStore,
+    router, serve, AppState, AuthConfig, AuthService, BlobStore, ColdTier, DropboxTier, FsBlobStore,
+    FsColdTier, MemoryStore, NullAuditSink, PgStore, WriteBackTier,
 };
 
-use crate::config::{LauncherConfig, Profile};
+use crate::config::{ColdTierCfg, LauncherConfig, Profile};
 use crate::layout::Layout;
 use crate::{bootstrap, pki};
+
+/// How often the background sweep offloads idle chunks to the cold tier. Far finer
+/// than the multi-day idle threshold (so offload latency is bounded) yet cheap when
+/// nothing is idle.
+const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Build the blob store for the configured cold tier. With `ColdTierCfg::Off` this
+/// is just the local `FsBlobStore` (today's behavior, no offload). Otherwise it is a
+/// write-back [`WriteBackTier`] over that local store + the configured cold tier,
+/// and a background idle-offload sweeper task is spawned. Returns the type-erased
+/// store either way. The Dropbox OAuth token is never logged.
+fn build_blobs(cfg: &LauncherConfig, layout: &Layout) -> std::io::Result<Arc<dyn BlobStore>> {
+    let local: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(layout.blobs_dir()));
+    let cold: Arc<dyn ColdTier> = match &cfg.cold_tier {
+        ColdTierCfg::Off => return Ok(local),
+        ColdTierCfg::Fs(dir) => Arc::new(FsColdTier::new(dir.clone())),
+        ColdTierCfg::Dropbox { token, root } => Arc::new(
+            DropboxTier::new(token.clone(), root.clone())
+                .map_err(|e| std::io::Error::other(format!("dropbox tier init: {e}")))?,
+        ),
+    };
+    let tier = Arc::new(WriteBackTier::new(
+        local,
+        cold,
+        cfg.cache_capacity_bytes,
+        Duration::from_secs(cfg.offload_idle_days * 24 * 3600),
+    ));
+    // Background idle-offload sweep: offloads chunks not requested for longer than
+    // the configured span. Detached; the Arc keeps the tier alive alongside AppState.
+    let sweeper = tier.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(IDLE_SWEEP_INTERVAL);
+        loop {
+            ticker.tick().await;
+            sweeper.run_idle_sweep().await;
+        }
+    });
+    Ok(tier)
+}
 
 /// What [`prepare`] produces: a bound listener + TLS config + the composed
 /// (monomorphized) router, plus the freshly-generated bootstrap secret (`Some`
@@ -50,7 +91,7 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
     let auth_cfg = AuthConfig::default()
         .with_directory_pub(directory_pub)
         .with_bootstrap_secret_hash(hash);
-    let blobs = Arc::new(FsBlobStore::new(layout.blobs_dir()));
+    let blobs = build_blobs(cfg, &layout)?;
 
     // Compose the router over the profile's Store. Each branch builds a distinct
     // `AppState<S>` and type-erases it via `router(..)` into the shared
@@ -122,6 +163,16 @@ pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
     eprintln!(
         "  client pins (copy into the client's config/): {}",
         client_pins.display()
+    );
+    // Cold-tier offload mode — never prints the Dropbox token, only its root.
+    let tier_label = match &cfg.cold_tier {
+        ColdTierCfg::Off => "off (local only)".to_owned(),
+        ColdTierCfg::Fs(dir) => format!("fs cold tier at {}", dir.display()),
+        ColdTierCfg::Dropbox { root, .. } => format!("Dropbox (root {root})"),
+    };
+    eprintln!(
+        "  cold-tier offload: {tier_label} (cache cap {} bytes, idle {} days)",
+        cfg.cache_capacity_bytes, cfg.offload_idle_days
     );
     eprintln!(
         "  pinned D5 (DEV ONLY — replace with the offline ceremony key in production): {}",
