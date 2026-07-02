@@ -62,6 +62,14 @@ class FakeAudio implements AudioContextLike {
     this.sources.push(s);
     return s;
   }
+  suspended = 0;
+  resumed = 0;
+  async suspend(): Promise<void> {
+    this.suspended++;
+  }
+  async resume(): Promise<void> {
+    this.resumed++;
+  }
 }
 
 // A small mono PCM DTO (2 i16-LE samples).
@@ -175,6 +183,110 @@ test("drops stale frames when the audio clock has jumped past them", () => {
   assert.strictEqual(player.stats().dropped, 1, "the stale frame is counted dropped");
 });
 
+test("video syncs to elapsed time from playback start, not the raw clock (no burst)", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  // Playback begins at a NONZERO wall-clock time (e.g. the app has been running 10s).
+  let clock = 10;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  player.play();
+
+  // The first audio chunk establishes the playback origin at clock=10, and still
+  // feeds the WebAudio graph.
+  bus.emit(EVT_VIDEO_AUDIO, pcmDto(0));
+  assert.ok(audio.sources.length >= 1, "audio fed into the WebAudio graph");
+  assert.ok(audio.sources[0].started, "audio source scheduled");
+
+  // Window-relative REAL video pts: a frame at 0ms and a frame at 1000ms.
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  bus.emit(EVT_VIDEO_FRAME, frameDto(1000));
+
+  // elapsed = 0: only the pts=0 frame is due. The OLD raw-clock code compared
+  // 1000/1000=1 <= clock=10 and would have BURST both frames immediately.
+  clock = 10;
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "no burst: the 1000ms frame is held");
+  assert.strictEqual(drawn[0].pts_ms, 0);
+
+  // elapsed = 0.5s: the 1000ms frame is still held.
+  clock = 10.5;
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "frame at 1000ms held until ~1s elapsed");
+
+  // elapsed = 1.0s: the 1000ms frame releases in sync with the audio clock.
+  clock = 11.0;
+  player.tick();
+  assert.strictEqual(drawn.length, 2);
+  assert.strictEqual(drawn[1].pts_ms, 1000);
+  assert.strictEqual(player.stats().dropped, 0, "frames paced (not burst), nothing dropped");
+});
+
+test("video-only: the first frame establishes the playback origin", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 5; // nonzero origin, no audio at all
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  player.play();
+
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0)); // sets playbackStart = 5
+  bus.emit(EVT_VIDEO_FRAME, frameDto(500));
+
+  clock = 5; // elapsed 0
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "only the pts=0 frame is due (no burst)");
+
+  clock = 5.5; // elapsed 0.5s
+  player.tick();
+  assert.strictEqual(drawn.length, 2, "the 500ms frame releases at ~0.5s elapsed");
+  assert.strictEqual(drawn[1].pts_ms, 500);
+});
+
+test("seek resets the playback origin for the new window", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  player.play();
+
+  // First window establishes origin at clock=0.
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  clock = 0;
+  player.tick();
+  assert.strictEqual(drawn.length, 1);
+
+  // Seek; the new window's first frame arrives at a later wall-clock time and must
+  // re-establish the origin there (so its window-relative pts=0 is due immediately,
+  // not treated as 20s in the past).
+  player.seek(9999);
+  clock = 20;
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0)); // new window, sets playbackStart = 20
+  clock = 20;
+  player.tick();
+  assert.strictEqual(drawn.length, 2, "the new window's first frame is due at its origin");
+  assert.strictEqual(player.stats().dropped, 0, "no stale drop from the stale origin");
+});
+
 // ---- volume --------------------------------------------------------------
 
 test("setVolume clamps to [0,1] and drives the GainNode + persists", () => {
@@ -270,7 +382,7 @@ test("reducedMotion blocks autoplay until an explicit play()", () => {
   assert.strictEqual(drawn.length, 1, "explicit play() releases the due frame");
 });
 
-test("without reducedMotion the first frame autostarts playback", () => {
+test("with reducedMotion:false a frame is drawn after explicit play()", () => {
   const bus = makeBus();
   const audio = new FakeAudio();
   const drawn: YuvFrame[] = [];
@@ -281,8 +393,9 @@ test("without reducedMotion the first frame autostarts playback", () => {
     reducedMotion: false,
   });
 
+  player.play();
   bus.emit(EVT_VIDEO_FRAME, frameDto(0));
-  assert.strictEqual(player.isPlaying(), true, "autoplay on first frame");
+  assert.strictEqual(player.isPlaying(), true, "playing after explicit play()");
   player.tick();
   assert.strictEqual(drawn.length, 1);
 });
@@ -313,6 +426,68 @@ test("ring is bounded, evicts oldest, and scrubTo draws the nearest frame", () =
   // 0 and 100 were evicted; nearest to 0 among {200,300,400} is 200.
   player.scrubTo(0);
   assert.strictEqual(drawn[1].pts_ms, 200);
+});
+
+// ---- bounded pending buffer (D-7, byte-capped) ---------------------------
+
+test("bounds the pending buffer: a burst beyond the byte cap drops the oldest", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: true, // no autoplay/tick drain — isolate the bound
+    // Each 2x2 frame is y(4)+u(1)+v(1)=6 bytes; 4 frames * 6 = 24 byte cap.
+    maxBufferBytes: 24,
+    audioClock: () => clock,
+  });
+
+  // A burst of 10 frames at increasing window-relative pts. reducedMotion holds the
+  // tick loop, so they all land in pending and the byte cap must shed the 6 oldest.
+  for (let i = 0; i < 10; i++) bus.emit(EVT_VIDEO_FRAME, frameDto(i * 10));
+  assert.strictEqual(player.stats().dropped, 6, "6 oldest dropped to stay within 24 bytes");
+  assert.ok(player.bufferedBytes() <= 24, `buffered ${player.bufferedBytes()} <= 24 bytes`);
+
+  // Drain far in the future: only the latest DUE frame is drawn (catch-up), the other 3
+  // retained are dropped as stale — the queue never grew unbounded.
+  player.play();
+  clock = 1000;
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "one frame drawn after catch-up");
+  assert.strictEqual(drawn[0].pts_ms, 90, "the NEWEST retained frame survives");
+  assert.strictEqual(player.stats().dropped, 9, "6 over-cap + 3 stale = 9 dropped");
+  assert.strictEqual(player.bufferedBytes(), 0, "buffer empty after tick drains pending");
+});
+
+test("under the byte cap nothing is dropped and sync is intact", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    // Each 2x2 frame is 6 bytes; 8 frames * 6 = 48 byte cap — well above 2 frames.
+    maxBufferBytes: 48,
+    audioClock: () => clock,
+  });
+  player.play();
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  bus.emit(EVT_VIDEO_FRAME, frameDto(100));
+  assert.strictEqual(player.bufferedBytes(), 12, "2 frames * 6 bytes each");
+  clock = 0;
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "pts=0 due, pts=100 held");
+  clock = 0.1;
+  player.tick();
+  assert.strictEqual(drawn.length, 2, "pts=100 releases in sync");
+  assert.strictEqual(player.stats().dropped, 0, "nothing dropped under the byte cap");
+  assert.strictEqual(player.bufferedBytes(), 0, "buffer drained after both frames drawn");
 });
 
 // ---- seek ----------------------------------------------------------------
@@ -381,6 +556,27 @@ test("dispose stops in-flight audio sources", () => {
 
 // ---- dispose -------------------------------------------------------------
 
+test("pause() suspends the audio context; play() resumes it", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => audio.currentTime,
+  });
+  // createPlayer suspends the context once at init; baseline after construction.
+  const s0 = audio.suspended, r0 = audio.resumed;
+  player.play();
+  assert.strictEqual(audio.resumed, r0 + 1, "play() resumes the context");
+  player.pause();
+  assert.strictEqual(audio.suspended, s0 + 1, "pause() suspends the context");
+  player.play();
+  assert.strictEqual(audio.resumed, r0 + 2, "play() resumes again");
+  player.dispose();
+});
+
 test("dispose unsubscribes all events", async () => {
   const bus = makeBus();
   const player = createPlayer({
@@ -395,4 +591,166 @@ test("dispose unsubscribes all events", async () => {
   player.dispose();
   await Promise.resolve();
   assert.strictEqual(bus.has(EVT_VIDEO_FRAME), false, "events torn down");
+});
+
+test("does not autostart on the first frame; play() is required", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  assert.strictEqual(player.isPlaying(), false, "no autostart");
+  player.tick();
+  assert.strictEqual(drawn.length, 0, "nothing drawn until play()");
+  player.play();
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "draws after play()");
+  player.dispose();
+});
+
+test("positionMs tracks the clock from play(); duration is settable", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  player.setDuration(59000);
+  assert.strictEqual(player.durationMs(), 59000);
+  player.play(); // clock=0 -> playbackStart captured at 0
+  clock = 2.5; // 2.5 s elapsed
+  assert.strictEqual(player.positionMs(), 2500, "position follows the clock");
+  player.dispose();
+});
+
+test("origin is captured at play(), not at frame arrival (wait-then-play does not skip)", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+  });
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0)); // buffered as a poster; origin NOT set yet
+  assert.strictEqual(player.positionMs(), 0, "no origin before play()");
+  clock = 5; // the user stares at the poster for 5 s
+  player.play(); // origin captured NOW (at clock=5)
+  assert.strictEqual(player.positionMs(), 0, "elapsed is 0 at play, not 5000 — no skip");
+  player.dispose();
+});
+
+test("evicts decoded frames by BYTE budget, not a fixed count", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+    // Each 2x2 frame is y(4)+u(1)+v(1) = 6 bytes; cap at 18 bytes => at most 3 frames buffered.
+    maxBufferBytes: 18,
+  });
+  player.play();
+  for (let i = 0; i < 10; i++) bus.emit(EVT_VIDEO_FRAME, frameDto(i * 1000));
+  // Buffer is byte-bounded: far more than 3 arrived, but only ~3 frames' worth is retained.
+  assert.ok(player.bufferedBytes() <= 18, `buffered ${player.bufferedBytes()} <= 18`);
+  player.dispose();
+});
+
+test("requests the next window when the buffered frontier runs low", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  let clock = 0;
+  const requested: number[] = [];
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+    bufferAheadMs: 3000,
+    lowWaterMs: 1500,
+    requestWindow: (pts) => requested.push(pts),
+  });
+  player.play();
+  // Frontier at 1000 ms, position 0 => ahead = 1000 < lowWater(1500) => request once.
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  bus.emit(EVT_VIDEO_FRAME, frameDto(1000));
+  player.tick();
+  assert.deepStrictEqual(requested, [1000], "requested next window at the frontier");
+  // No duplicate request while the same window is outstanding.
+  player.tick();
+  assert.deepStrictEqual(requested, [1000], "no duplicate request");
+  // New frames extend the frontier => guard clears, but frontier is now ahead so no new request.
+  bus.emit(EVT_VIDEO_FRAME, frameDto(2000));
+  bus.emit(EVT_VIDEO_FRAME, frameDto(3000));
+  player.tick();
+  assert.deepStrictEqual(requested, [1000], "frontier now ahead; still one request");
+  player.dispose();
+});
+
+test("seek clears the buffer and requests the window at the target", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  let clock = 0;
+  const requested: number[] = [];
+  const seeked: number[] = [];
+  const player = createPlayer({
+    audio,
+    renderer: () => {},
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+    requestWindow: (pts) => requested.push(pts),
+    onSeek: (pts) => seeked.push(pts),
+  });
+  player.play();
+  bus.emit(EVT_VIDEO_FRAME, frameDto(0));
+  bus.emit(EVT_VIDEO_FRAME, frameDto(1000));
+  player.seek(30000);
+  assert.strictEqual(player.bufferedBytes(), 0, "buffer cleared on seek");
+  assert.deepStrictEqual(seeked, [30000], "onSeek notified with the target");
+  assert.deepStrictEqual(requested, [30000], "requested the window at the seek target");
+  player.dispose();
+});
+
+test("after seek the position/timeline is absolute (origin shifts to the target)", () => {
+  const bus = makeBus();
+  const audio = new FakeAudio();
+  const drawn: YuvFrame[] = [];
+  let clock = 0;
+  const player = createPlayer({
+    audio,
+    renderer: (f) => drawn.push(f),
+    subscribe: bus.subscribe,
+    reducedMotion: false,
+    audioClock: () => clock,
+    requestWindow: () => {},
+  });
+  player.play();
+  player.seek(30000);     // base shifts to 30000; playbackStart reset to null
+  clock = 0.5;
+  player.tick();          // first tick after seek re-captures playbackStart at clock=0.5
+  bus.emit(EVT_VIDEO_FRAME, frameDto(30000)); // ABSOLUTE-pts frame at the target
+  player.tick();
+  assert.strictEqual(drawn.length, 1, "the absolute-pts frame at the target is drawn");
+  clock = 1.0;            // 0.5 s of real elapsed since the re-capture
+  assert.strictEqual(player.positionMs(), 30500, "position = seek target + elapsed");
+  player.dispose();
 });

@@ -44,11 +44,13 @@ pub enum UploadPhase {
     Encrypting { job_id: String },
     /// Staging the version (POST /v1/files).
     Staging { job_id: String },
-    /// Uploading ciphertext chunks (resumable).
+    /// Uploading ciphertext chunks (resumable). `bytes_per_s` is a rolling
+    /// throughput estimate (0 for the small image/blog path; live MB/s for video).
     Uploading {
         job_id: String,
         done: u64,
         total: u64,
+        bytes_per_s: u64,
     },
     /// Finalizing the version.
     Finalizing { job_id: String },
@@ -56,6 +58,43 @@ pub enum UploadPhase {
     Done { job_id: String, file_id: String },
     /// Failed with a sanitized code (no oracle).
     Failed { job_id: String, code: String },
+}
+
+/// The video **prepare** (author-side transcode) feedback channel — per-job progress
+/// for the confined ffmpeg ingest + re-mux that runs inside `stage_upload` for a
+/// video (before any bundle exists). Emitted over the Tauri event bus so the upload
+/// UI can show a live progress bar + a Cancel affordance during the slow confined
+/// transcode. Non-color-only: each variant carries a stable `phase` code.
+///
+/// # Contract (consumed by the UI task)
+/// * Event name: [`EVT_VIDEO_PREPARE`] = `"maxsecu://video-prepare"`.
+/// * Payload: this [`PreparePhase`], kebab-tagged on `"phase"` — exactly:
+///   - `{"phase":"transcoding","percent":<0..=100|null>}` (percent is `null` until
+///     ffmpeg reports the source duration),
+///   - `{"phase":"remuxing"}`,
+///   - `{"phase":"finalizing"}`,
+///   - `{"phase":"cancelled"}` (benign terminal after a cancel),
+///   - `{"phase":"failed","code":"<code>"}` (sanitized terminal).
+/// * Cancel: the `cancel_video_prepare` command (no args) cancels the in-flight
+///   transcode; `stage_upload` then returns `UiError{code:"cancelled"}` (benign — the
+///   UI returns to idle), while a real failure returns `UiError{code:"video_failed"}`.
+pub const EVT_VIDEO_PREPARE: &str = "maxsecu://video-prepare";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "phase")]
+pub enum PreparePhase {
+    /// Confined ffmpeg transcode in progress; `percent` is `None` until the source
+    /// duration is known (then `0..=100`).
+    Transcoding { percent: Option<u8> },
+    /// Re-muxing ffmpeg's output into canonical AV1/CMAF fragments (second confined
+    /// spawn).
+    Remuxing,
+    /// Deriving thumbnail/preview + validating the fragment index (final local step).
+    Finalizing,
+    /// Benign terminal: the user (or app shutdown) cancelled the transcode.
+    Cancelled,
+    /// Sanitized terminal failure (no decode oracle) — carries a stable code.
+    Failed { code: String },
 }
 
 /// The sandboxed-video player feedback channel (Phase 7, Gate 4) — per-file
@@ -72,6 +111,15 @@ pub const EVT_VIDEO_FRAME: &str = "maxsecu://video-frame";
 /// Decoded-audio channel: one [`crate::commands::video::PcmDto`] per re-validated
 /// PCM chunk (the UI feeds it to WebAudio in Gate 5).
 pub const EVT_VIDEO_AUDIO: &str = "maxsecu://video-audio";
+
+/// One-shot per-open metadata for the player UI (scrubber max + timer denominator).
+pub const EVT_VIDEO_INFO: &str = "maxsecu://video-info";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct VideoInfo {
+    pub duration_ms: u64,
+    pub fragment_count: u32,
+}
 
 /// The video player's state machine (spec §6/§7). Emitted over [`EVT_PLAYER`];
 /// the UI binds a buffering spinner / play state / error banner. `Error` carries a
@@ -207,6 +255,39 @@ mod player_phase_tests {
 }
 
 #[cfg(test)]
+mod prepare_phase_tests {
+    use super::*;
+
+    #[test]
+    fn prepare_phase_serializes_kebab_tagged() {
+        // percent present.
+        let s = serde_json::to_string(&PreparePhase::Transcoding { percent: Some(42) }).unwrap();
+        assert!(s.contains("\"phase\":\"transcoding\""), "got {s}");
+        assert!(s.contains("\"percent\":42"), "got {s}");
+        // percent unknown → null.
+        let s = serde_json::to_string(&PreparePhase::Transcoding { percent: None }).unwrap();
+        assert!(s.contains("\"percent\":null"), "got {s}");
+        assert_eq!(
+            serde_json::to_string(&PreparePhase::Remuxing).unwrap(),
+            "{\"phase\":\"remuxing\"}"
+        );
+        assert_eq!(
+            serde_json::to_string(&PreparePhase::Finalizing).unwrap(),
+            "{\"phase\":\"finalizing\"}"
+        );
+        assert_eq!(
+            serde_json::to_string(&PreparePhase::Cancelled).unwrap(),
+            "{\"phase\":\"cancelled\"}"
+        );
+        let f = serde_json::to_string(&PreparePhase::Failed {
+            code: "video_failed".into(),
+        })
+        .unwrap();
+        assert!(f.contains("\"phase\":\"failed\"") && f.contains("\"code\":\"video_failed\""));
+    }
+}
+
+#[cfg(test)]
 mod upload_phase_tests {
     use super::*;
 
@@ -216,15 +297,28 @@ mod upload_phase_tests {
             job_id: "j".into(),
             done: 2,
             total: 5,
+            bytes_per_s: 3_000_000,
         })
         .unwrap();
         assert!(s.contains("\"phase\":\"uploading\""), "got {s}");
         assert!(s.contains("\"done\":2") && s.contains("\"total\":5"));
+        assert!(s.contains("\"bytes_per_s\":3000000"), "got {s}");
         let d = serde_json::to_string(&UploadPhase::Done {
             job_id: "j".into(),
             file_id: "ab".into(),
         })
         .unwrap();
         assert!(d.contains("\"phase\":\"done\"") && d.contains("\"file_id\":\"ab\""));
+    }
+}
+
+#[cfg(test)]
+mod video_info_tests {
+    use super::*;
+    #[test]
+    fn video_info_serializes() {
+        let s = serde_json::to_string(&VideoInfo { duration_ms: 59000, fragment_count: 5 }).unwrap();
+        assert!(s.contains("\"duration_ms\":59000"));
+        assert!(s.contains("\"fragment_count\":5"));
     }
 }

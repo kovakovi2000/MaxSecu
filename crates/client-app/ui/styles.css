@@ -234,6 +234,24 @@ app-shell { display: block; min-height: 100vh; }
   background: var(--mx-accent);
   box-shadow: var(--mx-glow);
 }
+/* Nav rail is disabled while a transcode/upload is in flight (see busy.ts). The
+   click is suppressed in JS (so keyboard Enter is blocked too); this only styles
+   it. Links stay focusable — focus is not trapped. */
+.nav-rail a[aria-disabled="true"], .nav-rail a.nav-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* Live transcode progress + Cancel next to the upload status live region. */
+.up-prepare {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.5rem 0;
+}
+.up-prepare progress {
+  flex: 1;
+  min-width: 8rem;
+}
 .header-actions {
   grid-area: actions;
   display: flex;
@@ -258,7 +276,7 @@ app-shell { display: block; min-height: 100vh; }
   background: color-mix(in srgb, var(--mx-surface-2) 72%, transparent);
 }
 upload-tray { grid-area: tray; justify-self: end; }
-quick-settings[hidden] { display: none !important; }
+.ram-gauge-wrap[hidden] { display: none !important; }
 #outlet { position: relative; z-index: 1; }
 
 /* ---------- Routed screens ---------- */
@@ -418,6 +436,9 @@ pre {
 }
 #controls label { margin: 0; }
 #mine-toggle { align-self: center; }
+/* Keep the Refresh button compact (don't stretch to a full grid column when it
+   wraps to a second row on the Feed route). */
+.feed-refresh { justify-self: start; align-self: end; white-space: nowrap; }
 #grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(238px, 1fr));
@@ -568,33 +589,53 @@ settings-screen #set-form fieldset { margin: 0; }
 settings-screen main > fieldset { max-width: 760px; }
 #ram-hint, #exp-warn { margin-top: 0.5rem; font-size: var(--mx-fs-1); }
 
-/* ---------- Quick settings + upload tray + toasts ---------- */
-.qs { position: relative; }
-.qs #qs-btn {
-  width: 2.7rem;
-  min-width: 2.7rem;
-  padding: 0;
-  border-radius: 0.95rem;
+/* ---------- RAM gauge + upload tray + toasts ---------- */
+
+/* RAM-usage rainbow gauge bar — a horizontal bar in the shell header. The fill div
+   grows left→right; its width is set in JS to fillFraction × 100% of the RAM cache
+   cap. The rainbow gradient is sized to the FULL track (background-size), so growing
+   the fill REVEALS successive colours (red at empty → violet at full) rather than
+   compressing the whole spectrum into the filled portion. Static fill, no shimmer
+   (respects reduced-motion). */
+.ram-gauge-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
 }
-.qs #qs-pop, .upload-tray, .toast, video-player {
+.ram-gauge-text {
+  font-size: var(--mx-fs-1);
+  opacity: 0.8;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.ram-gauge {
+  position: relative;
+  flex: 0 0 auto;
+  width: 120px;
+  height: 16px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.1);
+}
+.ram-gauge-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: linear-gradient(to right, red, orange, yellow, green, blue, violet);
+  background-size: 120px 100%; /* full-track spectrum; revealed as the fill grows */
+  background-repeat: no-repeat;
+  background-position: left center;
+  /* width set inline by JS — no CSS transition so reduced-motion is respected */
+}
+
+.upload-tray, .toast, video-player {
   border: 1px solid var(--mx-border);
   border-radius: var(--mx-radius-lg);
   background: color-mix(in srgb, var(--mx-surface-1) 94%, transparent);
   box-shadow: var(--mx-elev-2), var(--mx-inset);
   backdrop-filter: blur(18px) saturate(1.1);
 }
-.qs #qs-pop {
-  position: absolute;
-  right: 0;
-  z-index: 40;
-  width: min(330px, calc(100vw - 2rem));
-  display: grid;
-  gap: 0.9rem;
-  padding: 1rem;
-  margin-top: 0.55rem;
-}
-.qs #qs-pop label { margin: 0; }
-.qs #qs-pop input[type="number"] { margin-top: 0.45rem; }
 .upload-tray {
   min-width: min(360px, calc(100vw - 2rem));
   max-width: 420px;

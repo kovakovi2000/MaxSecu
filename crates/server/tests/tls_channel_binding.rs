@@ -75,6 +75,7 @@ fn router() -> axum::Router {
         blobs: Arc::new(maxsecu_server::MemoryBlobStore::new()),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
+        max_file_bytes: None,
     };
     maxsecu_server::router(state)
 }

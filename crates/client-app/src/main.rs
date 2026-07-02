@@ -35,6 +35,7 @@ fn main() {
         .manage(ConnectLock::new())
         .manage(maxsecu_client_app::jobs::UploadJobs::new())
         .manage(maxsecu_client_app::jobs::VideoJobs::new())
+        .manage(maxsecu_client_app::jobs::VideoPrepareCancel::default())
         .manage(ContentCache::new(cap_bytes))
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
@@ -44,6 +45,7 @@ fn main() {
             maxsecu_client_app::commands::feed::decrypt_card,
             maxsecu_client_app::commands::viewer::open_content,
             maxsecu_client_app::commands::search::search_local,
+            maxsecu_client_app::commands::dialog::pick_file,
             maxsecu_client_app::commands::bootstrap::register_glassbreak,
             maxsecu_client_app::commands::bootstrap::create_first_admin,
             maxsecu_client_app::commands::bootstrap::register_user,
@@ -54,28 +56,69 @@ fn main() {
             maxsecu_client_app::commands::upload::stage_upload,
             maxsecu_client_app::commands::upload::confirm_upload,
             maxsecu_client_app::commands::upload::cancel_upload,
+            maxsecu_client_app::commands::upload::cancel_video_prepare,
             maxsecu_client_app::commands::upload::upload_jobs,
+            maxsecu_client_app::commands::upload::resume_upload,
+            maxsecu_client_app::commands::upload::list_pending_uploads,
+            maxsecu_client_app::commands::upload::dismiss_pending_upload,
             maxsecu_client_app::commands::video::preview_video,
+            maxsecu_client_app::commands::video::preview_seek,
             maxsecu_client_app::commands::settings::get_settings,
             maxsecu_client_app::commands::settings::set_settings,
             maxsecu_client_app::commands::settings::change_password,
             maxsecu_client_app::commands::settings::export_keystore,
             maxsecu_client_app::ram::ram_limits,
+            maxsecu_client_app::ram::memory_stats,
             maxsecu_client_app::commands::video::open_video,
             maxsecu_client_app::commands::video::video_seek,
             maxsecu_client_app::commands::video::video_set_volume,
             maxsecu_client_app::commands::video::cancel_video,
+            maxsecu_client_app::commands::video::stream_debug_log,
         ])
+        .register_asynchronous_uri_scheme_protocol("stream", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            // Parse "…/media/<file_id_hex>" and the Range header up front (cheap, sync).
+            let path = request.uri().path().to_string();
+            let range_header = request
+                .headers()
+                .get(http::header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            tauri::async_runtime::spawn(async move {
+                let resp = maxsecu_client_app::commands::video::stream_media(
+                    &app,
+                    &path,
+                    range_header.as_deref(),
+                )
+                .await;
+                responder.respond(resp);
+            });
+        })
         .build(tauri::generate_context!())
         .expect("error while running MaxSecu client");
 
-    // Zeroize the decrypted-content cache on shutdown so no plaintext survives the
-    // process (spec §6 — zeroized on app close, in addition to on-evict).
-    app.run(|app_handle, event| {
-        if let tauri::RunEvent::Exit = event {
+    // Shutdown handling:
+    // * `ExitRequested` (fired first, before teardown): flip the in-flight video
+    //   `stage_upload` transcode's cancel token so its confined ffmpeg / re-mux child
+    //   is terminated (via the watchdog's cancel poll) before the process exits — no
+    //   orphaned confined child, prompt shutdown. Best-effort (no-op if none running).
+    // * `Exit` (unchanged): zeroize the decrypted-content cache so no plaintext
+    //   survives the process (spec §6 — zeroized on app close, in addition to on-evict).
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { .. } => {
+            if let Some(prepare_cancel) =
+                app_handle.try_state::<maxsecu_client_app::jobs::VideoPrepareCancel>()
+            {
+                if let Some(flag) = prepare_cancel.0.lock().unwrap().as_ref() {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        tauri::RunEvent::Exit => {
             if let Some(cache) = app_handle.try_state::<ContentCache>() {
                 cache.clear_and_zeroize();
             }
         }
+        _ => {}
     });
 }

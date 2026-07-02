@@ -20,7 +20,7 @@ use std::path::Path;
 /// callers may log and continue on failure (the individual writers also create
 /// their own parent dirs).
 pub fn ensure_portable_layout(dir: &Path) -> std::io::Result<()> {
-    for sub in ["config", "keystore", "index", "cache", "logs"] {
+    for sub in ["config", "keystore", "index", "cache", "logs", "staging"] {
         std::fs::create_dir_all(dir.join(sub))?;
     }
     Ok(())
@@ -35,7 +35,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mxcl-layout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         ensure_portable_layout(&tmp).unwrap();
-        for sub in ["config", "keystore", "index", "cache", "logs"] {
+        for sub in ["config", "keystore", "index", "cache", "logs", "staging"] {
             assert!(tmp.join(sub).is_dir(), "{sub} should exist");
         }
         // Idempotent.

@@ -42,6 +42,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -68,8 +69,8 @@ use crate::download::{build_stream_header, parse_file_view};
 use crate::error::UiError;
 use crate::fragment_cache::FragmentCache;
 use crate::http_client::{get_bytes, get_json};
-use crate::jobs::{VideoJob, VideoJobs};
-use crate::state::{PlayerPhase, EVT_PLAYER, EVT_VIDEO_AUDIO, EVT_VIDEO_FRAME};
+use crate::jobs::{AuthedChannel, UploadJobs, VideoJob, VideoJobs};
+use crate::state::{PlayerPhase, VideoInfo, EVT_PLAYER, EVT_VIDEO_AUDIO, EVT_VIDEO_FRAME, EVT_VIDEO_INFO};
 use crate::video::{chunks_for_fragment, feed_fragment, fragment_for_time, FragmentEntry};
 
 /// Fragments decoded per bounded window. Small + finite: the UI requests further
@@ -84,6 +85,31 @@ const PLAY_WINDOW: u32 = 4;
 /// Hard clamp on the UI playback-gain preference (no decode effect; applied by
 /// WebAudio in Gate 5). Keeps a hand-set value in a sane range.
 const MAX_GAIN: f32 = 4.0;
+
+/// Cap on a single range response body (open-ended `bytes=N-` streams in pieces).
+/// Must be ≥ the content chunk size (currently 6 MiB) so a range request can
+/// span a full chunk/fMP4 fragment in one response without being truncated.
+const MAX_RANGE_BODY: u64 = 8 * 1024 * 1024;
+
+/// The body + metadata of one satisfied range response (206). `total_len` is the
+/// Content-Range denominator; `start`/`len` describe the returned slice.
+pub struct RangeResponse {
+    pub start: u64,
+    pub len: u64,
+    pub total_len: u64,
+    pub body: Vec<u8>,
+}
+
+/// D-7 backpressure: ceiling (bytes) on the DECODED I420 frames buffered for ONE
+/// fragment before the window-offset flush (Part C). One 4K I420 frame is ~12.4 MB and
+/// a high-res closed GOP can be dozens of frames (~600 MB), so buffering a whole such
+/// fragment in the KEY-HOLDING process is the real OOM risk for an EXTREME source. We
+/// cap the buffer and, when a fragment's decoded frames exceed it, DROP the oldest
+/// (count-only, surfaced as a benign [`PlayerPhase::Gap`]) so an extreme clip degrades
+/// to a brief frame-skip instead of exhausting RAM — never a hang/crash, no oracle.
+/// ~64 MiB holds ~5 frames at 4K (or one whole 8K frame ~50 MB) and ~20 at 1080p —
+/// ample for normal content, a hard backstop for extreme content.
+const MAX_FRAME_BUF_BYTES: usize = 64 * 1024 * 1024;
 
 /// One re-validated decoded I420 frame, base64-per-plane — the ONLY video payload
 /// that crosses the Tauri seam (the UI uploads the planes to a WebGL texture in
@@ -112,6 +138,10 @@ pub struct PcmDto {
 fn player_err() -> UiError {
     UiError::new("video_failed", "The video could not be played.")
 }
+
+/// The connection for this session dropped; the caller (stream_media_inner) may
+/// reconnect once and retry. Distinct from player_err so the retry is targeted.
+fn channel_dead() -> UiError { UiError::new("channel_dead", "The video connection dropped.") }
 
 /// Base64 a validated frame's planes into the seam DTO.
 fn frame_dto(f: &I420Frame) -> I420FrameDto {
@@ -163,6 +193,19 @@ type SessionDecoder = maxsecu_media_launcher::VideoSubprocessSession;
 
 fn make_decoder(app_dir: &Path) -> SessionDecoder {
     SessionDecoder::new(worker_path(app_dir))
+}
+
+/// Approximate clip duration (ms) from the fragment index: the last fragment's start pts
+/// plus one inter-fragment gap (fragments are ~uniform). Zero for an empty index.
+fn duration_ms_from_index(index: &[FragmentEntry]) -> u64 {
+    match (index.last(), index.len()) {
+        (Some(last), n) if n >= 2 => {
+            let gap = last.pts_ms.saturating_sub(index[n - 2].pts_ms);
+            last.pts_ms.saturating_add(gap)
+        }
+        (Some(last), _) => last.pts_ms.saturating_add(1000),
+        (None, _) => 0,
+    }
 }
 
 /// The confined `media-transcode-worker` binary lives beside the portable exe
@@ -311,9 +354,58 @@ where
 /// BEFORE its DTO is emitted (spec §7); a `WorkerMsg::Error` (a SOFT decode error —
 /// distinct from a hard abort) or any validation failure still fails closed. Emits
 /// `Playing` once the window's frames have flowed.
+/// The window-relative base offset (ms) for fragment `seq`: how far into THIS playback
+/// window the fragment begins, from the AUTHENTICATED fragment index. The decode worker
+/// emits FRAGMENT-relative pts (each fragment starts at ~0); the player needs a SINGLE
+/// window-relative timeline, so each frame/chunk's emitted pts is
+/// `(index[seq].pts_ms - window_start_pts) + worker_pts`. `window_start_pts` is the pts
+/// of the window's first fragment. Saturating so a (defensively) out-of-order index can
+/// never underflow; an unknown seq contributes 0 (fail-safe — the frame still flows).
+fn window_offset_ms(index: &[FragmentEntry], seq: u32, window_start_pts: u64) -> u64 {
+    index
+        .iter()
+        .find(|e| e.seq == seq)
+        .map(|e| e.pts_ms.saturating_sub(window_start_pts))
+        .unwrap_or(0)
+}
+
+/// Decoded-frame byte size of one I420 frame (its three planes).
+fn frame_bytes(f: &I420Frame) -> usize {
+    f.y.len() + f.u.len() + f.v.len()
+}
+
+/// Push `frame` onto the per-fragment decode buffer, then DROP the OLDEST buffered
+/// frame(s) while the buffered decoded-frame bytes exceed `budget` (always retaining at
+/// least the most recent frame). Returns how many were dropped. This BOUNDS the in-flight
+/// decoded-frame RAM in the key-holding process for an EXTREME (4K+ / high-frame-count)
+/// source: a hostile GOP degrades to a benign frame-skip (surfaced by the caller as
+/// [`PlayerPhase::Gap`]) instead of OOM. The bound is enforced ON EACH PUSH, before the
+/// buffer can grow past `budget` + one frame — never after unbounded accumulation.
+/// Window-offset correctness is unaffected: the seq (hence the offset) comes from
+/// `EndOfFragment`, and every SURVIVING frame keeps its own fragment-relative pts.
+fn push_bounded(
+    buf: &mut Vec<I420Frame>,
+    buf_bytes: &mut usize,
+    frame: I420Frame,
+    budget: usize,
+) -> u32 {
+    *buf_bytes += frame_bytes(&frame);
+    buf.push(frame);
+    let mut dropped = 0u32;
+    while *buf_bytes > budget && buf.len() > 1 {
+        let old = buf.remove(0);
+        *buf_bytes -= frame_bytes(&old);
+        dropped += 1;
+    }
+    dropped
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn decode_and_emit<D, E, OnF, OnA>(
     script: ScriptGuard,
     decoder: D,
+    frag_index: Vec<FragmentEntry>,
+    window_start_pts: u64,
     emit: &E,
     on_frame: &OnF,
     on_audio: &OnA,
@@ -357,20 +449,69 @@ where
     // resilience is for hard worker ABORTS only, NOT for soft decode errors (which
     // remain a fail-closed contract; a worker that survives to report one is trusted
     // to mean it).
+    //
+    // A/V SYNC (Task 5.2 Part C): the worker emits FRAGMENT-relative pts; we offset
+    // each into the SINGLE window-relative timeline the player syncs on. Frames/audio
+    // for one fragment arrive GROUPED and are delimited by `EndOfFragment{seq}` (which
+    // carries the real seq, robust to the resilient driver skipping a fragment). So we
+    // buffer a fragment's validated outputs, then on its `EndOfFragment` flush them with
+    // that fragment's window offset applied (`emitted = base + worker_pts`). Any frames
+    // left unflushed at the end (a fragment aborted mid-decode with no `EndOfFragment`,
+    // i.e. a skipped culprit) are dropped — their seq, hence their offset, is unknown.
+    //
+    // D-7 BACKPRESSURE: the per-fragment `frame_buf` is BOUNDED to `MAX_FRAME_BUF_BYTES`
+    // ([`push_bounded`]). An extreme (4K+ / high-frame-count) GOP whose decoded frames
+    // would exceed that ceiling drops its OLDEST buffered frames rather than holding
+    // hundreds of MB in the key-holding process; the drop count is surfaced once at the
+    // end as a benign count-only `Gap` (no oracle). Audio chunks stay (small — bounded by
+    // the Task-5.1 expansion ceiling). Dropping frames does NOT perturb the window offset:
+    // `base` is keyed on the `EndOfFragment` seq and each surviving frame keeps its own pts.
     let bounds = VideoBounds::default();
+    let mut frame_buf: Vec<I420Frame> = Vec::new();
+    let mut frame_buf_bytes = 0usize;
+    let mut audio_buf: Vec<PcmChunk> = Vec::new();
+    let mut dropped_frames = 0u32;
     for msg in outcome.msgs {
         match msg {
             WorkerMsg::Video(frame) => {
                 validate_i420(&frame, &bounds).map_err(|_| player_err())?;
-                on_frame(frame_dto(&frame));
+                dropped_frames += push_bounded(
+                    &mut frame_buf,
+                    &mut frame_buf_bytes,
+                    frame,
+                    MAX_FRAME_BUF_BYTES,
+                );
             }
             WorkerMsg::Audio(chunk) => {
                 validate_pcm(&chunk, &bounds).map_err(|_| player_err())?;
-                on_audio(pcm_dto(&chunk));
+                audio_buf.push(chunk);
             }
             WorkerMsg::Error(_) => return Err(player_err()),
-            WorkerMsg::Ready | WorkerMsg::EndOfFragment { .. } => {}
+            WorkerMsg::EndOfFragment { seq } => {
+                let base = window_offset_ms(&frag_index, seq, window_start_pts);
+                for frame in frame_buf.drain(..) {
+                    let mut dto = frame_dto(&frame);
+                    dto.pts_ms = base.saturating_add(frame.pts_ms);
+                    on_frame(dto);
+                }
+                frame_buf_bytes = 0;
+                for chunk in audio_buf.drain(..) {
+                    let mut dto = pcm_dto(&chunk);
+                    dto.pts_ms = base.saturating_add(chunk.pts_ms);
+                    on_audio(dto);
+                }
+            }
+            WorkerMsg::Ready => {}
         }
+    }
+
+    // Surface frames dropped by the in-flight bound MINIMALLY: one benign, non-terminal
+    // `Gap` carrying only the COUNT (no decode oracle / per-frame detail), the same channel
+    // the resilient-driver fragment skip uses.
+    if dropped_frames > 0 {
+        emit(PlayerPhase::Gap {
+            skipped: dropped_frames,
+        });
     }
 
     emit(PlayerPhase::Playing);
@@ -435,6 +576,51 @@ struct WindowPlan {
     start: u32,
     version: u64,
     fetch_indices: Vec<u64>,
+}
+
+/// Probe the total plaintext content length by decrypting the LAST chunk once
+/// over the real server (fetch its ciphertext, then `open_range`), caching the
+/// ciphertext as a side effect. Returns `(n-1)*chunk_size + last_chunk_plaintext`.
+/// Uses the job's stored `AuthedChannel` (no per-call reauth).
+async fn probe_total_len(
+    jobs: &VideoJobs,
+    file_id_hex: &str,
+    chunk_size: u64,
+) -> Result<u64, UiError> {
+    // Phase 1 (global lock): read n, last_idx, version, and clone the channel Arc.
+    let (n, last_idx, version, channel) = {
+        let guard = jobs.0.lock().await;
+        let job = guard.get(file_id_hex).ok_or_else(player_err)?;
+        let n = job.decryptor.content_chunk_count();
+        if n == 0 {
+            return Err(player_err());
+        }
+        let channel = job.channel.clone().ok_or_else(player_err)?;
+        (n, n - 1, job.version, channel)
+    };
+    // Phase 2 (channel lock, no global lock): fetch the last ciphertext chunk.
+    let ct = {
+        let mut ch = channel.lock().await;
+        let AuthedChannel { sender, host, token } = &mut *ch;
+        let uri = format!(
+            "/v1/files/{file_id_hex}/versions/{version}/streams/content/chunks/{last_idx}"
+        );
+        let (status, ct) = get_bytes(sender, &uri, Some(token.as_str()), host.as_str()).await?;
+        if status != hyper::StatusCode::OK {
+            return Err(player_err());
+        }
+        ct
+    };
+    // Phase 3 (global lock): decrypt just that chunk to learn its plaintext length.
+    let last_len = {
+        let guard = jobs.0.lock().await;
+        let job = guard.get(file_id_hex).ok_or_else(player_err)?;
+        job.decryptor
+            .open_range(last_idx, &[ct])
+            .map_err(|_| player_err())?
+            .len() as u64
+    };
+    crate::stream::total_len(n, chunk_size, last_len)
 }
 
 /// Drive one bounded window end-to-end while holding the global `VideoJobs` lock
@@ -507,22 +693,36 @@ where
     }
 
     // Phase C — decrypt the window IN THE TCB under the lock (sync), then DROP the
-    // guard. If the job was cancelled during prefetch, it is gone here ⇒ abort.
-    let script = {
+    // guard. If the job was cancelled during prefetch, it is gone here ⇒ abort. Also
+    // capture the (cloned) authenticated index for the decode step (absolute pts:
+    // window_start_pts = 0 so emitted pts = index[seq].pts_ms + worker_pts, forming a
+    // continuous absolute timeline across windows for the streaming player).
+    let (script, frag_index) = {
         let mut guard = jobs.0.lock().await;
         let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
-        decrypt_window(
+        let frag_index = job.index.clone();
+        let script = decrypt_window(
             job,
             plan.start,
             count,
             |i| prefetched.remove(&i).ok_or_else(player_err),
             emit,
-        )?
+        )?;
+        (script, frag_index)
     };
 
     // Phase D — decode OFF the runtime + re-validate + emit (no lock, no identity).
     let decoder = make_decoder(app_dir);
-    decode_and_emit(script, decoder, emit, on_frame, on_audio).await
+    decode_and_emit(
+        script,
+        decoder,
+        frag_index,
+        0,
+        emit,
+        on_frame,
+        on_audio,
+    )
+    .await
 }
 
 /// `open_video` — open + verify a video, register its decrypt-while-play session,
@@ -546,6 +746,9 @@ pub async fn open_video(
     let on_audio = |a: PcmDto| {
         let _ = app.emit(EVT_VIDEO_AUDIO, a);
     };
+    let on_info = |i: VideoInfo| {
+        let _ = app.emit(EVT_VIDEO_INFO, i);
+    };
     let out = open_video_inner(
         &file_id,
         &dir,
@@ -555,6 +758,7 @@ pub async fn open_video(
         &emit,
         &on_frame,
         &on_audio,
+        &on_info,
     )
     .await;
     if let Err(e) = &out {
@@ -570,20 +774,22 @@ pub async fn open_video(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn open_video_inner<E, OnF, OnA>(
+async fn open_video_inner<E, OnF, OnA, OnI>(
     file_id_str: &str,
     dir: &State<'_, AppDir>,
     session: &State<'_, Session>,
     connect_lock: &State<'_, ConnectLock>,
     jobs: &State<'_, VideoJobs>,
-    emit: &E,
-    on_frame: &OnF,
-    on_audio: &OnA,
+    _emit: &E,
+    _on_frame: &OnF,
+    _on_audio: &OnA,
+    _on_info: &OnI,
 ) -> Result<(), UiError>
 where
     E: Fn(PlayerPhase),
     OnF: Fn(I420FrameDto),
     OnA: Fn(PcmDto),
+    OnI: Fn(VideoInfo),
 {
     // Validate the REQUESTED id up front (it is what the served record must bind to
     // and is interpolated into the request URL). Canonical lowercase hex is the
@@ -646,9 +852,28 @@ where
     }?;
     let version = decryptor.version();
 
-    // Register the session. Cache cap from the Phase-5 performance setting.
+    // Content chunk size from the (authenticated-envelope) view — the byte↔chunk
+    // unit for range serving.
+    let chunk_size = view
+        .streams
+        .iter()
+        .find(|s| s.stream_type == StreamType::Content)
+        .map(|s| s.chunk_size)
+        .ok_or_else(player_err)?;
+
+    // Register the session first (so the fragment cache exists), then probe the
+    // total plaintext length by decrypting ONLY the last fragment once — its
+    // ciphertext is cached as a side effect (a back-seek to the end is warm).
     let cap = SettingsConfig::load(&dir.0).performance.ram_cache_cap_mb as u64 * 1024 * 1024;
     let cache = FragmentCache::open(&dir.0, cap).map_err(|_| player_err())?;
+
+    // Move the open-time authed connection into a persistent channel for all range
+    // fetches in this session (probe_total_len + every serve_range). After this point
+    // `sender`/`host`/`token` are consumed — all subsequent network access goes
+    // through the channel's Mutex, serializing overlapping range requests.
+    let channel = Arc::new(tokio::sync::Mutex::new(
+        AuthedChannel { sender, host, token },
+    ));
     jobs.0.lock().await.insert(
         file_id_hex.clone(),
         VideoJob {
@@ -657,25 +882,20 @@ where
             cache,
             file_id_hex: file_id_hex.clone(),
             version,
+            chunk_size,
+            total_len: 0, // set below
             gain: 1.0,
+            channel: Some(channel),
         },
     );
 
-    // Play the initial bounded window from the start.
-    play_window_command(
-        &mut sender,
-        &host,
-        &token,
-        jobs,
-        &file_id_hex,
-        0,
-        PLAY_WINDOW,
-        &dir.0,
-        emit,
-        on_frame,
-        on_audio,
-    )
-    .await
+    // Probe total_len via the last fragment (uses the job's persistent channel —
+    // no extra reauth needed).
+    let total = probe_total_len(jobs, &file_id_hex, chunk_size).await?;
+    if let Some(job) = jobs.0.lock().await.get_mut(&file_id_hex) {
+        job.total_len = total;
+    }
+    Ok(())
 }
 
 /// `video_seek` — map `pts_ms` to its fragment and play a bounded window from
@@ -820,42 +1040,87 @@ pub async fn cancel_video(
 // transcoded result rendered in `<video-player>` BEFORE confirming the upload.
 // ===========================================================================
 
-/// Slice the STAGED canonical `cmaf` plaintext into a confined-decode `script`:
-/// `Open → Fragment{seq,bytes}* → Close`, where each fragment's bytes are
-/// `cmaf[chunk_start*CS .. (chunk_start+chunk_len)*CS]` (CS = [`crate::upload::VIDEO_CHUNK_SIZE`]),
-/// exactly as the server-fetch player addresses content chunks. The plaintext copies
-/// live ONLY inside the returned [`ScriptGuard`] (zeroized on drop). Fail-closed on an
-/// empty/out-of-range index (the index was AEAD-authenticated upstream at upload time;
-/// the bound check is defense in depth against an arithmetic mismatch).
-fn build_preview_script(cmaf: &[u8], index: &[FragmentEntry]) -> Result<ScriptGuard, UiError> {
-    if index.is_empty() {
-        return Err(player_err());
-    }
+/// Slice fragments `[start_seq, start_seq+count)` of the staged canonical `cmaf` into a
+/// confined-decode script `Open -> Fragment* -> Close`. The bounded form of the old
+/// whole-clip `build_preview_script` — so preview STREAMS a window instead of decoding the
+/// entire clip (a 59 s clip is ~2.4 GB of frames). Fail-closed on an out-of-range slice.
+fn build_preview_window_script(
+    cmaf: &[u8],
+    index: &[FragmentEntry],
+    start_seq: u32,
+    count: u32,
+) -> Result<ScriptGuard, UiError> {
+    if index.is_empty() { return Err(player_err()); }
     let cs = crate::upload::VIDEO_CHUNK_SIZE as usize;
-    let mut script = ScriptGuard(Vec::with_capacity(index.len() + 2));
-    script.0.push(ClientMsg::Open {
-        bounds: VideoBounds::default(),
-    });
-    for e in index {
-        let start = (e.chunk_start as usize)
-            .checked_mul(cs)
-            .ok_or_else(player_err)?;
+    let n = index.len() as u32;
+    if start_seq >= n { return Err(player_err()); }
+    let end = start_seq.saturating_add(count).min(n);
+    let mut script = ScriptGuard(Vec::with_capacity((end - start_seq) as usize + 2));
+    script.0.push(ClientMsg::Open { bounds: VideoBounds::default() });
+    for e in index.iter().filter(|e| e.seq >= start_seq && e.seq < end) {
+        let start = (e.chunk_start as usize).checked_mul(cs).ok_or_else(player_err)?;
         let len = (e.chunk_len as usize).checked_mul(cs).ok_or_else(player_err)?;
-        let end = start.checked_add(len).ok_or_else(player_err)?;
-        let slice = cmaf.get(start..end).ok_or_else(player_err)?;
-        script.0.push(ClientMsg::Fragment {
-            seq: e.seq,
-            bytes: slice.to_vec(),
-        });
+        let end_b = start.checked_add(len).ok_or_else(player_err)?;
+        let slice = cmaf.get(start..end_b).ok_or_else(player_err)?;
+        script.0.push(ClientMsg::Fragment { seq: e.seq, bytes: slice.to_vec() });
     }
     script.0.push(ClientMsg::Close);
     Ok(script)
 }
 
+/// Decode the preview window covering `pts_ms` from the staged canonical `cmaf`
+/// (author-side, no server, no decrypt). Emits `Buffering` on entry. Maps `pts_ms`
+/// to a fragment via [`fragment_for_time`], builds a [`build_preview_window_script`]
+/// covering [`PLAY_WINDOW`] fragments, clones the index then DROPS the jobs lock
+/// before the off-runtime decode so the lock is never held across `spawn_blocking`.
+/// Passes `window_start_pts = 0` to [`decode_and_emit`] so emitted frame/audio pts
+/// are ABSOLUTE on the clip timeline (`index[seq].pts_ms + worker_pts`) — the
+/// streaming player requires a single continuous absolute timeline across windows;
+/// subtracting the window start would restart each window near 0 and break seek.
+async fn preview_window_inner<E, OnF, OnA>(
+    job_id: &str,
+    pts_ms: u64,
+    dir: &State<'_, AppDir>,
+    jobs: &State<'_, crate::jobs::UploadJobs>,
+    emit: &E,
+    on_frame: &OnF,
+    on_audio: &OnA,
+) -> Result<(), UiError>
+where
+    E: Fn(PlayerPhase),
+    OnF: Fn(I420FrameDto),
+    OnA: Fn(PcmDto),
+{
+    emit(PlayerPhase::Buffering);
+    // Build the windowed decode script under the jobs lock (sync slice copy), then
+    // DROP the guard before the off-runtime decode (the lock is never held across
+    // spawn_blocking — same discipline as play_window_command).
+    let (script, frag_index) = {
+        let guard = jobs.0.lock().await;
+        let staged = guard.get(job_id).ok_or_else(player_err)?;
+        let preview = staged.preview.as_ref().ok_or_else(player_err)?;
+        let start_seq = fragment_for_time(&preview.index, pts_ms).unwrap_or(0);
+        // Legacy confined-decode path: lazily read the on-disk fMP4 for the decode
+        // script. The canonical preview path is the native <video> range protocol
+        // (serve_preview_range / preview_slice_file); this read-then-decode path
+        // remains for the WebGL YUV player but is not expected on the hot path.
+        let cmaf = std::fs::read(&preview.out_mp4_path)
+            .map_err(|_| UiError::new("video_failed", "preview"))?;
+        let script = build_preview_window_script(&cmaf, &preview.index, start_seq, PLAY_WINDOW)?;
+        let frag_index = preview.index.clone();
+        (script, frag_index)
+    };
+    // Confined decode OFF the runtime + re-validate every worker output + emit DTOs.
+    // window_start_pts = 0: emitted pts = index[seq].pts_ms + worker_pts (absolute).
+    let decoder = make_decoder(&dir.0);
+    decode_and_emit(script, decoder, frag_index, 0, emit, on_frame, on_audio).await
+}
+
 /// `preview_video` — locally decode the STAGED canonical video for the author's
 /// WYSIWYG preview (no server, no decrypt). Drives the confined decode session over
 /// the held plaintext, re-validates every frame/PCM chunk in the main process, and
-/// emits the same DTOs + [`PlayerPhase`] as `open_video`. Sanitized errors.
+/// emits the same DTOs + [`PlayerPhase`] as `open_video`. Decodes only the initial
+/// bounded window; the UI drives further windows via [`preview_seek`]. Sanitized errors.
 #[tauri::command]
 pub async fn preview_video(
     job_id: String,
@@ -872,7 +1137,10 @@ pub async fn preview_video(
     let on_audio = |a: PcmDto| {
         let _ = app.emit(EVT_VIDEO_AUDIO, a);
     };
-    let out = preview_video_inner(&job_id, &dir, &jobs, &emit, &on_frame, &on_audio).await;
+    let on_info = |i: VideoInfo| {
+        let _ = app.emit(EVT_VIDEO_INFO, i);
+    };
+    let out = preview_video_inner(&job_id, &dir, &jobs, &emit, &on_frame, &on_audio, &on_info).await;
     if let Err(e) = &out {
         emit(PlayerPhase::Error {
             code: e.code.clone(),
@@ -881,31 +1149,323 @@ pub async fn preview_video(
     out
 }
 
-async fn preview_video_inner<E, OnF, OnA>(
+async fn preview_video_inner<E, OnF, OnA, OnI>(
     job_id: &str,
     dir: &State<'_, AppDir>,
     jobs: &State<'_, crate::jobs::UploadJobs>,
     emit: &E,
     on_frame: &OnF,
     on_audio: &OnA,
+    on_info: &OnI,
 ) -> Result<(), UiError>
 where
     E: Fn(PlayerPhase),
     OnF: Fn(I420FrameDto),
     OnA: Fn(PcmDto),
+    OnI: Fn(VideoInfo),
 {
-    emit(PlayerPhase::Buffering);
-    // Build the decode script from the staged canonical plaintext under the jobs
-    // lock (sync slice copy), then DROP the guard before the off-runtime decode.
-    let script = {
+    // Emit VideoInfo at open (only at initial open, not on seek): briefly lock the
+    // jobs registry, read the authenticated preview index, compute + emit, drop the lock.
+    {
         let guard = jobs.0.lock().await;
         let staged = guard.get(job_id).ok_or_else(player_err)?;
         let preview = staged.preview.as_ref().ok_or_else(player_err)?;
-        build_preview_script(&preview.cmaf, &preview.index)?
+        on_info(VideoInfo {
+            duration_ms: duration_ms_from_index(&preview.index),
+            fragment_count: preview.index.len() as u32,
+        });
+    }
+    // Delegate to preview_window_inner starting from the beginning of the clip
+    // (pts_ms = 0 → fragment 0 → first window). Buffering is emitted inside.
+    preview_window_inner(job_id, 0, dir, jobs, emit, on_frame, on_audio).await
+}
+
+/// `preview_seek` — decode the preview window covering `pts_ms` (author-side, staged
+/// cmaf, no server, no decrypt). Mirrors `video_seek` for the download path.
+/// Sanitized errors.
+#[tauri::command]
+pub async fn preview_seek(
+    job_id: String,
+    pts_ms: u64,
+    app: tauri::AppHandle,
+    dir: State<'_, AppDir>,
+    jobs: State<'_, crate::jobs::UploadJobs>,
+) -> Result<(), UiError> {
+    let emit = |p: PlayerPhase| { let _ = app.emit(EVT_PLAYER, p); };
+    let on_frame = |f: I420FrameDto| { let _ = app.emit(EVT_VIDEO_FRAME, f); };
+    let on_audio = |a: PcmDto| { let _ = app.emit(EVT_VIDEO_AUDIO, a); };
+    let out = preview_window_inner(&job_id, pts_ms, &dir, &jobs, &emit, &on_frame, &on_audio).await;
+    if let Err(e) = &out { emit(PlayerPhase::Error { code: e.code.clone() }); }
+    out
+}
+
+// ===========================================================================
+// stream:// range protocol (Task 5). Serves per-range-decrypted plaintext bytes
+// to a native <video> element via a Tauri async URI-scheme protocol. The content
+// key NEVER leaves this process; only sliced plaintext is returned. Errors are
+// oracle-free: 404 (unknown/closed id or bad path), 416 (unsatisfiable range),
+// 500 (everything else), empty bodies.
+// ===========================================================================
+
+/// Serve one plaintext byte range for an OPEN video session over the real server:
+/// (A) plan the covering fragment span + which ciphertext chunks are missing, under
+/// the jobs lock; (B) prefetch the missing ciphertext under the JOB's persistent
+/// `AuthedChannel` lock (no global jobs lock held, no per-range reauth); (C) assemble
+/// + slice under the jobs lock. Fail-closed. The content key never leaves this process;
+/// only the sliced plaintext is returned. `first`/`last_inclusive` are the parsed
+/// HTTP byte-range bounds. Returns `channel_dead` on a transport error so the caller
+/// can reconnect once and retry.
+///
+/// Public: the stream:// protocol core (carries no secret across the seam — only sliced
+/// plaintext the protocol already exposes).
+pub async fn serve_range(
+    jobs: &VideoJobs,
+    file_id_hex: &str,
+    first: u64,
+    last_inclusive: Option<u64>,
+) -> Result<RangeResponse, UiError> {
+    use crate::stream::{assemble_range, plan_range, resolve_range};
+
+    // Phase A — resolve the request + plan the fragment span + fetch list, under the lock.
+    // Also clone the channel Arc (a cheap ref-count bump) before dropping the guard.
+    let (req, plan, total_len, version, fetch_indices, channel) = {
+        let mut guard = jobs.0.lock().await;
+        let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
+        let req = resolve_range(first, last_inclusive, job.total_len, MAX_RANGE_BODY)
+            .ok_or_else(|| UiError::new("range_not_satisfiable", "range"))?;
+        let plan = plan_range(&job.index, job.chunk_size, &req)?;
+        let mut fetch_indices: Vec<u64> = Vec::new();
+        for seq in plan.f0..=plan.f1 {
+            let (cs, cl) = chunks_for_fragment(&job.index, seq).ok_or_else(player_err)?;
+            if !cached_fragment_valid(&mut job.cache, &job.file_id_hex, seq, cl) {
+                let end = cs.checked_add(cl).ok_or_else(player_err)?;
+                fetch_indices.extend(cs..end);
+            }
+        }
+        let channel = job.channel.clone().ok_or_else(player_err)?;
+        (req, plan, job.total_len, job.version, fetch_indices, channel)
     };
-    // Confined decode OFF the runtime + re-validate every worker output + emit DTOs.
-    let decoder = make_decoder(&dir.0);
-    decode_and_emit(script, decoder, emit, on_frame, on_audio).await
+
+    // Phase B — prefetch missing ciphertext under the channel lock (no global jobs lock
+    // held). Overlapping range requests serialize here over the single HTTP/1.1 connection
+    // instead of contending the ConnectLock with concurrent reauths.
+    let mut prefetched: HashMap<u64, Vec<u8>> = HashMap::new();
+    {
+        let mut ch = channel.lock().await;
+        let AuthedChannel { sender, host, token } = &mut *ch;
+        for i in fetch_indices {
+            let uri = format!(
+                "/v1/files/{file_id_hex}/versions/{version}/streams/content/chunks/{i}"
+            );
+            match get_bytes(sender, &uri, Some(token.as_str()), host.as_str()).await {
+                Ok((status, bytes)) if status == hyper::StatusCode::OK => {
+                    prefetched.insert(i, bytes);
+                }
+                Ok(_) => return Err(player_err()),    // server refused → not a dead channel
+                Err(_) => return Err(channel_dead()), // transport error → reconnectable
+            }
+        }
+    }
+
+    // Phase C — assemble + slice under the lock (sync decrypt in the TCB).
+    let body = {
+        let mut guard = jobs.0.lock().await;
+        let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
+        // Split borrows: index/decryptor are read-only, cache is &mut.
+        let VideoJob { index, cache, decryptor, file_id_hex: fid, .. } = &mut *job;
+        assemble_range(index, cache, decryptor, fid, &plan, &req, |i| {
+            prefetched.remove(&i).ok_or_else(player_err)
+        })?
+    };
+
+    Ok(RangeResponse { start: req.start, len: req.len, total_len, body })
+}
+
+/// The `stream://media/<file_id_hex>` protocol entry point. Resolves the open
+/// session, mints a fresh authed channel (Phase-3 reauth), serves the requested
+/// byte range, and builds a `206 Partial Content` response. Errors map to 416
+/// (unsatisfiable range) or 500 (everything else) with an empty body — no oracle.
+pub async fn stream_media(
+    app: &tauri::AppHandle,
+    path: &str,
+    range_header: Option<&str>,
+) -> http::Response<Vec<u8>> {
+    // TEMP DIAGNOSTIC (remove after the stream:// host-form is pinned): log the
+    // request path + range + outcome status to <appdir>/logs/stream.log. Non-secret
+    // metadata only (no plaintext). Confirms whether WebView2 reaches the handler.
+    stream_log(app, &format!("REQ path={path:?} range={range_header:?}"));
+    match stream_media_inner(app, path, range_header).await {
+        Ok(r) => {
+            stream_log(
+                app,
+                &format!("OK 206 start={} len={} total={}", r.start, r.len, r.total_len),
+            );
+            http::Response::builder()
+                .status(206)
+                .header(http::header::CONTENT_TYPE, "video/mp4")
+                .header(http::header::ACCEPT_RANGES, "bytes")
+                .header(
+                    http::header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", r.start, r.start + r.len - 1, r.total_len),
+                )
+                .header(http::header::CONTENT_LENGTH, r.len.to_string())
+                .body(r.body)
+                .unwrap_or_else(|_| http::Response::builder().status(500).body(Vec::new()).unwrap())
+        }
+        Err(code) => {
+            let status = if code == 416 { 416 } else { 500 };
+            stream_log(app, &format!("ERR status={status}"));
+            http::Response::builder().status(status).body(Vec::new()).unwrap()
+        }
+    }
+}
+
+/// TEMP DIAGNOSTIC command: let the UI append a line to `<appdir>/logs/stream.log`
+/// (so we can see, without devtools, whether the native player mounted, whether
+/// open_video succeeded, the exact `src` URL, video error codes, and CSP
+/// violations). Non-secret metadata only. Remove once the path is verified.
+#[tauri::command]
+pub async fn stream_debug_log(msg: String, app: tauri::AppHandle) {
+    stream_log(&app, &format!("UI {msg}"));
+}
+
+/// TEMP DIAGNOSTIC: append one line to `<appdir>/logs/stream.log`. Best-effort;
+/// non-secret metadata only. Remove once the stream:// path is verified in the GUI.
+fn stream_log(app: &tauri::AppHandle, msg: &str) {
+    use tauri::Manager;
+    if let Some(dir) = app.try_state::<AppDir>() {
+        let logs = dir.0.join("logs");
+        let _ = std::fs::create_dir_all(&logs);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(logs.join("stream.log"))
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
+
+/// Serve one bounded byte range from the on-disk staged fMP4 (`out.mp4` in the
+/// per-job temp dir). Bounded — never reads the whole file; caps the response to
+/// [`MAX_RANGE_BODY`]. Returns `None` (⇒ 416) for an unsatisfiable range or any
+/// I/O error (fail-closed). Pure — no lock, no network, no decrypt.
+fn preview_slice_file(path: &std::path::Path, first: u64, last_inclusive: Option<u64>) -> Option<RangeResponse> {
+    use std::io::{Read, Seek, SeekFrom};
+    let total = std::fs::metadata(path).ok()?.len();
+    let req = crate::stream::resolve_range(first, last_inclusive, total, MAX_RANGE_BODY)?;
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(req.start)).ok()?;
+    let mut body = vec![0u8; req.len as usize];
+    file.read_exact(&mut body).ok()?;
+    Some(RangeResponse { start: req.start, len: req.len, total_len: total, body })
+}
+
+/// Serve one byte range of an author PREVIEW's staged fMP4 — plaintext the author
+/// already owns, read by range from disk; NO decrypt, NO auth, NO network.
+/// Unknown job / no preview ⇒ not_found; unsatisfiable range ⇒ range_not_satisfiable.
+async fn serve_preview_range(jobs: &UploadJobs, job_id: &str, first: u64, last_inclusive: Option<u64>) -> Result<RangeResponse, UiError> {
+    let guard = jobs.0.lock().await;
+    let job = guard.get(job_id).ok_or_else(|| UiError::new("not_found", "unknown preview"))?;
+    let preview = job.preview.as_ref().ok_or_else(|| UiError::new("not_found", "no preview"))?;
+    preview_slice_file(&preview.out_mp4_path, first, last_inclusive).ok_or_else(|| UiError::new("range_not_satisfiable", "range"))
+}
+
+/// Inner: resolve the namespace and id from the path, dispatch to the media (view)
+/// or preview (author staged fMP4) handler, parse the Range header, and serve.
+/// Returns an HTTP status code (`u16`) on error.
+async fn stream_media_inner(
+    app: &tauri::AppHandle,
+    path: &str,
+    range_header: Option<&str>,
+) -> Result<RangeResponse, u16> {
+    use tauri::Manager;
+    // Parse `/<ns>/<id>` from the path. The host is `stream.localhost`; the FIRST
+    // non-empty segment is the namespace (`media` or `preview`), the SECOND is the id.
+    // Anything else (missing segment, extra segments, bare path) 404s.
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (ns, id) = match segs.as_slice() { [ns, id] => (*ns, *id), _ => return Err(404u16) };
+
+    match ns {
+        "media" => {
+            // Validate the file id — must be 16 raw hex bytes (32 hex chars).
+            let file_id_hex = id.to_string();
+            let _ = hex16(&file_id_hex).map_err(|_| 404u16)?;
+
+            let dir = app.state::<AppDir>();
+            let session = app.state::<Session>();
+            let connect_lock = app.state::<ConnectLock>();
+            let jobs = app.state::<VideoJobs>();
+
+            // The session must already be open (open_video registered it).
+            {
+                let guard = jobs.0.lock().await;
+                if !guard.contains_key(&file_id_hex) {
+                    return Err(404);
+                }
+            }
+
+            // Parse "bytes=first-[last]" (default first=0 when absent).
+            let (first, last_inclusive) = parse_byte_range(range_header);
+
+            // First attempt over the session's persistent authed channel (no reauth
+            // needed for normal operation — overlapping requests serialize via the
+            // channel Mutex).
+            match serve_range(&jobs, &file_id_hex, first, last_inclusive).await {
+                Ok(r) => Ok(r),
+                Err(e) if e.code == "channel_dead" => {
+                    // The persistent connection dropped. Reconnect ONCE (needs app
+                    // state), replace the job's channel in-place, and retry the range.
+                    let server = server_of(&dir.0).map_err(|_| 500u16)?;
+                    let (sender, host, token) =
+                        reauth(&dir.0, &server, &session, &connect_lock).await.map_err(|_| 500u16)?;
+                    let chan = {
+                        let g = jobs.0.lock().await;
+                        g.get(&file_id_hex).and_then(|j| j.channel.clone())
+                    }
+                    .ok_or(404u16)?;
+                    {
+                        let mut c = chan.lock().await;
+                        *c = AuthedChannel { sender, host, token };
+                    }
+                    serve_range(&jobs, &file_id_hex, first, last_inclusive)
+                        .await
+                        .map_err(|e| if e.code == "range_not_satisfiable" { 416 } else { 500 })
+                }
+                Err(e) => Err(if e.code == "range_not_satisfiable" { 416 } else { 500 }),
+            }
+        }
+        "preview" => {
+            // Serve the author's staged plaintext fMP4 by range. No hex16 validation —
+            // a job_id is an opaque string, not a file hex16. No decrypt, no auth, no
+            // network — the author already owns this plaintext.
+            let upload_jobs = app.state::<UploadJobs>();
+            let (first, last_inclusive) = parse_byte_range(range_header);
+            serve_preview_range(&upload_jobs, id, first, last_inclusive).await
+                .map_err(|e| match e.code.as_str() {
+                    "not_found" => 404u16,
+                    "range_not_satisfiable" => 416,
+                    _ => 500,
+                })
+        }
+        _ => Err(404u16),
+    }
+}
+
+/// Parse an HTTP `Range: bytes=first-[last]` value into `(first, last_inclusive)`.
+/// A missing/garbled header defaults to `(0, None)` (whole resource from the start,
+/// capped by `MAX_RANGE_BODY` in `resolve_range`). Only a single range is honored.
+fn parse_byte_range(h: Option<&str>) -> (u64, Option<u64>) {
+    let Some(h) = h else { return (0, None) };
+    let Some(spec) = h.trim().strip_prefix("bytes=") else { return (0, None) };
+    let spec = spec.split(',').next().unwrap_or("").trim();
+    let mut parts = spec.splitn(2, '-');
+    let first = parts.next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+    let last = parts
+        .next()
+        .and_then(|s| { let s = s.trim(); if s.is_empty() { None } else { s.parse::<u64>().ok() } });
+    (first, last)
 }
 
 #[cfg(test)]
@@ -993,7 +1553,9 @@ mod tests {
         }
     }
 
-    /// Fake decoder that emits one PCM chunk per fragment.
+    /// Fake decoder that emits one PCM chunk per fragment, each closed with its
+    /// `EndOfFragment` (the real worker's contract — the per-fragment delimiter the
+    /// window-offset flush keys on).
     struct AudioDecoder;
     impl VideoSessionDecoder for AudioDecoder {
         fn run_session(&self, script: &[ClientMsg]) -> Result<Vec<WorkerMsg>, SessionError> {
@@ -1006,6 +1568,31 @@ mod tests {
                         pts_ms: *seq as u64,
                         samples: vec![1, -1, 2, -2],
                     }));
+                    out.push(WorkerMsg::EndOfFragment { seq: *seq });
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    /// Fake decoder that emits SEVERAL frames per fragment with REAL fragment-relative
+    /// pts (0, 41, 83, … ms — every fragment restarts at 0, like the real worker),
+    /// each fragment closed with its `EndOfFragment{seq}`. Used to prove Part C offsets
+    /// fragment-relative pts into the SINGLE window timeline (monotonic across fragment
+    /// boundaries, fragment k starting at its window-relative index pts).
+    struct RealPtsDecoder {
+        frames_per_fragment: u32,
+        step_ms: u64,
+    }
+    impl VideoSessionDecoder for RealPtsDecoder {
+        fn run_session(&self, script: &[ClientMsg]) -> Result<Vec<WorkerMsg>, SessionError> {
+            let mut out = vec![WorkerMsg::Ready];
+            for m in script {
+                if let ClientMsg::Fragment { seq, .. } = m {
+                    for k in 0..self.frames_per_fragment {
+                        out.push(WorkerMsg::Video(ok_frame(k as u64 * self.step_ms)));
+                    }
+                    out.push(WorkerMsg::EndOfFragment { seq: *seq });
                 }
             }
             Ok(out)
@@ -1119,7 +1706,10 @@ mod tests {
             cache,
             file_id_hex: file_id_hex(),
             version,
+            chunk_size: 4096,
+            total_len: 0,
             gain: 1.0,
+            channel: None, // unit tests never serve ranges
         };
         (job, chunks)
     }
@@ -1173,6 +1763,7 @@ mod tests {
         let emit = |p| phases.borrow_mut().push(p);
 
         // Decrypt the window IN THE TCB (emits Buffering), then decode off-thread.
+        let frag_index = job.index.clone();
         let script = decrypt_window(
             &mut job,
             0,
@@ -1187,6 +1778,8 @@ mod tests {
         decode_and_emit(
             script,
             FrameDecoder,
+            frag_index,
+            0,
             &emit,
             &|f| frames.borrow_mut().push(f),
             &|a| audios.borrow_mut().push(a),
@@ -1219,6 +1812,7 @@ mod tests {
     async fn play_window_rejects_malformed_worker_frame() {
         let (mut job, chunks) = build_job("malformed");
         let frames: RefCell<Vec<I420FrameDto>> = RefCell::new(Vec::new());
+        let frag_index = job.index.clone();
         let script = decrypt_window(
             &mut job,
             0,
@@ -1230,6 +1824,8 @@ mod tests {
         let err = decode_and_emit(
             script,
             MalformedDecoder,
+            frag_index,
+            0,
             &|_p| {},
             &|f| frames.borrow_mut().push(f),
             &|_a| {},
@@ -1246,6 +1842,7 @@ mod tests {
     #[tokio::test]
     async fn play_window_fails_closed_on_worker_error() {
         let (mut job, chunks) = build_job("workererr");
+        let frag_index = job.index.clone();
         let script = decrypt_window(
             &mut job,
             0,
@@ -1254,7 +1851,7 @@ mod tests {
             &|_p| {},
         )
         .expect("decrypts");
-        let err = decode_and_emit(script, ErrorDecoder, &|_p| {}, &|_f| {}, &|_a| {})
+        let err = decode_and_emit(script, ErrorDecoder, frag_index, 0, &|_p| {}, &|_f| {}, &|_a| {})
             .await
             .unwrap_err();
         assert_eq!(err.code, "video_failed");
@@ -1264,6 +1861,7 @@ mod tests {
     async fn play_window_emits_revalidated_audio() {
         let (mut job, chunks) = build_job("audio");
         let audios: RefCell<Vec<PcmDto>> = RefCell::new(Vec::new());
+        let frag_index = job.index.clone();
         let script = decrypt_window(
             &mut job,
             0,
@@ -1272,7 +1870,7 @@ mod tests {
             &|_p| {},
         )
         .expect("decrypts");
-        decode_and_emit(script, AudioDecoder, &|_p| {}, &|_f| {}, &|a| {
+        decode_and_emit(script, AudioDecoder, frag_index, 0, &|_p| {}, &|_f| {}, &|a| {
             audios.borrow_mut().push(a)
         })
         .await
@@ -1284,6 +1882,204 @@ mod tests {
             want.extend_from_slice(&s.to_le_bytes());
         }
         assert_eq!(audios.borrow()[0].samples_b64, B64.encode(&want));
+    }
+
+    /// Part C (A/V sync): the worker emits FRAGMENT-relative pts (each fragment
+    /// restarts at 0); `decode_and_emit` must offset them into a SINGLE window-relative
+    /// timeline that stays monotonic ACROSS fragment boundaries — fragment k's first
+    /// frame lands at `index[k].pts_ms - window_start_pts`, not back at ~0. Audio is
+    /// offset by the same per-fragment base.
+    #[tokio::test]
+    async fn emitted_pts_are_window_relative_and_monotonic_across_fragments() {
+        let (mut job, chunks) = build_job("offset");
+        // The job index is two fragments at window pts 0 and 1000 ms.
+        assert_eq!(job.index[0].pts_ms, 0);
+        assert_eq!(job.index[1].pts_ms, 1000);
+        let frag_index = job.index.clone();
+        let frames: RefCell<Vec<I420FrameDto>> = RefCell::new(Vec::new());
+
+        let script = decrypt_window(
+            &mut job,
+            0,
+            PLAY_WINDOW,
+            |i| Ok(chunks[i as usize].clone()),
+            &|_p| {},
+        )
+        .expect("decrypts");
+        decode_and_emit(
+            script,
+            RealPtsDecoder {
+                frames_per_fragment: 3,
+                step_ms: 41,
+            },
+            frag_index,
+            0, // window_start_pts = first fragment's pts
+            &|_p| {},
+            &|f| frames.borrow_mut().push(f),
+            &|_a| {},
+        )
+        .await
+        .expect("decodes");
+
+        let pts: Vec<u64> = frames.borrow().iter().map(|f| f.pts_ms).collect();
+        // Fragment 0 (base 0): 0,41,82 ; Fragment 1 (base 1000): 1000,1041,1082.
+        assert_eq!(pts, vec![0, 41, 82, 1000, 1041, 1082]);
+        // Monotonic non-decreasing across the fragment boundary (NOT reset to ~0).
+        for w in pts.windows(2) {
+            assert!(w[1] >= w[0], "window-relative pts monotonic across fragments");
+        }
+        // Fragment 1's first frame ≈ index[1].pts - index[0].pts (the window offset).
+        assert_eq!(
+            pts[3], 1000,
+            "fragment 1 starts at its window-relative index offset, not back at 0"
+        );
+    }
+
+    /// A valid I420 frame of arbitrary even-ish dims (chroma = ceil/2), used to
+    /// exercise the in-flight byte bound with realistically-large decoded frames.
+    fn big_frame(w: u32, h: u32, pts_ms: u64) -> I420Frame {
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        I420Frame {
+            width: w,
+            height: h,
+            pts_ms,
+            y: vec![0u8; (w * h) as usize],
+            u: vec![0u8; (cw * ch) as usize],
+            v: vec![0u8; (cw * ch) as usize],
+        }
+    }
+
+    /// Fake decoder that emits MANY large frames inside ONE fragment (fragment-relative
+    /// pts k*step), then its `EndOfFragment` — the D-7 extreme-source shape (a high-res /
+    /// high-frame-count GOP) the in-flight bound must contain.
+    struct BurstDecoder {
+        count: u32,
+        w: u32,
+        h: u32,
+        step_ms: u64,
+    }
+    impl VideoSessionDecoder for BurstDecoder {
+        fn run_session(&self, _script: &[ClientMsg]) -> Result<Vec<WorkerMsg>, SessionError> {
+            let mut out = vec![WorkerMsg::Ready];
+            for k in 0..self.count {
+                out.push(WorkerMsg::Video(big_frame(self.w, self.h, k as u64 * self.step_ms)));
+            }
+            out.push(WorkerMsg::EndOfFragment { seq: 0 });
+            Ok(out)
+        }
+    }
+
+    /// D-7 (6.2): `push_bounded` drops the OLDEST buffered frames once the budget is
+    /// exceeded, keeps at least the newest, returns the drop count, and never lets the
+    /// buffer grow past `budget + one frame` — the bound is enforced ON EACH PUSH.
+    #[test]
+    fn push_bounded_caps_the_buffer_and_drops_oldest() {
+        // Tiny frames (1 byte/plane region) so the test is allocation-light: each 2x2
+        // frame is 4 + 1 + 1 = 6 bytes. Budget = 18 bytes ⇒ holds 3 frames.
+        let budget = 18usize;
+        let mut buf: Vec<I420Frame> = Vec::new();
+        let mut bytes = 0usize;
+        let mut dropped = 0u32;
+        for pts in 0..6u64 {
+            dropped += push_bounded(&mut buf, &mut bytes, ok_frame(pts), budget);
+            // The invariant: bytes never exceeds budget once more than one frame is held.
+            assert!(bytes <= budget || buf.len() == 1, "bounded on each push");
+        }
+        // 6 pushed, 3 retained, 3 dropped; the survivors are the NEWEST (pts 3,4,5).
+        assert_eq!(buf.len(), 3);
+        assert_eq!(dropped, 3);
+        assert_eq!(
+            buf.iter().map(|f| f.pts_ms).collect::<Vec<_>>(),
+            vec![3, 4, 5],
+            "oldest dropped, newest survive"
+        );
+        assert_eq!(bytes, 18, "byte accounting tracks the retained frames");
+    }
+
+    /// A single frame never gets dropped even if it alone exceeds the budget — there is
+    /// always at least one frame to render (fail-safe, not a stall).
+    #[test]
+    fn push_bounded_keeps_at_least_one_frame() {
+        let mut buf: Vec<I420Frame> = Vec::new();
+        let mut bytes = 0usize;
+        let dropped = push_bounded(&mut buf, &mut bytes, ok_frame(7), 1);
+        assert_eq!(dropped, 0);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0].pts_ms, 7);
+    }
+
+    /// D-7 (6.2) end-to-end through `decode_and_emit`: an extreme GOP whose decoded
+    /// frames exceed `MAX_FRAME_BUF_BYTES` is BOUNDED in the key-holding process — the
+    /// excess is dropped, a benign count-only `Gap{skipped}` is surfaced, and the
+    /// surviving frames still flow with correct window-relative pts. No OOM, no oracle.
+    #[tokio::test]
+    async fn decode_and_emit_bounds_inflight_frames_and_surfaces_gap() {
+        // 1280x720 I420 frame = 921600 + 230400 + 230400 = 1,382,400 bytes. The 64 MiB
+        // budget holds exactly 48 such frames (48 fit, 49 do not), so a 60-frame GOP
+        // drops 12 and emits 48.
+        let fb = 1280usize * 720 + 2 * (640 * 360);
+        let budget_frames = MAX_FRAME_BUF_BYTES / fb; // 48
+        let count = (budget_frames + 12) as u32; // 60
+        let frag_index = vec![FragmentEntry {
+            seq: 0,
+            pts_ms: 0,
+            chunk_start: 0,
+            chunk_len: 1,
+        }];
+        let script = ScriptGuard(vec![
+            ClientMsg::Open {
+                bounds: VideoBounds::default(),
+            },
+            ClientMsg::Fragment {
+                seq: 0,
+                bytes: Vec::new(),
+            },
+            ClientMsg::Close,
+        ]);
+        let phases: RefCell<Vec<PlayerPhase>> = RefCell::new(Vec::new());
+        let frames: RefCell<Vec<I420FrameDto>> = RefCell::new(Vec::new());
+        decode_and_emit(
+            script,
+            BurstDecoder {
+                count,
+                w: 1280,
+                h: 720,
+                step_ms: 33,
+            },
+            frag_index,
+            0,
+            &|p| phases.borrow_mut().push(p),
+            &|f| frames.borrow_mut().push(f),
+            &|_a| {},
+        )
+        .await
+        .expect("decodes within the bound");
+
+        let emitted = frames.borrow().len();
+        let dropped = count as usize - emitted;
+        assert_eq!(emitted, budget_frames, "in-flight buffer bounded to the budget");
+        assert_eq!(dropped, 12, "the excess frames were dropped, not held");
+        // A benign count-only Gap carries exactly the drop count (no oracle/detail).
+        assert!(
+            phases.borrow().contains(&PlayerPhase::Gap {
+                skipped: dropped as u32,
+            }),
+            "Gap{{skipped}} surfaced with the drop count"
+        );
+        assert_eq!(
+            phases.borrow().last(),
+            Some(&PlayerPhase::Playing),
+            "Playing still emitted last"
+        );
+        // The SURVIVING frames are the newest of the GOP and keep window-relative,
+        // monotonic pts (= base 0 + their own fragment-relative pts). The first survivor
+        // is frame index 12 (pts 12*33), proving the OLDEST were the ones dropped.
+        let pts: Vec<u64> = frames.borrow().iter().map(|f| f.pts_ms).collect();
+        assert_eq!(pts[0], 12 * 33, "oldest frames dropped; newest survive");
+        for w in pts.windows(2) {
+            assert!(w[1] >= w[0], "surviving pts monotonic");
+        }
     }
 
     /// M1: a `feed_fragment` error mid-window still returns through the
@@ -1317,6 +2113,8 @@ mod tests {
         assert_eq!(start1, 1, "pts 1000 maps to fragment 1");
         let fetch1 = Cell::new(0u32);
         let frames1: RefCell<Vec<I420FrameDto>> = RefCell::new(Vec::new());
+        let frag_index = job.index.clone();
+        let window_start1 = job.index[start1 as usize].pts_ms;
         let script1 = decrypt_window(
             &mut job,
             start1,
@@ -1331,6 +2129,8 @@ mod tests {
         decode_and_emit(
             script1,
             FrameDecoder,
+            frag_index.clone(),
+            window_start1,
             &|_p| {},
             &|f| frames1.borrow_mut().push(f),
             &|_a| {},
@@ -1354,6 +2154,8 @@ mod tests {
         decode_and_emit(
             script2,
             FrameDecoder,
+            frag_index,
+            window_start1,
             &|_p| {},
             &|f| frames2.borrow_mut().push(f),
             &|_a| {},
@@ -1469,7 +2271,7 @@ mod tests {
                 chunk_len: 2,
             },
         ];
-        let script = build_preview_script(&cmaf, &index).expect("script");
+        let script = build_preview_window_script(&cmaf, &index, 0, index.len() as u32).expect("script");
         // Open, two Fragments, Close.
         assert!(matches!(script.0[0], ClientMsg::Open { .. }));
         assert!(matches!(script.0[3], ClientMsg::Close));
@@ -1504,13 +2306,13 @@ mod tests {
         }];
         // `ScriptGuard` is intentionally not `Debug` (it holds plaintext), so the
         // `Ok` arm can't go through `unwrap_err`; match the error directly.
-        let err = match build_preview_script(&cmaf, &index) {
+        let err = match build_preview_window_script(&cmaf, &index, 0, index.len() as u32) {
             Ok(_) => panic!("an out-of-range index must fail closed"),
             Err(e) => e,
         };
         assert_eq!(err.code, "video_failed");
         // Empty index also fails closed.
-        let err = match build_preview_script(&cmaf, &[]) {
+        let err = match build_preview_window_script(&cmaf, &[], 0, 0) {
             Ok(_) => panic!("an empty index must fail closed"),
             Err(e) => e,
         };
@@ -1536,7 +2338,7 @@ mod tests {
                 chunk_len: 3,
             },
         ];
-        let script = build_preview_script(&cmaf, &index).expect("script");
+        let script = build_preview_window_script(&cmaf, &index, 0, index.len() as u32).expect("script");
         let phases: RefCell<Vec<PlayerPhase>> = RefCell::new(Vec::new());
         let frames: RefCell<Vec<I420FrameDto>> = RefCell::new(Vec::new());
         // The FrameDecoder fake emits one validated frame per Fragment — exactly the
@@ -1544,6 +2346,8 @@ mod tests {
         decode_and_emit(
             script,
             FrameDecoder,
+            index.clone(),
+            0,
             &|p| phases.borrow_mut().push(p),
             &|f| frames.borrow_mut().push(f),
             &|_a| {},
@@ -1573,5 +2377,78 @@ mod tests {
         want.extend_from_slice(&0x0102i16.to_le_bytes());
         want.extend_from_slice(&(-1i16).to_le_bytes());
         assert_eq!(pcm.samples_b64, B64.encode(&want));
+    }
+
+    #[test]
+    fn parse_byte_range_forms() {
+        assert_eq!(super::parse_byte_range(None), (0, None));
+        assert_eq!(super::parse_byte_range(Some("bytes=0-")), (0, None));
+        assert_eq!(super::parse_byte_range(Some("bytes=100-199")), (100, Some(199)));
+        assert_eq!(super::parse_byte_range(Some("bytes=500-")), (500, None));
+        assert_eq!(super::parse_byte_range(Some("garbage")), (0, None));
+        assert_eq!(super::parse_byte_range(Some("bytes=0-99,200-299")), (0, Some(99)));
+    }
+
+    /// `preview_slice_file` reads exactly the requested bounded range from disk, caps
+    /// open-ended requests at `MAX_RANGE_BODY`, and returns `None` for an unsatisfiable
+    /// range (`first == total_len`). Exercises the seek+read_exact path without a whole-
+    /// file read.
+    #[test]
+    fn preview_slice_file_reads_bounded_range() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "mxs-pvf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.mp4");
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        {
+            let mut f = std::fs::File::create(&path).expect("create test file");
+            f.write_all(&data).expect("write test data");
+        }
+
+        // Bounded range [100, 199] inclusive → exactly 100 bytes at the right offset.
+        let r = preview_slice_file(&path, 100, Some(199))
+            .expect("bounded range should be satisfiable");
+        assert_eq!(r.start, 100);
+        assert_eq!(r.len, 100);
+        assert_eq!(r.total_len, 5000);
+        assert_eq!(r.body, data[100..200].to_vec(), "body must match file bytes [100,200)");
+
+        // Open-ended [0, ): 5000 < MAX_RANGE_BODY → entire file returned.
+        let r2 = preview_slice_file(&path, 0, None)
+            .expect("open-ended range should be satisfiable");
+        assert_eq!(r2.len, 5000);
+        assert_eq!(r2.total_len, 5000);
+        assert_eq!(r2.body, data, "open-ended body must equal entire file");
+
+        // Unsatisfiable: first == total_len → None (⇒ 416).
+        assert!(
+            preview_slice_file(&path, 5000, None).is_none(),
+            "first == total_len must be unsatisfiable (None/416)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_window_slice_covers_only_the_requested_fragments() {
+        // A 5-fragment index over a cmaf tiled in VIDEO_CHUNK_SIZE units.
+        let cs = crate::upload::VIDEO_CHUNK_SIZE as usize;
+        let index: Vec<FragmentEntry> = (0..5)
+            .map(|k| FragmentEntry { seq: k, pts_ms: k as u64 * 1000, chunk_start: k as u64, chunk_len: 1 })
+            .collect();
+        let cmaf = vec![7u8; 5 * cs];
+        // Window [1,3) -> fragments seq 1,2 -> Open + 2 Fragments + Close.
+        let guard = build_preview_window_script(&cmaf, &index, 1, 2).expect("script");
+        let frags: Vec<u32> = guard.0.iter().filter_map(|m| {
+            if let ClientMsg::Fragment { seq, .. } = m { Some(*seq) } else { None }
+        }).collect();
+        assert_eq!(frags, vec![1, 2], "only the requested window's fragments");
     }
 }

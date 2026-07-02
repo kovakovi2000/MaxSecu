@@ -94,7 +94,7 @@ ui/
         ├── upload-screen.ts    # compose + preview + confirm an upload
         ├── upload-tray.ts      # persistent active-uploads tray (progress/retry)
         ├── settings-screen.ts  # full settings (appearance, a11y, account, RAM)
-        ├── quick-settings.ts   # ⚡ popover: Theme + RAM only
+        ├── ram-gauge.ts        # header RAM-usage rainbow meter
         ├── toast-host.ts       # renders toasts (assertive/polite live regions)
         ├── skeleton-card.ts    # shimmer placeholder while loading
         ├── state-badge.ts      # non-color-only status chip
@@ -138,6 +138,7 @@ All field names are **snake_case**; all enum string values are **kebab-case**.
 | `decrypt_card` | `{ req: { file_id, version? } }` | `Card` | media-card |
 | `open_content` | `{ req: { file_id, version? } }` | `OpenedContent` | media-viewer |
 | `search_local` | `{ req: { query } }` | `SearchHit[]` | feed-screen |
+| `pick_file` | `{ extensions: string[] }` | `string \| null` (chosen path, or null if cancelled) | upload-screen (image **and** video file picks) |
 | `register_glassbreak` | `{ req: { bootstrap_secret, save_path? } }` | `GlassbreakResponse` | bootstrap-screen |
 | `create_first_admin` | `{ req: { username, password, bootstrap_secret } }` | `string` (user_id) | bootstrap-screen |
 | `register_user` | `{ req: { username, password, voucher } }` | `string` (user_id) | (enrollment) |
@@ -160,8 +161,24 @@ All field names are **snake_case**; all enum string values are **kebab-case**.
 | `cancel_video` | `{ file_id }` | `void` | video-player |
 | `preview_video` | `{ job_id }` | `void` (streams via events) | upload-screen |
 
-`StageUploadRequest = { kind: "image"|"blog"|"video", path?, content?, source_b64?, title, tags? }`
-(image → `path`; blog → `content`; video → `path` or `source_b64`).
+`StageUploadRequest = { kind: "image"|"blog"|"video", path?, content?, options?, title, tags? }`
+(image → `path`; blog → `content`; video → `path` (a REAL video file path) +
+`options: TranscodeOptions`). The video path is picked via `pick_file` with video
+extensions (`mp4 mov mkv webm avi m4v mpg mpeg wmv flv ts`) — only the PATH crosses
+the seam; the confined ffmpeg ingest reads the bytes. (The old MXRAWV01 raw-frame
+`source_b64` video path is GONE.)
+
+`TranscodeOptions = { resolution: Resolution, bitrate: Bitrate }` — built by the
+upload screen's resolution/bitrate menu (`core/transcode-opts.ts`). Its JSON shape
+mirrors the Rust `media-launcher::TranscodeOptions` enum byte-for-byte (externally
+tagged: a unit variant is the bare string; a single-field variant is `{ Variant: value }`):
+
+- `Resolution`: `"Original"` (keep source) · `{ "Height": n }` (height presets 2160/1440/1080/720/480) · `{ "Custom": { "width": W, "height": H } }`.
+- `Bitrate`: `"Original"` (keep source) · `{ "Kbps": n }`.
+
+The menu auto-suggests a starting kbps from the target resolution's nominal dims at
+30 fps when you pick a non-Original resolution (you can edit it); the Rust side always
+re-clamps against the authoritative `VideoBounds`.
 
 ### 3.2 Events (backend → UI, via `on(name, cb)`)
 

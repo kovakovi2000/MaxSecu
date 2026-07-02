@@ -9,6 +9,11 @@ OUT="$ROOT/dist"
 echo "==> Building release binaries"
 cargo build --release -p maxsecu-portable-server
 cargo build --release -p maxsecu-client-app
+# The confined VIDEO worker binaries the client spawns BESIDE its own exe (the
+# decode media-worker + the author-side re-mux media-transcode-worker). Without
+# them staged, image posts work but every VIDEO upload fails ("could not be processed").
+cargo build --release -p maxsecu-media-worker
+cargo build --release -p maxsecu-media-transcode-worker
 
 echo "==> Laying out the portable SERVER folder ($OUT/MaxSecuServer)"
 mkdir -p "$OUT/MaxSecuServer"/{config,logs}
@@ -20,6 +25,13 @@ echo "==> Laying out the portable CLIENT folder ($OUT/MaxSecuClient)"
 mkdir -p "$OUT/MaxSecuClient"/{config,keystore,index,cache,logs}
 cp "$ROOT/target/release/maxsecu-client-app"* "$OUT/MaxSecuClient/" 2>/dev/null || \
   cp "$ROOT/target/release/maxsecu-client-app" "$OUT/MaxSecuClient/"
+# The confined video worker binaries MUST sit BESIDE the client exe (the client
+# resolves them relative to its own AppDir). ffmpeg is embedded in the client and
+# materialized at runtime, so it needs no staging here.
+for w in media-worker media-transcode-worker; do
+  cp "$ROOT/target/release/$w"* "$OUT/MaxSecuClient/" 2>/dev/null || \
+    cp "$ROOT/target/release/$w" "$OUT/MaxSecuClient/"
+done
 # Embedded UI assets (the WebView loads these).
 if [ -d "$ROOT/crates/client-app/ui/dist" ]; then
   mkdir -p "$OUT/MaxSecuClient/ui"; cp -r "$ROOT/crates/client-app/ui/dist/." "$OUT/MaxSecuClient/ui/"

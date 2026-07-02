@@ -1,4 +1,6 @@
+import "media-chrome";
 import { call, on } from "../core/rpc.ts";
+import { streamSrc, previewSrc } from "./video-src.ts";
 import { serial } from "../core/serial.ts";
 import {
   createYuvRenderer,
@@ -15,6 +17,7 @@ import {
   type I420FrameDto,
   type AudioContextLike,
 } from "../core/player.ts";
+import type { VideoInfo } from "../core/types.ts";
 
 // Sandboxed-video CHROME (Gate 5.3). Pure UI, OUTSIDE the TCB.
 //
@@ -69,11 +72,17 @@ export class VideoPlayer extends HTMLElement {
   // on. Kept so the preference + its warning have a home for a future HW path.
   private hwWaiver = false;
   private lastVol = 1; // volume to restore from mute
+  private uninfo: (() => void) | null = null;
+  private durationMs = 0;
 
   // PREVIEW MODE (Gate 6): when set, the player drives the local preview_video
   // path (decode of the author's STAGED canonical content — no server fetch, no
   // decrypt) instead of open_video. Set by the upload screen's preview surface.
   private _previewJob = "";
+
+  // True when the native <video> + Media Chrome path is active (view path only;
+  // the author-preview path keeps the confined-decode canvas engine).
+  private native = false;
 
   // file-id may be supplied as a property (media-viewer sets it) or attribute.
   set fileId(v: string) {
@@ -94,6 +103,12 @@ export class VideoPlayer extends HTMLElement {
   }
 
   connectedCallback() {
+    // Both the view and the author preview now use the native <video> + Media Chrome
+    // path. The confined-decode engine below is retained only until Task 7 deletes it;
+    // it is no longer reached.
+    this.connectNative();
+    return;
+    // ---- existing confined-preview setup continues UNCHANGED below ----
     this.reqId = this.fileId;
     // Static chrome skeleton — NO dynamic interpolation into innerHTML (XSS
     // guard). All dynamic text below goes through textContent/setAttribute.
@@ -162,7 +177,7 @@ export class VideoPlayer extends HTMLElement {
       this.audio = new AudioContext();
     } catch {
       this.setPhase({ phase: "error", code: "audio" });
-      this.renderer.dispose();
+      this.renderer?.dispose();
       this.renderer = null;
       this.disableControls(); // no audio graph → same: no inert focusable chrome
       return;
@@ -198,6 +213,13 @@ export class VideoPlayer extends HTMLElement {
       subscribe: on,
       reducedMotion,
       onPhase: (p) => this.setPhase(p),
+      requestWindow: (pts) => {
+        if (this.previewJob) {
+          void serial(() => call<void>("preview_seek", { jobId: this.previewJob, ptsMs: Math.round(pts) })).catch(() => {});
+        } else {
+          void serial(() => call<void>("video_seek", { fileId: this.reqId, ptsMs: Math.round(pts) })).catch(() => {});
+        }
+      },
     });
 
     // Track the buffered frontier independently (the player holds future frames
@@ -211,6 +233,11 @@ export class VideoPlayer extends HTMLElement {
       if (this.disposed) un();
       else this.unframe = un;
     });
+
+    void on<VideoInfo>("maxsecu://video-info", (info) => {
+      this.player?.setDuration(info.duration_ms);
+      this.durationMs = info.duration_ms;
+    }).then((un) => { if (this.disposed) un(); else this.uninfo = un; });
 
     this.wireControls();
     this.ticker = setInterval(() => this.refreshScrubber(), 250);
@@ -231,6 +258,8 @@ export class VideoPlayer extends HTMLElement {
     }
     this.unframe?.();
     this.unframe = null;
+    this.uninfo?.();
+    this.uninfo = null;
     this.player?.dispose();
     this.player = null;
     this.renderer?.dispose();
@@ -246,7 +275,81 @@ export class VideoPlayer extends HTMLElement {
     if (audio) void audio.close().catch(() => {});
   }
 
-  // ---- backend session ----------------------------------------------------
+  // ---- native view path (stream:// Range protocol + Media Chrome) ----------
+
+  private connectNative() {
+    this.native = true;
+    this.reqId = this.fileId;
+    // Static chrome — NO dynamic interpolation into innerHTML (XSS guard).
+    this.innerHTML = `
+      <section id="vp-region" tabindex="-1" role="region" aria-label="Video player">
+        <p id="vp-status" role="status" aria-live="polite" hidden></p>
+        <media-controller style="width:100%;aspect-ratio:16/9;background:#000">
+          <video slot="media" playsinline preload="metadata"></video>
+          <media-control-bar>
+            <media-play-button></media-play-button>
+            <media-time-range></media-time-range>
+            <media-time-display showduration></media-time-display>
+            <media-mute-button></media-mute-button>
+            <media-volume-range></media-volume-range>
+            <media-fullscreen-button></media-fullscreen-button>
+          </media-control-bar>
+        </media-controller>
+      </section>`;
+    (this.querySelector("#vp-region") as HTMLElement).focus();
+    // TEMP DIAGNOSTIC: surface CSP violations (which are otherwise invisible w/o
+    // devtools) to the backend log so we can see if the stream URL is blocked.
+    dlog(`connectNative id=${this.reqId} media-controller-defined=${!!customElements.get("media-controller")}`);
+    document.addEventListener("securitypolicyviolation", (e) => {
+      dlog(`CSP-VIOLATION directive=${e.violatedDirective} blocked=${e.blockedURI}`);
+    });
+    const video = this.querySelector("video") as HTMLVideoElement;
+    video.addEventListener("error", () => {
+      const code = video.error?.code ?? -1;
+      dlog(`video-error code=${code} src=${video.currentSrc || video.src}`);
+      const s = this.querySelector("#vp-status") as HTMLElement | null;
+      if (s) {
+        s.textContent = "⚠ This video could not be played.";
+        s.removeAttribute("hidden");
+      }
+    });
+    ["loadstart", "loadedmetadata", "canplay", "playing", "stalled"].forEach((ev) =>
+      video.addEventListener(ev, () => dlog(`video-${ev} t=${video.currentTime.toFixed(2)}`)),
+    );
+    if (this.previewJob) {
+      // Author preview: serve the OWN staged fMP4 by range — no open_video, no
+      // preview_video/preview_seek/cancel_video (the staged job is owned by the
+      // upload flow). Point the element straight at the preview namespace.
+      dlog(`connectNative: preview job=${this.previewJob}`);
+      video.src = previewSrc(this.previewJob);
+    } else {
+      void this.openNative(video);   // view path: open_video (register+probe) then streamSrc
+    }
+  }
+
+  private async openNative(video: HTMLVideoElement) {
+    try {
+      this.opened = true;
+      dlog(`openNative: calling open_video id=${this.reqId}`);
+      // open_video registers the decrypt-while-stream session (register-only +
+      // total-length probe). Only decrypted plaintext crosses the stream:// seam.
+      await serial(() => call<void>("open_video", { fileId: this.reqId }));
+      // Point the native element at the stream:// range protocol; the browser
+      // owns demux/decode/seek/buffer/sync.
+      const url = streamSrc(this.reqId);
+      dlog(`openNative: open_video OK, setting src=${url}`);
+      video.src = url;
+    } catch (x) {
+      dlog(`openNative: open_video ERR code=${phaseCode(x)}`);
+      const s = this.querySelector("#vp-status") as HTMLElement | null;
+      if (s) {
+        s.textContent = `⚠ Error: ${phaseCode(x)}`;
+        s.removeAttribute("hidden");
+      }
+    }
+  }
+
+  // ---- backend session (preview/legacy path) --------------------------------
 
   private async open() {
     try {
@@ -319,15 +422,12 @@ export class VideoPlayer extends HTMLElement {
       this.updateTime(Number(scrub.value), this.loadedMs);
     });
     // 'change' commits the seek (fires for pointer release AND arrow/Home/End).
+    // player.seek() calls requestWindow() internally, which issues preview_seek
+    // or video_seek as appropriate — no separate call needed here.
     scrub.addEventListener("change", () => {
       this.dragging = false;
       const pts = Math.max(0, Math.round(Number(scrub.value)));
       this.player?.seek(pts);
-      // In preview mode there is no backend session to re-window — the whole
-      // staged clip is already decoded locally, so scrub stays local.
-      if (!this.previewJob) {
-        void serial(() => call<void>("video_seek", { fileId: this.reqId, ptsMs: pts })).catch(() => {});
-      }
     });
 
     const vol = this.querySelector("#vp-vol") as HTMLInputElement;
@@ -388,34 +488,35 @@ export class VideoPlayer extends HTMLElement {
     play.setAttribute("aria-label", playing ? "Pause" : "Play");
   }
 
-  // The scrubber range spans [0, loaded frontier]; the thumb sits at the played
-  // position, so the track itself visualises played-vs-loaded. A <progress>
-  // mirrors the loaded fragment count for an at-a-glance buffered indication.
+  // The scrubber thumb sits at the engine's current play position; max is the
+  // total clip duration from the engine (set via VideoInfo on open).
   private refreshScrubber() {
     const scrub = this.querySelector("#vp-scrub") as HTMLInputElement | null;
-    const loaded = this.querySelector("#vp-loaded") as HTMLProgressElement | null;
-    if (!scrub || !loaded) return;
-    const max = Math.max(this.loadedMs, this.playedMs);
-    scrub.max = String(max);
-    scrub.setAttribute("aria-valuemax", String(max));
+    if (!scrub || !this.player) return;
+    const pos = this.player.positionMs();
+    const dur = this.player.durationMs() || this.durationMs;
+    scrub.max = String(dur);
     if (!this.dragging) {
-      scrub.value = String(this.playedMs);
-      scrub.setAttribute("aria-valuenow", String(this.playedMs));
-      this.updateTime(this.playedMs, max);
+      scrub.value = String(pos);
+      scrub.setAttribute("aria-valuenow", String(pos));
     }
-    loaded.max = Math.max(1, this.fragments);
-    loaded.value = this.fragments;
-    loaded.setAttribute("aria-valuetext", `${this.fragments} fragment(s) loaded`);
+    this.updateTime(pos, dur);
   }
 
   private updateTime(playedMs: number, loadedMs: number) {
     const t = this.querySelector("#vp-time") as HTMLElement | null;
     if (!t) return;
-    const text = `${fmt(playedMs)} / ${fmt(loadedMs)} loaded`;
+    const text = `${fmt(playedMs)} / ${fmt(loadedMs)}`;
     t.textContent = text;
     const scrub = this.querySelector("#vp-scrub") as HTMLInputElement | null;
     scrub?.setAttribute("aria-valuetext", text);
   }
+}
+
+// TEMP DIAGNOSTIC: fire-and-forget a line to the backend log (<appdir>/logs/
+// stream.log) so we can trace the native player without devtools. Remove later.
+function dlog(msg: string): void {
+  void call<void>("stream_debug_log", { msg }).catch(() => {});
 }
 
 // Sanitized error -> a short stable code for the status line (no oracle).

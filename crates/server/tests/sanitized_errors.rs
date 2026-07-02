@@ -47,7 +47,7 @@ use maxsecu_encoding::types::{
 };
 use maxsecu_server::{
     router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteWrapError,
-    FileListEntry, FileView, FinalizeError, ListFilter, MemoryBlobStore, MemoryStore,
+    DiscardError, FileListEntry, FileView, FinalizeError, ListFilter, MemoryBlobStore, MemoryStore,
     NullAuditSink, ParsedStage, PendingUser, RecipientView, SessionRecord, StageError, Store,
     StoreError, StoredBinding, StoredControlRecord, TlsExporter, UserRecord, VersionMeta,
     VersionSelector, WrapInput,
@@ -233,6 +233,13 @@ impl Store for FaultyStore {
     ) -> Result<Option<Vec<RecipientView>>, StoreError> {
         Err(bait("list_recipients"))
     }
+    async fn discard_unfinalized(
+        &self,
+        _file_id: [u8; 16],
+        _caller_id: [u8; 16],
+    ) -> Result<Vec<String>, DiscardError> {
+        Err(DiscardError::Store(bait("discard_unfinalized")))
+    }
 }
 
 /// A backend that authenticates normally (delegates auth/session to an inner
@@ -374,6 +381,13 @@ impl Store for FileFaultyStore {
     ) -> Result<Option<Vec<RecipientView>>, StoreError> {
         Err(bait("list_recipients"))
     }
+    async fn discard_unfinalized(
+        &self,
+        _file_id: [u8; 16],
+        _caller_id: [u8; 16],
+    ) -> Result<Vec<String>, DiscardError> {
+        Err(DiscardError::Store(bait("discard_unfinalized")))
+    }
 }
 
 // ---- harness ----
@@ -392,6 +406,7 @@ fn state_router<S: Store + 'static>(store: S) -> Router {
         blobs: Arc::new(MemoryBlobStore::new()),
         audit: Arc::new(NullAuditSink),
         direct_links_enabled: false,
+        max_file_bytes: None,
     };
     router(state).layer(Extension(TlsExporter(EXPORTER)))
 }
@@ -406,6 +421,7 @@ fn router_with_config<S: Store + 'static>(store: S, cfg: AuthConfig) -> Router {
         blobs: Arc::new(MemoryBlobStore::new()),
         audit: Arc::new(NullAuditSink),
         direct_links_enabled: false,
+        max_file_bytes: None,
     };
     router(state).layer(Extension(TlsExporter(EXPORTER)))
 }
@@ -459,6 +475,7 @@ async fn app() -> (Router, SigningKey, SigningKey) {
         blobs: Arc::new(MemoryBlobStore::new()),
         audit: Arc::new(NullAuditSink),
         direct_links_enabled: false,
+        max_file_bytes: None,
     };
     let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
     (router, admin, bob)

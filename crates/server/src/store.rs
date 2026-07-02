@@ -11,8 +11,8 @@
 use crate::control::decode_control;
 use crate::error::{ControlAppendError, StoreError};
 use crate::files::{
-    AddWrapError, DeleteWrapError, FinalizeError, ListFilter, ParsedStage, StageError, StreamRow,
-    VersionSelector, WrapInput,
+    AddWrapError, DeleteWrapError, DiscardError, FinalizeError, ListFilter, ParsedStage, StageError,
+    StreamRow, VersionSelector, WrapInput,
 };
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
@@ -368,6 +368,18 @@ pub trait Store: Send + Sync {
         file_id: [u8; 16],
         caller_id: [u8; 16],
     ) -> Result<Option<Vec<RecipientView>>, StoreError>;
+
+    /// Discard a staged-but-never-finalized upload (`DELETE /v1/files/{id}`).
+    /// Returns the `blob_ref` strings of the freed streams so the handler can
+    /// call `BlobStore::delete_stream` on each. Returns `Ok(vec![])` if the file
+    /// is absent or has no staged version (idempotent success). Rejects if any
+    /// finalized version exists (append-only model, §11.7). Owner-only:
+    /// missing-or-not-owner collapses to `NotFound` (no oracle, §9.3).
+    async fn discard_unfinalized(
+        &self,
+        file_id: [u8; 16],
+        caller_id: [u8; 16],
+    ) -> Result<Vec<String>, DiscardError>;
 }
 
 /// Defensive cap on the server-assembled re-share ancestor chain (mirrors the
@@ -1040,6 +1052,49 @@ impl Store for MemoryStore {
             .collect();
         Ok(Some(out))
     }
+
+    async fn discard_unfinalized(
+        &self,
+        file_id: [u8; 16],
+        caller_id: [u8; 16],
+    ) -> Result<Vec<String>, DiscardError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Phase 1: checks + collect blob_refs (immutable borrow of inner.files).
+        let (staged_keys, blob_refs) = {
+            let Some(entry) = inner.files.get(&file_id) else {
+                return Ok(vec![]); // idempotent: absent file has no staged version
+            };
+            if entry.owner_id != caller_id {
+                return Err(DiscardError::NotFound); // no oracle
+            }
+            if entry.current_version >= 1 {
+                return Err(DiscardError::HasFinalizedVersion);
+            }
+            let mut blob_refs: Vec<String> = Vec::new();
+            let staged_keys: Vec<u64> = entry
+                .versions
+                .iter()
+                .filter_map(|(k, v)| {
+                    if !v.finalized {
+                        for s in &v.streams {
+                            blob_refs.push(s.blob_ref.clone());
+                        }
+                        Some(*k)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            (staged_keys, blob_refs)
+        };
+        // Phase 2: remove the staged version entries (phase-1 borrow now dropped).
+        if let Some(entry) = inner.files.get_mut(&file_id) {
+            for k in staged_keys {
+                entry.versions.remove(&k);
+            }
+        }
+        Ok(blob_refs)
+    }
 }
 
 /// A [`Store`] whose every method returns `Err(StoreError)` — used to prove the
@@ -1215,6 +1270,14 @@ impl Store for FaultyStore {
         _caller_id: [u8; 16],
     ) -> Result<Option<Vec<RecipientView>>, StoreError> {
         Err(Self::fault("list_recipients"))
+    }
+
+    async fn discard_unfinalized(
+        &self,
+        _file_id: [u8; 16],
+        _caller_id: [u8; 16],
+    ) -> Result<Vec<String>, DiscardError> {
+        Err(DiscardError::Store(Self::fault("discard_unfinalized")))
     }
 }
 

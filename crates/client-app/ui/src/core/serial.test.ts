@@ -50,3 +50,16 @@ test("cancelPending rejects queued (not-yet-started) tasks", async () => {
   assert.equal(started, false, "queued task never ran");
   assert.equal(res, "cancelled");
 });
+
+test("cancelPending KEEPS priority (user-initiated) jobs but drops the normal backlog", async () => {
+  const ran: string[] = [];
+  const slow = serial(async () => { await tick(); ran.push("slow"); });
+  const normal = serial(async () => { ran.push("normal"); }).catch((e) => `x:${(e as Error).message}`);
+  const prio = serialPriority(async () => { ran.push("prio"); });
+  cancelPending(); // flush the backlog: normal is cancelled, prio survives
+  const normalRes = await normal;
+  await Promise.all([slow, prio]);
+  assert.equal(normalRes, "x:cancelled", "the normal backlog job was cancelled");
+  assert.ok(ran.includes("prio"), "the priority (viewer-open) job survived and ran");
+  assert.ok(!ran.includes("normal"), "the cancelled normal job never ran");
+});

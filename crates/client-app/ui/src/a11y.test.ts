@@ -162,15 +162,51 @@ test("screens use a live region for feedback", () => {
     );
   });
 
-  test("quick-settings + settings expose a labelled Theme + RAM control", () => {
-    const qs = readFileSync("src/components/quick-settings.ts", "utf8");
-    const set = readFileSync("src/components/settings-screen.ts", "utf8");
-    for (const src of [qs, set]) {
-      assert.match(src, /Theme/, "Theme control present");
-      assert.match(src, /aria-label|<label|name="theme"/, "controls labelled");
+  test("upload-screen video resolution/bitrate controls are present + labelled", () => {
+    const up = readFileSync("src/components/upload-screen.ts", "utf8");
+    // The video flow ingests a REAL video file (no MXRAWV01 raw-frame sample).
+    assert.doesNotMatch(up, /MXRAWV01|source_b64|sampleSourceB64/, "no raw-frame/source_b64 video path");
+    // Resolution + bitrate menu controls must each be present and named so they
+    // are picked up by FormData; each lives inside a wrapping <label>.
+    for (const n of ["resolution", "cw", "ch", "kbps", "origbitrate"]) {
+      assert.match(up, new RegExp(`name="${n}"`), `video upload missing the "${n}" control`);
     }
-    // quick-settings builds the slider via the DOM API (`range.type = "range"`),
-    // not literal HTML — accept either form.
-    assert.match(qs, /type="range"|\.type\s*=\s*"range"/, "quick-settings RAM uses a range slider");
+    // Wrapping-<label> pattern: a labelled <select> for resolution and labelled
+    // number inputs for the custom dims + bitrate (no orphan controls).
+    assert.match(up, /<label>Resolution[\s\S]*?name="resolution"/, "Resolution select must be labelled");
+    assert.match(up, /<label>Custom width[\s\S]*?name="cw"/, "Custom width must be labelled");
+    assert.match(up, /<label>Custom height[\s\S]*?name="ch"/, "Custom height must be labelled");
+    assert.match(up, /<label>Bitrate[\s\S]*?name="kbps"/, "Bitrate input must be labelled");
+    assert.match(up, /<label><input name="origbitrate"/, "Original-bitrate checkbox must be labelled");
+  });
+
+  test("upload-screen live transcode progress + Cancel are present + labelled", () => {
+    const up = readFileSync("src/components/upload-screen.ts", "utf8");
+    // A <progress> element carries an accessible name (aria-label) for the
+    // transcode; status text goes through the existing #up-status live region.
+    assert.match(up, /createElement\("progress"\)/, "transcode progress uses a <progress> element");
+    assert.match(up, /"aria-label",\s*"Transcode progress"/, "the <progress> must be labelled");
+    // A Cancel control that calls cancel_video_prepare and disables itself to
+    // avoid a double-fire.
+    assert.match(up, /"Cancel"/, "a Cancel control must be present");
+    assert.match(up, /cancel_video_prepare/, "Cancel must call cancel_video_prepare");
+    assert.match(up, /cancelBtn\.disabled\s*=\s*true/, "Cancel must disable itself on click");
+    // Progress text is set via textContent, never innerHTML interpolation.
+    assert.match(up, /status\.textContent\s*=/, "status updates via textContent");
+  });
+
+  test("settings screen exposes a labelled Theme + RAM control", () => {
+    const set = readFileSync("src/components/settings-screen.ts", "utf8");
+    assert.match(set, /Theme/, "Theme control present");
+    assert.match(set, /aria-label|<label|name="theme"/, "controls labelled");
+    // The RAM cache cap uses a range slider (built via DOM API or literal HTML).
+    assert.match(set, /type="range"|\.type\s*=\s*"range"/, "RAM cap uses a range slider");
+  });
+
+  test("ram-gauge is a labelled meter", () => {
+    const rg = readFileSync("src/components/ram-gauge.ts", "utf8");
+    assert.match(rg, /role="meter"/, "RAM gauge is a meter");
+    assert.match(rg, /aria-valuemin|aria-valuenow/, "RAM gauge exposes aria value");
+    assert.match(rg, /aria-label/, "RAM gauge is labelled (non-colour-only)");
   });
 }

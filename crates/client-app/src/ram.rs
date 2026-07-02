@@ -57,6 +57,31 @@ pub async fn ram_limits() -> Result<RamLimits, UiError> {
     Ok(compute_ram_limits(system_total_mb()))
 }
 
+/// Live process + budget memory figures for the RAM-usage gauge in the UI.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct MemoryStats {
+    pub used_bytes: Option<u64>,  // process RSS; None if the OS query is unavailable (fail-soft)
+    pub budget_bytes: u64,
+}
+
+/// Current process resident memory in bytes, or None if unavailable (fail-soft — never panic).
+fn current_process_rss_bytes() -> Option<u64> {
+    use sysinfo::{get_current_pid, ProcessesToUpdate, System};
+    let pid = get_current_pid().ok()?;
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    sys.process(pid).map(|p| p.memory()) // sysinfo 0.33: memory() is RSS in bytes
+}
+
+/// `memory_stats` — current process RSS and the RAM budget ceiling, for the
+/// quick-settings rainbow gauge. Fail-soft: `used_bytes` is `None` if the OS
+/// process query is unavailable on this platform.
+#[tauri::command]
+pub async fn memory_stats() -> Result<MemoryStats, UiError> {
+    let budget_bytes = compute_ram_limits(system_total_mb()).max_mb as u64 * 1024 * 1024;
+    Ok(MemoryStats { used_bytes: current_process_rss_bytes(), budget_bytes })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

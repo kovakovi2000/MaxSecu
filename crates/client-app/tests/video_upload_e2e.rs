@@ -4,11 +4,14 @@
 //!
 //! Drives the **real** `client-app` video upload modules end to end:
 //!
-//! - GATE T (confined transcode, NO network): `upload::prepare_video_streams` runs
-//!   the AppContainer/subprocess-confined `media-transcode-worker` over a small
-//!   `MXRAWV01` raw-frame source and returns canonical AV1/CMAF streams + the
-//!   fragment seek index. This step makes NO server call (no `Conn`/TLS is even
-//!   created before it) — it is the preview-before-upload transcode.
+//! - GATE T (confined ingest, NO network): `upload::prepare_video_streams` runs the
+//!   TWO confined spawns — the embedded ffmpeg decodes a small real `.y4m` source to
+//!   AV1/AAC `out.mp4` + a first-frame `thumb.png`, then the
+//!   AppContainer/subprocess-confined `media-transcode-worker` re-muxes `out.mp4` to
+//!   canonical AV1/CMAF streams + the fragment seek index (thumbnail/preview derived
+//!   from `thumb.png` via the pure-Rust image codec). This step makes NO server call
+//!   (no `Conn`/TLS is even created before it) — it is the preview-before-upload
+//!   transcode.
 //! - GATE D (preview decodes to source dims): slicing the STAGED canonical `cmaf`
 //!   by each fragment's chunk range and feeding it to the confined decode session
 //!   (`media-worker --video-session`) decodes back to the source dimensions with
@@ -44,17 +47,17 @@ use base64::Engine;
 
 use maxsecu_ceremony_harness::Ceremony;
 use maxsecu_client_app::directory::resolve_recovery_recipient;
-use maxsecu_client_app::upload::{prepare_video_streams, run_pipeline};
+use maxsecu_client_app::upload::{prepare_video_streams, run_pipeline, VIDEO_CHUNK_SIZE};
 use maxsecu_client_app::video::parse_fragment_index;
 use maxsecu_client_core::video::{validate_i420, ClientMsg, VideoBounds, WorkerMsg};
 use maxsecu_client_core::{
     build_upload, verify_and_open, DirectoryVerifier, DownloadBundle, Identity, MemoryTrustStore,
-    StreamChunks, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
+    PlaintextStreams, StreamChunks, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_crypto::{sha256, EncPublicKey, WrappedDek};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::types::{FileType, Id, Role, StreamType, Timestamp};
-use maxsecu_media_launcher::VideoSubprocessSession;
+use maxsecu_media_launcher::{TranscodeOptions, VideoSubprocessSession};
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuthConfig, AuthService, FsBlobStore, MemoryStore,
 };
@@ -62,7 +65,7 @@ use maxsecu_server::{
 const VOUCHER: &str = "in-person-code-001";
 const VOUCHER2: &str = "in-person-code-002";
 const TS: u64 = 1_719_500_000_000;
-const CHUNK: usize = 4096; // == upload chunk_size == TRANSCODE_CHUNK_SIZE
+const CHUNK: usize = VIDEO_CHUNK_SIZE as usize; // == upload chunk_size == video fragment-index unit (6 MiB)
 
 // ---- worker-binary discovery (workspace target dir) -----------------------
 
@@ -85,23 +88,64 @@ fn find_worker(name: &str) -> Option<PathBuf> {
     None
 }
 
-// ---- MXRAWV01 raw-frame source (the transcode worker's default-path container) --
+// ---- real source video synthesis (Y4M; ffmpeg always reads it, no codec dep) ----
 
-fn make_raw_source(w: u32, h: u32, frames: u32, fps: u32) -> Vec<u8> {
+/// The vendored static ffmpeg the universal-video-ingest path drives. Discovered
+/// relative to this crate (`crates/client-app/../../vendor/ffmpeg/ffmpeg.exe`).
+/// `None` ⇒ the spawn gates SKIP (it is gitignored, fetched by `fetch-ffmpeg.ps1`).
+fn vendored_ffmpeg() -> Option<PathBuf> {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("vendor")
+        .join("ffmpeg")
+        .join("ffmpeg.exe");
+    p.is_file().then_some(p)
+}
+
+/// A fresh, unique temp dir for a test's source file.
+fn temp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "mxviding-{tag}-{}-{}",
+        std::process::id(),
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Build a real, decodable raw video as YUV4MPEG2 (`.y4m`) bytes — the confined
+/// ffmpeg under test reads this with its built-in demuxer (no external codec), then
+/// transcodes it to canonical AV1. `w`/`h` must be even (4:2:0). No audio track (the
+/// re-mux worker handles an audio-absent source).
+fn make_y4m(w: u32, h: u32, frames: u32, fps: u32) -> Vec<u8> {
     let mut v = Vec::new();
-    v.extend_from_slice(b"MXRAWV01");
-    v.extend_from_slice(&w.to_le_bytes());
-    v.extend_from_slice(&h.to_le_bytes());
-    v.extend_from_slice(&frames.to_le_bytes());
-    v.extend_from_slice(&fps.to_le_bytes());
+    v.extend_from_slice(format!("YUV4MPEG2 W{w} H{h} F{fps}:1 Ip A1:1 C420jpeg\n").as_bytes());
+    let (cw, ch) = (w / 2, h / 2);
     for f in 0..frames {
-        for i in 0..(w * h) {
-            v.push(((i + f) & 0xff) as u8); // R
-            v.push(((i / w) & 0xff) as u8); // G
-            v.push((f.wrapping_mul(40) & 0xff) as u8); // B
+        v.extend_from_slice(b"FRAME\n");
+        for y in 0..h {
+            for x in 0..w {
+                v.push(((x + y + f) & 0xff) as u8); // Y: a moving gradient
+            }
+        }
+        for _ in 0..(cw * ch) {
+            v.push(((f.wrapping_mul(3)) & 0xff) as u8); // U
+        }
+        for _ in 0..(cw * ch) {
+            v.push(((f.wrapping_mul(7)) & 0xff) as u8); // V
         }
     }
     v
+}
+
+/// Write a `.y4m` source into a fresh temp dir and return its path.
+fn write_source_y4m(tag: &str, w: u32, h: u32, frames: u32, fps: u32) -> (PathBuf, PathBuf) {
+    let dir = temp_dir(tag);
+    let path = dir.join("source.y4m");
+    std::fs::write(&path, make_y4m(w, h, frames, fps)).unwrap();
+    (dir, path)
 }
 
 // ---- TLS harness (copied from upload_e2e.rs) ------------------------------
@@ -380,10 +424,10 @@ async fn download_bundle(c: &mut Conn, token: &str, fid_hex: &str) -> DownloadBu
 
 #[tokio::test]
 async fn phase7_video_upload_over_real_tls() {
-    // ---- worker binaries (skip the spawn gates if a bare -p run did not build them) ----
+    // ---- worker binaries + vendored ffmpeg (skip the spawn gates if absent) ----
     let transcode_worker = find_worker("media-transcode-worker");
     let decode_worker = find_worker("media-worker");
-    let Some(transcode_worker) = transcode_worker else {
+    let Some(_transcode_worker) = transcode_worker else {
         eprintln!(
             "SKIP phase7_video_upload_over_real_tls: media-transcode-worker binary not found in \
              the target dir (build it, e.g. `cargo test --workspace`, to exercise the confined \
@@ -391,40 +435,77 @@ async fn phase7_video_upload_over_real_tls() {
         );
         return;
     };
+    let Some(ffmpeg) = vendored_ffmpeg() else {
+        eprintln!(
+            "SKIP phase7_video_upload_over_real_tls: vendored ffmpeg \
+             (vendor/ffmpeg/ffmpeg.exe) not present; run scripts/fetch-ffmpeg.ps1 to exercise the \
+             confined ffmpeg ingest."
+        );
+        return;
+    };
 
-    let (w, h, frames, fps) = (16u32, 16u32, 3u32, 10u32);
-    let source = make_raw_source(w, h, frames, fps);
+    // A tiny 64x64 clip; ~12 frames fits in a single GOP → one canonical fragment
+    // (enough for the round-trip gates; the multi-fragment seek path is covered by
+    // video_e2e.rs).
+    let (w, h, frames, fps) = (64u32, 64u32, 12u32, 24u32);
+    let (src_dir, source_path) = write_source_y4m("upload", w, h, frames, fps);
 
-    // ---- GATE T: confined transcode, NO network ----
+    // ---- GATE T: confined ffmpeg ingest + re-mux, NO network ----
     //
-    // INVARIANT (no-network-at-stage): the transcode happens with NO connection /
+    // INVARIANT (no-network-at-stage): the ingest happens with NO connection /
     // transport / server in scope. This is STRUCTURAL, not merely ordering:
-    // `prepare_video_streams` takes only `(source, worker_path, bounds, title, tags)`
-    // — it has NO `SendRequest`/host/socket parameter, so it cannot reach the
-    // network even if a future refactor moved the server setup earlier. The asserts
-    // below enforce that no networking object has been constructed yet at this point:
-    // the only bindings in scope are the source + worker paths (the server harness —
-    // `listener`/`addr`/`Conn`/`AppState` — is built only AFTER this gate). If a
-    // refactor introduces a transport before here, this comment + the post-transcode
-    // placement of the server setup are the tripwire (and `prepare_video_streams`'s
-    // signature is the hard guarantee).
-    let (streams, fragments) = prepare_video_streams(
-        &source,
-        &transcode_worker,
+    // `prepare_video_streams` takes only `(input_path, ffmpeg_path, worker_path,
+    // options, bounds, title, tags, on_phase, cancel)` — a local progress sink + a
+    // cancel flag, NO `SendRequest`/host/socket parameter,
+    // so it cannot reach the network even if a future refactor moved the server setup
+    // earlier. The asserts below enforce that no networking object has been
+    // constructed yet at this point: the only bindings in scope are the source +
+    // tool paths (the server harness — `listener`/`addr`/`Conn`/`AppState` — is built
+    // only AFTER this gate). The two confined spawns (ffmpeg, then the re-mux worker)
+    // each run with no net/keys/children; `prepare_video_streams`'s signature is the
+    // hard guarantee.
+    let prepared = prepare_video_streams(
+        &source_path,
+        &ffmpeg,
+        &TranscodeOptions::default(),
         &VideoBounds::default(),
         "Holiday clip",
         &["beach".to_owned()],
+        |_p| {},                                    // no-op progress sink (not asserted here)
+        &std::sync::atomic::AtomicBool::new(false), // never cancelled
     )
-    .expect("GATE T: the confined transcode produced canonical streams");
-    assert_eq!(
-        fragments.len(),
-        frames as usize,
-        "one fragment per source frame"
+    .expect("GATE T: the confined ffmpeg + re-mux produced canonical streams");
+    let _ = std::fs::remove_dir_all(&src_dir);
+    // The handle keeps the transcoded fMP4 on DISK (content is not in RAM). Reconstruct
+    // the in-memory `PlaintextStreams`/`fragments` the round-trip gates work against.
+    let content = std::fs::read(&prepared.out_mp4_path).expect("read transcoded fMP4");
+    let fragments = prepared.fragments.clone();
+    let streams = PlaintextStreams {
+        content,
+        metadata: Some(prepared.metadata.clone()),
+        thumbnail: Some(prepared.thumbnail.clone()),
+        preview: Some(prepared.preview.clone()),
+    };
+    // `prepare_video_streams` no longer deletes its temp dir on success — the test owns it.
+    let _ = std::fs::remove_dir_all(&prepared.job_dir);
+    assert!(
+        !fragments.is_empty(),
+        "GATE T: the re-mux produced at least one canonical fragment"
     );
     let canonical = streams.content.clone();
     assert!(
-        !canonical.is_empty() && canonical.len() % CHUNK == 0,
-        "GATE T: canonical content is whole 4096-byte chunks"
+        !canonical.is_empty(),
+        "GATE T: canonical content is non-empty (the fMP4 is not chunk-aligned)"
+    );
+    // The thumbnail + preview are DERIVED from ffmpeg's first-frame PNG via the
+    // pure-Rust image codec (this key-holding process stays codec-free).
+    assert!(
+        streams.thumbnail.as_ref().is_some_and(|t| !t.is_empty()),
+        "GATE T: a thumbnail was derived from the first-frame PNG"
+    );
+    assert!(
+        streams.preview.as_ref().is_some_and(|p| !p.is_empty()),
+        "GATE T: a preview was derived from the first-frame PNG"
     );
     let metadata = streams.metadata.clone().expect("metadata present");
 
@@ -439,12 +520,15 @@ async fn phase7_video_upload_over_real_tls() {
             "GATE M: parsed fragment matches the transcode output"
         );
     }
-    // The index tiles the canonical content exactly in 4096-byte chunks.
+    // The index tiles the canonical content in VIDEO_CHUNK_SIZE chunks; the LAST chunk
+    // is short (the fMP4 is not a whole multiple of the chunk size), so coverage is
+    // asserted in chunk COUNT rather than byte length.
     let last = parsed.last().unwrap();
+    let total_chunks = (canonical.len() as u64).div_ceil(CHUNK as u64);
     assert_eq!(
-        (last.chunk_start + last.chunk_len) as usize * CHUNK,
-        canonical.len(),
-        "GATE M: fragment ranges cover the cmaf exactly"
+        last.chunk_start + last.chunk_len,
+        total_chunks,
+        "GATE M: fragment ranges cover the content's chunk count exactly"
     );
 
     // ---- GATE D: the STAGED canonical content decodes to source dims in the
@@ -455,7 +539,8 @@ async fn phase7_video_upload_over_real_tls() {
         }];
         for fr in &parsed {
             let start = fr.chunk_start as usize * CHUNK;
-            let end = (fr.chunk_start + fr.chunk_len) as usize * CHUNK;
+            // The last chunk is short (the fMP4 is not chunk-aligned) — clamp to len.
+            let end = ((fr.chunk_start + fr.chunk_len) as usize * CHUNK).min(canonical.len());
             script.push(ClientMsg::Fragment {
                 seq: fr.seq,
                 bytes: canonical[start..end].to_vec(),
@@ -481,13 +566,12 @@ async fn phase7_video_upload_over_real_tls() {
                 videos += 1;
             }
         }
+        // A canonical fragment is now a whole GOP (not a single frame), so the
+        // decoded-frame count is the source frame count, not the fragment count; we
+        // only assert that at least one validated frame decoded back to source dims.
         assert!(
             videos >= 1,
             "GATE D: at least one validated frame decoded from the staged content"
-        );
-        assert_eq!(
-            videos, frames as usize,
-            "GATE D: every fragment decoded back to a frame"
         );
     } else {
         eprintln!(
@@ -514,6 +598,7 @@ async fn phase7_video_upload_over_real_tls() {
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
+        max_file_bytes: None,
     };
     let pki = test_pki();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -545,7 +630,7 @@ async fn phase7_video_upload_over_real_tls() {
     .await
     .unwrap();
 
-    // ---- GATE P: build_upload(Video, chunk_size 4096) + run_pipeline → round-trip ----
+    // ---- GATE P: build_upload(Video, chunk_size VIDEO_CHUNK_SIZE) + run_pipeline → round-trip ----
     let file_id = Id(maxsecu_crypto::random_array::<16>());
     let fid_hex = hex(&file_id.0);
     let bundle = build_upload(
@@ -555,7 +640,7 @@ async fn phase7_video_upload_over_real_tls() {
             owner_key_version: 1,
             file_id,
             file_type: FileType::Video,
-            chunk_size: 4096,
+            chunk_size: VIDEO_CHUNK_SIZE,
             recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
             recovery_mlkem_pub: rr.mlkem_pub,
             created_at: Timestamp(TS),

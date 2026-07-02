@@ -10,13 +10,13 @@
 //! and self-checks the wraps it holds the key for before returning.
 
 use maxsecu_crypto::{
-    deserialize_hybrid_wrap, seal_stream, serialize_hybrid_wrap, unwrap_dek, unwrap_dek_hybrid,
-    wrap_dek, wrap_dek_hybrid, CryptoError, Dek, EncPublicKey, EncSecretKey, HybridEncPublicKey,
-    HybridEncSecretKey, HybridWrappedDek, SigningKey, WrappedDek,
+    deserialize_hybrid_wrap, seal_stream, seal_stream_streaming, serialize_hybrid_wrap, unwrap_dek,
+    unwrap_dek_hybrid, wrap_dek, wrap_dek_hybrid, CryptoError, Dek, EncPublicKey, EncSecretKey,
+    HybridEncPublicKey, HybridEncSecretKey, HybridWrappedDek, SigningKey, WrappedDek,
 };
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::WrapContext;
-use maxsecu_encoding::structs::{Genesis, Grant, Manifest, Stream};
+use maxsecu_encoding::structs::{ChunkAad, Genesis, Grant, Manifest, Stream};
 use maxsecu_encoding::types::{
     Bytes32, Compression, FileType, Id, RecipientType, StreamType, Suite, Timestamp,
 };
@@ -82,6 +82,90 @@ pub struct SealedStreamOut {
     pub chunks: Vec<Vec<u8>>,
 }
 
+/// The non-content streams for a streaming-path upload (metadata, thumbnail,
+/// preview). The content ciphertext is produced externally by
+/// [`ContentStreamSealer`] and committed via `(content_digest,
+/// content_chunk_count)` — it never enters the records builder.
+pub struct SmallStreams {
+    pub metadata: Option<Vec<u8>>,
+    pub thumbnail: Option<Vec<u8>>,
+    pub preview: Option<Vec<u8>>,
+}
+
+/// Holds the per-stream content subkey derived from a `Dek` and delegates to
+/// [`seal_stream_streaming`] so client-app can stream-seal content from disk
+/// chunk-by-chunk without the DEK or its subkey ever crossing the crate boundary
+/// — the caller only receives ciphertext via the `emit` callback.
+///
+/// The raw `Dek` is **not** stored; only the `Zeroizing<[u8;32]>` subkey is
+/// retained, and no getter exposes it.
+pub struct ContentStreamSealer {
+    subkey: zeroize::Zeroizing<[u8; 32]>,
+    file_id: Id,
+    version: u64,
+    stream_type: StreamType,
+    chunk_size: usize,
+}
+
+impl ContentStreamSealer {
+    /// Derive and hold the per-stream subkey for `stream_type` from `dek`.
+    /// The `Dek` is consumed by reference; only the subkey is stored.
+    pub fn new(
+        dek: &Dek,
+        file_id: Id,
+        version: u64,
+        stream_type: StreamType,
+        chunk_size: usize,
+    ) -> Self {
+        Self {
+            subkey: dek.stream_subkey(stream_type),
+            file_id,
+            version,
+            stream_type,
+            chunk_size,
+        }
+    }
+
+    /// Seal bytes from `reader` chunk-at-a-time, calling `emit(index, &ciphertext)`
+    /// per chunk (O(one chunk) RAM). Returns `(chunk_count, digest)` byte-identical
+    /// to `seal_stream` for the same input. Pure delegation to `seal_stream_streaming`.
+    pub fn seal_from_reader<R, E>(
+        &self,
+        reader: &mut R,
+        emit: E,
+    ) -> Result<(u64, [u8; 32]), CryptoError>
+    where
+        R: std::io::Read,
+        E: FnMut(u64, &[u8]) -> Result<(), CryptoError>,
+    {
+        seal_stream_streaming(
+            &*self.subkey,
+            self.file_id,
+            self.version,
+            self.stream_type,
+            self.chunk_size,
+            reader,
+            emit,
+        )
+    }
+
+    /// Seal ONE content chunk at `index` (random access), for the streaming confirm/
+    /// resume pass where the total `chunk_count` is already known so the caller supplies
+    /// `is_last = (index == chunk_count - 1)`. Produces BYTE-IDENTICAL ciphertext to
+    /// `seal_from_reader` / `seal_stream` for the same index. Does NOT touch the digest
+    /// (already committed in the manifest from the pass-1 `seal_from_reader`).
+    pub fn seal_chunk(&self, index: u64, plaintext: &[u8], is_last: bool) -> Vec<u8> {
+        let aad = ChunkAad {
+            file_id: self.file_id,
+            version: self.version,
+            stream_type: self.stream_type,
+            chunk_index: index,
+            is_last,
+        };
+        maxsecu_crypto::seal_chunk(&*self.subkey, &aad, plaintext)
+    }
+}
+
 /// One recipient's wrap plus its signed read-grant (api.md §8.1 `wraps[]`).
 pub struct WrapOut {
     pub recipient_id: Id,
@@ -104,6 +188,21 @@ pub struct UploadBundle {
     pub wraps: Vec<WrapOut>,
 }
 
+/// The signed manifest/genesis/wraps plus the SMALL sealed streams (no content
+/// chunks). Used by the streaming-path upload: the caller streams content
+/// separately via [`ContentStreamSealer`] then calls [`build_records_inner`] /
+/// [`StreamingUploadBuilder::finish`] to assemble this set.
+pub struct UploadRecords {
+    pub file_id: Id,
+    pub file_type: FileType,
+    pub genesis: Genesis,
+    pub genesis_sig: [u8; 64],
+    pub manifest: Manifest,
+    pub manifest_sig: [u8; 64],
+    pub wraps: Vec<WrapOut>,
+    pub small_streams: Vec<SealedStreamOut>,
+}
+
 /// Build the complete signed, encrypted upload for version 1 of a new file
 /// (DESIGN §12.2). Wraps to **self + recovery**; owner-only write (D29).
 ///
@@ -113,177 +212,23 @@ pub fn build_upload(
     params: &UploadParams,
     streams: &PlaintextStreams,
 ) -> Result<UploadBundle, UploadError> {
-    if params.chunk_size < CHUNK_SIZE_MIN || params.chunk_size > CHUNK_SIZE_MAX {
-        return Err(UploadError::ChunkSizeOutOfRange {
-            chunk_size: params.chunk_size,
-        });
-    }
-
-    // One fresh DEK per file; only ever a KDF root (L-5).
-    let dek = Dek::generate();
-    let dek_commit = dek.commit();
-
-    let (manifest_streams, sealed_out) =
-        seal_streams(&dek, params.file_id, FIRST_VERSION, params.chunk_size, streams);
-
-    let signer = params.owner.signing_key();
-
-    // Suite-selection policy (P7.5): emit Suite::V2 iff BOTH the uploader's own
-    // identity AND the recovery recipient carry an ML-KEM key. Recovery is a
-    // mandatory recipient (DESIGN §6.3), so V2 requires the recovery binding to be
-    // PQ too; otherwise a partially-enrolled fleet still uploads under Suite::V1.
-    let pq = params
-        .owner
-        .mlkem_pub_bytes()
-        .zip(params.recovery_mlkem_pub);
-    let suite = if pq.is_some() { Suite::V2 } else { Suite::V1 };
-
-    let manifest = Manifest {
-        file_id: params.file_id,
-        version: FIRST_VERSION,
-        file_type: params.file_type,
-        alg: suite,
-        chunk_size: params.chunk_size,
-        dek_commit: Bytes32(dek_commit),
-        streams: manifest_streams,
-        recovery_present: true,
-        author_id: params.owner_id,
-        created_at: params.created_at,
-    };
-    let manifest_sig = signer.sign_canonical(labels::MANIFEST, &manifest);
-
-    let genesis = Genesis {
-        file_id: params.file_id,
-        owner_id: params.owner_id,
-        owner_key_version: params.owner_key_version,
-        created_at: params.created_at,
-    };
-    let genesis_sig = signer.sign_canonical(labels::GENESIS, &genesis);
-
-    // Wrap to self (we hold the secret, so self-check the wrap) and to the
-    // standing recovery recipient. Owner-only write ⇒ no other recipients (D29).
-    // The wrap wire layout matches `manifest.alg`: V1 classical HPKE, V2 hybrid.
-    let wraps = match pq {
-        Some((owner_mlkem, recovery_mlkem)) => {
-            // Suite::V2 — hybrid wraps to {x25519, ML-KEM} recipients. The same
-            // WrapContext binding as V1 is used (file_id/version/recipient_id).
-            let owner_hybrid_pub = HybridEncPublicKey {
-                x25519: params.owner.enc_pub_bytes(),
-                mlkem: owner_mlkem,
-            };
-            let owner_hybrid_sec = HybridEncSecretKey::from_components(
-                params.owner.enc_secret().expose_bytes(),
-                params
-                    .owner
-                    .mlkem_seed()
-                    .expect("owner ML-KEM pub implies its seed"),
-            );
-            let recovery_hybrid_pub = HybridEncPublicKey {
-                x25519: params.recovery_pub.to_bytes(),
-                mlkem: recovery_mlkem,
-            };
-            vec![
-                wrap_and_grant_hybrid(
-                    signer,
-                    params.file_id,
-                    FIRST_VERSION,
-                    params.owner_id,
-                    RecipientType::User,
-                    &owner_hybrid_pub,
-                    &dek,
-                    dek_commit,
-                    params.owner_id,
-                    params.created_at,
-                    Some(&owner_hybrid_sec),
-                )?,
-                wrap_and_grant_hybrid(
-                    signer,
-                    params.file_id,
-                    FIRST_VERSION,
-                    RECOVERY_ID,
-                    RecipientType::Recovery,
-                    &recovery_hybrid_pub,
-                    &dek,
-                    dek_commit,
-                    params.owner_id,
-                    params.created_at,
-                    None,
-                )?,
-            ]
-        }
-        None => {
-            // Suite::V1 — classical HPKE wraps (behavior unchanged from Phase 3).
-            let owner_enc_pub = EncPublicKey::from_bytes(params.owner.enc_pub_bytes());
-            vec![
-                wrap_and_grant(
-                    signer,
-                    params.file_id,
-                    FIRST_VERSION,
-                    params.owner_id,
-                    RecipientType::User,
-                    &owner_enc_pub,
-                    &dek,
-                    dek_commit,
-                    params.owner_id,
-                    params.created_at,
-                    Some(params.owner.enc_secret()),
-                )?,
-                wrap_and_grant(
-                    signer,
-                    params.file_id,
-                    FIRST_VERSION,
-                    RECOVERY_ID,
-                    RecipientType::Recovery,
-                    &params.recovery_pub,
-                    &dek,
-                    dek_commit,
-                    params.owner_id,
-                    params.created_at,
-                    None,
-                )?,
-            ]
-        }
-    };
-
-    Ok(UploadBundle {
-        file_id: params.file_id,
-        file_type: params.file_type,
-        genesis,
-        genesis_sig,
-        manifest,
-        manifest_sig,
-        streams: sealed_out,
-        wraps,
-    })
+    build_upload_inner(&Dek::generate(), params, streams)
 }
 
-/// Seal each present plaintext stream under its own DEK subkey, in ascending
-/// `stream_type` order (content < metadata < thumbnail < preview) — the
-/// manifest's required ordering (encoding-spec V-13) holds by construction.
-/// Phase 3 leaves every stream uncompressed (`Compression::None`). Shared by
-/// [`build_upload`] (version 1) and rotation (a new version under a fresh DEK).
-pub(crate) fn seal_streams(
+/// Inner sealing loop shared by [`seal_streams`] and [`build_records_inner`].
+/// Seals each `(StreamType, &[u8])` pair under its own DEK subkey in the order
+/// supplied (callers must maintain ascending `stream_type` order themselves).
+fn seal_inputs(
     dek: &Dek,
     file_id: Id,
     version: u64,
     chunk_size: u32,
-    streams: &PlaintextStreams,
+    inputs: &[(StreamType, &[u8])],
 ) -> (Vec<Stream>, Vec<SealedStreamOut>) {
     let frame = chunk_size as usize;
-    let mut inputs: Vec<(StreamType, &[u8])> = vec![(StreamType::Content, &streams.content)];
-    if let Some(m) = &streams.metadata {
-        inputs.push((StreamType::Metadata, m));
-    }
-    if let Some(t) = &streams.thumbnail {
-        inputs.push((StreamType::Thumbnail, t));
-    }
-    if let Some(p) = &streams.preview {
-        inputs.push((StreamType::Preview, p));
-    }
-
     let mut manifest_streams: Vec<Stream> = Vec::with_capacity(inputs.len());
     let mut sealed_out: Vec<SealedStreamOut> = Vec::with_capacity(inputs.len());
-    for (st, plaintext) in inputs {
+    for &(st, plaintext) in inputs {
         let ck = dek.stream_subkey(st);
         let sealed = seal_stream(&ck, file_id, version, st, frame, plaintext);
         let total_bytes = sealed.chunks.iter().map(|c| c.len() as u64).sum();
@@ -304,6 +249,31 @@ pub(crate) fn seal_streams(
         });
     }
     (manifest_streams, sealed_out)
+}
+
+/// Seal each present plaintext stream under its own DEK subkey, in ascending
+/// `stream_type` order (content < metadata < thumbnail < preview) — the
+/// manifest's required ordering (encoding-spec V-13) holds by construction.
+/// Phase 3 leaves every stream uncompressed (`Compression::None`). Shared by
+/// [`build_upload`] (version 1) and rotation (a new version under a fresh DEK).
+pub(crate) fn seal_streams(
+    dek: &Dek,
+    file_id: Id,
+    version: u64,
+    chunk_size: u32,
+    streams: &PlaintextStreams,
+) -> (Vec<Stream>, Vec<SealedStreamOut>) {
+    let mut inputs: Vec<(StreamType, &[u8])> = vec![(StreamType::Content, &streams.content)];
+    if let Some(m) = &streams.metadata {
+        inputs.push((StreamType::Metadata, m));
+    }
+    if let Some(t) = &streams.thumbnail {
+        inputs.push((StreamType::Thumbnail, t));
+    }
+    if let Some(p) = &streams.preview {
+        inputs.push((StreamType::Preview, p));
+    }
+    seal_inputs(dek, file_id, version, chunk_size, &inputs)
 }
 
 /// Wrap the DEK to one recipient and sign its read-grant rooted at `granted_by`
@@ -461,6 +431,323 @@ pub(crate) fn unpack_hybrid_wrap(w: &WrappedDek) -> Result<HybridWrappedDek, Cry
     bytes.extend_from_slice(&w.enc);
     bytes.extend_from_slice(&w.ct);
     deserialize_hybrid_wrap(&bytes)
+}
+
+/// Shared manifest+genesis+wraps assembly used by both [`build_upload_inner`]
+/// and [`build_records_inner`]. Takes `manifest_streams` already in ascending
+/// order (caller's responsibility) and the pre-computed `dek_commit`. Applies
+/// the V1/V2 suite-selection policy (P7.5) and the self-check on the owner wrap.
+fn assemble_records(
+    dek: &Dek,
+    dek_commit: [u8; 32],
+    params: &UploadParams,
+    manifest_streams: Vec<Stream>,
+) -> Result<(Manifest, [u8; 64], Genesis, [u8; 64], Vec<WrapOut>), UploadError> {
+    let signer = params.owner.signing_key();
+
+    // Suite-selection policy (P7.5): V2 iff BOTH the uploader AND the recovery
+    // recipient are PQ-enrolled; otherwise V1 (partially-enrolled fleet fallback).
+    let pq = params
+        .owner
+        .mlkem_pub_bytes()
+        .zip(params.recovery_mlkem_pub);
+    let suite = if pq.is_some() { Suite::V2 } else { Suite::V1 };
+
+    let manifest = Manifest {
+        file_id: params.file_id,
+        version: FIRST_VERSION,
+        file_type: params.file_type,
+        alg: suite,
+        chunk_size: params.chunk_size,
+        dek_commit: Bytes32(dek_commit),
+        streams: manifest_streams,
+        recovery_present: true,
+        author_id: params.owner_id,
+        created_at: params.created_at,
+    };
+    let manifest_sig = signer.sign_canonical(labels::MANIFEST, &manifest);
+
+    let genesis = Genesis {
+        file_id: params.file_id,
+        owner_id: params.owner_id,
+        owner_key_version: params.owner_key_version,
+        created_at: params.created_at,
+    };
+    let genesis_sig = signer.sign_canonical(labels::GENESIS, &genesis);
+
+    // Wrap to self (self-check) and to the standing recovery recipient.
+    // Owner-only write ⇒ no other recipients (D29).
+    let wraps = match pq {
+        Some((owner_mlkem, recovery_mlkem)) => {
+            // Suite::V2 — hybrid wraps to {x25519, ML-KEM} recipients.
+            let owner_hybrid_pub = HybridEncPublicKey {
+                x25519: params.owner.enc_pub_bytes(),
+                mlkem: owner_mlkem,
+            };
+            let owner_hybrid_sec = HybridEncSecretKey::from_components(
+                params.owner.enc_secret().expose_bytes(),
+                params
+                    .owner
+                    .mlkem_seed()
+                    .expect("owner ML-KEM pub implies its seed"),
+            );
+            let recovery_hybrid_pub = HybridEncPublicKey {
+                x25519: params.recovery_pub.to_bytes(),
+                mlkem: recovery_mlkem,
+            };
+            vec![
+                wrap_and_grant_hybrid(
+                    signer,
+                    params.file_id,
+                    FIRST_VERSION,
+                    params.owner_id,
+                    RecipientType::User,
+                    &owner_hybrid_pub,
+                    dek,
+                    dek_commit,
+                    params.owner_id,
+                    params.created_at,
+                    Some(&owner_hybrid_sec),
+                )?,
+                wrap_and_grant_hybrid(
+                    signer,
+                    params.file_id,
+                    FIRST_VERSION,
+                    RECOVERY_ID,
+                    RecipientType::Recovery,
+                    &recovery_hybrid_pub,
+                    dek,
+                    dek_commit,
+                    params.owner_id,
+                    params.created_at,
+                    None,
+                )?,
+            ]
+        }
+        None => {
+            // Suite::V1 — classical HPKE wraps (behavior unchanged from Phase 3).
+            let owner_enc_pub = EncPublicKey::from_bytes(params.owner.enc_pub_bytes());
+            vec![
+                wrap_and_grant(
+                    signer,
+                    params.file_id,
+                    FIRST_VERSION,
+                    params.owner_id,
+                    RecipientType::User,
+                    &owner_enc_pub,
+                    dek,
+                    dek_commit,
+                    params.owner_id,
+                    params.created_at,
+                    Some(params.owner.enc_secret()),
+                )?,
+                wrap_and_grant(
+                    signer,
+                    params.file_id,
+                    FIRST_VERSION,
+                    RECOVERY_ID,
+                    RecipientType::Recovery,
+                    &params.recovery_pub,
+                    dek,
+                    dek_commit,
+                    params.owner_id,
+                    params.created_at,
+                    None,
+                )?,
+            ]
+        }
+    };
+
+    Ok((manifest, manifest_sig, genesis, genesis_sig, wraps))
+}
+
+/// Build a complete [`UploadBundle`] from a caller-supplied DEK (which may be
+/// freshly generated or recovered for a resume). Shared by [`build_upload`]
+/// and the test-only streaming-path comparator.
+pub(crate) fn build_upload_inner(
+    dek: &Dek,
+    params: &UploadParams,
+    streams: &PlaintextStreams,
+) -> Result<UploadBundle, UploadError> {
+    if params.chunk_size < CHUNK_SIZE_MIN || params.chunk_size > CHUNK_SIZE_MAX {
+        return Err(UploadError::ChunkSizeOutOfRange {
+            chunk_size: params.chunk_size,
+        });
+    }
+    let dek_commit = dek.commit();
+    let (manifest_streams, sealed_out) =
+        seal_streams(dek, params.file_id, FIRST_VERSION, params.chunk_size, streams);
+    let (manifest, manifest_sig, genesis, genesis_sig, wraps) =
+        assemble_records(dek, dek_commit, params, manifest_streams)?;
+    Ok(UploadBundle {
+        file_id: params.file_id,
+        file_type: params.file_type,
+        genesis,
+        genesis_sig,
+        manifest,
+        manifest_sig,
+        streams: sealed_out,
+        wraps,
+    })
+}
+
+/// Build the signed manifest/genesis/wraps and seal the SMALL (non-content)
+/// streams from a caller-supplied DEK, using a pre-computed `content_digest`
+/// and `content_chunk_count` from the streaming content sealer. The content
+/// `Stream` is prepended so the manifest's ascending order holds.
+pub(crate) fn build_records_inner(
+    dek: &Dek,
+    params: &UploadParams,
+    small: &SmallStreams,
+    content_digest: [u8; 32],
+    content_chunk_count: u64,
+) -> Result<UploadRecords, UploadError> {
+    if params.chunk_size < CHUNK_SIZE_MIN || params.chunk_size > CHUNK_SIZE_MAX {
+        return Err(UploadError::ChunkSizeOutOfRange {
+            chunk_size: params.chunk_size,
+        });
+    }
+    let dek_commit = dek.commit();
+
+    // Seal the small (non-content) streams.
+    let mut small_inputs: Vec<(StreamType, &[u8])> = Vec::new();
+    if let Some(m) = &small.metadata {
+        small_inputs.push((StreamType::Metadata, m));
+    }
+    if let Some(t) = &small.thumbnail {
+        small_inputs.push((StreamType::Thumbnail, t));
+    }
+    if let Some(p) = &small.preview {
+        small_inputs.push((StreamType::Preview, p));
+    }
+    let (small_manifest, small_sealed) =
+        seal_inputs(dek, params.file_id, FIRST_VERSION, params.chunk_size, &small_inputs);
+
+    // Content sorts lowest (encoding-spec V-13); prepend it then extend.
+    let mut manifest_streams = vec![Stream {
+        stream_type: StreamType::Content,
+        compression: Compression::None,
+        chunk_count: content_chunk_count,
+        digest: Bytes32(content_digest),
+    }];
+    manifest_streams.extend(small_manifest);
+
+    let (manifest, manifest_sig, genesis, genesis_sig, wraps) =
+        assemble_records(dek, dek_commit, params, manifest_streams)?;
+    Ok(UploadRecords {
+        file_id: params.file_id,
+        file_type: params.file_type,
+        genesis,
+        genesis_sig,
+        manifest,
+        manifest_sig,
+        wraps,
+        small_streams: small_sealed,
+    })
+}
+
+/// Drives the streaming-path upload. The caller generates a builder, streams
+/// content through [`content_sealer`][StreamingUploadBuilder::content_sealer],
+/// then calls [`finish`][StreamingUploadBuilder::finish] with the content digest
+/// and the small streams to assemble the complete [`UploadRecords`]. The DEK is
+/// owned privately and never exposed outside this crate.
+pub struct StreamingUploadBuilder {
+    dek: Dek,
+}
+
+impl StreamingUploadBuilder {
+    /// Generate a fresh DEK for this upload.
+    pub fn new() -> Self {
+        Self { dek: Dek::generate() }
+    }
+
+    /// Derive a [`ContentStreamSealer`] for the content stream. The sealer holds
+    /// only the content subkey — the raw DEK never leaves this builder.
+    pub fn content_sealer(&self, params: &UploadParams) -> ContentStreamSealer {
+        ContentStreamSealer::new(
+            &self.dek,
+            params.file_id,
+            FIRST_VERSION,
+            StreamType::Content,
+            params.chunk_size as usize,
+        )
+    }
+
+    /// Consume the builder and assemble the [`UploadRecords`] from the small
+    /// streams and the content digest/chunk-count reported by the sealer.
+    pub fn finish(
+        self,
+        params: &UploadParams,
+        small: &SmallStreams,
+        content_digest: [u8; 32],
+        content_chunk_count: u64,
+    ) -> Result<UploadRecords, UploadError> {
+        build_records_inner(&self.dek, params, small, content_digest, content_chunk_count)
+    }
+}
+
+impl Default for StreamingUploadBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Recover the DEK from a classical (Suite::V1) self-wrap for a resumable
+/// upload. The DEK stays in-crate; only the returned `Dek` is held by the
+/// caller (who must immediately derive a subkey and let the `Dek` drop).
+pub(crate) fn recover_dek(
+    self_secret: &EncSecretKey,
+    wrapped_dek: &WrappedDek,
+    ctx: &WrapContext,
+) -> Result<Dek, CryptoError> {
+    unwrap_dek(self_secret, wrapped_dek, ctx)
+}
+
+/// Recover the DEK from a hybrid (Suite::V2) self-wrap for a resumable upload.
+pub(crate) fn recover_dek_hybrid(
+    self_secret: &HybridEncSecretKey,
+    wrapped_dek: &WrappedDek,
+    ctx: &WrapContext,
+) -> Result<Dek, CryptoError> {
+    let h = unpack_hybrid_wrap(wrapped_dek)?;
+    unwrap_dek_hybrid(self_secret, &h, ctx)
+}
+
+/// Recover a [`ContentStreamSealer`] from the owner's self-wrapped DEK for a
+/// resumable content upload. The DEK is recovered, a content subkey is derived,
+/// and the DEK is immediately dropped (zeroized). The returned sealer produces
+/// byte-identical ciphertext to the original upload for the same
+/// `file_id`/`version`/`chunk_size`.
+pub fn resume_content_sealer(
+    owner: &Identity,
+    self_wrapped_dek: &WrappedDek,
+    ctx: &WrapContext,
+    suite: Suite,
+    file_id: Id,
+    version: u64,
+    chunk_size: u32,
+) -> Result<ContentStreamSealer, UploadError> {
+    let dek = match suite {
+        Suite::V1 => recover_dek(owner.enc_secret(), self_wrapped_dek, ctx)?,
+        Suite::V2 => {
+            let seed = owner
+                .mlkem_seed()
+                .ok_or(UploadError::Crypto(CryptoError::WrapOpen))?;
+            let sk = HybridEncSecretKey::from_components(
+                owner.enc_secret().expose_bytes(),
+                seed,
+            );
+            recover_dek_hybrid(&sk, self_wrapped_dek, ctx)?
+        }
+    };
+    // `dek` drops (zeroized) after the subkey is derived inside `new`.
+    Ok(ContentStreamSealer::new(
+        &dek,
+        file_id,
+        version,
+        StreamType::Content,
+        chunk_size as usize,
+    ))
 }
 
 #[cfg(test)]
@@ -640,6 +927,49 @@ mod tests {
     }
 
     #[test]
+    fn content_stream_sealer_matches_seal_stream() {
+        use std::io::Cursor;
+
+        let chunk_size = 4096usize;
+        let file_id = Id([0x5A; 16]);
+        let version = 1u64;
+        let st = StreamType::Content;
+
+        let lengths: &[usize] = &[1, 2 * chunk_size, 2 * chunk_size + 123, 0];
+        for &len in lengths {
+            let dek = Dek::generate();
+            let pt: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+            // (a) expected — whole-buffer sealer via direct subkey derivation
+            let ck = dek.stream_subkey(st);
+            let expected = maxsecu_crypto::seal_stream(&ck, file_id, version, st, chunk_size, &pt);
+
+            // (b) actual — via ContentStreamSealer
+            let sealer = ContentStreamSealer::new(&dek, file_id, version, st, chunk_size);
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            let (count, digest) = sealer
+                .seal_from_reader(&mut Cursor::new(&pt), |_i, ct| {
+                    got.push(ct.to_vec());
+                    Ok(())
+                })
+                .expect("sealing succeeds");
+
+            assert_eq!(
+                got, expected.chunks,
+                "chunks match for len={}", len
+            );
+            assert_eq!(
+                count, expected.chunk_count,
+                "chunk_count matches for len={}", len
+            );
+            assert_eq!(
+                digest, expected.digest,
+                "digest matches for len={}", len
+            );
+        }
+    }
+
+    #[test]
     fn chunk_size_below_floor_is_rejected() {
         let owner = Identity::generate();
         let (_rsk, rpk) = generate_enc_keypair();
@@ -746,5 +1076,327 @@ mod tests {
         p2.recovery_mlkem_pub = Some(rmlkem);
         let b2 = build_upload(&p2, &streams()).expect("v1 upload builds");
         assert!(matches!(b2.manifest.alg, Suite::V1), "identity-missing ⇒ V1");
+    }
+
+    // ── Streaming-path tests ──────────────────────────────────────────────────
+
+    /// The streaming path (build_records_inner + ContentStreamSealer) produces a
+    /// byte-identical manifest/genesis/sigs to the monolithic path (build_upload_inner)
+    /// when driven by the same DEK. The self-wrap opens to the committed DEK in
+    /// both paths. The small sealed streams are byte-identical.
+    #[test]
+    fn streaming_records_match_monolithic_v1() {
+        use std::io::Cursor;
+
+        let owner = Identity::generate();
+        let (_rsk, rpk) = generate_enc_keypair();
+        // V1: recovery_mlkem_pub = None ⇒ partially-enrolled fallback to V1.
+        let p = params(&owner, rpk);
+
+        let content: Vec<u8> = (0..(4096 * 2 + 123)).map(|i| (i % 251) as u8).collect();
+        let meta: Option<Vec<u8>> = Some(b"title=x".to_vec());
+
+        // ONE DEK drives both paths to ensure determinism.
+        let dek = Dek::generate();
+
+        // (a) monolithic path.
+        let full_streams = PlaintextStreams {
+            content: content.clone(),
+            metadata: meta.clone(),
+            thumbnail: None,
+            preview: None,
+        };
+        let bundle = build_upload_inner(&dek, &p, &full_streams).expect("inner build");
+
+        // (b) streaming path: seal content via ContentStreamSealer (discarding chunks),
+        //     then build records from the digest + small streams.
+        let sealer = ContentStreamSealer::new(
+            &dek,
+            p.file_id,
+            FIRST_VERSION,
+            StreamType::Content,
+            p.chunk_size as usize,
+        );
+        let (count, digest) = sealer
+            .seal_from_reader(&mut Cursor::new(&content), |_, _| Ok(()))
+            .expect("sealing succeeds");
+        let recs = build_records_inner(
+            &dek,
+            &p,
+            &SmallStreams {
+                metadata: meta.clone(),
+                thumbnail: None,
+                preview: None,
+            },
+            digest,
+            count,
+        )
+        .expect("records build");
+
+        // Manifests must be byte-identical (all fields deterministic for same DEK).
+        assert_eq!(
+            encode(&bundle.manifest),
+            encode(&recs.manifest),
+            "manifests are byte-identical"
+        );
+        assert_eq!(bundle.manifest_sig, recs.manifest_sig, "manifest sigs match");
+        assert_eq!(bundle.genesis, recs.genesis, "genesis matches");
+        assert_eq!(bundle.genesis_sig, recs.genesis_sig, "genesis sigs match");
+
+        // Wrap metadata matches; wrapped_dek bytes differ (HPKE randomizes the ephemeral).
+        assert_eq!(bundle.wraps.len(), recs.wraps.len(), "wrap count matches");
+        for (bw, rw) in bundle.wraps.iter().zip(recs.wraps.iter()) {
+            assert_eq!(bw.recipient_id, rw.recipient_id, "recipient_id");
+            assert_eq!(bw.recipient_type, rw.recipient_type, "recipient_type");
+            assert_eq!(bw.granted_by, rw.granted_by, "granted_by");
+            assert_eq!(bw.grant, rw.grant, "grant");
+            assert_eq!(bw.grant_sig, rw.grant_sig, "grant_sig");
+        }
+
+        // Both self-wraps open to the committed DEK.
+        let ctx = WrapContext {
+            file_id: p.file_id,
+            version: 1,
+            recipient_id: p.owner_id,
+        };
+        let bundle_self = bundle
+            .wraps
+            .iter()
+            .find(|w| w.recipient_id == p.owner_id && w.recipient_type == RecipientType::User)
+            .expect("bundle self wrap");
+        let recs_self = recs
+            .wraps
+            .iter()
+            .find(|w| w.recipient_id == p.owner_id && w.recipient_type == RecipientType::User)
+            .expect("recs self wrap");
+        let dek_commit = bundle.manifest.dek_commit.0;
+        assert_eq!(
+            unwrap_dek(owner.enc_secret(), &bundle_self.wrapped_dek, &ctx)
+                .expect("bundle self opens")
+                .commit(),
+            dek_commit,
+            "bundle self-wrap → committed DEK"
+        );
+        assert_eq!(
+            unwrap_dek(owner.enc_secret(), &recs_self.wrapped_dek, &ctx)
+                .expect("recs self opens")
+                .commit(),
+            dek_commit,
+            "recs self-wrap → committed DEK"
+        );
+
+        // Metadata sealed stream matches in both paths.
+        let bundle_meta = bundle
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Metadata)
+            .expect("bundle has metadata stream");
+        let recs_meta = recs
+            .small_streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Metadata)
+            .expect("recs has metadata stream");
+        assert_eq!(bundle_meta.chunk_count, recs_meta.chunk_count, "meta chunk_count");
+        assert_eq!(bundle_meta.digest, recs_meta.digest, "meta digest");
+        assert_eq!(bundle_meta.total_bytes, recs_meta.total_bytes, "meta total_bytes");
+        assert_eq!(bundle_meta.chunks, recs_meta.chunks, "meta chunks");
+    }
+
+    /// Recovering the DEK from a V1 self-wrap via `recover_dek` and
+    /// `resume_content_sealer` reproduces the original content ciphertext.
+    #[test]
+    fn recover_dek_v1_reproduces_content() {
+        use std::io::Cursor;
+
+        let owner = Identity::generate();
+        let (_rsk, rpk) = generate_enc_keypair();
+        let p = params(&owner, rpk); // V1
+
+        let content: Vec<u8> = (0..4096 * 3).map(|i| (i % 127) as u8).collect();
+        let full_streams = PlaintextStreams {
+            content: content.clone(),
+            metadata: None,
+            thumbnail: None,
+            preview: None,
+        };
+        let dek = Dek::generate();
+        let bundle = build_upload_inner(&dek, &p, &full_streams).expect("inner build");
+
+        let self_wrap = bundle
+            .wraps
+            .iter()
+            .find(|w| w.recipient_id == p.owner_id && w.recipient_type == RecipientType::User)
+            .expect("self wrap");
+        let ctx = WrapContext {
+            file_id: p.file_id,
+            version: 1,
+            recipient_id: p.owner_id,
+        };
+
+        // recover_dek opens to the committed DEK.
+        let dek2 = recover_dek(owner.enc_secret(), &self_wrap.wrapped_dek, &ctx)
+            .expect("recover_dek succeeds");
+        assert_eq!(
+            dek2.commit(),
+            bundle.manifest.dek_commit.0,
+            "recovered DEK matches commitment"
+        );
+
+        // Sealing with the recovered DEK reproduces the original ciphertext.
+        let sealer2 =
+            ContentStreamSealer::new(&dek2, p.file_id, 1, StreamType::Content, 4096);
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let (count2, digest2) = sealer2
+            .seal_from_reader(&mut Cursor::new(&content), |_, ct| {
+                got.push(ct.to_vec());
+                Ok(())
+            })
+            .expect("re-seal succeeds");
+        let orig_content = bundle
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .expect("original content stream");
+        assert_eq!(got, orig_content.chunks, "recovered DEK chunks match");
+        assert_eq!(count2, orig_content.chunk_count, "chunk count matches");
+        assert_eq!(digest2, orig_content.digest, "digest matches");
+
+        // resume_content_sealer produces the same ciphertext.
+        let sealer3 =
+            resume_content_sealer(&owner, &self_wrap.wrapped_dek, &ctx, Suite::V1, p.file_id, 1, 4096)
+                .expect("resume_content_sealer succeeds");
+        let mut got3: Vec<Vec<u8>> = Vec::new();
+        let (count3, digest3) = sealer3
+            .seal_from_reader(&mut Cursor::new(&content), |_, ct| {
+                got3.push(ct.to_vec());
+                Ok(())
+            })
+            .expect("resume re-seal succeeds");
+        assert_eq!(got3, orig_content.chunks, "resume sealer chunks match");
+        assert_eq!(count3, orig_content.chunk_count);
+        assert_eq!(digest3, orig_content.digest);
+    }
+
+    /// Recovering the DEK from a V2 hybrid self-wrap via `recover_dek_hybrid` and
+    /// `resume_content_sealer` reproduces the original content ciphertext.
+    #[test]
+    fn recover_dek_v2_reproduces_content() {
+        use maxsecu_crypto::generate_mlkem_keypair;
+        use std::io::Cursor;
+
+        // Both owner and recovery are PQ-enrolled ⇒ Suite::V2.
+        let owner = Identity::generate();
+        let (_recovery_sk, recovery_pk) = generate_enc_keypair();
+        let (_recovery_seed, recovery_mlkem) = generate_mlkem_keypair();
+        let mut p = params(&owner, recovery_pk);
+        p.recovery_mlkem_pub = Some(recovery_mlkem);
+
+        let content: Vec<u8> = (0..4096 * 2 + 7).map(|i| (i % 199) as u8).collect();
+        let full_streams = PlaintextStreams {
+            content: content.clone(),
+            metadata: None,
+            thumbnail: None,
+            preview: None,
+        };
+        let dek = Dek::generate();
+        let bundle = build_upload_inner(&dek, &p, &full_streams).expect("v2 inner build");
+        assert!(matches!(bundle.manifest.alg, Suite::V2), "manifest.alg is V2");
+
+        let self_wrap = bundle
+            .wraps
+            .iter()
+            .find(|w| w.recipient_id == p.owner_id && w.recipient_type == RecipientType::User)
+            .expect("v2 self wrap");
+        let ctx = WrapContext {
+            file_id: p.file_id,
+            version: 1,
+            recipient_id: p.owner_id,
+        };
+
+        // recover_dek_hybrid directly: reconstruct the owner's hybrid secret.
+        let owner_sec = HybridEncSecretKey::from_components(
+            owner.enc_secret().expose_bytes(),
+            owner.mlkem_seed().expect("owner is PQ"),
+        );
+        let dek2 = recover_dek_hybrid(&owner_sec, &self_wrap.wrapped_dek, &ctx)
+            .expect("recover_dek_hybrid succeeds");
+        assert_eq!(
+            dek2.commit(),
+            bundle.manifest.dek_commit.0,
+            "hybrid-recovered DEK matches commitment"
+        );
+
+        // resume_content_sealer with Suite::V2 reproduces the original ciphertext.
+        let sealer = resume_content_sealer(
+            &owner,
+            &self_wrap.wrapped_dek,
+            &ctx,
+            Suite::V2,
+            p.file_id,
+            1,
+            4096,
+        )
+        .expect("v2 resume_content_sealer succeeds");
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let (count, digest) = sealer
+            .seal_from_reader(&mut Cursor::new(&content), |_, ct| {
+                got.push(ct.to_vec());
+                Ok(())
+            })
+            .expect("v2 resume re-seal succeeds");
+        let orig_content = bundle
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .expect("original v2 content stream");
+        assert_eq!(got, orig_content.chunks, "v2 resume sealer chunks match");
+        assert_eq!(count, orig_content.chunk_count);
+        assert_eq!(digest, orig_content.digest);
+    }
+
+    /// `ContentStreamSealer::seal_chunk` produces BYTE-IDENTICAL ciphertext to
+    /// `seal_from_reader` for every chunk index, including the short final chunk.
+    #[test]
+    fn seal_chunk_matches_seal_from_reader() {
+        use std::io::Cursor;
+
+        let chunk_size = 4096usize;
+        let file_id = Id([0xCC; 16]);
+        let version = 1u64;
+
+        // 3 full chunks + a short tail (exercises is_last on a short final chunk).
+        let pt_len = chunk_size * 3 + 100;
+        let plaintext: Vec<u8> = (0..pt_len).map(|i| (i % 251) as u8).collect();
+
+        let dek = Dek::generate();
+        let sealer = ContentStreamSealer::new(
+            &dek,
+            file_id,
+            version,
+            StreamType::Content,
+            chunk_size,
+        );
+
+        // (a) reference — drive seal_from_reader and collect each emitted chunk.
+        let mut reference: Vec<Vec<u8>> = Vec::new();
+        let (count, _digest) = sealer
+            .seal_from_reader(&mut Cursor::new(&plaintext), |_i, ct| {
+                reference.push(ct.to_vec());
+                Ok(())
+            })
+            .expect("seal_from_reader succeeds");
+
+        // (b) random-access — split the plaintext manually and call seal_chunk per index.
+        let chunks_in: Vec<&[u8]> = plaintext.chunks(chunk_size).collect();
+        assert_eq!(chunks_in.len() as u64, count, "chunk count matches");
+
+        for i in 0..count {
+            let is_last = i == count - 1;
+            let ct = sealer.seal_chunk(i, chunks_in[i as usize], is_last);
+            assert_eq!(
+                ct, reference[i as usize],
+                "seal_chunk({i}) bytes must match seal_from_reader chunk {i}"
+            );
+        }
     }
 }

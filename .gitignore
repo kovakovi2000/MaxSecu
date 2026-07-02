@@ -29,3 +29,10 @@ target-repro-b/
 
 # Brainstorming visual-companion scratch (superpowers)
 .superpowers/
+
+# Vendored static ffmpeg for the universal-video-ingest feature (D-1). The binary
+# is FETCHED (scripts/fetch-ffmpeg.ps1) and its SHA-256 is pinned in source
+# (vendor/ffmpeg/README.md + crates/client-app/src/ffmpeg_bin.rs); the bytes
+# themselves are never committed.
+/vendor/ffmpeg/*.exe
+/vendor/ffmpeg/*.zip

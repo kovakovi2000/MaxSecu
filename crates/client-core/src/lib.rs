@@ -71,7 +71,8 @@ pub use video::{
 };
 pub use version_memory::{open_and_remember, FileVersionRecord, MemoryVersionStore, VersionStore};
 pub use upload::{
-    build_upload, PlaintextStreams, SealedStreamOut, UploadBundle, UploadParams, WrapOut,
+    build_upload, resume_content_sealer, ContentStreamSealer, PlaintextStreams, SealedStreamOut,
+    SmallStreams, StreamingUploadBuilder, UploadBundle, UploadParams, UploadRecords, WrapOut,
 };
 pub use reshare::{build_reshare, ReshareError, ReshareParams};
 pub use rotate::{

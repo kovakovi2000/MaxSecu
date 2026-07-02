@@ -632,6 +632,7 @@ async fn phase7_exit_gates_over_real_tls() {
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(publisher),
         direct_links_enabled: false,
+        max_file_bytes: None,
     };
     let app_pki = test_pki();
     let app_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1078,6 +1079,7 @@ async fn r27_cutoff_over_real_sink() {
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(publisher),
         direct_links_enabled: false,
+        max_file_bytes: None,
     };
     let app_pki = test_pki();
     let app_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

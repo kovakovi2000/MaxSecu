@@ -42,8 +42,12 @@ export interface PcmDto {
 }
 
 // Backend player phase (kebab-tagged), surfaced to the component via onPhase.
+// `gap` is a BENIGN, non-terminal notice that the decode dropped `skipped` fragment(s)
+// or frame(s) (resilient-driver respawn, or the D-7 in-flight bound) — count-only, no
+// oracle. The player keeps going; the component may show a brief "skipped" hint.
 export type PlayerPhase =
   | { phase: "buffering" | "playing" | "stalled" | "codec-unavailable" }
+  | { phase: "gap"; skipped: number }
   | { phase: "error"; code: string };
 
 // A decoded frame: render planes plus the presentation timestamp we sync on.
@@ -81,6 +85,10 @@ export interface AudioContextLike {
   createGain(): GainLike;
   createBuffer(channels: number, length: number, sampleRate: number): AudioBufferLike;
   createBufferSource(): AudioBufferSourceLike;
+  // Pause/resume the whole audio clock so scheduled audio + the video master
+  // clock freeze together (real pause). Optional so non-audio fakes can omit them.
+  suspend?(): Promise<void>;
+  resume?(): Promise<void>;
 }
 
 // The frame sink: either the 5.1 YuvRenderer ({ draw }) or a bare function.
@@ -99,6 +107,13 @@ export interface PlayerOptions {
   reducedMotion: boolean;
   // Max decoded frames retained for instant local scrub (default 16).
   ringCapacity?: number;
+  // Byte ceiling on the decoded-frame buffer (default 192 MiB). Decoded I420 frames are
+  // ~1.4 MB each, so this bounds WebView RAM regardless of clip length. Over the cap the
+  // OLDEST frame is dropped (counted). A byte cap (not a frame count) is correct because a
+  // 4K frame is ~12 MB and a 1080p frame ~3 MB.
+  maxBufferBytes?: number;
+  // Total clip duration in ms (from the fragment index). May be set later via setDuration().
+  durationMs?: number;
   // Master clock in SECONDS; defaults to audio.currentTime. Injectable so tests
   // drive sync deterministically.
   audioClock?: () => number;
@@ -111,6 +126,14 @@ export interface PlayerOptions {
   onSeek?: (pts_ms: number) => void;
   // Receives every player-state phase from the backend.
   onPhase?: (phase: PlayerPhase) => void;
+  // Streaming: `bufferAheadMs` is the (reserved) target horizon of frames buffered ahead of
+  // the playhead; `lowWaterMs` is the trigger — when the buffered frontier leads the playhead
+  // by less than this, the next window is requested. `requestWindow(fromPtsMs)` asks the
+  // component to decode the window covering fromPtsMs (it maps pts -> fragment seq and calls
+  // the backend).
+  bufferAheadMs?: number;
+  lowWaterMs?: number;
+  requestWindow?: (fromPtsMs: number) => void;
 }
 
 export interface Player {
@@ -136,6 +159,14 @@ export interface Player {
   stats(): { drawn: number; dropped: number };
   readonly volume: number;
   readonly rate: number;
+  // Current play position in ms (from the clock). Returns 0 before play() is called.
+  positionMs(): number;
+  // Total clip duration in ms (set by the component via setDuration).
+  durationMs(): number;
+  // Update the clip duration (from the fragment index, available after headers are parsed).
+  setDuration(ms: number): void;
+  // Total bytes currently held in the decoded-frame pending buffer.
+  bufferedBytes(): number;
 }
 
 // ---- portable base64 (atob may be absent under node) ---------------------
@@ -184,11 +215,15 @@ function decodeI16Le(b64: string): Int16Array {
 export function createPlayer(opts: PlayerOptions): Player {
   const audio = opts.audio;
   const subscribe: Subscribe = opts.subscribe ?? on;
-  const reducedMotion = opts.reducedMotion;
   const ringCapacity = Math.max(1, opts.ringCapacity ?? 16);
+  const maxBufferBytes = Math.max(1, opts.maxBufferBytes ?? 192 * 1024 * 1024);
+  // Retain a little played history for tiny back-scrubs before re-decoding from Tier-1.
+  const KEEP_BEHIND_MS = 1500;
   const maxGain = opts.maxGain ?? 1;
   const toleranceSec = (opts.toleranceMs ?? 8) / 1000;
   const audioClock = opts.audioClock ?? (() => audio.currentTime);
+  const lowWaterMs = opts.lowWaterMs ?? 1500;
+  const requestWindow = opts.requestWindow;
   const renderer = opts.renderer;
   const drawFrame: (f: YuvFrame) => void =
     typeof renderer === "function" ? renderer : (f) => renderer.draw(f);
@@ -206,15 +241,35 @@ export function createPlayer(opts: PlayerOptions): Player {
   const liveSources = new Set<AudioBufferSourceLike>();
 
   let playing = false;
-  let started = false; // first-frame autostart latch
   let disposed = false;
   let volume = clamp(1, 0, maxGain);
   let rate = 1;
   let drawnCount = 0;
   let droppedCount = 0;
   let nextAudioTime = 0; // playout cursor for the audio graph (seconds)
+  // The audio-clock reading captured when playback begins (at play()). The audio is
+  // master and is scheduled gaplessly from here, so video frames sync against ELAPSED
+  // time since this origin (audioClock() - playbackStart) rather than the raw clock —
+  // otherwise window-relative pts (which start near 0) would all read as "due" against
+  // a nonzero wall clock and the whole window would burst then stall. Reset on seek (a
+  // new window). null until play() establishes the origin.
+  let playbackStart: number | null = null;
+  // Absolute clip pts (ms) that corresponds to elapsed = 0. 0 for normal playback; a seek
+  // shifts it to the target so position/frame-release/timer stay on the absolute timeline.
+  let originPtsMs = 0;
+  let durationMs = Math.max(0, opts.durationMs ?? 0);
+  let bufferedBytes = 0;
+  let frontierMs = 0;            // max pts received so far
+  let windowOutstanding = false; // a requestWindow is in flight (until the frontier advances)
+
+  function frameBytes(f: YuvFrame): number {
+    return f.y.length + f.u.length + f.v.length;
+  }
 
   gain.gain.value = volume;
+  // No autoplay: start suspended so the audio clock is frozen and any pre-play audio
+  // chunks stay silent until the user presses Play (which resume()s the context).
+  void audio.suspend?.();
 
   // rAF pacing when in a browser; under node the loop is inert and tests drive
   // tick() directly.
@@ -253,11 +308,12 @@ export function createPlayer(opts: PlayerOptions): Player {
       v: decodeBase64(dto.v_b64),
     };
     pending.push(frame);
+    bufferedBytes += frameBytes(frame);
+    evictBuffer();
     pushRing(frame);
-    // Autostart on the first frame unless reduced-motion asked us to hold.
-    if (!started) {
-      started = true;
-      if (!reducedMotion) play();
+    if (frame.pts_ms > frontierMs) {
+      frontierMs = frame.pts_ms;
+      windowOutstanding = false; // new frames arrived; allow the next request
     }
   }
 
@@ -302,22 +358,60 @@ export function createPlayer(opts: PlayerOptions): Player {
     opts.onPhase?.(phase);
   }
 
+  // Current play position in ms on the ABSOLUTE clip timeline.
+  // Before play() is called, returns originPtsMs (0 normally; seek target after a seek).
+  function positionMs(): number {
+    if (playbackStart === null) return originPtsMs;
+    return Math.max(0, originPtsMs + Math.round((audioClock() - playbackStart) * 1000));
+  }
+
+  // Keep the decoded buffer bounded: first drop frames well behind the playhead
+  // (a back-scrub re-decodes from the Tier-1 cache), then enforce the byte ceiling
+  // by dropping the oldest. Always keep at least one frame so tick() has something.
+  function evictBuffer(): void {
+    const floor = positionMs() - KEEP_BEHIND_MS;
+    while (pending.length > 1 && pending[0].pts_ms < floor) {
+      bufferedBytes -= frameBytes(pending.shift() as YuvFrame);
+      droppedCount++;
+    }
+    while (pending.length > 1 && bufferedBytes > maxBufferBytes) {
+      bufferedBytes -= frameBytes(pending.shift() as YuvFrame);
+      droppedCount++;
+    }
+  }
+
+  function maybePrefetch(): void {
+    if (!playing || windowOutstanding || !requestWindow) return;
+    // Ahead = how far the buffered frontier leads the playhead.
+    const ahead = frontierMs - positionMs();
+    if (ahead < lowWaterMs && (durationMs === 0 || frontierMs < durationMs)) {
+      windowOutstanding = true;
+      requestWindow(frontierMs); // decode the window starting after the frontier
+    }
+  }
+
   // ---- A/V sync scheduler ----
   // Audio is master. Walk the pending queue: future frames (pts beyond clock +
   // tolerance) are HELD; among consecutive DUE frames only the latest is drawn
   // and the earlier ones are DROPPED, so video catches up to audio.
   function tick(): void {
     if (!playing || disposed) return;
-    const now = audioClock();
+    maybePrefetch();
+    // Sync against ELAPSED time since playback start, not the raw clock, so the
+    // window-relative pts (which start near 0) line up with the audio that began at
+    // playbackStart. If no frame/audio has set the origin yet, set it now.
+    if (playbackStart === null) playbackStart = audioClock();
+    const now = originPtsMs / 1000 + (audioClock() - playbackStart);
     let toDraw: YuvFrame | null = null;
     while (pending.length > 0) {
       const head = pending[0];
       const ptsSec = head.pts_ms / 1000;
       if (ptsSec > now + toleranceSec) break; // future: hold
-      if (toDraw !== null) droppedCount++; // previous due frame is stale
+      if (toDraw !== null) { droppedCount++; bufferedBytes -= frameBytes(toDraw); } // previous due frame is stale
       toDraw = pending.shift() as YuvFrame;
     }
     if (toDraw) {
+      bufferedBytes -= frameBytes(toDraw);
       drawnCount++;
       drawFrame(toDraw);
     }
@@ -328,23 +422,29 @@ export function createPlayer(opts: PlayerOptions): Player {
   function play(): void {
     if (disposed) return;
     playing = true;
-    started = true;
+    void audio.resume?.();
+    if (playbackStart === null) playbackStart = audioClock();
     startLoop();
   }
 
   function pause(): void {
     playing = false;
+    void audio.suspend?.();
     stopLoop();
   }
 
   function seek(pts_ms: number): void {
-    // Drop the local window; the component will request a fresh one. Stop any
-    // already-scheduled audio so it doesn't bleed over the new window.
     pending.length = 0;
     ring.length = 0;
+    bufferedBytes = 0;
     nextAudioTime = 0;
+    playbackStart = null;      // re-anchored on the next tick
+    originPtsMs = pts_ms;      // the new timeline base = the absolute seek target
+    frontierMs = pts_ms;       // the new window begins at the target
+    windowOutstanding = true;  // about to request it; guard until frames arrive
     stopAllSources();
     opts.onSeek?.(pts_ms);
+    requestWindow?.(pts_ms);
   }
 
   function setVolume(g: number): void {
@@ -395,7 +495,10 @@ export function createPlayer(opts: PlayerOptions): Player {
     for (const un of unlisteners) un();
     unlisteners.length = 0;
     pending.length = 0;
+    bufferedBytes = 0;
     ring.length = 0;
+    frontierMs = 0;
+    windowOutstanding = false;
   }
 
   return {
@@ -415,6 +518,12 @@ export function createPlayer(opts: PlayerOptions): Player {
     get rate() {
       return rate;
     },
+    positionMs,
+    durationMs: () => durationMs,
+    setDuration: (ms: number) => {
+      durationMs = Math.max(0, ms);
+    },
+    bufferedBytes: () => bufferedBytes,
   };
 }
 

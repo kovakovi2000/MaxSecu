@@ -1,43 +1,59 @@
 //! Upload commands. `stage_upload` transcodes/encrypts the user's chosen content
-//! and holds the bundle for preview (NO network write); `confirm_upload` (Task 7)
-//! runs the pipeline. Only preview/progress DTOs cross the seam — never the bundle,
+//! and holds the bundle for preview (NO network write); `confirm_upload` runs the
+//! network pipeline. Only preview/progress DTOs cross the seam — never the bundle,
 //! keys, or plaintext.
+//!
+//! Video uploads are STREAMING (no whole-file RAM buffer):
+//!   - `stage_upload` does a pass-1 disk stream to compute the manifest digest,
+//!     builds the signed records WITHOUT content ciphertext, persists a
+//!     `StagingRecord`, and moves `out.mp4` into the app staging dir — NO network.
+//!   - `confirm_upload` does a pass-2 disk stream: re-seals one chunk at a time
+//!     (O(one 6 MiB chunk) RAM) and PUTs each chunk immediately.
+//! Images and blogs are unchanged (in-RAM `UploadBundle`).
+
+use std::io::{Read, Seek, SeekFrom};
 
 use tauri::State;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use maxsecu_client_core::{
-    build_upload, DirectoryVerifier, Identity, MemoryTrustStore, UploadParams,
+    build_upload, resume_content_sealer, DirectoryVerifier, Identity, MemoryTrustStore,
+    SmallStreams, StreamingUploadBuilder, UploadParams,
 };
-use maxsecu_crypto::EncPublicKey;
-use maxsecu_encoding::types::{Id, Timestamp};
+use maxsecu_crypto::{EncPublicKey, WrappedDek};
+use maxsecu_encoding::structs::WrapContext;
+use maxsecu_encoding::types::{Id, RecipientType, Suite, Timestamp};
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{open_conn, reauth, server_of};
 use crate::config::{load_directory_pub, recovery_recipient_username};
 use crate::directory::{resolve_my_binding, resolve_recovery_recipient};
 use crate::dto::{
-    CancelUploadRequest, ConfirmUploadRequest, StageUploadRequest, UploadJobView, UploadKind,
-    UploadPreview,
+    CancelUploadRequest, ConfirmUploadRequest, PendingUploadView, StageUploadRequest, UploadJobView,
+    UploadKind, UploadPreview,
 };
 use crate::error::UiError;
-use crate::jobs::{StagedUpload, StagedVideoPreview, UploadJobs};
-use crate::state::{UploadPhase, EVT_UPLOAD};
+use crate::ffmpeg_bin::ensure_ffmpeg;
+use crate::http_client::{delete_req, post_json};
+use crate::jobs::{StagedContent, StagedUpload, StagedVideoPreview, UploadJobs, VideoPrepareCancel};
+use crate::state::{PreparePhase, UploadPhase, EVT_UPLOAD, EVT_VIDEO_PREPARE};
 use crate::upload::{
-    prepare_blog_streams, prepare_image_streams, prepare_video_streams, run_pipeline, total_chunks,
+    prepare_blog_streams, prepare_image_streams, prepare_video_streams, put_chunk_retried,
+    run_pipeline, total_chunks, wrap_wire, PreparedVideo,
 };
+use crate::upload_staging::{StagedSmallStream, StagedWrap, StagingRecord, StagingStore};
 
 use tauri::Emitter;
 
 /// Max bytes we read from a chosen file / accept as blog text (DoS guard).
 const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
-/// The `build_upload` chunk size for EVERY kind. This is the SINGLE source of truth
-/// for the 4096-byte chunking — it is `crate::upload::VIDEO_CHUNK_SIZE`, the same
-/// constant the video fragment-index validator uses. Tying them here makes it
-/// impossible to stage video at a `chunk_size` that differs from the fragment
+/// The content chunk size for EVERY upload kind. This is the SINGLE source of truth
+/// for the content chunk size — it is `crate::upload::VIDEO_CHUNK_SIZE` (6 MiB),
+/// the same constant the video fragment-index validator uses. Tying them here makes
+/// it impossible to stage video at a `chunk_size` that differs from the fragment
 /// index's chunk unit (a divergence would silently misseek after upload).
 const CHUNK_SIZE: u32 = crate::upload::VIDEO_CHUNK_SIZE;
 
@@ -54,47 +70,127 @@ fn rand_job_id() -> String {
         .collect()
 }
 
-/// Read the `MXRAWV01` raw-frame source for a video stage from the request: either
-/// `source_b64` (base64 bytes the UI provides) or `path` (a raw-frame file). Bounded
-/// by [`MAX_UPLOAD_BYTES`] (the worker re-enforces every `VideoBounds` cap in its own
-/// confined address space). Fail-closed on a missing/oversized/undecodable source.
-fn read_video_source(req: &StageUploadRequest) -> Result<Vec<u8>, UiError> {
-    if let Some(b64) = req.source_b64.as_ref() {
-        if b64.len() as u64 > MAX_UPLOAD_BYTES * 2 {
-            return Err(UiError::new("too_large", "That video is too large."));
-        }
-        let bytes = B64
-            .decode(b64)
-            .map_err(|_| UiError::new("bad_request", "That video source was malformed."))?;
-        if bytes.len() as u64 > MAX_UPLOAD_BYTES {
-            return Err(UiError::new("too_large", "That video is too large."));
-        }
-        return Ok(bytes);
-    }
-    let path = req
-        .path
-        .clone()
-        .ok_or_else(|| UiError::new("bad_request", "No video source was provided."))?;
-    let meta = std::fs::metadata(&path)
-        .map_err(|_| UiError::new("bad_request", "That file could not be read."))?;
-    if meta.len() > MAX_UPLOAD_BYTES {
-        return Err(UiError::new("too_large", "That video is too large."));
-    }
-    std::fs::read(&path).map_err(|_| UiError::new("bad_request", "That file could not be read."))
+/// Rolling throughput estimate: ciphertext bytes over elapsed seconds.
+fn bytes_per_s_from_window(bytes: u64, secs: f64) -> u64 {
+    if secs <= 0.0 { 0 } else { (bytes as f64 / secs) as u64 }
 }
 
-/// `stage_upload` — prepare + encrypt a post and hold it for preview. No network write.
+/// Map a `StagedSmallStream.stream_type` (u8) to the wire name used in the
+/// POST /v1/files `streams[]` array. Never called for type 1 (content).
+fn small_stream_type_name(v: u8) -> &'static str {
+    match v {
+        0x02 => "metadata",
+        0x03 => "thumbnail",
+        0x04 => "preview",
+        _ => "unknown",
+    }
+}
+
+/// Map a `StagedSmallStream.stream_type` u8 to the typed `StreamType` enum for
+/// `put_chunk_retried`. Fail-closed on unknown values.
+fn stream_type_from_u8(v: u8) -> Option<maxsecu_encoding::types::StreamType> {
+    use maxsecu_encoding::types::StreamType;
+    match v {
+        0x01 => Some(StreamType::Content),
+        0x02 => Some(StreamType::Metadata),
+        0x03 => Some(StreamType::Thumbnail),
+        0x04 => Some(StreamType::Preview),
+        _ => None,
+    }
+}
+
+/// Shape the §8.1 `POST /v1/files` JSON body from a disk-backed `StagingRecord`.
+/// Mirrors `upload::stage_body` but base64-encodes the already-stored bytes
+/// directly (no re-encoding). `total_bytes` for the content stream is the exact
+/// ciphertext byte count from pass 1 (advisory: server uses it for listing/quota,
+/// not enforcement).
+fn stage_body_from_record(rec: &StagingRecord) -> serde_json::Value {
+    let file_id_hex: String = rec.file_id.iter().map(|b| format!("{b:02x}")).collect();
+
+    // Content stream first (ascending stream_type order)
+    let mut streams = vec![serde_json::json!({
+        "stream_type": "content",
+        "chunk_count":  rec.content_chunk_count,
+        "chunk_size":   rec.chunk_size,
+        "total_bytes":  rec.content_total_bytes,
+    })];
+    for s in &rec.small_streams {
+        streams.push(serde_json::json!({
+            "stream_type": small_stream_type_name(s.stream_type),
+            "chunk_count":  s.chunk_count,
+            "chunk_size":   s.chunk_size,
+            "total_bytes":  s.total_bytes,
+        }));
+    }
+
+    let hex16 = |b: &[u8; 16]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+    let wraps: Vec<serde_json::Value> = rec.wraps.iter().map(|w| {
+        let rid = if w.recipient_type == "recovery" {
+            "recovery".to_owned()
+        } else {
+            hex16(&w.recipient_id)
+        };
+        serde_json::json!({
+            "recipient_id":    rid,
+            "recipient_type":  &w.recipient_type,
+            "wrapped_dek_b64": B64.encode(&w.wrapped_dek),
+            "wrap_alg":        1,
+            "granted_by":      hex16(&w.granted_by),
+            "grant_b64":       B64.encode(&w.grant),
+            "grant_sig_b64":   B64.encode(&w.grant_sig),
+        })
+    }).collect();
+
+    serde_json::json!({
+        "file_id":         file_id_hex,
+        "file_type":       &rec.file_type,
+        "genesis_b64":     B64.encode(&rec.genesis),
+        "genesis_sig_b64": B64.encode(&rec.genesis_sig),
+        "manifest_b64":    B64.encode(&rec.manifest),
+        "manifest_sig_b64":B64.encode(&rec.manifest_sig),
+        "streams": streams,
+        "wraps":   wraps,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// stage_upload
+// ---------------------------------------------------------------------------
+
+/// `stage_upload` — prepare + encrypt/stage a post and hold it for preview.
+/// No network write. Video uploads are streaming (disk-backed); image/blog are
+/// in-RAM as before.
 #[tauri::command]
 pub async fn stage_upload(
     req: StageUploadRequest,
+    app: tauri::AppHandle,
     dir: State<'_, AppDir>,
     session: State<'_, Session>,
     jobs: State<'_, UploadJobs>,
+    prepare_cancel: State<'_, VideoPrepareCancel>,
 ) -> Result<UploadPreview, UiError> {
-    // 1) Prepare the plaintext streams from the user's own content. For a video the
-    //    transcode runs in the CONFINED worker (no network) and additionally yields
-    //    the canonical plaintext + fragment index held for the local preview.
-    let (file_type, mut streams, video_preview) = match req.kind {
+    // RAII guard that deletes a dir on any error path before the job is inserted.
+    // For video: initially guards the transcode temp dir; switched to the staging
+    // dir once the file is moved. Disarmed after `jobs.insert`.
+    struct DirCleanup(Option<std::path::PathBuf>);
+    impl Drop for DirCleanup {
+        fn drop(&mut self) {
+            if let Some(d) = &self.0 {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
+    // Aggregates the results of `prepare_video_streams` so we can carry them
+    // out of the match arm without a large tuple.
+    struct VideoPrep {
+        prepared: PreparedVideo,
+        frag_index: Vec<crate::video::FragmentEntry>,
+        job_dir: std::path::PathBuf,
+    }
+
+    // 1) Type-specific preparation — no network, no crypto yet.
+    let (file_type, opt_streams, opt_video) = match req.kind {
         UploadKind::Blog => {
             let text = req.content.clone().unwrap_or_default();
             if text.len() as u64 > MAX_UPLOAD_BYTES {
@@ -102,8 +198,8 @@ pub async fn stage_upload(
             }
             (
                 maxsecu_encoding::types::FileType::Blog,
-                prepare_blog_streams(text.into_bytes(), &req.title, &req.tags),
-                None,
+                Some(prepare_blog_streams(text.into_bytes(), &req.title, &req.tags)),
+                None::<VideoPrep>,
             )
         }
         UploadKind::Image => {
@@ -119,30 +215,64 @@ pub async fn stage_upload(
             let bytes = std::fs::read(&path)
                 .map_err(|_| UiError::new("bad_request", "That file could not be read."))?;
             let (ft, s) = prepare_image_streams(&bytes, &req.title, &req.tags)?;
-            (ft, s, None)
+            (ft, Some(s), None)
         }
         UploadKind::Video => {
-            let source = read_video_source(&req)?;
-            // Confined transcode OFF the async runtime (the worker spawn + pipe I/O
-            // must not run on a tokio worker thread). NO network here — this is the
-            // preview-before-upload transcode.
-            let tw_path = crate::commands::video::transcode_worker_path(&dir.0);
+            let path = req
+                .path
+                .clone()
+                .ok_or_else(|| UiError::new("bad_request", "No video was chosen."))?;
+            let input_path = std::path::PathBuf::from(path);
+            let ffmpeg_path = ensure_ffmpeg(&dir.0)
+                .map_err(|_| UiError::new("video_failed", "That video could not be processed."))?;
+            let options = req.options.clone().unwrap_or_default();
             let title = req.title.clone();
             let tags = req.tags.clone();
-            let (s, frags) = tokio::task::spawn_blocking(move || {
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            *prepare_cancel.0.lock().unwrap() = Some(cancel.clone());
+            let handle = app.clone();
+            let cancel_task = cancel.clone();
+            let staged = tokio::task::spawn_blocking(move || {
+                let on_phase = move |phase: PreparePhase| {
+                    let _ = handle.emit(EVT_VIDEO_PREPARE, phase);
+                };
                 prepare_video_streams(
-                    &source,
-                    &tw_path,
+                    &input_path,
+                    &ffmpeg_path,
+                    &options,
                     &maxsecu_client_core::video::VideoBounds::default(),
                     &title,
                     &tags,
+                    on_phase,
+                    &cancel_task,
                 )
             })
-            .await
-            .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))??;
-            // Hold the canonical plaintext + the authenticated seek index for the
-            // local WYSIWYG preview (the bundle also carries the ciphertext form).
-            let index: Vec<crate::video::FragmentEntry> = frags
+            .await;
+            *prepare_cancel.0.lock().unwrap() = None;
+            let prepared: PreparedVideo = match staged {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    let phase = if e.code == "cancelled" {
+                        PreparePhase::Cancelled
+                    } else {
+                        PreparePhase::Failed { code: e.code.clone() }
+                    };
+                    let _ = app.emit(EVT_VIDEO_PREPARE, phase);
+                    return Err(e);
+                }
+                Err(_) => {
+                    let _ = app.emit(
+                        EVT_VIDEO_PREPARE,
+                        PreparePhase::Failed { code: "video_failed".into() },
+                    );
+                    return Err(UiError::new(
+                        "encrypt_failed",
+                        "Could not prepare the upload.",
+                    ));
+                }
+            };
+            let frag_index: Vec<crate::video::FragmentEntry> = prepared
+                .fragments
                 .iter()
                 .map(|f| crate::video::FragmentEntry {
                     seq: f.seq,
@@ -151,22 +281,32 @@ pub async fn stage_upload(
                     chunk_len: f.chunk_len,
                 })
                 .collect();
-            // Hold the canonical plaintext in a Zeroizing buffer so the full-file
-            // plaintext is wiped on drop (confirm/cancel) — matching the per-window
-            // ScriptGuard zeroize discipline. It is RAM-only, never on disk.
-            let preview = StagedVideoPreview {
-                cmaf: Zeroizing::new(s.content.clone()),
-                index,
-            };
+            let job_dir = prepared.job_dir.clone();
             (
                 maxsecu_encoding::types::FileType::Video,
-                s,
-                Some(preview),
+                None,
+                Some(VideoPrep { prepared, frag_index, job_dir }),
             )
         }
     };
-    let thumbnail_b64 = streams.thumbnail.as_ref().map(|t| B64.encode(t));
-    let byte_size = streams.content.len() as u64;
+
+    // Arm the stage-error cleanup guard. For video: guards the transcode temp dir
+    // until we switch it to the staging dir (or disarm after insert). For
+    // image/blog: DirCleanup(None) is a no-op.
+    let mut dir_cleanup = DirCleanup(opt_video.as_ref().map(|v| v.job_dir.clone()));
+
+    // Compute thumbnail_b64 and byte_size BEFORE consuming thumbnail/content into
+    // SmallStreams (must be before the session lock block for video).
+    let thumbnail_b64: Option<String> = if let Some(ref v) = opt_video {
+        Some(B64.encode(&v.prepared.thumbnail))
+    } else {
+        opt_streams.as_ref().and_then(|s| s.thumbnail.as_ref().map(|t| B64.encode(t)))
+    };
+    let byte_size: u64 = if let Some(ref v) = opt_video {
+        v.prepared.output_size
+    } else {
+        opt_streams.as_ref().map(|s| s.content.len() as u64).unwrap_or(0)
+    };
 
     // 2) Resolve recipients under the pinned D5 (unauth directory GETs).
     let pinned = load_directory_pub(&dir.0)?;
@@ -177,7 +317,8 @@ pub async fn stage_upload(
         .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
     let server = server_of(&dir.0)?;
     let (mut sender, host, _exporter) = open_conn(&dir.0, &server).await?;
-    let me = resolve_my_binding(&mut sender, &host, &username, &verifier, &mut trust, now).await?;
+    let me =
+        resolve_my_binding(&mut sender, &host, &username, &verifier, &mut trust, now).await?;
     let recovery_username = recovery_recipient_username(&dir.0)?;
     let recovery = resolve_recovery_recipient(
         &mut sender,
@@ -189,50 +330,188 @@ pub async fn stage_upload(
     )
     .await?;
 
-    // 3) Build the signed, encrypted bundle (identity borrowed UNDER the lock, sync).
+    // 3) Build the upload content. Video: streaming (disk-backed); Image/Blog: InRam.
     let file_id = Id(maxsecu_crypto::random_array::<16>());
-    let bundle = {
-        let guard = session.0.lock().await;
-        let identity: &Identity = guard
-            .identity
-            .as_ref()
-            .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-        let params = UploadParams {
-            owner: identity,
-            owner_id: Id(me.user_id),
-            owner_key_version: me.key_version,
-            file_id,
-            file_type,
-            chunk_size: CHUNK_SIZE,
-            recovery_pub: EncPublicKey::from_bytes(recovery.enc_pub),
-            recovery_mlkem_pub: recovery.mlkem_pub,
-            created_at: Timestamp(now),
+
+    let (content, final_preview, final_job_dir) = if let Some(vp) = opt_video {
+        // ── VIDEO STREAMING PATH ──────────────────────────────────────────────
+        // Pass 1 (digest) + finish (sign/wrap/seal small streams) happen under the
+        // session lock. The lock is held for the full streaming + move + persist
+        // sequence, which mirrors the old `build_upload` placement.
+        let (rec, staging_dir) = {
+            let guard = session.0.lock().await;
+            let identity: &Identity = guard
+                .identity
+                .as_ref()
+                .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+            let params = UploadParams {
+                owner: identity,
+                owner_id: Id(me.user_id),
+                owner_key_version: me.key_version,
+                file_id,
+                file_type,
+                chunk_size: CHUNK_SIZE,
+                recovery_pub: EncPublicKey::from_bytes(recovery.enc_pub),
+                recovery_mlkem_pub: recovery.mlkem_pub,
+                created_at: Timestamp(now),
+            };
+
+            let builder = StreamingUploadBuilder::new();
+            let sealer = builder.content_sealer(&params);
+
+            // Pass 1: stream out.mp4 → (chunk_count, digest). The emit closure
+            // also sums the ciphertext bytes for the advisory `total_bytes`.
+            let mut mp4_file = std::fs::File::open(&vp.prepared.out_mp4_path).map_err(|_| {
+                UiError::new("encrypt_failed", "Could not prepare the upload.")
+            })?;
+            let mut ct_total: u64 = 0;
+            let (count, digest) = sealer
+                .seal_from_reader(&mut mp4_file, |_, ct| {
+                    ct_total += ct.len() as u64;
+                    Ok(())
+                })
+                .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
+            drop(mp4_file); // close before rename
+
+            // Build small (non-content) streams — these are sealed in-RAM (small).
+            let small = SmallStreams {
+                metadata: Some(vp.prepared.metadata),
+                thumbnail: Some(vp.prepared.thumbnail),
+                preview: Some(vp.prepared.preview),
+            };
+            let records = builder
+                .finish(&params, &small, digest, count)
+                .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
+
+            // Move out.mp4 into the staging dir. rename() can fail across volumes
+            // → fall back to copy+remove.
+            let store = StagingStore::new(dir.0.join("staging"));
+            let sdir = store.dir_for(&file_id.0);
+            std::fs::create_dir_all(&sdir).map_err(|_| {
+                UiError::new("encrypt_failed", "Could not prepare the upload.")
+            })?;
+            let dest = sdir.join("out.mp4");
+            if std::fs::rename(&vp.prepared.out_mp4_path, &dest).is_err() {
+                std::fs::copy(&vp.prepared.out_mp4_path, &dest).map_err(|_| {
+                    UiError::new("encrypt_failed", "Could not prepare the upload.")
+                })?;
+                let _ = std::fs::remove_file(&vp.prepared.out_mp4_path);
+            }
+            // Delete the now-empty transcode temp dir (Low-IL container artifacts).
+            let _ = std::fs::remove_dir_all(&vp.job_dir);
+            // Switch the cleanup guard to the staging dir: if persist fails, we wipe
+            // the staging dir on drop.
+            dir_cleanup.0 = Some(sdir.clone());
+
+            let rec = StagingRecord {
+                file_id: file_id.0,
+                file_type: "video".into(),
+                title: req.title.clone(),
+                manifest: maxsecu_encoding::encode(&records.manifest),
+                manifest_sig: records.manifest_sig.to_vec(),
+                genesis: maxsecu_encoding::encode(&records.genesis),
+                genesis_sig: records.genesis_sig.to_vec(),
+                wraps: records
+                    .wraps
+                    .iter()
+                    .map(|w| StagedWrap {
+                        recipient_id: w.recipient_id.0,
+                        recipient_type: if w.recipient_type == RecipientType::Recovery {
+                            "recovery".into()
+                        } else {
+                            "user".into()
+                        },
+                        wrapped_dek: wrap_wire(w),
+                        granted_by: w.granted_by.0,
+                        grant: maxsecu_encoding::encode(&w.grant),
+                        grant_sig: w.grant_sig.to_vec(),
+                    })
+                    .collect(),
+                out_mp4_path: dest,
+                chunk_size: CHUNK_SIZE,
+                content_chunk_count: count,
+                content_total_bytes: ct_total,
+                small_streams: records
+                    .small_streams
+                    .iter()
+                    .map(|s| StagedSmallStream {
+                        stream_type: s.stream_type as u8,
+                        chunk_size: s.chunk_size,
+                        chunk_count: s.chunk_count,
+                        total_bytes: s.total_bytes,
+                        digest: s.digest.to_vec(),
+                        chunks: s.chunks.clone(),
+                    })
+                    .collect(),
+                progress: 0,
+                created_ms: now,
+                last_progress_ms: now,
+                finalized: false,
+            };
+            store.persist(&rec).map_err(|_| {
+                UiError::new("encrypt_failed", "Could not prepare the upload.")
+            })?;
+            (rec, sdir)
+        }; // session lock drops here
+
+        let preview = StagedVideoPreview {
+            out_mp4_path: rec.out_mp4_path.clone(),
+            index: vp.frag_index,
         };
-        build_upload(&params, &streams)
-            .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?
+        (StagedContent::Streaming(rec), Some(preview), Some(staging_dir))
+    } else {
+        // ── IMAGE / BLOG PATH (unchanged) ────────────────────────────────────
+        let mut streams = opt_streams.unwrap();
+        let bundle = {
+            let guard = session.0.lock().await;
+            let identity: &Identity = guard
+                .identity
+                .as_ref()
+                .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+            let params = UploadParams {
+                owner: identity,
+                owner_id: Id(me.user_id),
+                owner_key_version: me.key_version,
+                file_id,
+                file_type,
+                chunk_size: CHUNK_SIZE,
+                recovery_pub: EncPublicKey::from_bytes(recovery.enc_pub),
+                recovery_mlkem_pub: recovery.mlkem_pub,
+                created_at: Timestamp(now),
+            };
+            build_upload(&params, &streams)
+                .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?
+        };
+        // Wipe the transient plaintext content (defense-in-depth).
+        streams.content.zeroize();
+        (StagedContent::InRam(bundle), None, None)
     };
 
-    // The bundle now holds the encrypted content; wipe the transient plaintext
-    // content copy in `streams` (defense-in-depth, matching the Zeroizing preview
-    // copy). The small metadata/thumbnail/preview streams are derived public-shape
-    // data; the full-file content is the sensitive plaintext.
-    streams.content.zeroize();
+    // 4) Compute total_chunks and file_type_str per content variant.
+    let (total, file_type_str) = match &content {
+        StagedContent::InRam(b) => (total_chunks(b), bundle_file_type_str(b)),
+        StagedContent::Streaming(r) => {
+            let sc: u64 = r.small_streams.iter().map(|s| s.chunk_count).sum();
+            (r.content_chunk_count + sc, "video".to_owned())
+        }
+    };
 
-    // 4) Hold for preview (NO network). The bundle stays in the TCB.
-    let total = total_chunks(&bundle);
-    let file_type_str = bundle_file_type_str(&bundle);
+    // 5) Hold for preview (NO network). The content stays in the TCB.
     let job_id = rand_job_id();
     jobs.0.lock().await.insert(
         job_id.clone(),
         StagedUpload {
-            bundle,
+            content,
             file_type: file_type_str.clone(),
             title: req.title.clone(),
             total_chunks: total,
             byte_size,
-            preview: video_preview,
+            preview: final_preview,
+            job_dir: final_job_dir,
         },
     );
+    // Ownership of the dir now lives in StagedUpload — disarm the guard.
+    dir_cleanup.0 = None;
     Ok(UploadPreview {
         job_id,
         file_type: file_type_str,
@@ -254,10 +533,14 @@ fn bundle_file_type_str(b: &maxsecu_client_core::UploadBundle) -> String {
     .to_owned()
 }
 
+// ---------------------------------------------------------------------------
+// confirm_upload
+// ---------------------------------------------------------------------------
+
 /// `confirm_upload` — run the staged bundle's network pipeline (stage → resumable
 /// chunk PUT → finalize), emitting `UploadPhase` over `EVT_UPLOAD`. On success the
-/// job is removed; on failure it is RETAINED so the tray can retry. The bundle
-/// never leaves the TCB — only progress events + the returned file_id cross.
+/// job is removed; on failure it is RETAINED so the tray can retry. Neither the
+/// bundle nor the DEK ever leaves the TCB.
 #[tauri::command]
 pub async fn confirm_upload(
     req: ConfirmUploadRequest,
@@ -274,9 +557,6 @@ pub async fn confirm_upload(
     let out = confirm_inner(&req, &dir, &session, &connect_lock, &jobs, &emit).await;
     match &out {
         Ok(file_id) => {
-            // committed — drop the staged copy (confirm_inner already took it out on
-            // the success path; this is a defensive no-op that also covers a racing
-            // retry insert).
             jobs.0.lock().await.remove(&job_id);
             emit(UploadPhase::Done {
                 job_id: job_id.clone(),
@@ -284,7 +564,6 @@ pub async fn confirm_upload(
             });
         }
         Err(e) => {
-            // The job is retained by confirm_inner so the user can retry from the tray.
             emit(UploadPhase::Failed {
                 job_id: job_id.clone(),
                 code: e.code.clone(),
@@ -304,57 +583,349 @@ async fn confirm_inner(
 ) -> Result<String, UiError> {
     let job_id = req.job_id.clone();
     let server = server_of(&dir.0)?;
-    emit(UploadPhase::Staging {
-        job_id: job_id.clone(),
-    });
+    emit(UploadPhase::Staging { job_id: job_id.clone() });
     let (mut sender, host, token) = reauth(&dir.0, &server, session, connect_lock).await?;
 
-    // Take the bundle out for the duration of the upload (UploadBundle isn't Clone);
-    // re-insert on failure so the tray can retry.
+    // Take the job out of the registry for the duration of the upload.
+    // Re-inserted on failure so the tray can retry.
     let staged = { jobs.0.lock().await.remove(&job_id) }
         .ok_or_else(|| UiError::new("no_such_job", "That upload is no longer staged."))?;
-    let file_id_hex = staged
-        .bundle
-        .file_id
-        .0
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
 
-    // Emit `Uploading{done,total}` per chunk; when the last chunk lands (done==total)
-    // emit `Finalizing` — `run_pipeline` finalizes immediately after the chunk loop,
-    // so this is the honest pre-finalize signal. `emit` already captures `app`.
-    let result = run_pipeline(&mut sender, &host, &token, &staged.bundle, |done, total| {
-        emit(UploadPhase::Uploading {
-            job_id: job_id.clone(),
-            done,
-            total,
-        });
-        if done == total {
-            emit(UploadPhase::Finalizing {
-                job_id: job_id.clone(),
-            });
+    // Destructure so we can move `content` into the branch and reconstruct on error.
+    let StagedUpload { content, file_type, title, total_chunks, byte_size, preview, job_dir } =
+        staged;
+
+    // Derive file_id_hex from whichever variant we have.
+    let file_id_hex: String = match &content {
+        StagedContent::InRam(b) => b.file_id.0.iter().map(|b| format!("{b:02x}")).collect(),
+        StagedContent::Streaming(r) => r.file_id.iter().map(|b| format!("{b:02x}")).collect(),
+    };
+
+    // Clone the re-insertable fields (preview + job_dir are small).
+    let preview_clone = preview.clone();
+    let job_dir_clone = job_dir.clone();
+
+    let (result, content_back) = match content {
+        StagedContent::InRam(bundle) => {
+            // ── IMAGE / BLOG: unchanged run_pipeline path ─────────────────────
+            let r = run_pipeline(
+                &mut sender,
+                &host,
+                &token,
+                &bundle,
+                |done, total| {
+                    emit(UploadPhase::Uploading {
+                        job_id: job_id.clone(),
+                        done,
+                        total,
+                        bytes_per_s: 0,
+                    });
+                    if done == total {
+                        emit(UploadPhase::Finalizing { job_id: job_id.clone() });
+                    }
+                },
+            )
+            .await;
+            (r, StagedContent::InRam(bundle))
         }
-    })
-    .await;
+        StagedContent::Streaming(mut rec) => {
+            // ── VIDEO STREAMING CONFIRM ───────────────────────────────────────
+            let r = streaming_confirm(
+                &mut rec,
+                &job_id,
+                &file_id_hex,
+                &dir.0,
+                session,
+                &mut sender,
+                &host,
+                &token,
+                total_chunks,
+                emit,
+            )
+            .await;
+            (r, StagedContent::Streaming(rec))
+        }
+    };
 
     match result {
-        Ok(()) => Ok(file_id_hex),
+        Ok(()) => {
+            // For video: staging dir already removed inside streaming_confirm.
+            // For image/blog: job_dir is None (no-op).
+            if let Some(d) = &job_dir {
+                let _ = std::fs::remove_dir_all(d);
+            }
+            Ok(file_id_hex)
+        }
         Err(e) => {
-            jobs.0.lock().await.insert(job_id, staged); // retain for retry
+            // Retain for retry — the staging dir (video) must survive so the
+            // updated progress persists and preview ranges keep working.
+            jobs.0.lock().await.insert(
+                job_id,
+                StagedUpload {
+                    content: content_back,
+                    file_type,
+                    title,
+                    total_chunks,
+                    byte_size,
+                    preview: preview_clone,
+                    job_dir: job_dir_clone,
+                },
+            );
             Err(e)
         }
     }
 }
 
-/// `cancel_upload` — drop a staged (pre-confirm or retained-after-failure) job. An
-/// in-flight confirm is not interrupted (documented Phase-4 limitation).
+/// Pass-2 streaming upload for a video `StagingRecord`. Called from `confirm_inner`.
+///
+/// Steps:
+/// 1. POST /v1/files (stage).
+/// 2. PUT each small-stream chunk (idempotent).
+/// 3. Recover the DEK from the self-wrap; seal + PUT each content chunk from disk
+///    one at a time (O(one 6 MiB chunk) RAM), checkpointing `rec.progress` after
+///    each successful PUT.
+/// 4. POST finalize. On success: wipe staging dir.
+///
+/// On failure at any step: return the error without wiping the staging dir so the
+/// caller can re-insert `rec` (with updated `progress`) for retry.
+#[allow(clippy::too_many_arguments)]
+async fn streaming_confirm(
+    rec: &mut StagingRecord,
+    job_id: &str,
+    file_id_hex: &str,
+    app_dir: &std::path::Path,
+    session: &State<'_, Session>,
+    sender: &mut hyper::client::conn::http1::SendRequest<
+        http_body_util::Full<hyper::body::Bytes>,
+    >,
+    host: &str,
+    token: &str,
+    total_for_progress: u64,
+    emit: &impl Fn(UploadPhase),
+) -> Result<(), UiError> {
+    use maxsecu_encoding::structs::Manifest;
+
+    // ── Steps 1+2: POST /v1/files + small-stream PUT (skipped on resume) ─────
+    //
+    // Guard: if `progress > 0` the file-version is already staged on the server
+    // and its small streams are already uploaded.  Re-POSTing `/v1/files` would
+    // trigger a `DELETE FROM file_versions WHERE finalized=false` cascade on the
+    // server, silently wiping all content chunks `0..progress`.  Skip directly to
+    // the content pass-2 loop in that case; the finalize step is unchanged.
+    //
+    // When `progress == 0` (fresh confirm OR a resume that failed before any chunk
+    // was PUT), the POST+small run harmlessly re-stages any partial server state.
+    let small_done: u64 = rec.small_streams.iter().map(|s| s.chunk_count).sum();
+    let mut done: u64 = 0;
+
+    if rec.progress == 0 {
+        // ── Step 1: POST /v1/files ────────────────────────────────────────────
+        let body = stage_body_from_record(rec);
+        let (st, _) = post_json(sender, "/v1/files", &body, Some(token), host).await?;
+        if st != hyper::StatusCode::CREATED {
+            return Err(UiError::new("stage_failed", "Could not start the upload."));
+        }
+
+        // ── Step 2: PUT small-stream chunks ──────────────────────────────────
+        for s in &rec.small_streams {
+            let stype = stream_type_from_u8(s.stream_type).ok_or_else(|| {
+                UiError::new("upload_chunk_failed", "Bad stream type in staging record.")
+            })?;
+            for (i, chunk) in s.chunks.iter().enumerate() {
+                put_chunk_retried(sender, host, token, file_id_hex, stype, i as u64, chunk)
+                    .await?;
+                done += 1;
+                emit(UploadPhase::Uploading {
+                    job_id: job_id.to_owned(),
+                    done,
+                    total: total_for_progress,
+                    bytes_per_s: 0,
+                });
+            }
+        }
+    }
+
+    // ── Step 3: Pass 2 — seal + PUT content chunks from disk ─────────────────
+    //
+    // Recover the DEK from the self-wrap under the session lock (brief: only
+    // `resume_content_sealer` runs while the lock is held, then the lock drops
+    // so network I/O can proceed without blocking other session operations).
+    let suite = maxsecu_encoding::decode::<Manifest>(&rec.manifest)
+        .map(|m| m.alg)
+        .unwrap_or(Suite::V1);
+
+    let self_wrap = rec
+        .wraps
+        .iter()
+        .find(|w| w.recipient_type == "user")
+        .ok_or_else(|| UiError::new("encrypt_failed", "Upload data is corrupt (no self-wrap)."))?;
+
+    if self_wrap.wrapped_dek.len() < 32 {
+        return Err(UiError::new("encrypt_failed", "Upload data is corrupt (short wrap)."));
+    }
+    let wrapped_dek = WrappedDek {
+        enc: self_wrap.wrapped_dek[..32].try_into().unwrap(),
+        ct: self_wrap.wrapped_dek[32..].to_vec(),
+    };
+    let file_id_arr: [u8; 16] = rec.file_id;
+    let file_id_id = Id(file_id_arr);
+    let ctx = WrapContext {
+        file_id: file_id_id,
+        version: 1,
+        recipient_id: Id(self_wrap.recipient_id),
+    };
+
+    // Borrow identity under lock, derive sealer, release lock before any .await.
+    let sealer = {
+        let guard = session.0.lock().await;
+        let identity: &Identity = guard.identity.as_ref().ok_or_else(|| {
+            UiError::new("locked", "Unlock your keystore first.")
+        })?;
+        resume_content_sealer(identity, &wrapped_dek, &ctx, suite, file_id_id, 1, rec.chunk_size)
+            .map_err(|_| UiError::new("encrypt_failed", "Could not resume upload."))?
+    }; // guard drops here — identity no longer borrowed
+
+    // Open the on-disk fMP4 for sequential read (pass 2).
+    let mut mp4_file = std::fs::File::open(&rec.out_mp4_path)
+        .map_err(|_| UiError::new("upload_chunk_failed", "Cannot read the staged video file."))?;
+
+    let chunk_size = rec.chunk_size as u64;
+    let count = rec.content_chunk_count;
+
+    // Rolling throughput window.
+    let mut speed_instant = std::time::Instant::now();
+    let mut speed_bytes: u64 = 0;
+    let mut bps: u64 = 0;
+
+    // One reused read buffer (at most chunk_size bytes in RAM at any time).
+    let mut buf = vec![0u8; rec.chunk_size as usize];
+
+    let store = StagingStore::new(app_dir.join("staging"));
+
+    for i in rec.progress..count {
+        // Seek to chunk boundary and read up to chunk_size bytes.
+        mp4_file.seek(SeekFrom::Start(i * chunk_size)).map_err(|_| {
+            UiError::new("upload_chunk_failed", "Cannot seek in staged video file.")
+        })?;
+        let n = read_exact_or_eof(&mut mp4_file, &mut buf).map_err(|_| {
+            UiError::new("upload_chunk_failed", "Cannot read staged video file.")
+        })?;
+        let plaintext = &buf[..n];
+        let is_last = i == count - 1;
+        let ct = sealer.seal_chunk(i, plaintext, is_last);
+
+        put_chunk_retried(
+            sender,
+            host,
+            token,
+            file_id_hex,
+            maxsecu_encoding::types::StreamType::Content,
+            i,
+            &ct,
+        )
+        .await?;
+
+        // Update rolling throughput.
+        speed_bytes += ct.len() as u64;
+        let elapsed = speed_instant.elapsed().as_secs_f64();
+        if elapsed >= 1.0 {
+            bps = bytes_per_s_from_window(speed_bytes, elapsed);
+            speed_bytes = 0;
+            speed_instant = std::time::Instant::now();
+        }
+
+        // Checkpoint progress (best-effort — a persist failure does not abort the upload).
+        rec.progress = i + 1;
+        rec.last_progress_ms = now_ms();
+        let _ = store.persist(rec);
+
+        done = small_done + i + 1;
+        emit(UploadPhase::Uploading {
+            job_id: job_id.to_owned(),
+            done,
+            total: total_for_progress,
+            bytes_per_s: bps,
+        });
+        if done == total_for_progress {
+            emit(UploadPhase::Finalizing { job_id: job_id.to_owned() });
+        }
+    }
+
+    // ── Step 4: POST finalize ─────────────────────────────────────────────────
+    let (st, _) = post_json(
+        sender,
+        &format!("/v1/files/{file_id_hex}/versions/1/finalize"),
+        &serde_json::Value::Null,
+        Some(token),
+        host,
+    )
+    .await?;
+    if st != hyper::StatusCode::OK {
+        return Err(UiError::new("finalize_failed", "Could not finalize the upload."));
+    }
+
+    // Success: wipe the staging dir (record.json + out.mp4).
+    let _ = store.remove(&rec.file_id);
+    let staging_dir = store.dir_for(&rec.file_id);
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    Ok(())
+}
+
+/// Read from `r` filling `buf` as much as possible, returning the bytes read.
+/// Returns `Ok(0)` only at the very start of an EOF. Unlike `read_exact`, a
+/// short read at the end of a file is normal (last chunk).
+fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match r.read(&mut buf[total..])? {
+            0 => break,
+            n => total += n,
+        }
+    }
+    Ok(total)
+}
+
+// ---------------------------------------------------------------------------
+// cancel_upload / cancel_video_prepare / upload_jobs
+// ---------------------------------------------------------------------------
+
+/// `cancel_upload` — drop a staged (pre-confirm or retained-after-failure) job.
+/// Also deletes the per-job dir (video staging dir or None for image/blog) so no
+/// artifacts linger on disk.  For streaming (video) jobs, additionally issues a
+/// best-effort server DELETE so the orphaned unfinalized file-version is cleaned up
+/// (server returns 204/404/409; all are silently ignored).  InRam (image/blog) jobs
+/// have no server state at cancel time — nothing was ever POSTed during stage.
 #[tauri::command]
 pub async fn cancel_upload(
     req: CancelUploadRequest,
     jobs: State<'_, UploadJobs>,
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
 ) -> Result<(), UiError> {
-    jobs.0.lock().await.remove(&req.job_id);
+    if let Some(s) = jobs.0.lock().await.remove(&req.job_id) {
+        if let Some(d) = &s.job_dir {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        // Best-effort server DELETE for streaming jobs (the file may or may not have
+        // been staged yet; 404 from the server is silently ignored).
+        if let StagedContent::Streaming(rec) = &s.content {
+            let fid_hex: String = rec.file_id.iter().map(|b| format!("{b:02x}")).collect();
+            discard_server_orphan(&dir.0, &session, &connect_lock, &fid_hex).await;
+        }
+    }
+    Ok(())
+}
+
+/// `cancel_video_prepare` — request cancellation of the in-flight video
+/// `stage_upload` transcode. Best-effort: sets the stored cancel token's flag.
+#[tauri::command]
+pub async fn cancel_video_prepare(
+    prepare_cancel: State<'_, VideoPrepareCancel>,
+) -> Result<(), UiError> {
+    if let Some(flag) = prepare_cancel.0.lock().unwrap().as_ref() {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -370,4 +941,442 @@ pub async fn upload_jobs(jobs: State<'_, UploadJobs>) -> Result<Vec<UploadJobVie
             total_chunks: s.total_chunks,
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Resume / sweep / dismiss helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a 32-char lowercase hex string into a 16-byte file id.
+fn parse_file_id_hex(hex: &str) -> Result<[u8; 16], UiError> {
+    if hex.len() != 32 {
+        return Err(UiError::new("bad_request", "Invalid file id."));
+    }
+    let mut bytes = [0u8; 16];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| UiError::new("bad_request", "Invalid file id."))?;
+    }
+    Ok(bytes)
+}
+
+/// Returns `true` when a staged upload has had no progress for more than 24 hours
+/// and should be swept (local dir removed + server orphan discarded).
+fn should_sweep(now_ms: u64, last_progress_ms: u64) -> bool {
+    now_ms.saturating_sub(last_progress_ms) > 24 * 60 * 60 * 1000
+}
+
+/// Best-effort server DELETE for an unfinalized file-version.  Opens a fresh
+/// authenticated channel, sends `DELETE /v1/files/<file_id_hex>`, and ignores all
+/// errors (204 / 404 / 409 / network failure are all silent).
+async fn discard_server_orphan(
+    dir: &std::path::Path,
+    session: &Session,
+    connect_lock: &ConnectLock,
+    file_id_hex: &str,
+) {
+    let server = match server_of(dir) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let (mut sender, host, token) =
+        match reauth(dir, &server, session, connect_lock).await {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+    let uri = format!("/v1/files/{file_id_hex}");
+    let _ = delete_req(&mut sender, &uri, Some(&token), &host).await;
+}
+
+// ---------------------------------------------------------------------------
+// resume_upload / list_pending_uploads / dismiss_pending_upload
+// ---------------------------------------------------------------------------
+
+/// `resume_upload` — resume an interrupted video upload from the last persisted
+/// checkpoint.  Calls `streaming_confirm` which skips the POST+small-stream phase
+/// (because `rec.progress > 0` after any chunk was PUT) and continues from
+/// `rec.progress`.  On success the staging dir is removed and `file_id_hex` is
+/// returned.  On failure the record is already checkpointed on disk with the
+/// advanced `progress`; return the error so the UI can offer another retry later.
+#[tauri::command]
+pub async fn resume_upload(
+    file_id_hex: String,
+    app: tauri::AppHandle,
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
+) -> Result<String, UiError> {
+    let file_id = parse_file_id_hex(&file_id_hex)?;
+    let store = StagingStore::new(dir.0.join("staging"));
+    let mut rec = store
+        .load(&file_id)
+        .map_err(|_| UiError::new("no_such_job", "No staged upload to resume."))?;
+
+    // Already finalized (edge case: previous run succeeded but cleanup failed).
+    if rec.finalized {
+        let _ = store.remove(&file_id);
+        return Ok(file_id_hex);
+    }
+
+    let server = server_of(&dir.0)?;
+    let (mut sender, host, token) = reauth(&dir.0, &server, &session, &connect_lock).await?;
+
+    let total: u64 = rec.content_chunk_count
+        + rec.small_streams.iter().map(|s| s.chunk_count).sum::<u64>();
+
+    // Use file_id_hex as both job_id and file_id_hex for progress events so the
+    // UI can key the tray entry by it — mirrors confirm_upload's pattern.
+    let job_id = file_id_hex.clone();
+    let emit = |p: UploadPhase| {
+        let _ = app.emit(EVT_UPLOAD, p);
+    };
+
+    emit(UploadPhase::Staging { job_id: job_id.clone() });
+
+    let result = streaming_confirm(
+        &mut rec,
+        &job_id,
+        &file_id_hex,
+        &dir.0,
+        &session,
+        &mut sender,
+        &host,
+        &token,
+        total,
+        &emit,
+    )
+    .await;
+
+    match result {
+        Ok(()) => {
+            emit(UploadPhase::Done {
+                job_id: job_id.clone(),
+                file_id: file_id_hex.clone(),
+            });
+            Ok(file_id_hex)
+        }
+        Err(e) => {
+            // The staging record already has the advanced progress on disk — a
+            // later retry (via resume_upload again) will continue from there.
+            emit(UploadPhase::Failed {
+                job_id: job_id.clone(),
+                code: e.code.clone(),
+            });
+            Err(e)
+        }
+    }
+}
+
+/// `list_pending_uploads` — scan the staging store for incomplete video uploads
+/// from previous sessions.  Any upload whose `last_progress_ms` is more than 24 h
+/// ago is SWEPT (local dir deleted + best-effort server DELETE).  The rest are
+/// returned as `PendingUploadView` for the UI's resume prompt.
+#[tauri::command]
+pub async fn list_pending_uploads(
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
+) -> Result<Vec<PendingUploadView>, UiError> {
+    let store = StagingStore::new(dir.0.join("staging"));
+    let now = now_ms();
+    let mut result = Vec::new();
+
+    for rec in store.list_pending() {
+        if should_sweep(now, rec.last_progress_ms) {
+            // Remove local staging dir (record.json + out.mp4).
+            let _ = store.remove(&rec.file_id);
+            // Best-effort server DELETE — 404 if never staged, ignored either way.
+            let fid_hex: String = rec.file_id.iter().map(|b| format!("{b:02x}")).collect();
+            discard_server_orphan(&dir.0, &session, &connect_lock, &fid_hex).await;
+        } else {
+            let total = rec.content_chunk_count
+                + rec.small_streams.iter().map(|s| s.chunk_count).sum::<u64>();
+            let fid_hex: String = rec.file_id.iter().map(|b| format!("{b:02x}")).collect();
+            result.push(PendingUploadView {
+                file_id_hex: fid_hex,
+                title: rec.title.clone(),
+                progress: rec.progress,
+                total,
+            });
+        }
+    }
+
+    Ok(result)
+}
+
+/// `dismiss_pending_upload` — the user explicitly dismisses a pending (interrupted)
+/// upload from the resume prompt.  Removes the local staging dir and issues a
+/// best-effort server DELETE.
+#[tauri::command]
+pub async fn dismiss_pending_upload(
+    file_id_hex: String,
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
+) -> Result<(), UiError> {
+    let file_id = parse_file_id_hex(&file_id_hex)?;
+    let store = StagingStore::new(dir.0.join("staging"));
+    let _ = store.remove(&file_id);
+    discard_server_orphan(&dir.0, &session, &connect_lock, &file_id_hex).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::upload_staging::{StagedSmallStream, StagedWrap, StagingRecord};
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    // ── should_sweep unit tests ───────────────────────────────────────────────
+
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+
+    #[test]
+    fn should_sweep_more_than_24h_returns_true() {
+        let now = 1_700_000_000_000u64;
+        assert!(should_sweep(now, now - DAY_MS - 1));
+    }
+
+    #[test]
+    fn should_sweep_exactly_24h_returns_false() {
+        // The boundary is STRICTLY greater-than; exactly 24 h is not swept.
+        let now = 1_700_000_000_000u64;
+        assert!(!should_sweep(now, now - DAY_MS));
+    }
+
+    #[test]
+    fn should_sweep_less_than_24h_returns_false() {
+        let now = 1_700_000_000_000u64;
+        assert!(!should_sweep(now, now - HOUR_MS));
+    }
+
+    #[test]
+    fn should_sweep_future_last_progress_saturates_to_false() {
+        // last_progress_ms > now_ms (e.g. clock skew): saturating_sub → 0 → false.
+        let now = 1_700_000_000_000u64;
+        assert!(!should_sweep(now, now + 1));
+    }
+
+    #[test]
+    fn should_sweep_zero_last_progress_far_future_now_is_true() {
+        // A record that was persisted at epoch 0 is always swept once now > 24 h.
+        let now = DAY_MS + 1;
+        assert!(should_sweep(now, 0));
+    }
+
+    // ── parse_file_id_hex unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_file_id_hex_roundtrips() {
+        let id = [0xf1u8; 16];
+        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        let parsed = parse_file_id_hex(&hex).unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn parse_file_id_hex_rejects_short() {
+        assert!(parse_file_id_hex("abc").is_err());
+    }
+
+    #[test]
+    fn parse_file_id_hex_rejects_non_hex() {
+        assert!(parse_file_id_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+    }
+
+    // ── bytes_per_s tests (unchanged) ─────────────────────────────────────────
+
+    #[test]
+    fn bytes_per_s_computes_correctly() {
+        assert_eq!(bytes_per_s_from_window(6 * 1024 * 1024, 1.0), 6 * 1024 * 1024);
+        assert_eq!(bytes_per_s_from_window(1_000_000, 0.5), 2_000_000);
+        assert_eq!(bytes_per_s_from_window(0, 1.0), 0);
+        // No divide-by-zero on zero elapsed.
+        assert_eq!(bytes_per_s_from_window(1000, 0.0), 0);
+    }
+
+    fn make_test_record() -> StagingRecord {
+        StagingRecord {
+            file_id: [0xF1u8; 16],
+            file_type: "video".into(),
+            title: "clip.mp4".into(),
+            manifest: vec![0x01, 0x02],
+            manifest_sig: vec![0xAB; 64],
+            genesis: vec![0x03, 0x04],
+            genesis_sig: vec![0xCD; 64],
+            wraps: vec![
+                StagedWrap {
+                    recipient_id: [0x11; 16],
+                    recipient_type: "user".into(),
+                    wrapped_dek: vec![0xDE; 48], // enc(32) ‖ ct(16)
+                    granted_by: [0x11; 16],
+                    grant: vec![0x55; 8],
+                    grant_sig: vec![0x77; 64],
+                },
+                StagedWrap {
+                    recipient_id: [0x22; 16],
+                    recipient_type: "recovery".into(),
+                    wrapped_dek: vec![0xEF; 48],
+                    granted_by: [0x11; 16],
+                    grant: vec![0x66; 8],
+                    grant_sig: vec![0x88; 64],
+                },
+            ],
+            out_mp4_path: PathBuf::from("/tmp/out.mp4"),
+            chunk_size: 6 * 1024 * 1024,
+            content_chunk_count: 3,
+            content_total_bytes: 3 * 6 * 1024 * 1024,
+            small_streams: vec![
+                StagedSmallStream {
+                    stream_type: 0x02, // metadata
+                    chunk_size: 65536,
+                    chunk_count: 1,
+                    total_bytes: 128,
+                    digest: vec![0xAA; 32],
+                    chunks: vec![vec![0u8; 8]],
+                },
+            ],
+            progress: 0,
+            created_ms: 1_700_000_000_000,
+            last_progress_ms: 1_700_000_000_000,
+            finalized: false,
+        }
+    }
+
+    #[test]
+    fn stage_body_from_record_shapes_the_post() {
+        let rec = make_test_record();
+        let body = stage_body_from_record(&rec);
+
+        // file_id is the hex of [0xF1; 16]
+        assert_eq!(
+            body["file_id"],
+            "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+        );
+        assert_eq!(body["file_type"], "video");
+
+        // genesis and manifest are base64-encoded.
+        assert!(body["genesis_b64"].is_string());
+        assert!(body["manifest_b64"].is_string());
+
+        // streams: content first, then small streams.
+        let streams = body["streams"].as_array().unwrap();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0]["stream_type"], "content");
+        assert_eq!(streams[0]["chunk_count"], 3u64);
+        assert_eq!(streams[0]["total_bytes"], 3u64 * 6 * 1024 * 1024);
+        assert_eq!(streams[1]["stream_type"], "metadata");
+
+        // wraps: user + recovery; each carries wrapped_dek_b64 and grant_b64.
+        let wraps = body["wraps"].as_array().unwrap();
+        assert_eq!(wraps.len(), 2);
+        assert!(wraps.iter().any(|w| w["recipient_type"] == "user"));
+        assert!(wraps.iter().any(|w| w["recipient_type"] == "recovery"));
+        // Recovery recipient_id is the literal string "recovery".
+        let rec_wrap = wraps.iter().find(|w| w["recipient_type"] == "recovery").unwrap();
+        assert_eq!(rec_wrap["recipient_id"], "recovery");
+        // User wrap carries a hex recipient_id.
+        let user_wrap = wraps.iter().find(|w| w["recipient_type"] == "user").unwrap();
+        assert_eq!(user_wrap["recipient_id"], "11111111111111111111111111111111");
+        assert!(user_wrap["wrapped_dek_b64"].is_string());
+        assert!(user_wrap["grant_b64"].is_string());
+        assert_eq!(user_wrap["wrap_alg"], 1);
+    }
+
+    /// Prove that `resume_content_sealer` recovers the same DEK as the original
+    /// upload: pass-1 `seal_from_reader` and pass-2 `seal_chunk` produce
+    /// BYTE-IDENTICAL ciphertext for the same plaintext input.
+    #[test]
+    fn seal_chunk_pass2_is_byte_identical_to_seal_from_reader() {
+        use maxsecu_client_core::{
+            resume_content_sealer, SmallStreams, StreamingUploadBuilder, UploadParams,
+            Identity,
+        };
+        use maxsecu_crypto::generate_enc_keypair;
+        use maxsecu_encoding::types::{FileType, Id, Suite, Timestamp};
+
+        let owner = Identity::generate();
+        let (_rsk, rpk) = generate_enc_keypair();
+        let file_id = Id([0x5C; 16]);
+        let params = UploadParams {
+            owner: &owner,
+            owner_id: Id([0x11; 16]),
+            owner_key_version: 1,
+            file_id,
+            file_type: FileType::Video,
+            chunk_size: 4096,
+            recovery_pub: rpk,
+            recovery_mlkem_pub: None,
+            created_at: Timestamp(1_719_500_000_000),
+        };
+
+        // A small fixture — fits in ONE 4096-byte chunk.
+        let fixture: Vec<u8> = (0u8..200).collect();
+
+        // Pass 1: seal_from_reader → capture ciphertext chunks.
+        let builder = StreamingUploadBuilder::new();
+        let sealer1 = builder.content_sealer(&params);
+        let mut chunks_pass1: Vec<Vec<u8>> = Vec::new();
+        let (count, digest) = sealer1
+            .seal_from_reader(&mut Cursor::new(&fixture), |_, ct| {
+                chunks_pass1.push(ct.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 1, "fixture fits in one chunk");
+
+        // finish → UploadRecords (signs/wraps; needed to find the self-wrap for pass 2).
+        let records = builder
+            .finish(
+                &params,
+                &SmallStreams { metadata: None, thumbnail: None, preview: None },
+                digest,
+                count,
+            )
+            .unwrap();
+
+        // Find the self-wrap (recipient_type == User).
+        use maxsecu_encoding::types::RecipientType;
+        let self_wrap = records
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == RecipientType::User)
+            .expect("self-wrap present");
+
+        // Build WrappedDek from wire form (enc ‖ ct).
+        let wire = wrap_wire(self_wrap);
+        let wrapped_dek = WrappedDek {
+            enc: wire[..32].try_into().unwrap(),
+            ct: wire[32..].to_vec(),
+        };
+        let ctx = WrapContext {
+            file_id,
+            version: 1,
+            recipient_id: self_wrap.recipient_id,
+        };
+
+        // Pass 2: resume_content_sealer → seal_chunk → must match pass-1 ct.
+        let sealer2 = resume_content_sealer(
+            &owner,
+            &wrapped_dek,
+            &ctx,
+            Suite::V1,
+            file_id,
+            1,
+            params.chunk_size,
+        )
+        .unwrap();
+
+        let ct2 = sealer2.seal_chunk(0, &fixture, true);
+        assert_eq!(
+            ct2, chunks_pass1[0],
+            "pass-2 seal_chunk must produce byte-identical ciphertext to pass-1"
+        );
+    }
 }

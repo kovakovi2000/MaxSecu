@@ -42,10 +42,11 @@ export class FeedScreen extends HTMLElement {
     if (r) { this.filter = r.filter; this.sort = r.sort; }
 
     // NOTE: the innerHTML template below is FULLY STATIC — no `${}` interpolation.
-    // The two dynamic bits (heading text + presence of the "Only my uploads"
-    // toggle) are applied AFTER assignment via textContent / DOM removal. This is
-    // deliberate: the a11y XSS lint flags ANY `${` inside an innerHTML template,
-    // and a route flag templated raw would still trip it. Keep it static.
+    // The one dynamic bit (heading text: "Feed" vs "My Content") is applied AFTER
+    // assignment via textContent. This is deliberate: the a11y XSS lint flags ANY
+    // `${` inside an innerHTML template, and a route flag templated raw would still
+    // trip it. Keep it static. (The old "Only my uploads" checkbox was removed —
+    // the My Content nav tab (#/mine → the `mine` attribute) is the owner-only view.)
     this.innerHTML = `
       <main id="main" tabindex="-1" aria-labelledby="fd-h">
         <h1 id="fd-h"></h1>
@@ -64,14 +65,13 @@ export class FeedScreen extends HTMLElement {
               <option value="newest-first">Newest first</option>
               <option value="oldest-first">Oldest first</option>
             </select></label>
-          <label id="mine-toggle"><input type="checkbox" name="mine" /> Only my uploads</label>
+          <button id="refresh" type="button" class="feed-refresh">Refresh</button>
         </form>
         <p id="fd-status" role="status" aria-live="polite"></p>
         <div id="grid" role="list"></div>
       </main>`;
 
     (this.querySelector("#fd-h") as HTMLElement).textContent = this.mineOnly ? "My Content" : "Feed";
-    if (this.mineOnly) this.querySelector("#mine-toggle")?.remove();
 
     (this.querySelector("#main") as HTMLElement).focus();
 
@@ -84,11 +84,18 @@ export class FeedScreen extends HTMLElement {
       const d = new FormData(form);
       this.filter = (d.get("type") as FeedFilter) ?? "all";
       this.sort = (d.get("sort") as FeedSort) ?? "newest-first";
-      if (!this.hasAttribute("mine")) this.mineOnly = !!d.get("mine");
       this.load();
     });
     const q = form.querySelector('input[name="q"]') as HTMLInputElement;
     q.addEventListener("input", () => this.runSearch(q.value));
+
+    // Manual refresh: clear any search box and force a fresh server listing,
+    // bypassing the retained (cached) view so newly-posted items appear.
+    (this.querySelector("#refresh") as HTMLButtonElement).addEventListener("click", () => {
+      q.value = "";
+      retained[this.key] = null;
+      this.load();
+    });
 
     if (r && r.entries.length) {
       this.renderEntries(r.entries);

@@ -4,25 +4,26 @@
 //! bundle via client-core, then stages + resumably uploads + finalizes. Only
 //! preview/progress DTOs cross the Tauri seam — never keys/wraps/plaintext.
 
-use maxsecu_client_core::media::{
-    FragmentEntry as TranscodeFragment, TranscodeRequest, TranscodeResult,
-};
+use std::path::Path;
+
+use maxsecu_client_core::media::FragmentEntry as TranscodeFragment;
 use maxsecu_client_core::video::VideoBounds;
 use maxsecu_client_core::{MediaBounds, PlaintextStreams, RustImageCodec, Transcoder};
 use maxsecu_encoding::types::FileType;
-use maxsecu_media_launcher::TranscodeLauncher;
+use maxsecu_media_launcher::{build_ffmpeg_args, FfmpegLauncher, TranscodeOptions};
 
 use crate::error::UiError;
 
-/// The upload `chunk_size` for video content. It **MUST** equal the transcode
-/// worker's `TRANSCODE_CHUNK_SIZE` (4096): the fragment index's `chunk_start` /
-/// `chunk_len` are expressed in whole units of this size, so the upload's content
-/// chunks line up one-for-one with the fragment ranges. A mismatch would silently
-/// break seek (`chunks_for_fragment` would resolve a fragment to the wrong byte
-/// range), so [`prepare_video_streams`] enforces the alignment against this value.
-/// (The worker's `TRANSCODE_CHUNK_SIZE` lives in a crate this codec-free process
-/// does not depend on, so the constant is duplicated here and checked at runtime.)
-pub const VIDEO_CHUNK_SIZE: u32 = 4096;
+/// The upload `chunk_size` for video content (6 MiB). Both the manifest
+/// `chunk_size` and the fragment index's `chunk_start`/`chunk_len` unit are this
+/// value, so the content chunks line up one-for-one with the fragment ranges (a
+/// mismatch would silently misseek — `chunks_for_fragment` would resolve a
+/// fragment to the wrong byte range).
+pub const VIDEO_CHUNK_SIZE: u32 = 6 * 1024 * 1024;
+
+/// Content chunks per fMP4 seek fragment: 1 content chunk (6 MiB) per fMP4
+/// seek fragment, matching the native `<video>` seek granularity for 6 MiB chunks.
+const FRAG_CHUNKS: u64 = 1;
 
 /// Build the canonical metadata blob: JSON `{"title","tags"}` (UTF-8) — exactly
 /// what `commands::feed::parse_title_tags` reads back.
@@ -63,48 +64,203 @@ fn video_prep_err() -> UiError {
     UiError::new("video_failed", "That video could not be processed.")
 }
 
-/// Transcode the author's source media to canonical AV1/CMAF streams **in the
-/// confined transcode worker** (`media-launcher::TranscodeLauncher`, an
-/// AppContainer-isolated one-shot spawn on Windows). The author's source is
-/// untrusted, so the codec runs OUT of this key-holding process; only the worker's
-/// (untrusted) [`TranscodeResult`] crosses back, and it is bounds-checked by the
-/// launcher's framed codec. This does **NO network** — it is the preview-before-
-/// upload transcode.
+/// DISTINCT, benign terminal for a user-initiated (or app-shutdown) cancel of the
+/// confined transcode — the UI returns to idle rather than surfacing a failure. Kept
+/// separate from [`video_prep_err`] so a real decode failure and a deliberate cancel
+/// never look alike.
+fn video_cancelled_err() -> UiError {
+    UiError::new("cancelled", "Transcode cancelled.")
+}
+
+/// Outcome of a successful confined transcode. `out.mp4` stays on disk — it is NOT
+/// read into RAM here (disk-backed path). The caller owns `job_dir` and MUST delete
+/// it on confirm-success, cancel, or any stage-error that occurs after prepare
+/// returns. All error/cancel paths inside [`prepare_video_streams`] still wipe the
+/// dir via [`JobDirGuard`]; only the success path calls `std::mem::forget` to hand
+/// ownership here.
+pub struct PreparedVideo {
+    /// On-disk path of the transcoded fMP4 (`out.mp4` in the per-job temp dir).
+    pub out_mp4_path: std::path::PathBuf,
+    /// The per-job temp dir (Low-IL container artifacts). Caller must delete.
+    pub job_dir: std::path::PathBuf,
+    /// On-disk byte size of `out.mp4` (used to derive `n_chunks`, not re-read here).
+    pub output_size: u64,
+    /// Serialized `{"title","tags","fragments"}` metadata blob.
+    pub metadata: Vec<u8>,
+    /// Derived thumbnail bytes (canonical image stream, from `thumb.png`).
+    pub thumbnail: Vec<u8>,
+    /// Derived preview bytes (canonical preview stream, from `thumb.png`).
+    pub preview: Vec<u8>,
+    /// Chunk-grouped fragment seek index (VIDEO_CHUNK_SIZE units).
+    pub fragments: Vec<TranscodeFragment>,
+}
+
+/// RAII guard that recursively deletes a per-job temp dir on **every** exit path
+/// (success and error). This is the [`FfmpegLauncher::run`] CLEANUP OBLIGATION, not
+/// mere hygiene: the confined ffmpeg writes output files inside the granted dir that
+/// inherit the container-SID allow ACE + a Low integrity label at creation, and
+/// revoking the dir grant cannot retroactively strip those from the child files —
+/// only wholesale deletion of the WHOLE per-job dir removes the
+/// container-accessible, Low-IL artifacts. Because the wipe is in `Drop`, it runs
+/// even on an early `?`/`return` mid-flow.
+struct JobDirGuard {
+    dir: std::path::PathBuf,
+}
+
+impl Drop for JobDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A fresh, unique per-job dir path under the system temp dir. The pid + 8 random
+/// bytes make it collision-free across concurrent ingests; the caller `create_dir`s
+/// it so it is guaranteed freshly created (not pre-existing).
+fn unique_job_dir() -> std::path::PathBuf {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        hex(&maxsecu_crypto::random_array::<8>())
+    );
+    std::env::temp_dir().join(format!("maxsecu-vjob-{unique}"))
+}
+
+/// Build a contiguous, chunk-grouped fragment seek index for `n_chunks` content
+/// chunks. Each fragment covers up to `frag_chunks` whole chunks; the last fragment
+/// is short when `n_chunks` is not an exact multiple. `seq` is 0-based; `pts_ms` is
+/// 0 for every fragment (unused by native `<video>` playback). Requires
+/// `n_chunks >= 1` and `frag_chunks >= 1`.
+fn chunk_grouped_index(n_chunks: u64, frag_chunks: u64) -> Vec<TranscodeFragment> {
+    let mut frags = Vec::new();
+    let mut chunk_start: u64 = 0;
+    let mut seq: u32 = 0;
+    while chunk_start < n_chunks {
+        let remaining = n_chunks - chunk_start;
+        let chunk_len = frag_chunks.min(remaining);
+        frags.push(TranscodeFragment { seq, pts_ms: 0, chunk_start, chunk_len });
+        chunk_start += chunk_len;
+        seq += 1;
+    }
+    frags
+}
+
+/// Transcode the author's **arbitrary** source video to a canonical AV1+AAC
+/// fragmented-MP4 (`fMP4`) via ONE confined spawn, keeping this key-holding process
+/// CODEC-FREE (it links only the codec-free `media-launcher` + the pure-Rust
+/// `RustImageCodec`; rav1d / symphonia never enter it).
 ///
-/// Maps `TranscodeResult.cmaf` → `content`, `thumbnail`/`preview` straight through,
-/// and `build_metadata_with_fragments(title, tags, &fragments)` → `metadata`.
+/// Flow (single confined spawn):
+/// 1. A fresh, unique, freshly-created per-job dir is made; a [`JobDirGuard`]
+///    recursively deletes the WHOLE dir on every return path (the
+///    [`FfmpegLauncher::run`] cleanup obligation).
+/// 2. The source is COPIED into the granted dir (the confined ffmpeg reads it under
+///    the single ReadWrite grant), preserving the extension so ffmpeg can sniff it.
+/// 3. **Confined ffmpeg** ([`FfmpegLauncher`], no net/keys/children, mem cap,
+///    bounded timeout) runs the pinned [`build_ffmpeg_args`] argv — ONE invocation
+///    producing both `out.mp4` (AV1+AAC fragmented-MP4 via `-movflags
+///    +frag_keyframe+empty_moov+default_base_moof`) and `thumb.png` (first frame). A
+///    nonzero exit fails closed; the bounded stderr tail is diagnostic only and never
+///    surfaced to the UI (no decode oracle).
+/// 4. `out.mp4` is stored DIRECTLY as the encrypted content (no re-mux worker). The
+///    fragment seek index is built by [`chunk_grouped_index`] over the content's
+///    [`VIDEO_CHUNK_SIZE`]-chunk count, grouped in [`FRAG_CHUNKS`]-sized bands.
+/// 5. The real thumbnail + preview are derived from `thumb.png` via the pure-Rust
+///    [`RustImageCodec`] (the same path image uploads use).
 ///
-/// **Chunk-size invariant.** The fragment index is expressed in
-/// [`VIDEO_CHUNK_SIZE`] (4096)-byte units. This re-validates the worker's index
-/// against the canonical content: it must parse + validate as a contiguous index
-/// (`parse_fragment_index`) AND cover the `cmaf` exactly in whole 4096-byte chunks
-/// (so the upload's content chunks map one-for-one onto the fragment ranges). A
-/// worker that returns a misaligned stream/index fails closed here rather than
-/// silently breaking seek after upload.
+/// Maps `out.mp4` bytes → `content`, the derived image streams →
+/// `thumbnail`/`preview`, and `build_metadata_with_fragments(title, tags,
+/// &fragments)` → `metadata`. This does **NO network** — it is the
+/// preview-before-upload transcode.
+///
+/// **Defense-in-depth.** After building the chunk-grouped index, `prepare_video_streams`
+/// round-trips the metadata through `parse_fragment_index` and asserts the last
+/// fragment covers exactly `n_chunks`, failing closed on any mismatch.
+// Each input is a distinct concern of the single confined transcode (source path,
+// the confined binary, options/bounds, the title/tags baked into metadata, the
+// progress sink, and the cancel flag); a params struct would only indirect the one
+// call site in `commands::upload::stage_upload`.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_video_streams(
-    source: &[u8],
-    transcode_worker_path: &std::path::Path,
+    input_path: &Path,
+    ffmpeg_path: &Path,
+    options: &TranscodeOptions,
     bounds: &VideoBounds,
     title: &str,
     tags: &[String],
-) -> Result<(PlaintextStreams, Vec<TranscodeFragment>), UiError> {
-    let launcher = TranscodeLauncher::new(transcode_worker_path);
-    let result: TranscodeResult = launcher
-        .transcode(&TranscodeRequest {
-            source: source.to_vec(),
-            bounds: *bounds,
-        })
+    on_phase: impl Fn(crate::state::PreparePhase) + Sync,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<PreparedVideo, UiError> {
+    // 1) Fresh, unique, freshly-created per-job dir. The guard recursively deletes
+    //    the WHOLE dir on every return path (security cleanup, see JobDirGuard).
+    let dir = unique_job_dir();
+    std::fs::create_dir(&dir).map_err(|_| video_prep_err())?;
+    let _guard = JobDirGuard { dir: dir.clone() };
+
+    // 2) Copy the source INTO the granted dir so the confined ffmpeg can read it
+    //    under the single ReadWrite grant. Preserve the original extension (ffmpeg
+    //    sniffs by content too, so a missing ext falls back to `input.bin`).
+    let input_copy = match input_path.extension() {
+        Some(ext) => {
+            let mut name = std::ffi::OsString::from("input.");
+            name.push(ext);
+            dir.join(name)
+        }
+        None => dir.join("input.bin"),
+    };
+    std::fs::copy(input_path, &input_copy).map_err(|_| video_prep_err())?;
+
+    // 3) The pinned argv: ONE confined ffmpeg run → out.mp4 (AV1+AAC) + thumb.png.
+    let out_mp4 = dir.join("out.mp4");
+    let thumb_png = dir.join("thumb.png");
+    let args = build_ffmpeg_args(&input_copy, &out_mp4, &thumb_png, options, bounds);
+
+    // 4) Decode the untrusted source in the CONFINED ffmpeg (no net / keys /
+    //    children, mem cap, bounded timeout). A nonzero exit fails closed; the
+    //    bounded stderr is diagnostic only and never reaches the UI.
+    //    `on_progress` forwards ffmpeg's sanitized percent to the UI as a
+    //    `Transcoding{percent}` phase; `cancel` is polled throughout so a user cancel
+    //    / app shutdown tears the confined child down (RAII grant revoked on that path
+    //    exactly as on every other) and returns the DISTINCT `cancelled` error.
+    let outcome = FfmpegLauncher::new(ffmpeg_path)
+        .run(
+            &args,
+            &dir,
+            |p| on_phase(crate::state::PreparePhase::Transcoding { percent: p.percent }),
+            cancel,
+        )
         .map_err(|_| video_prep_err())?;
-
-    let metadata = build_metadata_with_fragments(title, tags, &result.fragments);
-
-    // Enforce the chunk-size mapping (seek correctness). The metadata fragment
-    // index must validate (contiguity/ordering/coverage) AND tile the canonical
-    // content exactly in whole VIDEO_CHUNK_SIZE chunks.
-    let chunk = VIDEO_CHUNK_SIZE as usize;
-    if result.cmaf.is_empty() || !result.cmaf.len().is_multiple_of(chunk) {
+    if outcome.cancelled {
+        return Err(video_cancelled_err());
+    }
+    if outcome.exit_code != 0 {
         return Err(video_prep_err());
     }
+
+    // 5) Get file sizes — out.mp4 is NOT read into RAM (disk-backed path). thumb.png
+    //    IS read for the pure-Rust image codec. Both must exist and be non-empty.
+    let thumb_png_bytes = std::fs::read(&thumb_png).map_err(|_| video_prep_err())?;
+    let output_size = std::fs::metadata(&out_mp4).map_err(|_| video_prep_err())?.len();
+    if output_size == 0 || thumb_png_bytes.is_empty() {
+        return Err(video_prep_err());
+    }
+
+    // 6) Derive the real thumbnail + preview from ffmpeg's first-frame PNG via the
+    //    pure-Rust image codec — NO C codec enters this key-holding process.
+    on_phase(crate::state::PreparePhase::Finalizing);
+    let derived = RustImageCodec
+        .transcode(&thumb_png_bytes, &MediaBounds::default())
+        .map_err(|_| video_prep_err())?;
+
+    // 7) Build the chunk-grouped fragment seek index from `output_size` (no in-RAM
+    //    buffer needed). `n_chunks` is the number of VIDEO_CHUNK_SIZE-byte chunks the
+    //    fMP4 occupies on disk (div_ceil → last chunk is short, which is normal).
+    let n_chunks = output_size.div_ceil(VIDEO_CHUNK_SIZE as u64);
+    let fragments = chunk_grouped_index(n_chunks, FRAG_CHUNKS);
+    let metadata = build_metadata_with_fragments(title, tags, &fragments);
+
+    // 8) Defense-in-depth: round-trip the index through the viewer's authenticated
+    //    metadata reader to confirm it is contiguous, coverage-complete, and
+    //    consistent with the content chunk count.
     let meta_json: serde_json::Value =
         serde_json::from_slice(&metadata).map_err(|_| video_prep_err())?;
     let index = crate::video::parse_fragment_index(&meta_json)?;
@@ -113,17 +269,25 @@ pub fn prepare_video_streams(
         .chunk_start
         .checked_add(last.chunk_len)
         .ok_or_else(video_prep_err)?;
-    if covered_chunks != (result.cmaf.len() / chunk) as u64 {
+    if covered_chunks != n_chunks {
         return Err(video_prep_err());
     }
 
-    let streams = PlaintextStreams {
-        content: result.cmaf,
-        metadata: Some(metadata),
-        thumbnail: Some(result.thumbnail),
-        preview: Some(result.preview),
-    };
-    Ok((streams, result.fragments))
+    // 9) Success path: forget the guard so the dir is NOT deleted here. All
+    //    `?`/early-return paths above still drop `_guard` and wipe the dir (the
+    //    security-cleanup obligation — Low-IL container artifacts). Only this path
+    //    reaches `forget`. CALLER OWNS `job_dir` and MUST delete it on
+    //    confirm-success, cancel, or any stage-error that occurs after this return.
+    std::mem::forget(_guard);
+    Ok(PreparedVideo {
+        out_mp4_path: out_mp4.clone(),
+        job_dir: dir.clone(),
+        output_size,
+        metadata,
+        thumbnail: derived.thumbnail,
+        preview: derived.preview,
+        fragments,
+    })
 }
 
 /// Blog: `content` is the plain UTF-8 bytes; metadata is the JSON title/tags; no
@@ -176,7 +340,7 @@ fn stream_name(s: StreamType) -> &'static str {
         StreamType::Preview => "preview",
     }
 }
-fn wrap_wire(w: &WrapOut) -> Vec<u8> {
+pub(crate) fn wrap_wire(w: &WrapOut) -> Vec<u8> {
     let mut v = w.wrapped_dek.enc.to_vec();
     v.extend_from_slice(&w.wrapped_dek.ct);
     v
@@ -237,8 +401,8 @@ pub fn total_chunks(b: &UploadBundle) -> u64 {
 
 /// PUT one chunk, retrying up to MAX_CHUNK_RETRY on a transport error or non-200
 /// (idempotent by index → safe). Fail-closed `upload_chunk_failed` after retries.
-// Wired into `confirm_upload` + exercised by the Task-10 e2e.
-async fn put_chunk_retried(
+// Wired into `confirm_upload` + the streaming confirm path.
+pub(crate) async fn put_chunk_retried(
     sender: &mut SendRequest<Full<Bytes>>,
     host: &str,
     token: &str,
@@ -359,11 +523,74 @@ mod tests {
     }
 
     #[test]
+    fn chunk_grouped_index_contiguous_and_covers() {
+        // Non-multiple: 133 = 64*2 + 5 → 3 fragments, last is short (5)
+        let frags = chunk_grouped_index(133, 64);
+        assert_eq!(frags.len(), 3);
+        // seq is 0..len contiguous
+        for (i, f) in frags.iter().enumerate() {
+            assert_eq!(f.seq, i as u32);
+        }
+        // chunk_start[0] == 0
+        assert_eq!(frags[0].chunk_start, 0);
+        // each chunk_start[k] == chunk_start[k-1] + chunk_len[k-1]
+        for k in 1..frags.len() {
+            assert_eq!(frags[k].chunk_start, frags[k - 1].chunk_start + frags[k - 1].chunk_len);
+        }
+        // last fragment's chunk_len is the short remainder (5)
+        assert_eq!(frags.last().unwrap().chunk_len, 5);
+        // sum(chunk_len) == n_chunks
+        assert_eq!(frags.iter().map(|f| f.chunk_len).sum::<u64>(), 133);
+
+        // Exact multiple: 128 = 64*2 → 2 fragments, each full (64)
+        let frags2 = chunk_grouped_index(128, 64);
+        assert_eq!(frags2.len(), 2);
+        assert_eq!(frags2.last().unwrap().chunk_len, 64);
+    }
+
+    #[test]
+    fn chunk_grouped_index_single_short_fragment() {
+        // n_chunks smaller than frag_chunks → exactly one short fragment
+        let frags = chunk_grouped_index(3, 64);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].seq, 0);
+        assert_eq!(frags[0].chunk_start, 0);
+        assert_eq!(frags[0].chunk_len, 3);
+    }
+
+    #[test]
+    fn chunk_grouped_index_round_trips_through_parse() {
+        let frags = chunk_grouped_index(133, 64);
+        let meta = build_metadata_with_fragments("t", &[], &frags);
+        let json: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+        let parsed = crate::video::parse_fragment_index(&json).unwrap();
+        assert_eq!(parsed.len(), frags.len());
+        // last fragment covers exactly n_chunks
+        let last = parsed.last().unwrap();
+        assert_eq!(last.chunk_start + last.chunk_len, 133);
+    }
+
+    #[test]
     fn video_chunk_size_matches_the_upload_chunk_size() {
         // The fragment index is in VIDEO_CHUNK_SIZE units; the upload stages video
-        // content at exactly this chunk size so the ranges map one-for-one. This is
-        // the same 4096 the transcode worker's TRANSCODE_CHUNK_SIZE pads to.
-        assert_eq!(VIDEO_CHUNK_SIZE, 4096);
+        // content at exactly this chunk size so the ranges map one-for-one.
+        assert_eq!(VIDEO_CHUNK_SIZE, 6 * 1024 * 1024);
+    }
+
+    #[test]
+    fn chunk_grouped_index_covers_a_159mib_file_at_6mib() {
+        let cs = VIDEO_CHUNK_SIZE as u64;
+        let file_len: u64 = 159 * 1024 * 1024;
+        let n_chunks = file_len.div_ceil(cs); // 27
+        let frags = chunk_grouped_index(n_chunks, FRAG_CHUNKS);
+        // contiguous + coverage-complete
+        assert_eq!(frags[0].chunk_start, 0);
+        for k in 1..frags.len() {
+            assert_eq!(frags[k].chunk_start, frags[k - 1].chunk_start + frags[k - 1].chunk_len);
+        }
+        let last = frags.last().unwrap();
+        assert_eq!(last.chunk_start + last.chunk_len, n_chunks);
+        assert_eq!(frags.iter().map(|f| f.chunk_len).sum::<u64>(), n_chunks);
     }
 
     #[test]

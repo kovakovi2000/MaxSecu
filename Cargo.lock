@@ -3,40 +3,6 @@
 version = 4
 
 [[package]]
-name = "ac-ffmpeg"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd5735fde11540ea2a6e5cc93fea7fe8d8ff0f39f1630cbd21c74155d5ae6710"
-dependencies = [
- "ac-ffmpeg-build",
- "ac-ffmpeg-features",
- "cc",
- "lazy_static",
- "rustc_version",
-]
-
-[[package]]
-name = "ac-ffmpeg-build"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddd4d05f90fca97e6f5960cbca5154985db2b3e91592d874f0f22a8a34f53aa9"
-dependencies = [
- "cfg-if",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
-name = "ac-ffmpeg-features"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6bdd0b60d57a35283db1b94d786f47857b412195943b38be68a9dbb481adb9c"
-dependencies = [
- "ac-ffmpeg-build",
- "cc",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2609,6 +2575,7 @@ name = "maxsecu-client-app"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -2620,6 +2587,7 @@ dependencies = [
  "maxsecu-media-launcher",
  "maxsecu-server",
  "rcgen",
+ "rfd",
  "serde",
  "serde_json",
  "sysinfo",
@@ -2700,6 +2668,8 @@ name = "maxsecu-media-launcher"
 version = "0.0.0"
 dependencies = [
  "maxsecu-client-core",
+ "serde",
+ "serde_json",
  "windows-sys 0.61.2",
  "zeroize",
 ]
@@ -2708,12 +2678,9 @@ dependencies = [
 name = "maxsecu-media-transcode-worker"
 version = "0.0.0"
 dependencies = [
- "ac-ffmpeg",
- "image",
  "maxsecu-client-core",
  "maxsecu-media-launcher",
- "rav1d",
- "rav1e",
+ "maxsecu-media-worker",
  "symphonia",
 ]
 
@@ -2724,6 +2691,7 @@ dependencies = [
  "image",
  "maxsecu-client-core",
  "maxsecu-media-launcher",
+ "maxsecu-media-transcode-worker",
  "rav1d",
  "rav1e",
  "symphonia",
@@ -4036,6 +4004,27 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+]
+
+[[package]]
+name = "rfd"
+version = "0.15.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef2bee61e6cffa4635c72d7d81a84294e28f0930db0ddcb0f66d10244674ebed"
+dependencies = [
+ "block2",
+ "dispatch2",
+ "js-sys",
+ "log",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "raw-window-handle",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

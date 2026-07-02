@@ -6,6 +6,25 @@
 // behind a backlog of card decrypts); `cancelPending` rejects everything still
 // queued (used when leaving the feed) so a stalled backlog can't wedge the lock.
 
+// The rejection `cancelPending` uses. A distinct type so callers (e.g. a feed
+// card) can tell a benign queue-flush from a real backend failure and react
+// differently — a still-on-screen card retries; a torn-down one drops silently.
+// `.message` stays "cancelled" for back-compat with existing assertions/logs.
+export class CancelledError extends Error {
+  constructor() {
+    super("cancelled");
+    this.name = "CancelledError";
+  }
+}
+
+/** True if `e` is a serial-queue cancellation (vs a real error). */
+export function isCancelled(e: unknown): e is CancelledError {
+  return (
+    e instanceof CancelledError ||
+    (typeof e === "object" && e !== null && (e as { message?: unknown }).message === "cancelled")
+  );
+}
+
 type Job<T = unknown> = {
   task: () => Promise<T>;
   resolve: (v: T) => void;
@@ -70,11 +89,20 @@ export function serialPriority<T>(task: () => Promise<T>): Promise<T> {
   return enqueue(task, true);
 }
 
-// Reject everything still queued (not the running task). Used when navigating
-// away from the feed so a backlog of card decrypts cannot wedge the lock.
+// Reject the queued NON-priority backlog (not the running task). Used when
+// navigating away from the feed so a backlog of card decrypts cannot wedge the
+// lock. PRIORITY jobs are RETAINED: they are user-initiated (a viewer open via
+// `serialPriority`) and must survive a feed-teardown flush — otherwise navigating
+// feed→viewer while cards are still decrypting cancels the open ("cancelled" /
+// "Could not open this item"), a timing race that broke video (and any) playback.
 export function cancelPending(): void {
+  const kept: Job[] = [];
   while (queue.length) {
     const job = queue.shift()!;
-    job.reject(new Error("cancelled"));
+    if (job.priority) kept.push(job);
+    else job.reject(new CancelledError());
   }
+  // Restore the retained priority jobs (order preserved) and resume the queue.
+  queue.push(...kept);
+  pump();
 }

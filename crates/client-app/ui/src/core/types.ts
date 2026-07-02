@@ -67,10 +67,30 @@ export interface UploadPreview {
 export type UploadMsg =
   | { phase: "encrypting"; job_id: string }
   | { phase: "staging"; job_id: string }
-  | { phase: "uploading"; job_id: string; done: number; total: number }
+  | { phase: "uploading"; job_id: string; done: number; total: number; bytes_per_s: number }
   | { phase: "finalizing"; job_id: string }
   | { phase: "done"; job_id: string; file_id: string }
   | { phase: "failed"; job_id: string; code: string };
+
+// Returned by list_pending_uploads() — one entry per interrupted upload that is
+// still within the 24-hour retention window.
+export interface PendingUploadView {
+  file_id_hex: string;
+  title: string;
+  progress: number;
+  total: number;
+}
+
+// --- Universal video ingest: transcode lifecycle events (maxsecu://video-prepare) ---
+// kebab-tagged on "phase". `transcoding.percent` is null (indeterminate) until
+// ffmpeg reports the source Duration; `cancelled` is a benign terminal; `failed`
+// carries a sanitized code. Mirrors the Rust `PreparePhase` serde shape.
+export type PreparePhase =
+  | { phase: "transcoding"; percent: number | null }
+  | { phase: "remuxing" }
+  | { phase: "finalizing" }
+  | { phase: "cancelled" }
+  | { phase: "failed"; code: string };
 
 // --- Phase 5 (settings + a11y) DTO mirror of the Rust SettingsConfig serde shape ---
 // Section objects, snake_case fields — match server/core serde exactly.
@@ -84,3 +104,10 @@ export interface Settings {
 
 // The RAM-cache slider/number bounds from the `ram_limits` command (Task 1).
 export interface RamLimits { default_mb: number; min_mb: number; max_mb: number }
+
+// Live process + budget memory figures from the `memory_stats` command.
+// `used_bytes` is null when the OS process-RSS query is unavailable (fail-soft).
+export interface MemoryStats { used_bytes: number | null; budget_bytes: number }
+
+// --- Video player: one-shot duration metadata emitted at open (maxsecu://video-info) ---
+export interface VideoInfo { duration_ms: number; fragment_count: number }

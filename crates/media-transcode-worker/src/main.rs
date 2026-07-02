@@ -1,23 +1,27 @@
-//! The author-side transcode **worker** process (DESIGN §8.1/D30, Phase 7 Gate 6).
+//! The author-side transcode **worker** process (Universal Video Ingest, Task 3.3;
+//! DESIGN §8.1/D30).
 //!
 //! Secret-less and network-less by construction: it reads **one** framed
-//! [`TranscodeRequest`] on stdin, runs the bounded transcode (no keys, no sockets),
+//! [`TranscodeRequest`] on stdin, runs the bounded re-mux (no keys, no sockets),
 //! writes **one** framed [`TranscodeResult`] on stdout, and exits — one job per
 //! process (the same one-shot, confined shape as the decode `media-worker`).
 //! `media-launcher::TranscodeLauncher` spawns exactly this binary inside the OS
 //! confinement (AppContainer + Job Object on Windows).
 //!
-//! The transcode body is the pure-Rust `rav1e` encode + hand-rolled chunk-aligned
-//! CMAF mux (Task 6.2); the optional `ac-ffmpeg` broad-format ingest stays a
-//! documented deferred stub behind the off-by-default `ffmpeg` feature.
+//! The transcode body is pure-Rust and links/runs **no codec**: it symphonia-demuxes
+//! ffmpeg's output AV1/AAC mp4 (the request `source`) and re-muxes it into the
+//! canonical chunk-aligned CMAF fragment layout (see the crate lib). The
+//! arbitrary-format decode + AV1/AAC encode happen UPSTREAM in a separate confined
+//! `ffmpeg.exe` spawned by `client-app` — that external process, not this crate, is
+//! the C carve-out.
 //!
-//! In `--selftest-*` mode (Phase 7 Gate 6) it performs ONE containment probe —
-//! attempt a network connect / spawn a child / read a sensitive path — and writes a
-//! single verdict byte (`1` = the action SUCCEEDED, `0` = it was DENIED), so the
-//! containment tests can assert the AppContainer + Job Object confinement denies each
-//! from inside the sandbox (the same probes the decode `media-worker` uses). This
-//! bounds the blast radius of the future, deferred ffmpeg C decode: even a libav 0-day
-//! in the confined worker cannot reach the network, shell out, or read the user's keys.
+//! In `--selftest-*` mode it performs ONE containment probe — attempt a network
+//! connect / spawn a child / read a sensitive path — and writes a single verdict byte
+//! (`1` = the action SUCCEEDED, `0` = it was DENIED), so the containment tests can
+//! assert the AppContainer + Job Object confinement denies each from inside the sandbox
+//! (the same probes the decode `media-worker` uses). This bounds the blast radius of
+//! the confined worker: even a parser 0-day in it cannot reach the network, shell out,
+//! or read the user's keys.
 //!
 //! [`TranscodeRequest`]: maxsecu_client_core::media::TranscodeRequest
 //! [`TranscodeResult`]: maxsecu_client_core::media::TranscodeResult
