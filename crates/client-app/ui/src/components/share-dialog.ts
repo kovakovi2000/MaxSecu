@@ -101,6 +101,9 @@ export class ShareDialog extends HTMLElement {
     const status = this.querySelector("#sd-status") as HTMLElement;
     status.textContent = "";
     this.hidden = false;
+    // Guard against a double-open (reopen before close()) registering the
+    // keydown handler twice: always remove any prior registration first.
+    document.removeEventListener("keydown", this.keydownHandler);
     document.addEventListener("keydown", this.keydownHandler);
 
     const input = this.querySelector("#sd-username") as HTMLInputElement;
@@ -314,6 +317,15 @@ export class ShareDialog extends HTMLElement {
 
   private renderRows() {
     const ul = this.querySelector("#sd-rows") as HTMLUListElement;
+
+    // `replaceChildren()` below destroys every row's DOM, so a keyboard user who
+    // just activated a row's Retry/Remove would lose focus to <body> (the trap
+    // only recovers on the next Tab). If focus was on a control INSIDE a row,
+    // remember which row so we can restore an equivalent target after rebuild.
+    const active = document.activeElement as HTMLElement | null;
+    const actedRow = active && ul.contains(active) ? active.closest(".sd-row") : null;
+    const actedRowKey = actedRow?.getAttribute("data-row") ?? null;
+
     ul.replaceChildren();
     for (const row of this.rows) {
       const li = document.createElement("li");
@@ -365,6 +377,19 @@ export class ShareDialog extends HTMLElement {
       }
 
       ul.appendChild(li);
+    }
+
+    // Restore focus after a row-level action rebuilt the list: prefer a button
+    // in the same (still-present) row; otherwise fall back to the add-username
+    // input. Never leave focus stranded on <body>.
+    if (actedRowKey !== null) {
+      const rebuilt = Array.from(ul.children).find(
+        (li) => (li as HTMLElement).getAttribute("data-row") === actedRowKey,
+      ) as HTMLElement | undefined;
+      const target =
+        rebuilt?.querySelector<HTMLButtonElement>("button") ??
+        (this.querySelector("#sd-username") as HTMLInputElement);
+      target.focus();
     }
   }
 }
