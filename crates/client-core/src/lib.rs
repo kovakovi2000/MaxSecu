@@ -50,10 +50,7 @@ pub use media::{
     MAX_TRANSCODE_BYTES, MAX_TRANSCODE_FRAGMENTS, MEDIA_MAX_PIXELS, PREVIEW_MAX_DIM,
     THUMBNAIL_MAX_DIM,
 };
-pub use sandbox::{
-    decode_rgba_bounded, validate_decoded, DecodeError, DecodedImage, InProcessFakeDecoder,
-    OutputReject, SandboxedDecoder,
-};
+pub use sandbox::{decode_rgba_bounded, validate_decoded, DecodeError, DecodedImage, OutputReject};
 pub use revocation::{ControlRecordIn, IssuerInfo, TombstoneError, TombstoneSet};
 pub use sink::{verify_anchor_proof, AnchorProof, AnchoredHead, FakeSink, SinkClient, SinkError};
 #[cfg(feature = "net")]
@@ -65,10 +62,7 @@ pub use transparency::{
 pub use sanitize::{safe_export_path, sanitize_filename, SanitizeError};
 pub use update::{verify_update, LogInclusion, UpdateError, UpdateManifest, Verified};
 pub use identity::Identity;
-pub use video::{
-    decode_client_msg, decode_worker_msg, encode_client_msg, encode_worker_msg, validate_i420,
-    validate_pcm, ClientMsg, I420Frame, PcmChunk, VideoBounds, VideoProtoError, WorkerMsg,
-};
+pub use video::VideoBounds;
 pub use version_memory::{open_and_remember, FileVersionRecord, MemoryVersionStore, VersionStore};
 pub use upload::{
     build_upload, resume_content_sealer, ContentStreamSealer, PlaintextStreams, SealedStreamOut,

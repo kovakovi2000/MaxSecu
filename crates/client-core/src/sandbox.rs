@@ -1,24 +1,18 @@
-//! Sandboxed media **decode** — the viewer path (DESIGN §8.1/D30, media-sandbox).
+//! In-process bounded image decode — the viewer path (DESIGN §8.1/D30, media-sandbox).
 //!
 //! Viewing shared media runs a decoder on **attacker-authored bytes** (authenticated
-//! ≠ benign, D24) — the system's top RCE surface. The defense is to decode in an
-//! OS-isolated worker that holds **no keys and no network**, behind hard
-//! **pre-decode bounds**, and to treat the worker's **output as untrusted too**
+//! ≠ benign, D24) — the system's top RCE surface. The defense is hard
+//! **pre-decode bounds** plus treating the decoder's **output as untrusted too**
 //! (media-sandbox §1).
 //!
 //! This module is the cross-platform, fully-testable core of that path:
-//! * [`SandboxedDecoder`] — the seam: "hand raw canonical bytes to the isolated
-//!   worker, get decoded frames back." The real Windows AppContainer worker
-//!   implements this in a later increment (`P4b.6b`, `cfg(windows)`); the
-//!   [`InProcessFakeDecoder`] here stands in for tests on every platform.
-//! * **Pre-decode bounds** — reject oversize dimensions/pixels **before**
-//!   allocation (the decompression-bomb guard, media-sandbox §3), reusing
+//! * [`decode_rgba_bounded`] — pre-decode bounds: reject oversize dimensions/pixels
+//!   **before** allocation (the decompression-bomb guard, media-sandbox §3), reusing
 //!   [`MediaBounds`].
-//! * [`validate_decoded`] — the **untrusted-output** check: the main process
-//!   validates the worker's returned dimensions / channel count / buffer length
-//!   for internal consistency and against the caps **before** handing anything to
-//!   the renderer (media-sandbox §1). A worker compromise that returns a
-//!   malformed frame is caught here.
+//! * [`validate_decoded`] — the **untrusted-output** check: validates the decoder's
+//!   returned dimensions / channel count / buffer length for internal consistency
+//!   and against the caps **before** handing anything to the renderer
+//!   (media-sandbox §1).
 
 use crate::media::MediaBounds;
 
@@ -88,17 +82,6 @@ pub fn validate_decoded(img: &DecodedImage, bounds: &MediaBounds) -> Result<(), 
     Ok(())
 }
 
-/// Hand raw **canonical** bytes to an isolated decoder and get a decoded frame.
-/// Implementors must enforce the pre-decode bounds; the caller still runs
-/// [`validate_decoded`] on the result (output is untrusted).
-pub trait SandboxedDecoder {
-    fn decode_image(
-        &self,
-        canonical: &[u8],
-        bounds: &MediaBounds,
-    ) -> Result<DecodedImage, DecodeError>;
-}
-
 /// Decode canonical image bytes to an RGBA8 [`DecodedImage`] under the pre-decode
 /// bounds (the decompression-bomb guard, media-sandbox §3). Pure Rust (`image`),
 /// no keys, no I/O beyond the in-memory buffer — the **exact decode the isolated
@@ -145,22 +128,6 @@ pub fn decode_rgba_bounded(
     })
 }
 
-/// In-process decoder fake (cross-platform) standing in for the real isolated
-/// worker in tests: runs [`decode_rgba_bounded`] directly. The **real**
-/// AppContainer/Job-Object worker (`media-worker`, P4b.6b) runs the same decode
-/// in an OS-isolated process; both feed [`validate_decoded`].
-pub struct InProcessFakeDecoder;
-
-impl SandboxedDecoder for InProcessFakeDecoder {
-    fn decode_image(
-        &self,
-        canonical: &[u8],
-        bounds: &MediaBounds,
-    ) -> Result<DecodedImage, DecodeError> {
-        decode_rgba_bounded(canonical, bounds)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,11 +147,9 @@ mod tests {
     }
 
     #[test]
-    fn fake_decodes_canonical_png_to_rgba_frame() {
+    fn decodes_canonical_png_to_rgba_frame() {
         let png = make_png(48, 32);
-        let img = InProcessFakeDecoder
-            .decode_image(&png, &MediaBounds::default())
-            .unwrap();
+        let img = decode_rgba_bounded(&png, &MediaBounds::default()).unwrap();
         assert_eq!((img.width, img.height), (48, 32));
         assert_eq!(img.channels, 4);
         assert_eq!(img.pixels.len(), 48 * 32 * 4);
@@ -193,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn fake_rejects_oversize_before_decode() {
+    fn rejects_oversize_before_decode() {
         let png = make_png(64, 64);
         let bounds = MediaBounds {
             max_width: 16,
@@ -201,7 +166,7 @@ mod tests {
             max_pixels: 256,
         };
         assert_eq!(
-            InProcessFakeDecoder.decode_image(&png, &bounds),
+            decode_rgba_bounded(&png, &bounds),
             Err(DecodeError::TooLarge {
                 width: 64,
                 height: 64
@@ -210,13 +175,13 @@ mod tests {
     }
 
     #[test]
-    fn fake_rejects_empty_and_garbage() {
+    fn rejects_empty_and_garbage() {
         assert_eq!(
-            InProcessFakeDecoder.decode_image(&[], &MediaBounds::default()),
+            decode_rgba_bounded(&[], &MediaBounds::default()),
             Err(DecodeError::Empty)
         );
         assert_eq!(
-            InProcessFakeDecoder.decode_image(&[1, 2, 3, 4], &MediaBounds::default()),
+            decode_rgba_bounded(&[1, 2, 3, 4], &MediaBounds::default()),
             Err(DecodeError::DecodeFailed)
         );
     }
