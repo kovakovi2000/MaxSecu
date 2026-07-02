@@ -10,6 +10,7 @@ import "./feed-screen.ts";
 import "./media-viewer.ts";
 import "./upload-screen.ts";
 import "./upload-tray.ts";
+import "./share-tray.ts";
 import "./settings-screen.ts";
 import "./ram-gauge.ts";
 import "./toast-host.ts";
@@ -48,7 +49,10 @@ export class AppShell extends HTMLElement {
           <span id="sync-ind" class="sync-ind" role="status" aria-live="polite">Zero-knowledge session</span>
           <span id="tasks-ind" class="tasks-ind" role="status" aria-live="polite">No active tasks</span>
         </div>
-        <upload-tray></upload-tray>
+        <div class="tray-stack">
+          <upload-tray></upload-tray>
+          <share-tray></share-tray>
+        </div>
       </header>
       <toast-host></toast-host>
       <div id="outlet"></div>`;

@@ -62,6 +62,17 @@ export interface ReshareOutcome {
   code: string | null; // sanitized failure code, null on success
 }
 
+// The background reshare feedback channel (T4 spec §6), emitted over
+// maxsecu://reshare-state. kebab-tagged on "phase"; mirrors the Rust
+// `SharePhase` serde shape exactly. No key material — file_id/username/
+// ok/code/counts only.
+export type SharePhase =
+  | { phase: "resolving"; file_id: string; username: string }
+  | { phase: "verifying"; file_id: string; username: string }
+  | { phase: "wrapping"; file_id: string; username: string }
+  | { phase: "recipient"; file_id: string; username: string; ok: boolean; code: string | null }
+  | { phase: "done"; file_id: string; shared: number; failed: number };
+
 export interface SearchHit { file_id: string; title: string; file_type: string }
 
 export type FetchMsg =

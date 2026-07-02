@@ -275,7 +275,7 @@ app-shell { display: block; min-height: 100vh; }
   border-radius: 999px;
   background: color-mix(in srgb, var(--mx-surface-2) 72%, transparent);
 }
-upload-tray { grid-area: tray; justify-self: end; }
+.tray-stack { grid-area: tray; justify-self: end; display: grid; gap: 0.6rem; }
 .ram-gauge-wrap[hidden] { display: none !important; }
 #outlet { position: relative; z-index: 1; }
 
@@ -629,24 +629,24 @@ settings-screen main > fieldset { max-width: 760px; }
   /* width set inline by JS — no CSS transition so reduced-motion is respected */
 }
 
-.upload-tray, .toast, video-player {
+.upload-tray, .share-tray, .toast, video-player {
   border: 1px solid var(--mx-border);
   border-radius: var(--mx-radius-lg);
   background: color-mix(in srgb, var(--mx-surface-1) 94%, transparent);
   box-shadow: var(--mx-elev-2), var(--mx-inset);
   backdrop-filter: blur(18px) saturate(1.1);
 }
-.upload-tray {
+.upload-tray, .share-tray {
   min-width: min(360px, calc(100vw - 2rem));
   max-width: 420px;
   padding: 0.85rem;
 }
-.upload-tray .ut-title {
+.upload-tray .ut-title, .share-tray .st-title {
   margin: 0 0 0.6rem;
   font-size: 0.98rem;
   letter-spacing: -0.02em;
 }
-.upload-tray ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.55rem; }
+.upload-tray ul, .share-tray ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.55rem; }
 .upload-tray li {
   display: grid;
   grid-template-columns: auto 1fr auto;
@@ -657,7 +657,33 @@ settings-screen main > fieldset { max-width: 760px; }
   border-radius: var(--mx-radius-sm);
   background: color-mix(in srgb, var(--mx-surface-2) 80%, transparent);
 }
-.upload-tray button { min-height: 2rem; padding: 0.35rem 0.6rem; }
+.share-tray > ul > li {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.4rem;
+  padding: 0.5rem;
+  border: 1px solid var(--mx-border);
+  border-radius: var(--mx-radius-sm);
+  background: color-mix(in srgb, var(--mx-surface-2) 80%, transparent);
+}
+.upload-tray button, .share-tray button { min-height: 2rem; padding: 0.35rem 0.6rem; }
+.share-tray .st-head { display: flex; align-items: center; gap: 0.5rem; }
+.share-tray .st-summary { color: var(--mx-muted); font-size: var(--mx-fs-1); }
+.share-tray .st-dismiss { align-self: flex-end; }
+.share-tray .st-failures { display: grid; gap: 0.3rem; }
+.share-tray .st-failures:empty { display: none; }
+.share-tray .st-failures li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--mx-border);
+  border-radius: var(--mx-radius-sm);
+  background: color-mix(in srgb, var(--mx-surface-1) 70%, transparent);
+  font-size: var(--mx-fs-1);
+}
 .toast-stack {
   position: fixed;
   right: var(--mx-space-4);
@@ -784,8 +810,8 @@ video-player media-loading-indicator {
       "status status"
       "tray tray";
   }
-  upload-tray { justify-self: stretch; }
-  .upload-tray { max-width: none; width: 100%; }
+  .tray-stack { justify-self: stretch; }
+  .upload-tray, .share-tray { max-width: none; width: 100%; }
   #controls { grid-template-columns: 1fr; }
   settings-screen #set-form { grid-template-columns: 1fr; }
 }
@@ -1519,7 +1545,7 @@ media-card article.media-card-shell:focus-within::before {
 app-shell:not([data-app-chrome]) .app-brand,
 app-shell:not([data-app-chrome]) .nav-rail,
 app-shell:not([data-app-chrome]) .status-strip,
-app-shell:not([data-app-chrome]) upload-tray {
+app-shell:not([data-app-chrome]) .tray-stack {
   display: none !important;
 }
 app-shell:not([data-app-chrome]) .app-header {
