@@ -7,26 +7,33 @@
 //! - `reconstruct_recovery_key` — reassemble the recovery key from the collected
 //!   shares INTO the session, returning only an opaque `ceremony_handle` — the
 //!   reconstructed key never crosses the seam (T6, this file).
+//! - `record_split_ceremony` — append a single non-secret log line (who/when,
+//!   `k`/`n`, issued custodian indices, label) on the operator's EXPLICIT
+//!   completion of a split — the only disk write in this module (T6 step 9).
 //!
-//! **Synchronous, local-only — no network, no disk write.** This module
-//! deliberately imports no HTTP client crate and no async networking runtime
-//! type (spec §3; the module-source grep gate in `discard_tests` enforces this
-//! at test time). The split
-//! operation is (1) read the sealed file the caller named, (2) unseal it with the
-//! passphrase (`admin_core::recovery_seal::open_recovery_secret`, T1), (3)
-//! Shamir-split the recovery scalar (`admin_core::recovery::split_recovery_key`),
-//! (4) wire-encode each `Share` as MSHARE1 (`crate::recovery_share::encode`, T2).
+//! **Synchronous, local-only — no network.** This module deliberately imports
+//! no HTTP client crate and no async networking runtime type (spec §3; the
+//! module-source grep gate in `discard_tests` enforces this at test time). The
+//! split operation itself is disk-write-free: (1) read the sealed file the
+//! caller named, (2) unseal it with the passphrase
+//! (`admin_core::recovery_seal::open_recovery_secret`, T1), (3) Shamir-split
+//! the recovery scalar (`admin_core::recovery::split_recovery_key`), (4)
+//! wire-encode each `Share` as MSHARE1 (`crate::recovery_share::encode`, T2) —
+//! nothing touches disk until the operator explicitly calls
+//! `record_split_ceremony`.
 //!
 //! Secret hygiene: the unsealed [`EncSecretKey`] carries its own zero-on-drop, and
-//! the transient `Vec<Share>` bodies are wiped before return. Nothing sensitive is
-//! written to disk or logged; the passphrase arrives already `Debug`-redacted in
-//! the DTO and is dropped with the request. The reconstructed key lives only in
-//! the [`CeremonySession`] (also zero-on-drop) behind a random opaque handle.
+//! the transient `Vec<Share>` bodies are wiped before return. No share/secret
+//! bytes are ever written to disk or logged — the ceremony log carries only
+//! non-secret metadata (§4 step 5); the passphrase arrives already
+//! `Debug`-redacted in the DTO and is dropped with the request. The
+//! reconstructed key lives only in the [`CeremonySession`] (also zero-on-drop)
+//! behind a random opaque handle.
 
 use crate::ceremony::CeremonySession;
 use crate::dto::{
     AddShareRequest, AddShareResponse, ProveRequest, ProveResponse, ReconstructResponse,
-    SplitRecoveryKeyRequest, SplitRecoveryKeyResponse,
+    SplitCeremonyLogRequest, SplitRecoveryKeyRequest, SplitRecoveryKeyResponse,
 };
 use crate::error::UiError;
 use crate::recovery_share::{parse_and_verify, ShareParseError};
@@ -447,6 +454,52 @@ fn prove_in_session(
     Ok(ProveResponse { verified })
 }
 
+// ---- ceremony log ----
+
+/// Build the ONE structured, non-secret log line for a completed split
+/// ceremony (spec §4 step 5): a timestamp (when), the operator (who — falls
+/// back to `"unknown"` when unset; this is an offline ceremony with no server
+/// identity to fall back on instead), the operation kind, `k`-of-`n`, the
+/// issued custodian indices, and the label. NOTHING else ever goes in this
+/// line — `SplitCeremonyLogRequest` carries no share body / secret field by
+/// construction, so there is nothing sensitive this function COULD embed.
+fn split_ceremony_log_line(req: &SplitCeremonyLogRequest, ts_unix: u64) -> String {
+    let operator = req.operator.as_deref().unwrap_or("unknown");
+    format!(
+        "ts_unix={} op=split operator={} k={} n={} custodians={:?} label={:?}\n",
+        ts_unix, operator, req.k, req.n, req.custodian_indices, req.label
+    )
+}
+
+/// `record_split_ceremony` — append a single non-secret ceremony-log line on
+/// the operator's EXPLICIT completion of a split (spec §4 step 5).
+///
+/// `split_recovery_key` (above) is deliberately disk-write-free (T4) — this is
+/// a SEPARATE, explicit-completion write the split wizard calls only after the
+/// operator has finished distributing every share. Synchronous, no network.
+/// Creates `req.log_path` if missing and always APPENDS — a prior ceremony's
+/// line is never truncated or overwritten. An IO failure maps to a generic,
+/// non-oracle `UiError`: a local path is not itself secret, but the message
+/// stays deliberately unspecific regardless (no path echoed back).
+#[tauri::command]
+pub fn record_split_ceremony(req: SplitCeremonyLogRequest) -> Result<(), UiError> {
+    let ts_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let line = split_ceremony_log_line(&req, ts_unix);
+
+    use std::io::Write;
+    let log_err = || UiError::new("log_write_failed", "Could not write the ceremony log.");
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&req.log_path)
+        .map_err(|_| log_err())?;
+    f.write_all(line.as_bytes()).map_err(|_| log_err())?;
+    Ok(())
+}
+
 // ---- discard ----
 
 /// `discard_ceremony_session` — end the in-progress ceremony and wipe every
@@ -596,9 +649,21 @@ mod tests {
     }
 
     /// A unique throwaway directory (no external tempdir crate — mirrors the
-    /// keystore/config test convention in this crate).
+    /// keystore/config test convention in this crate). Includes a random
+    /// 8-byte suffix ON TOP of pid+nanos: under parallel test execution the
+    /// pid is constant and the clock is coarse enough that two threads can
+    /// land on the same `(pid, nanos)` pair in the same tick, which made
+    /// `create_dir_all` silently share one directory between two unrelated
+    /// tests (flaky). A cryptographically random suffix makes a collision
+    /// between concurrent test runs effectively impossible.
     fn tempdir() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("maxsecu-rc-{}-{}", std::process::id(), nanos()));
+        let rand = crate::commands::feed::hex(&maxsecu_crypto::random_array::<8>());
+        let p = std::env::temp_dir().join(format!(
+            "maxsecu-rc-{}-{}-{}",
+            std::process::id(),
+            nanos(),
+            rand
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -1181,5 +1246,144 @@ mod prove_tests {
         };
         let err = prove_in_session(req, &session).expect_err("bad base64 must fail closed");
         assert_eq!(err.code, "bad_recovery_wrap");
+    }
+}
+
+#[cfg(test)]
+mod ceremony_log_tests {
+    use super::*;
+    use crate::dto::SplitCeremonyLogRequest;
+
+    /// A unique, unlikely-to-collide throwaway log FILE path (not a directory
+    /// — `record_split_ceremony` creates the file itself via `OpenOptions`).
+    /// Random suffix for the same reason as `tests::tempdir`'s fix: pid+coarse
+    /// clock alone can collide under parallel test execution.
+    fn temp_log_path() -> std::path::PathBuf {
+        let rand = crate::commands::feed::hex(&maxsecu_crypto::random_array::<8>());
+        std::env::temp_dir().join(format!(
+            "maxsecu-rc-log-{}-{}.log",
+            std::process::id(),
+            rand
+        ))
+    }
+
+    fn req(log_path: &str, custodian_indices: Vec<u8>) -> SplitCeremonyLogRequest {
+        SplitCeremonyLogRequest {
+            log_path: log_path.to_owned(),
+            label: "MaxSecu recovery key, 2026-07".to_owned(),
+            k: 3,
+            n: 5,
+            custodian_indices,
+            operator: Some("alice".to_owned()),
+        }
+    }
+
+    #[test]
+    fn completed_split_writes_a_non_secret_log_line() {
+        let path = temp_log_path();
+        let path_str = path.to_string_lossy().into_owned();
+
+        record_split_ceremony(req(&path_str, vec![1, 2, 3, 4, 5])).expect("log write ok");
+
+        let contents = std::fs::read_to_string(&path).expect("read log");
+        assert!(
+            contents.contains("MaxSecu recovery key, 2026-07"),
+            "label missing: {contents}"
+        );
+        assert!(contents.contains("k=3"), "k missing: {contents}");
+        assert!(contents.contains("n=5"), "n missing: {contents}");
+        assert!(contents.contains("alice"), "operator missing: {contents}");
+        assert!(contents.contains("op=split"), "operation kind missing: {contents}");
+        assert!(contents.contains("ts_unix="), "timestamp missing: {contents}");
+        for i in [1u8, 2, 3, 4, 5] {
+            assert!(
+                contents.contains(&i.to_string()),
+                "custodian index {i} missing: {contents}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The load-bearing negative assertion: construct a REAL MSHARE1 share
+    /// string the way `split_recovery_key` would, and confirm not one byte of
+    /// it — nor the MSHARE1 tag, nor a raw body fragment — ever reaches the
+    /// log. `SplitCeremonyLogRequest` has no field a share/secret could ride
+    /// in, but this proves it end-to-end against the actual written bytes.
+    #[test]
+    fn log_line_never_contains_share_or_secret_bytes() {
+        let path = temp_log_path();
+        let path_str = path.to_string_lossy().into_owned();
+
+        record_split_ceremony(req(&path_str, vec![1, 2, 3])).expect("log write ok");
+
+        let contents = std::fs::read_to_string(&path).expect("read log");
+
+        let bogus_share = Share {
+            index: 1,
+            body: b"super-secret-share-body-bytes".to_vec(),
+        };
+        let share_text = crate::recovery_share::encode(&bogus_share, "some-label", 3, 5);
+
+        assert!(
+            !contents.contains(&share_text),
+            "a full share text leaked into the ceremony log: {contents}"
+        );
+        assert!(
+            !contents.contains("MSHARE1"),
+            "the MSHARE1 tag leaked into the ceremony log: {contents}"
+        );
+        assert!(
+            !contents.contains("super-secret-share-body-bytes"),
+            "raw share body bytes leaked into the ceremony log: {contents}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn two_calls_append_two_lines() {
+        let path = temp_log_path();
+        let path_str = path.to_string_lossy().into_owned();
+
+        record_split_ceremony(req(&path_str, vec![1, 2, 3])).expect("first write ok");
+        record_split_ceremony(req(&path_str, vec![4, 5])).expect("second write ok");
+
+        let contents = std::fs::read_to_string(&path).expect("read log");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "two explicit completions must append two lines, got: {contents}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_operator_falls_back_to_a_placeholder() {
+        let path = temp_log_path();
+        let path_str = path.to_string_lossy().into_owned();
+        let mut r = req(&path_str, vec![1]);
+        r.operator = None;
+
+        record_split_ceremony(r).expect("log write ok");
+        let contents = std::fs::read_to_string(&path).expect("read log");
+        assert!(
+            contents.contains("operator=unknown"),
+            "missing-operator fallback not applied: {contents}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unwritable_path_maps_to_a_sanitized_error() {
+        // A parent directory that does not exist — `OpenOptions` does not
+        // create parents, so this must fail closed with a generic code (no
+        // path echoed back).
+        let err = record_split_ceremony(req("/no/such/dir/ceremony.log", vec![1]))
+            .expect_err("an unwritable path must fail closed");
+        assert_eq!(err.code, "log_write_failed");
     }
 }

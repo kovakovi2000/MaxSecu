@@ -420,6 +420,22 @@ pub struct ProveResponse {
     pub verified: bool,
 }
 
+/// A non-secret record of an operator's EXPLICIT completion of a split
+/// ceremony (spec §4 step 5): who/when, `k`/`n`, which custodian indices were
+/// issued, and the label. Every field here is ordinary metadata — there is NO
+/// share body / secret field on this DTO by construction (the wizard never
+/// passes share bytes into `record_split_ceremony`), so plain derived `Debug`
+/// is fine, unlike `SplitRecoveryKeyRequest`/`AddShareRequest` above.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SplitCeremonyLogRequest {
+    pub log_path: String, // operator-chosen local file to append to
+    pub label: String,    // the §5 non-secret label
+    pub k: u8,
+    pub n: u8,
+    pub custodian_indices: Vec<u8>, // which share indices were issued (non-secret)
+    pub operator: Option<String>,   // who (operator-entered; offline, no server identity)
+}
+
 #[cfg(test)]
 mod reshare_dto_tests {
     use super::*;
@@ -628,5 +644,24 @@ mod recovery_ceremony_dto_tests {
         let resp = ProveResponse { verified: true };
         let s = serde_json::to_string(&resp).unwrap();
         assert_eq!(s, r#"{"verified":true}"#);
+    }
+
+    #[test]
+    fn split_ceremony_log_request_roundtrips() {
+        let j = r#"{"log_path":"/tmp/ceremony.log","label":"MaxSecu recovery key, 2026-07","k":3,"n":5,"custodian_indices":[1,2,3,4,5],"operator":"alice"}"#;
+        let req: SplitCeremonyLogRequest = serde_json::from_str(j).unwrap();
+        assert_eq!(req.log_path, "/tmp/ceremony.log");
+        assert_eq!(req.label, "MaxSecu recovery key, 2026-07");
+        assert_eq!(req.k, 3);
+        assert_eq!(req.n, 5);
+        assert_eq!(req.custodian_indices, vec![1, 2, 3, 4, 5]);
+        assert_eq!(req.operator.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn split_ceremony_log_request_operator_is_optional() {
+        let j = r#"{"log_path":"/tmp/ceremony.log","label":"label","k":2,"n":3,"custodian_indices":[1,2],"operator":null}"#;
+        let req: SplitCeremonyLogRequest = serde_json::from_str(j).unwrap();
+        assert_eq!(req.operator, None);
     }
 }
