@@ -1,6 +1,6 @@
 import { call } from "../core/rpc.ts";
 import { setUsername } from "../core/session.ts";
-import type { AccountStateMsg, Settings } from "../core/types.ts";
+import type { Settings } from "../core/types.ts";
 
 export class ConnectScreen extends HTMLElement {
   connectedCallback() {
@@ -93,23 +93,14 @@ export class ConnectScreen extends HTMLElement {
             use_tor: !!d.get("tor"),
           },
         });
-        status.textContent = "Checking account clearance…";
-        // Stash the username so the pending screen can poll account_status for
-        // the right user; UI-only convenience state, not a security boundary.
+        // Stash the username so the app shell can gate session-only routes and
+        // display the signed-in user; UI-only convenience state, not a security
+        // boundary. Enrollment is registration-key-only (spec §5) and grants a
+        // signed binding immediately, so a successful connect goes straight to
+        // the feed — there is no separate approval/pending step.
         setUsername(uname);
-        // Route a not-yet-approved account to the status-only pending screen; an
-        // active account goes straight to the app. account_status is a
-        // request/response command (no event), so the connect handler decides.
-        try {
-          const acct = await call<AccountStateMsg>("account_status", { req: { username: uname } });
-          status.textContent = acct.state === "active" ? "Access granted. Loading feed…" : "Account pending. Loading status…";
-          location.hash = acct.state === "active" ? "#/feed" : "#/pending";
-        } catch {
-          // If the status check fails, fall back to the feed (which handles its
-          // own errors); the connect itself already succeeded.
-          status.textContent = "Connected. Loading feed…";
-          location.hash = "#/feed";
-        }
+        status.textContent = "Access granted. Loading feed…";
+        location.hash = "#/feed";
       } catch (x) {
         err.textContent =
           (x && typeof x === "object" && "message" in x

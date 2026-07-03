@@ -570,7 +570,6 @@ settings-screen main > form,
 settings-screen main > fieldset,
 upload-screen form,
 connect-screen form,
-bootstrap-screen form,
 admin-screen section[aria-labelledby] {
   max-width: 760px;
 }

@@ -19,8 +19,6 @@ const screens = [
   "src/components/media-viewer.ts",
   "src/components/upload-screen.ts",
   "src/components/settings-screen.ts",
-  "src/components/bootstrap-screen.ts",
-  "src/components/pending-screen.ts",
   "src/components/admin-screen.ts",
 ];
 
@@ -29,9 +27,8 @@ for (const f of screens) {
 
   test(`${f}: focusable main landmark`, () => {
     // Every screen builds a `<main id="main" …>` whose focusable target carries
-    // tabindex="-1". Most put tabindex on the <main> itself; bootstrap- and
-    // pending-screen additionally (or instead) put it on the <h1 id="…"> that
-    // receives focus on each step. Either way both tokens are present in source.
+    // tabindex="-1" (on the <main> itself or the focused heading). Either way
+    // both tokens are present in source.
     assert.match(
       src,
       /id="main"[\s\S]*tabindex="-1"|tabindex="-1"[\s\S]*id="main"/,
@@ -45,10 +42,10 @@ for (const f of screens) {
   });
 
   test(`${f}: no unescaped innerHTML interpolation (XSS guard)`, () => {
-    // Dynamic data must never be templated raw into innerHTML. bootstrap-screen
-    // legitimately interpolates `${esc(...)}` (HTML-escaped) into its creds
-    // dialog; everything else builds dynamic nodes via textContent/createElement.
-    // So: flag any `${` inside an innerHTML template literal that is NOT `${esc(`.
+    // Dynamic data must never be templated raw into innerHTML. Screens build
+    // dynamic nodes via textContent/createElement (or interpolate only the
+    // HTML-escaped `${esc(...)}` helper). So: flag any `${` inside an innerHTML
+    // template literal that is NOT `${esc(`.
     assert.doesNotMatch(
       src,
       /\.innerHTML\s*=\s*`[^`]*\$\{(?!esc\()/,

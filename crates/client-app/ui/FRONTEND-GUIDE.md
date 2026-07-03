@@ -84,9 +84,9 @@ ui/
         ├── app-shell.ts        # top-level shell: header, nav rail, router, outlet
         ├── status-pill.ts      # connection-state indicator
         ├── connect-screen.ts   # unlock keystore + connect
-        ├── bootstrap-screen.ts # first-run glass-break + first-admin provisioning
-        ├── pending-screen.ts   # "awaiting approval" status (adaptive polling)
-        ├── admin-screen.ts     # approval queue + voucher issuance (admin only)
+        ├── register-screen.ts  # registration-key enrollment panel (spec §5)
+        ├── recovery-login-screen.ts # cold recovery challenge-response login
+        ├── admin-screen.ts     # registration-key minting (admin only)
         ├── feed-screen.ts      # the feed / library grid (also #/mine variant)
         ├── media-card.ts       # one feed item (self-decrypting card → "View")
         ├── media-viewer.ts     # one opened post (image / blog text / video player)
@@ -139,10 +139,7 @@ All field names are **snake_case**; all enum string values are **kebab-case**.
 | `open_content` | `{ req: { file_id, version? } }` | `OpenedContent` | media-viewer |
 | `search_local` | `{ req: { query } }` | `SearchHit[]` | feed-screen |
 | `pick_file` | `{ extensions: string[] }` | `string \| null` (chosen path, or null if cancelled) | upload-screen (image **and** video file picks) |
-| `register_glassbreak` | `{ req: { bootstrap_secret, save_path? } }` | `GlassbreakResponse` | bootstrap-screen |
-| `create_first_admin` | `{ req: { username, password, bootstrap_secret } }` | `string` (user_id) | bootstrap-screen |
-| `register_user` | `{ req: { username, password, voucher } }` | `string` (user_id) | (enrollment) |
-| `account_status` | `{ req: { username } }` | `AccountStateMsg` | connect/pending |
+| `register_with_key` | `{ req: { username, passphrase } }` | `RegisteredDto` | register-screen |
 | `list_pending` | `{}` | `PendingUserDto[]` | admin-screen |
 | `issue_voucher` | `{}` | `{ code }` | admin-screen |
 | `request_approval` | `{ req: { user_id } }` | `CeremonyWorkItem` | admin-screen |
@@ -238,8 +235,8 @@ Rules when reworking:
   opening the viewer over a backlog of card decrypts).
 - Call `cancelPending()` from a screen's teardown (`disconnectedCallback`) if it
   enqueued background work (the feed does this), so a backlog can't wedge the lock.
-- Unauthenticated commands (`get_settings`, `ram_limits`, `account_status`,
-  bootstrap commands, `search_local`) do **not** need the queue.
+- Unauthenticated commands (`get_settings`, `ram_limits`, `register_with_key`,
+  `search_local`) do **not** need the queue.
 
 ---
 

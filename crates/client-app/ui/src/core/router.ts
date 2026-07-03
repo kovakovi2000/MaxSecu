@@ -1,7 +1,7 @@
 import { isBusy } from "./busy.ts";
 
 export const ROUTES = [
-  "connect", "feed", "mine", "bootstrap", "pending", "admin", "viewer", "upload", "settings",
+  "connect", "feed", "mine", "admin", "viewer", "upload", "settings",
   "recovery", "register",
 ] as const;
 export type Route = (typeof ROUTES)[number];

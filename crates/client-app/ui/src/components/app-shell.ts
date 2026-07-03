@@ -5,8 +5,6 @@ import "./status-pill.ts";
 import "./connect-screen.ts";
 import "./recovery-login-screen.ts";
 import "./register-screen.ts";
-import "./bootstrap-screen.ts";
-import "./pending-screen.ts";
 import "./admin-screen.ts";
 import "./feed-screen.ts";
 import "./media-viewer.ts";
@@ -93,15 +91,14 @@ export class AppShell extends HTMLElement {
     new Router((incomingRoute) => {
       let r = incomingRoute;
       const hasSession = getUsername().trim().length > 0;
-      const publicRoute = r === "connect" || r === "bootstrap" || r === "recovery"
-        || r === "register";
+      const publicRoute = r === "connect" || r === "recovery" || r === "register";
       if (!hasSession && !publicRoute) {
         r = "connect";
         if (location.hash !== "#/connect") history.replaceState(null, "", "#/connect");
       }
 
-      const showAppChrome = hasSession && r !== "connect" && r !== "bootstrap"
-        && r !== "pending" && r !== "recovery" && r !== "register";
+      const showAppChrome = hasSession && r !== "connect"
+        && r !== "recovery" && r !== "register";
       this.toggleAttribute("data-app-chrome", showAppChrome);
       this.querySelectorAll<HTMLAnchorElement>(".nav-rail a").forEach((a) => {
         const isActive = showAppChrome && (a.getAttribute("data-route") === r
@@ -110,11 +107,7 @@ export class AppShell extends HTMLElement {
         a.classList.toggle("active", isActive);
       });
 
-      if (r === "pending") {
-        const el = document.createElement("pending-screen");
-        el.setAttribute("username", getUsername());
-        outlet.replaceChildren(el);
-      } else if (r === "mine") {
+      if (r === "mine") {
         const el = document.createElement("feed-screen");
         el.setAttribute("mine", "");
         outlet.replaceChildren(el);
@@ -129,8 +122,6 @@ export class AppShell extends HTMLElement {
           ? "<settings-screen></settings-screen>"
           : r === "admin"
           ? "<admin-screen></admin-screen>"
-          : r === "bootstrap"
-          ? "<bootstrap-screen></bootstrap-screen>"
           : r === "recovery"
           ? "<recovery-login-screen></recovery-login-screen>"
           : r === "register"

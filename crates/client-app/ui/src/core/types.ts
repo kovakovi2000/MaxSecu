@@ -1,8 +1,6 @@
 export interface ConnState { state: string }
 export interface AuthStateMsg { state: string }
-export interface GlassbreakResponse { username: string; password: string; user_id: string }
 export interface MintedKeyResponse { registration_key: string }
-export interface AccountStateMsg { state: "unknown" | "pending" | "active" }
 
 // --- Trusted-server recovery login (spec §6) DTO mirrors ---
 // No key material ever crosses the seam: only an opaque status + the public

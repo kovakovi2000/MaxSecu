@@ -28,39 +28,6 @@ pub struct ExportKeystoreRequest {
     pub dest_path: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct BootstrapRequest {
-    pub bootstrap_secret: String,
-    /// Optional directory to ALSO write the encrypted glass-break keystore into.
-    pub save_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct GlassbreakResponse {
-    pub username: String,
-    pub password: String,
-    pub user_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FirstAdminRequest {
-    pub username: String,
-    pub password: String,
-    pub bootstrap_secret: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RegisterUserRequest {
-    pub username: String,
-    pub password: String,
-    pub voucher: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AccountStatusRequest {
-    pub username: String,
-}
-
 /// Registration-key enrollment (spec §5). The single-use key itself is NOT on the
 /// seam — it is read from the local `register.key` file entirely in Rust — so only
 /// the chosen username + the keystore passphrase cross the boundary.
