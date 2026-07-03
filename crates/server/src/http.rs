@@ -188,7 +188,13 @@ fn hex_encode(b: &[u8]) -> String {
 }
 
 fn hex_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
-    if s.len() != 2 * N {
+    // ASCII-gate FIRST: `s.len()` is a *byte* length, but the loop slices by byte
+    // offset — a multibyte UTF-8 char straddling an even offset would panic on a
+    // non-char-boundary slice (attacker-reachable via `recovery_verify`'s
+    // challenge_id and every other caller; same class as T6 M-1). Rejecting
+    // non-ASCII up front makes byte offsets == char boundaries, so the slice is
+    // always safe and bad input returns None (→ the handler's 400 path).
+    if !s.is_ascii() || s.len() != 2 * N {
         return None;
     }
     let mut out = [0u8; N];
@@ -498,7 +504,9 @@ async fn recovery_verify<S: Store + 'static>(
     {
         Ok(token) => Json(RecoveryVerifyRes {
             session_token: token.to_hex(),
-            expires_in_s: 3600,
+            // Report the actual configured TTL (mirror the login path) so the
+            // client's expiry can't be a lie if the TTL is reconfigured.
+            expires_in_s: st.auth.session_ttl_ms() / 1000,
         })
         .into_response(),
         // Single 401 shape for every auth-failure cause — no oracle.
@@ -1715,9 +1723,51 @@ async fn list_files<S: Store + 'static>(
     }
 }
 
-/// An authenticated, channel-bound session, resolved from the
-/// `Authorization: MaxSecu-Session <hex>` header and validated against the live
-/// connection's exporter (api.md §1.5/§2.3). Rejects with `401` on any failure.
+/// The shared, principal-agnostic session resolution (api.md §1.5/§2.3): parse
+/// the `Authorization: MaxSecu-Session <hex>` token, bind it to the live
+/// connection's TLS exporter, and validate it. Returns the session's principal
+/// `user_id` and the raw token, or the uniform `401`/`500`. Both `AuthedSession`
+/// and `AdminSession` build on THIS (not on each other), so each applies its own
+/// principal policy independently — the recovery principal is admitted by the
+/// admin gate but NOT by the file/content gate.
+async fn resolve_session<S: Store + 'static>(
+    parts: &mut Parts,
+    state: &AppState<S>,
+) -> Result<([u8; 16], [u8; 32]), StatusCode> {
+    let exporter = parts
+        .extensions
+        .get::<TlsExporter>()
+        .copied()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let token = parts
+        .headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("MaxSecu-Session "))
+        .and_then(hex_fixed::<32>)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let user_id = state
+        .auth
+        .validate_session(&token, &exporter.0, now_ms())
+        .await
+        .map_err(|e| match e {
+            AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AuthError::Internal(e) => {
+                log_internal(e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    Ok((user_id, token))
+}
+
+/// An authenticated, channel-bound session for **file/content** endpoints,
+/// resolved from the `Authorization: MaxSecu-Session <hex>` header and validated
+/// against the live connection's exporter (api.md §1.5/§2.3). Rejects with `401`
+/// on any auth failure, and **`403` for the recovery principal**: a recovery
+/// session (spec §9) authorizes admin SERVER actions only and is NOT a
+/// file-read/write principal — barring it here (rather than relying on it
+/// happening to own no files) keeps every current and future file endpoint out
+/// of the recovery session's blast radius.
 pub struct AuthedSession {
     pub user_id: [u8; 16],
     pub token: [u8; 32],
@@ -1730,40 +1780,34 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AuthedSession {
         parts: &mut Parts,
         state: &AppState<S>,
     ) -> Result<Self, StatusCode> {
-        let exporter = parts
-            .extensions
-            .get::<TlsExporter>()
-            .copied()
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-        let token = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.strip_prefix("MaxSecu-Session "))
-            .and_then(hex_fixed::<32>)
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-        let user_id = state
-            .auth
-            .validate_session(&token, &exporter.0, now_ms())
-            .await
-            .map_err(|e| match e {
-                AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
-                AuthError::Internal(e) => {
-                    log_internal(e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-            })?;
+        let (user_id, token) = resolve_session(parts, state).await?;
+        // The recovery principal is admin-only (spec §9) — never a file principal.
+        if user_id == maxsecu_encoding::RECOVERY_ID.0 {
+            return Err(StatusCode::FORBIDDEN);
+        }
         Ok(AuthedSession { user_id, token })
     }
 }
 
-/// A channel-bound session whose caller is a **D5-verified admin** (DESIGN
-/// §4.2/§10.1, D-K): the session resolves to a `user_id` whose stored binding
-/// verifies under the pinned D5 key, is within its validity window, and carries
-/// `Role::Admin`. The server can never confer admin — authority flows only from
-/// the offline directory ceremony. This is the coarse server gate; the client
-/// re-verifies every control-log record's authenticity independently. Rejects
-/// `401` (not a session) or `403` (authenticated but not a verified admin).
+/// A channel-bound session authorized for **admin server actions**. Two disjoint
+/// principals satisfy it:
+///
+///  * a **D5-verified user admin** (DESIGN §4.2/§10.1, D-K): the session's
+///    `user_id` has a stored binding that verifies under the pinned D5 key, is
+///    within its validity window, and carries `Role::Admin`. The server can never
+///    confer admin — authority flows only from the offline directory ceremony;
+///  * the **recovery principal** (spec §6/§9): the reserved `RECOVERY_ID` minted
+///    by the escrow recovery login, which has no users-table binding. No normal
+///    user can ever hold this id (user ids are server-assigned random 16-byte
+///    values, so the all-zero sentinel is unreachable via `POST /v1/users` +
+///    login), so admitting it here does not touch the user admin path below.
+///
+/// This is the coarse server gate; the client re-verifies every control-log
+/// record's authenticity independently. It grants admin SERVER actions ONLY (e.g.
+/// minting user-role registration keys) — file/content endpoints use
+/// `AuthedSession`, which bars the recovery principal — and never yields any
+/// private key. Rejects `401` (not a session) or `403` (authenticated but not
+/// authorized as admin).
 pub struct AdminSession {
     pub user_id: [u8; 16],
     #[allow(dead_code)] // mirrors AuthedSession; kept for symmetry / future use
@@ -1777,26 +1821,21 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AdminSession {
         parts: &mut Parts,
         state: &AppState<S>,
     ) -> Result<Self, StatusCode> {
-        let session = AuthedSession::from_request_parts(parts, state).await?;
-        // A recovery-origin session (spec §6) authorizes as admin without a user
-        // binding: its principal is the reserved `RECOVERY_ID`, which the escrow
-        // recovery login mints and which no users-table user can ever hold (user
-        // ids are server-assigned random 16-byte values, so the all-zero sentinel
-        // is unreachable via the normal `POST /v1/users` + login path). This does
-        // not weaken the normal admin path below — it is a distinct principal.
-        if session.user_id == maxsecu_encoding::RECOVERY_ID.0 {
-            return Ok(AdminSession {
-                user_id: session.user_id,
-                token: session.token,
-            });
+        // Built on the shared resolver — NOT on `AuthedSession` (which now bars the
+        // recovery principal). Each gate applies its own principal policy.
+        let (user_id, token) = resolve_session(parts, state).await?;
+        // Recovery-origin admin (spec §6): bindingless, admin server actions only.
+        if user_id == maxsecu_encoding::RECOVERY_ID.0 {
+            return Ok(AdminSession { user_id, token });
         }
+        // Normal user admin path — unchanged.
         let Some(dir_pub) = state.auth.directory_pub() else {
             return Err(StatusCode::FORBIDDEN); // admin authz disabled (no pinned D5)
         };
         let stored = state
             .auth
             .store()
-            .binding_by_user_id(&session.user_id)
+            .binding_by_user_id(&user_id)
             .await
             .map_err(|e| {
                 log_internal(e);
@@ -1818,10 +1857,7 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AdminSession {
         if !binding.roles.roles().contains(&Role::Admin) {
             return Err(StatusCode::FORBIDDEN); // a valid binding, but not an admin
         }
-        Ok(AdminSession {
-            user_id: session.user_id,
-            token: session.token,
-        })
+        Ok(AdminSession { user_id, token })
     }
 }
 
@@ -1840,6 +1876,19 @@ mod tests {
     use tower::ServiceExt; // oneshot
 
     const EXPORTER: [u8; 32] = [0xE7; 32];
+
+    #[test]
+    fn hex_fixed_rejects_non_ascii_without_panicking() {
+        // A 32-byte string whose length passes the `2*N` guard but which contains a
+        // multibyte char straddling an even byte offset must return None — NOT panic
+        // on a non-char-boundary slice. This input is attacker-reachable through
+        // `recovery_verify`'s `challenge_id` (and every other hex_fixed caller).
+        let s = "a\u{20AC}".repeat(8); // 'a'(1) + '€'(3) × 8 = 32 bytes, offsets straddle
+        assert_eq!(s.len(), 32, "the length guard would pass");
+        assert!(hex_fixed::<16>(&s).is_none(), "non-ASCII hex input is rejected, not a panic");
+        // A well-formed ASCII hex string of the right length still decodes.
+        assert!(hex_fixed::<16>("00112233445566778899aabbccddeeff").is_some());
+    }
 
     fn app(exporter: [u8; 32]) -> (Router, SigningKey) {
         let store = MemoryStore::new();

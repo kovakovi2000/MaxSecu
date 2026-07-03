@@ -20,10 +20,12 @@
 //!     [`AdminSession`](crate::http::AdminSession) extractor without a user
 //!     binding, since the escrow identity is not a users-table user.
 //!
-//! A stolen recovery *session* is bounded: it authorizes coarse admin *server*
-//! actions (e.g. minting registration keys) but yields no private key, so it can
-//! never decrypt content. The recovery private key stays in the operator's cold
-//! file; the server only ever holds its public halves.
+//! A stolen recovery *session* is tightly bounded: `AuthedSession` bars the
+//! recovery principal from every file/content endpoint, so it authorizes only
+//! coarse admin *server* actions (e.g. minting registration keys) — never a file
+//! read/write — and it yields no private key, so it can never decrypt content
+//! (spec §9). The recovery private key stays in the operator's cold file; the
+//! server only ever holds its public halves.
 
 use crate::auth::SessionToken;
 use crate::auth::AuthService;
@@ -219,8 +221,10 @@ impl<S: Store> AuthService<S> {
                     .insert_session(
                         sha256(&token),
                         SessionRecord {
-                            // The reserved recovery principal — no user binding; the
-                            // AdminSession extractor recognizes it as admin.
+                            // The reserved recovery principal — no user binding. The
+                            // AdminSession extractor admits it for admin server
+                            // actions, while AuthedSession bars it from every
+                            // file/content endpoint (spec §9 blast radius).
                             user_id: RECOVERY_ID.0,
                             tls_exporter: *exporter,
                             expires_at_ms: now_ms + self.session_ttl_ms(),

@@ -125,13 +125,23 @@ async fn post(
 }
 
 async fn get(conn: &mut Conn, uri: &str) -> (StatusCode, serde_json::Value) {
+    get_auth(conn, uri, None).await
+}
+
+async fn get_auth(
+    conn: &mut Conn,
+    uri: &str,
+    auth: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     conn.sender.ready().await.unwrap();
-    let req = Request::builder()
+    let mut builder = Request::builder()
         .method("GET")
         .uri(uri)
-        .header("host", "localhost")
-        .body(Full::new(Bytes::new()))
-        .unwrap();
+        .header("host", "localhost");
+    if let Some(t) = auth {
+        builder = builder.header("authorization", format!("MaxSecu-Session {t}"));
+    }
+    let req = builder.body(Full::new(Bytes::new())).unwrap();
     let resp = conn.sender.send_request(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -271,6 +281,39 @@ async fn recovery_login_hybrid_over_real_tls() {
     .await;
     assert_eq!(st, StatusCode::CREATED, "recovery session mints a registration key");
     assert!(!res["registration_key"].as_str().unwrap().is_empty());
+
+    // ---- BLAST RADIUS (spec §9): the recovery session authorizes admin SERVER
+    // actions ONLY. It must be refused on file/content endpoints (403) — it is not
+    // a general file-read/write principal — even though it just minted a key. ----
+    let (st, _) = get_auth(
+        &mut c,
+        "/v1/files/00000000000000000000000000000000",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "recovery session is refused on file endpoints (not a file principal)"
+    );
+    let (st, _) = post(
+        &mut c,
+        "/v1/files",
+        Some(&token),
+        serde_json::json!({
+            "file_id": "00000000000000000000000000000000",
+            "file_type": "image",
+            "genesis_b64": "", "genesis_sig_b64": "",
+            "manifest_b64": "", "manifest_sig_b64": "",
+            "streams": [], "wraps": []
+        }),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "recovery session cannot create/write files"
+    );
 
     // ---- REPLAY: verifying the same challenge again is rejected (single-use). ----
     let proof2 = recovery_proof(&sig, &server_id, &c.exporter, &nonce, TS);
