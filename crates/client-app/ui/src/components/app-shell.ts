@@ -3,6 +3,7 @@ import { on } from "../core/rpc.ts";
 import { getUsername } from "../core/session.ts";
 import "./status-pill.ts";
 import "./connect-screen.ts";
+import "./recovery-login-screen.ts";
 import "./bootstrap-screen.ts";
 import "./pending-screen.ts";
 import "./admin-screen.ts";
@@ -89,13 +90,14 @@ export class AppShell extends HTMLElement {
     new Router((incomingRoute) => {
       let r = incomingRoute;
       const hasSession = getUsername().trim().length > 0;
-      const publicRoute = r === "connect" || r === "bootstrap";
+      const publicRoute = r === "connect" || r === "bootstrap" || r === "recovery";
       if (!hasSession && !publicRoute) {
         r = "connect";
         if (location.hash !== "#/connect") history.replaceState(null, "", "#/connect");
       }
 
-      const showAppChrome = hasSession && r !== "connect" && r !== "bootstrap" && r !== "pending";
+      const showAppChrome = hasSession && r !== "connect" && r !== "bootstrap"
+        && r !== "pending" && r !== "recovery";
       this.toggleAttribute("data-app-chrome", showAppChrome);
       this.querySelectorAll<HTMLAnchorElement>(".nav-rail a").forEach((a) => {
         const isActive = showAppChrome && (a.getAttribute("data-route") === r
@@ -125,6 +127,8 @@ export class AppShell extends HTMLElement {
           ? "<admin-screen></admin-screen>"
           : r === "bootstrap"
           ? "<bootstrap-screen></bootstrap-screen>"
+          : r === "recovery"
+          ? "<recovery-login-screen></recovery-login-screen>"
           : "<connect-screen></connect-screen>";
       }
       const main = outlet.querySelector<HTMLElement>("#main");

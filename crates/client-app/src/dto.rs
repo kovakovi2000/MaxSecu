@@ -298,6 +298,25 @@ pub struct ReshareRequest {
     pub recipient_usernames: Vec<String>,
 }
 
+/// The outcome of `request_recovery_challenge` — an opaque status handle plus the
+/// server's public self-asserted id. Carries NO nonce and NO key material: the
+/// unwrapped challenge nonce and the cold recovery Identity stay entirely in
+/// Rust-managed state.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RecoveryChallengeDto {
+    pub status: String,
+    pub server_id: String,
+}
+
+/// The outcome of `answer_recovery_challenge` — success establishes an ADMIN
+/// session (stored where normal sessions live). No key material; the recovery
+/// private key never crosses this boundary.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RecoveryLoginDto {
+    pub status: String,
+    pub server_id: String,
+}
+
 /// The per-recipient outcome of a `reshare` call — one entry per requested
 /// username, in request order. No key material; `code` is a sanitized failure
 /// code (no oracle), `None` on success.
@@ -358,6 +377,28 @@ mod reshare_dto_tests {
         let s = serde_json::to_string(&dto).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["can_share"], true);
+    }
+
+    #[test]
+    fn recovery_dtos_serialize_without_key_material() {
+        let ch = RecoveryChallengeDto {
+            status: "challenge-ready".into(),
+            server_id: "maxsecu-1".into(),
+        };
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ch).unwrap()).unwrap();
+        assert_eq!(v["status"], "challenge-ready");
+        assert_eq!(v["server_id"], "maxsecu-1");
+        // Exactly two fields — no nonce/token/key ever leaks onto the DTO.
+        assert_eq!(v.as_object().unwrap().len(), 2);
+
+        let login = RecoveryLoginDto {
+            status: "admin-session".into(),
+            server_id: "maxsecu-1".into(),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&login).unwrap()).unwrap();
+        assert_eq!(v["status"], "admin-session");
+        assert_eq!(v.as_object().unwrap().len(), 2);
     }
 
     #[test]

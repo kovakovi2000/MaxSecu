@@ -5,6 +5,12 @@ export interface PendingUserDto { user_id: string; username: string; created_at:
 export interface IssueVoucherResponse { code: string }
 export interface AccountStateMsg { state: "unknown" | "pending" | "active" }
 
+// --- Trusted-server recovery login (spec §6) DTO mirrors ---
+// No key material ever crosses the seam: only an opaque status + the public
+// server_id. The cold recovery private key + the challenge nonce stay in Rust.
+export interface RecoveryChallengeDto { status: string; server_id: string }
+export interface RecoveryLoginDto { status: string; server_id: string }
+
 // --- Phase 3 (browse + view) DTO mirrors of the Rust serde shapes ---
 // kebab-case enum values, snake_case fields — match server/core serde exactly.
 export type FeedFilter = "all" | "image" | "video" | "blog";
