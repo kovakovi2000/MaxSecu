@@ -12,12 +12,14 @@
 //!     log key, and
 //!   - an app server whose `audit` sink is a real `HttpSinkPublisher` pinned to
 //!     that sink,
+//!
 //! then enrolls TWO users (registration-key-only, as Task 4) and proves:
 //!   1. after enrolling both, the KT log holds BOTH bindings (`tree_size == 2`);
 //!   2. an INCLUSION proof for the first enrollee verifies against the served tree
 //!      head with the REAL `crypto::merkle::verify_inclusion`;
 //!   3. a CONSISTENCY proof between the checkpoint after enrollee #1 and the
 //!      checkpoint after enrollee #2 verifies with `crypto::merkle::verify_consistency`.
+//!
 //! The KT checkpoint signatures are additionally verified under the pinned KT key
 //! (the same primitive `client-core::transparency` uses), so the heads are authentic.
 
