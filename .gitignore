@@ -39,3 +39,10 @@ target-repro-b/
 # themselves are never committed.
 /vendor/ffmpeg/*.exe
 /vendor/ffmpeg/*.zip
+
+# Compile-time recovery-account pubkey PIN. Written by `maxsecu-setup` (T14) and
+# baked into the client by `crates/client-app/build.rs` via a generated const;
+# the bytes are a per-deployment trust anchor and are never committed. Absent →
+# the build fails closed (or emits a labelled test pin under `--features
+# unpinned-dev`). See `crates/client-app/src/recovery_pin.rs`.
+/crates/client-app/recovery_pin.bin

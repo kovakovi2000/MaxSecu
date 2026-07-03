@@ -28,6 +28,10 @@ description = "MaxSecu media client (Tauri shell over client-core TCB)."
 # `scripts/fetch-ffmpeg.ps1`), in which case `ensure_ffmpeg` fail-closes.
 default = ["embed-ffmpeg"]
 embed-ffmpeg = []
+# Build the crate with a NON-SECURE, clearly-labelled compile-time TEST recovery
+# pin when no `recovery_pin.bin` is present (see `build.rs`/`src/recovery_pin.rs`).
+# For tests only — a real build MUST embed a genuine pin (fail-closed otherwise).
+unpinned-dev = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

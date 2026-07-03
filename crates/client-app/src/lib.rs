@@ -21,6 +21,7 @@ pub mod keystore;
 pub mod layout;
 pub mod ram;
 pub mod recipients;
+pub(crate) mod recovery_pin;
 pub mod revocations;
 pub mod session;
 pub mod sink;
