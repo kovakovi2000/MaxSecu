@@ -34,10 +34,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
 use maxsecu_ceremony_harness::Ceremony;
-use maxsecu_client_app::directory::resolve_recovery_recipient;
 use maxsecu_client_core::{
-    resume_content_sealer, verify_and_open, DirectoryVerifier, DownloadBundle, Identity,
-    MemoryTrustStore, SmallStreams, StreamChunks, StreamingUploadBuilder, UploadParams,
+    resume_content_sealer, verify_and_open, DownloadBundle, Identity,
+    SmallStreams, StreamChunks, StreamingUploadBuilder, UploadParams,
     UploadRecords, VerifyContext, WrapOut, NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_crypto::{sha256, EncPublicKey, WrappedDek};
@@ -471,18 +470,9 @@ async fn streaming_upload_download_roundtrips_over_tls() {
         register_and_login(&mut c, &recovery, "recovery-1", VOUCHER2).await;
     publish_binding(&mut c, &ceremony, "recovery-1", recovery_uid, &recovery).await;
 
-    let verifier = DirectoryVerifier::new(pinned);
-    let mut trust = MemoryTrustStore::new();
-    let rr = resolve_recovery_recipient(
-        &mut c.sender,
-        "localhost",
-        "recovery-1",
-        &verifier,
-        &mut trust,
-        TS,
-    )
-    .await
-    .unwrap();
+    // Recovery wrap target: the recovery identity's keys directly (buddy resolve
+    // retired in T8). Classical (V1) — the published binding carries no ML-KEM.
+    let recovery_enc = recovery.enc_pub_bytes();
 
     // ── (3) Synthetic content: 2 full 6 MiB chunks + a short tail ───────────
     // Three sealed chunks total; the last is a short tail of 1234 bytes.
@@ -508,8 +498,8 @@ async fn streaming_upload_download_roundtrips_over_tls() {
         file_id,
         file_type: FileType::Video,
         chunk_size: CHUNK_SIZE,
-        recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
-        recovery_mlkem_pub: rr.mlkem_pub,
+        recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+        recovery_mlkem_pub: None,
         created_at: Timestamp(TS),
     };
     let meta_bytes = serde_json::to_vec(&serde_json::json!({
@@ -661,18 +651,9 @@ async fn interrupted_streaming_upload_resumes_to_completion() {
         register_and_login(&mut c, &recovery, "recovery-1", VOUCHER2).await;
     publish_binding(&mut c, &ceremony, "recovery-1", recovery_uid, &recovery).await;
 
-    let verifier = DirectoryVerifier::new(pinned);
-    let mut trust = MemoryTrustStore::new();
-    let rr = resolve_recovery_recipient(
-        &mut c.sender,
-        "localhost",
-        "recovery-1",
-        &verifier,
-        &mut trust,
-        TS,
-    )
-    .await
-    .unwrap();
+    // Recovery wrap target: the recovery identity's keys directly (buddy resolve
+    // retired in T8). Classical (V1) — the published binding carries no ML-KEM.
+    let recovery_enc = recovery.enc_pub_bytes();
 
     // ── Synthetic content (same shape as A) ──────────────────────────────────
     let content: Vec<u8> =
@@ -696,8 +677,8 @@ async fn interrupted_streaming_upload_resumes_to_completion() {
         file_id,
         file_type: FileType::Video,
         chunk_size: CHUNK_SIZE,
-        recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
-        recovery_mlkem_pub: rr.mlkem_pub,
+        recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+        recovery_mlkem_pub: None,
         created_at: Timestamp(TS),
     };
     let small = SmallStreams { metadata: None, thumbnail: None, preview: None };
@@ -867,18 +848,9 @@ async fn discard_removes_never_finalized_upload() {
         register_and_login(&mut c, &recovery, "recovery-1", VOUCHER2).await;
     publish_binding(&mut c, &ceremony, "recovery-1", recovery_uid, &recovery).await;
 
-    let verifier = DirectoryVerifier::new(pinned);
-    let mut trust = MemoryTrustStore::new();
-    let rr = resolve_recovery_recipient(
-        &mut c.sender,
-        "localhost",
-        "recovery-1",
-        &verifier,
-        &mut trust,
-        TS,
-    )
-    .await
-    .unwrap();
+    // Recovery wrap target: the recovery identity's keys directly (buddy resolve
+    // retired in T8). Classical (V1) — the published binding carries no ML-KEM.
+    let recovery_enc = recovery.enc_pub_bytes();
 
     // ── Small synthetic content: fits in one 6 MiB chunk ─────────────────────
     // Using a tiny buffer (no large allocation needed for the discard scenario).
@@ -894,8 +866,8 @@ async fn discard_removes_never_finalized_upload() {
         file_id,
         file_type: FileType::Video,
         chunk_size: CHUNK_SIZE,
-        recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
-        recovery_mlkem_pub: rr.mlkem_pub,
+        recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+        recovery_mlkem_pub: None,
         created_at: Timestamp(TS),
     };
     let small = SmallStreams { metadata: None, thumbnail: None, preview: None };

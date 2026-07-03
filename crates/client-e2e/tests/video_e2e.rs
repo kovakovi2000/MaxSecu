@@ -37,7 +37,7 @@ use base64::Engine;
 
 use maxsecu_ceremony_harness::Ceremony;
 use maxsecu_client_app::directory::{
-    resolve_and_verify_author, resolve_my_user_id, resolve_recovery_recipient,
+    resolve_and_verify_author, resolve_my_user_id,
 };
 use maxsecu_client_app::download::{build_stream_header, parse_file_view};
 use maxsecu_client_app::fragment_cache::FragmentCache;
@@ -349,16 +349,9 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
 
     let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
-    let rr = resolve_recovery_recipient(
-        &mut c.sender,
-        "localhost",
-        "recovery-1",
-        &verifier,
-        &mut trust,
-        TS,
-    )
-    .await
-    .unwrap();
+    // Recovery wrap target: the recovery identity's keys directly (buddy resolve
+    // retired in T8). Classical (V1) — the published binding carries no ML-KEM.
+    let recovery_enc = recovery.enc_pub_bytes();
 
     // ---- Upload the synthetic video ----
     let file_id = Id(maxsecu_crypto::random_array::<16>());
@@ -371,8 +364,8 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
             file_id,
             file_type: FileType::Video,
             chunk_size: 4096,
-            recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
-            recovery_mlkem_pub: rr.mlkem_pub,
+            recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+            recovery_mlkem_pub: None,
             created_at: Timestamp(TS),
         },
         &streams,

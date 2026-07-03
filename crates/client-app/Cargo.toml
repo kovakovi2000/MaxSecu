@@ -35,6 +35,12 @@ unpinned-dev = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Only used by the `unpinned-dev` branch of `build.rs`: derive the NON-SECURE test
+# recovery pin's public keys from fixed, well-known seeds (X25519 pub from a fixed
+# scalar + ML-KEM pub from a fixed seed), so the test pin is a REAL keypair whose
+# private half tests can reconstruct (via `recovery_pin::test_recovery_secret_seeds`).
+# Not linked into the crate itself — build-script host dep only.
+maxsecu-crypto = { path = "../crypto" }
 
 [dependencies]
 maxsecu-client-core = { path = "../client-core", features = ["net"] }

@@ -159,6 +159,15 @@ pub fn generate_hybrid_keypair() -> (HybridEncSecretKey, HybridEncPublicKey) {
     (secret, public)
 }
 
+/// Derive the X25519 public key from a raw 32-byte secret scalar. `StaticSecret`
+/// clamps the scalar exactly as [`HybridEncSecretKey`] does at unwrap time, so the
+/// returned public key pairs with a hybrid secret rebuilt from the same scalar.
+/// Used by the recovery-pin producers (the T14 setup tool and the client's
+/// `build.rs` test pin) to embed the classical half of a pin from a known seed.
+pub fn x25519_public_from_secret(secret: &[u8; X25519_LEN]) -> [u8; X25519_LEN] {
+    PublicKey::from(&StaticSecret::from(*secret)).to_bytes()
+}
+
 /// Serialize an ML-KEM encapsulation key to its 1184-byte wire form.
 fn ek_to_bytes(ek: &EncapsulationKey<MlKem768>) -> [u8; MLKEM_PUB_LEN] {
     let mut out = [0u8; MLKEM_PUB_LEN];
@@ -497,6 +506,25 @@ mod tests {
         };
         let sk = HybridEncSecretKey::from_components(x_sec.to_bytes(), mlkem_seed);
         let dek = Dek::from_bytes([9; 32]);
+        let c = ctx(0x55, 1);
+        let w = wrap_dek_hybrid(&pk, &dek, &c).unwrap();
+        assert_eq!(unwrap_dek_hybrid(&sk, &w, &c).unwrap().expose(), dek.expose());
+    }
+
+    #[test]
+    fn x25519_public_from_secret_pairs_with_a_rebuilt_hybrid_secret() {
+        // The pin producer derives the classical pub from a fixed scalar; a hybrid
+        // secret rebuilt from that same scalar + an ML-KEM seed unwraps a wrap to
+        // {that pub, mlkem_public_from_seed(seed)}.
+        let x_seed = [0x5Au8; 32];
+        let (mlkem_seed, mlkem_pub) = generate_mlkem_keypair();
+        let x_pub = x25519_public_from_secret(&x_seed);
+        let pk = HybridEncPublicKey {
+            x25519: x_pub,
+            mlkem: mlkem_pub,
+        };
+        let sk = HybridEncSecretKey::from_components(x_seed, mlkem_seed);
+        let dek = Dek::from_bytes([0x24; 32]);
         let c = ctx(0x55, 1);
         let w = wrap_dek_hybrid(&pk, &dek, &c).unwrap();
         assert_eq!(unwrap_dek_hybrid(&sk, &w, &c).unwrap().expose(), dek.expose());

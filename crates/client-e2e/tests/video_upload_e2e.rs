@@ -46,12 +46,11 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
 use maxsecu_ceremony_harness::Ceremony;
-use maxsecu_client_app::directory::resolve_recovery_recipient;
 use maxsecu_client_app::upload::{prepare_video_streams, run_pipeline, VIDEO_CHUNK_SIZE};
 use maxsecu_client_app::video::parse_fragment_index;
 use maxsecu_client_core::video::VideoBounds;
 use maxsecu_client_core::{
-    build_upload, verify_and_open, DirectoryVerifier, DownloadBundle, Identity, MemoryTrustStore,
+    build_upload, verify_and_open, DownloadBundle, Identity,
     PlaintextStreams, StreamChunks, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_crypto::{sha256, EncPublicKey, WrappedDek};
@@ -537,18 +536,11 @@ async fn phase7_video_upload_over_real_tls() {
     let (recovery_uid, _rt) = register_and_login(&mut c, &recovery, "recovery-1", VOUCHER2).await;
     publish_binding(&mut c, &ceremony, "recovery-1", recovery_uid, &recovery).await;
 
-    let verifier = DirectoryVerifier::new(pinned);
-    let mut trust = MemoryTrustStore::new();
-    let rr = resolve_recovery_recipient(
-        &mut c.sender,
-        "localhost",
-        "recovery-1",
-        &verifier,
-        &mut trust,
-        TS,
-    )
-    .await
-    .unwrap();
+    // The recovery wrap target is the recovery identity's keys directly (the buddy
+    // directory-resolve was retired in T8 in favour of the embedded recovery pin;
+    // this round-trip test just needs SOME recovery recipient). Classical (V1):
+    // the published binding carries no ML-KEM, matching the prior behaviour.
+    let recovery_enc = recovery.enc_pub_bytes();
 
     // ---- GATE P: build_upload(Video, chunk_size VIDEO_CHUNK_SIZE) + run_pipeline → round-trip ----
     let file_id = Id(maxsecu_crypto::random_array::<16>());
@@ -561,8 +553,8 @@ async fn phase7_video_upload_over_real_tls() {
             file_id,
             file_type: FileType::Video,
             chunk_size: VIDEO_CHUNK_SIZE,
-            recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
-            recovery_mlkem_pub: rr.mlkem_pub,
+            recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+            recovery_mlkem_pub: None,
             created_at: Timestamp(TS),
         },
         &streams,

@@ -30,7 +30,7 @@ pub use hash::sha256;
 pub use hybrid::{
     deserialize_hybrid_wrap, generate_hybrid_keypair, generate_mlkem_keypair,
     mlkem_public_from_seed, serialize_hybrid_wrap, unwrap_dek_hybrid, wrap_dek_hybrid,
-    HybridEncPublicKey, HybridEncSecretKey, HybridWrappedDek,
+    x25519_public_from_secret, HybridEncPublicKey, HybridEncSecretKey, HybridWrappedDek,
 };
 pub use kdf::hkdf_sha256_32;
 pub use pwkdf::{derive_key, Argon2Params, ARGON2_DESKTOP_TARGET, ARGON2_FLOOR};

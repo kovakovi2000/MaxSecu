@@ -49,7 +49,7 @@ use base64::Engine;
 
 use maxsecu_admin_core::{CoSign, ControlChain, DirectorySigner, RevokeParams};
 use maxsecu_client_app::config::{client_config_for_pinned_root, load_sink_pins};
-use maxsecu_client_app::directory::{resolve_recipient, resolve_recovery_recipient};
+use maxsecu_client_app::directory::resolve_recipient;
 use maxsecu_client_app::download::parse_file_view;
 use maxsecu_client_app::sink::fetch_anchored_head;
 use maxsecu_client_app::upload::{prepare_image_streams, run_pipeline};
@@ -679,7 +679,11 @@ impl Fixture {
     /// otherwise a classical `Suite::V1` file. Returns `(file_id, canonical content)`.
     async fn upload_image(&mut self, pq: bool) -> ([u8; 16], Vec<u8>) {
         let rname = format!("recovery-{}", self.ctr);
-        let _ = enroll(
+        // Enroll the standing recovery recipient and take its keys directly (the
+        // buddy directory-resolve was retired in T8). `pq` still drives the suite:
+        // include the recovery ML-KEM key only when a PQ recovery is requested, so
+        // `build_upload` selects Suite::V2 exactly as before (self+recovery both PQ).
+        let (recovery_id, _uid, _tok) = enroll(
             &mut self.conn,
             &self.dir_signer,
             &mut self.ctr,
@@ -688,18 +692,8 @@ impl Fixture {
             pq,
         )
         .await;
-        let verifier = DirectoryVerifier::new(self.pinned);
-        let mut trust = MemoryTrustStore::new();
-        let rr = resolve_recovery_recipient(
-            &mut self.conn.sender,
-            "localhost",
-            &rname,
-            &verifier,
-            &mut trust,
-            TS,
-        )
-        .await
-        .unwrap();
+        let recovery_enc = recovery_id.enc_pub_bytes();
+        let recovery_mlkem = if pq { recovery_id.mlkem_pub_bytes() } else { None };
 
         let src_png = gen_png();
         let (file_type, streams) =
@@ -715,8 +709,8 @@ impl Fixture {
                 file_id,
                 file_type,
                 chunk_size: 4096,
-                recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
-                recovery_mlkem_pub: rr.mlkem_pub,
+                recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+                recovery_mlkem_pub: recovery_mlkem,
                 created_at: Timestamp(TS),
             },
             &streams,
