@@ -754,13 +754,16 @@ async fn phase7_exit_gates_over_real_tls() {
     // ============================================================
     // GATE 2 — KT split-view over real TLS.
     // ============================================================
-    // Enroll bindings into the HONEST sink's KT log: the PQ owner at leaf 0, plus
-    // fillers so the tree grows (a meaningful consistency proof later).
+    // Enroll bindings into the HONEST sink's KT log. The app server ALREADY
+    // auto-published alice's *enrollment* binding here at leaf 0 (T6 — enrollment →
+    // transparency log), so the explicitly-published PQ owner binding below lands at
+    // the NEXT leaf; add fillers so the tree grows (a meaningful consistency proof
+    // later).
     let d5 = DirectorySigner::generate();
     let owner_binding = pq_binding("alice", 0x11, &owner);
     let owner_leaf = encode(&d5.sign_binding(&owner_binding, None).binding);
-    let idx0 = post_binding(sink_addr, sink_pki.client_config.clone(), &owner_leaf).await;
-    assert_eq!(idx0, 0, "first enrolled binding lands at leaf 0");
+    let owner_idx = post_binding(sink_addr, sink_pki.client_config.clone(), &owner_leaf).await;
+    assert_eq!(owner_idx, 1, "the enrollment binding is leaf 0; the owner binding follows");
     for u in [0x21u8, 0x22] {
         let leaf = encode(&d5.sign_binding(&filler_binding(u), None).binding);
         post_binding(sink_addr, sink_pki.client_config.clone(), &leaf).await;
@@ -769,8 +772,8 @@ async fn phase7_exit_gates_over_real_tls() {
     // The client ACCEPTS the enrolled owner binding via inclusion under a pinned,
     // KT-signed checkpoint (TOFU on first contact).
     let cp_a = fetch_checkpoint(sink_addr, sink_pki.client_config.clone()).await;
-    assert_eq!(cp_a.tree_size, 3, "honest KT log has 3 leaves");
-    let inc0 = fetch_inclusion(sink_addr, sink_pki.client_config.clone(), 0).await;
+    assert_eq!(cp_a.tree_size, 4, "enrollment binding + owner binding + 2 fillers");
+    let inc0 = fetch_inclusion(sink_addr, sink_pki.client_config.clone(), owner_idx).await;
     let mut store = MemoryKtCheckpointStore::new();
     verify_binding_in_log(&owner_leaf, &inc0, &cp_a, &[], &kt_pin, &mut store)
         .expect("enrolled binding is inclusion-provable + client-accepted over TLS");
@@ -789,10 +792,10 @@ async fn phase7_exit_gates_over_real_tls() {
     // The client also accepts a CONSISTENT advance (grow the honest log by one,
     // verify the new checkpoint against the pinned one via a consistency proof).
     let leaf3 = encode(&d5.sign_binding(&filler_binding(0x23), None).binding);
-    post_binding(sink_addr, sink_pki.client_config.clone(), &leaf3).await;
+    let leaf3_idx = post_binding(sink_addr, sink_pki.client_config.clone(), &leaf3).await;
     let cp_a2 = fetch_checkpoint(sink_addr, sink_pki.client_config.clone()).await;
-    assert_eq!(cp_a2.tree_size, 4);
-    let inc3 = fetch_inclusion(sink_addr, sink_pki.client_config.clone(), 3).await;
+    assert_eq!(cp_a2.tree_size, 5);
+    let inc3 = fetch_inclusion(sink_addr, sink_pki.client_config.clone(), leaf3_idx).await;
     let cons_a = fetch_consistency(sink_addr, sink_pki.client_config.clone(), cp_a.tree_size).await;
     verify_binding_in_log(&leaf3, &inc3, &cp_a2, &cons_a, &kt_pin, &mut store)
         .expect("a consistency-proven advance is accepted");
@@ -821,7 +824,7 @@ async fn phase7_exit_gates_over_real_tls() {
 
     // Publish DIFFERENT leaves to the fork (a divergent history, larger size).
     let mut fork_leaf0 = Vec::new();
-    for (i, u) in [0xB0u8, 0xB1, 0xB2, 0xB3, 0xB4].into_iter().enumerate() {
+    for (i, u) in [0xB0u8, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5].into_iter().enumerate() {
         let leaf = encode(&d5.sign_binding(&filler_binding(u), None).binding);
         let idx = post_binding(fork_addr, fork_pki.client_config.clone(), &leaf).await;
         if i == 0 {
@@ -830,7 +833,7 @@ async fn phase7_exit_gates_over_real_tls() {
         }
     }
     let cp_fork = fetch_checkpoint(fork_addr, fork_pki.client_config.clone()).await;
-    assert_eq!(cp_fork.tree_size, 5, "fork log has a divergent, larger history");
+    assert_eq!(cp_fork.tree_size, 6, "fork log has a divergent, larger history");
     let fork_inc0 = fetch_inclusion(fork_addr, fork_pki.client_config.clone(), 0).await;
     // The fork's own (internally valid) consistency proof from the gossiped size.
     let fork_cons =

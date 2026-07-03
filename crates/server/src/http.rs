@@ -242,8 +242,10 @@ struct RegisterRes {
 ///    so a retry with the same key works. The first-ever registrant is
 ///    `{User, Admin}`; everyone else `{User}`.
 ///
-/// (T6 will append the enrollment to the transparency log at the `Enrolled`
-/// success point — the signed-and-stored path is the clean hook.)
+/// 4. (T6) append the just-stored, server-signed binding to the directory
+///    key-transparency log via the audit-sink seam — AFTER the atomic store, so the
+///    log never carries a binding the directory does not serve. Best-effort: an
+///    append failure does not undo a successful enrollment.
 ///
 /// [`enroll`]: crate::store::Store::enroll
 async fn register<S: Store>(
@@ -309,13 +311,26 @@ async fn register<S: Store>(
         )
         .await
     {
-        Ok(crate::store::EnrollOutcome::Enrolled { .. }) => (
-            StatusCode::CREATED,
-            Json(RegisterRes {
-                user_id: hex_encode(&user_id),
-            }),
-        )
-            .into_response(),
+        Ok(crate::store::EnrollOutcome::Enrolled { is_admin }) => {
+            // T6: append the JUST-STORED, server-signed binding to the directory
+            // key-transparency log — the SAME leaf a Phase-7 published binding takes.
+            // Done AFTER the atomic `enroll` durably stored it, so the log never
+            // carries a binding the directory does not serve. `is_admin` selects the
+            // exact variant `enroll` persisted, so the logged leaf byte-matches the
+            // served one. Best-effort: a publish failure does not undo enrollment
+            // (the fail-closed authority is the client-side inclusion check, T10).
+            let logged = if is_admin { &admin_binding } else { &user_binding };
+            st.audit
+                .publish_dir_binding(logged.binding_bytes.clone())
+                .await;
+            (
+                StatusCode::CREATED,
+                Json(RegisterRes {
+                    user_id: hex_encode(&user_id),
+                }),
+            )
+                .into_response()
+        }
         Ok(crate::store::EnrollOutcome::KeyInvalid) => StatusCode::FORBIDDEN.into_response(),
         Ok(crate::store::EnrollOutcome::UsernameTaken) => StatusCode::CONFLICT.into_response(),
         Err(e) => internal_error(e),
