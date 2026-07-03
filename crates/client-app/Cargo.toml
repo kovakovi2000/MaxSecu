@@ -6,7 +6,7 @@
 # suites) is a member here; it links the server WITHOUT the postgres feature.
 [workspace]
 resolver = "2"
-members = [".", "../client-e2e", "../../tools/demo-seed"]
+members = [".", "../client-e2e", "../../tools/demo-seed", "../../tools/maxsecu-setup"]
 
 [workspace.package]
 edition = "2021"
