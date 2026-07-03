@@ -13,6 +13,7 @@ pub mod register;
 pub mod search;
 pub mod settings;
 pub mod share;
+pub mod startup;
 pub mod upload;
 pub mod video;
 pub mod viewer;

@@ -1,5 +1,5 @@
 import { Router, type Route } from "../core/router.ts";
-import { on } from "../core/rpc.ts";
+import { call, on } from "../core/rpc.ts";
 import { getUsername } from "../core/session.ts";
 import "./status-pill.ts";
 import "./connect-screen.ts";
@@ -16,6 +16,7 @@ import "./share-tray.ts";
 import "./settings-screen.ts";
 import "./ram-gauge.ts";
 import "./toast-host.ts";
+import "./trust-alarm.ts";
 import "./skeleton-card.ts";
 import { loadAndApplySettings, bindDocumentToSettings } from "../core/settings.ts";
 import { activeTasks } from "../core/tasks.ts";
@@ -57,6 +58,7 @@ export class AppShell extends HTMLElement {
         </div>
       </header>
       <toast-host></toast-host>
+      <trust-alarm></trust-alarm>
       <div id="outlet"></div>`;
 
     void loadAndApplySettings();
@@ -139,12 +141,37 @@ export class AppShell extends HTMLElement {
       main?.focus();
     });
 
+    // Startup precedence (spec §0-D7): on a fresh launch route to the recovery
+    // panel if a cold recovery keyblob sits beside the exe, else the register panel
+    // if a single-use registration key is present, else leave the normal connect
+    // landing. Only the INITIAL screen follows this order — the user can navigate
+    // elsewhere afterwards, and an explicit deep-link/reload to a non-landing hash
+    // is respected. Fire-and-forget: any failure falls safe to the connect landing.
+    void this.applyStartupMode();
+
     on<ConnState>("maxsecu://connection-state", (s) => { pill.state = s.state; });
 
     const tasksInd = this.querySelector("#tasks-ind") as HTMLElement;
     activeTasks.subscribe((n) => {
       tasksInd.textContent = n === 0 ? "No active tasks" : `${n} active task${n === 1 ? "" : "s"}`;
     });
+  }
+
+  // Route the initial screen by startup precedence (recovery → register → normal).
+  // Only overrides the default connect landing; an explicit route (reload/deep-link)
+  // is left untouched so the gate never hijacks in-app navigation.
+  private async applyStartupMode() {
+    const landing = location.hash === "" || location.hash === "#/"
+      || location.hash === "#/connect";
+    if (!landing) return;
+    try {
+      const mode = await call<string>("startup_mode");
+      if (mode === "recovery") location.hash = "#/recovery";
+      else if (mode === "register") location.hash = "#/register";
+      // "normal" → keep the default connect landing.
+    } catch {
+      // Fail safe: stay on the normal connect landing on any error.
+    }
   }
 }
 customElements.define("app-shell", AppShell);

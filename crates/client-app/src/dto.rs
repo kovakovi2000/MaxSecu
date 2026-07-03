@@ -334,6 +334,20 @@ pub struct RecoveryLoginDto {
     pub server_id: String,
 }
 
+/// The startup screen the client should open, chosen by file-presence precedence
+/// (spec §5 / §0-D7): a cold recovery keyblob → `Recovery` (WINS even if a register
+/// key is also present), else a single-use registration key → `Register`, else
+/// `Normal` (keystore-unlock + connect). Serializes to a bare lowercase string
+/// (`"recovery"` / `"register"` / `"normal"`) — the ONLY thing that crosses the
+/// seam. No key material, no file contents.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StartupMode {
+    Recovery,
+    Register,
+    Normal,
+}
+
 /// The per-recipient outcome of a `reshare` call — one entry per requested
 /// username, in request order. No key material; `code` is a sanitized failure
 /// code (no oracle), `None` on success.

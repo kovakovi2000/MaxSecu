@@ -333,3 +333,49 @@ test("screens use a live region for feedback", () => {
   });
 }
 
+// --- T13 shared fail-closed trust alarm: <trust-alarm> ----------------------
+// The single shared modal for all three trust alarms (A/B/C). Not a routed
+// screen — it is a shell-mounted modal like <share-dialog> — so it gets its own
+// structural-lint block. It MUST be a properly labelled alert dialog that blocks
+// with NO "continue anyway" affordance (fail closed, spec §0-D2).
+{
+  const taPath = "src/components/trust-alarm.ts";
+  const ta = readFileSync(taPath, "utf8");
+
+  test(`${taPath}: labelled alert dialog`, () => {
+    assert.match(ta, /role="alertdialog"/, "trust-alarm panel needs role=\"alertdialog\"");
+    assert.match(ta, /aria-modal="true"/, "trust-alarm panel needs aria-modal=\"true\"");
+    assert.match(ta, /aria-labelledby="ta-h"/, "trust-alarm needs aria-labelledby");
+    assert.match(ta, /id="ta-h"/, "the aria-labelledby target heading must exist");
+    assert.match(ta, /aria-describedby="ta-guidance"/, "trust-alarm needs aria-describedby guidance");
+  });
+
+  test(`${taPath}: plain-language "stop" guidance, focus + Escape`, () => {
+    assert.match(ta, /may be compromised/i, "must carry the plain-language compromise warning");
+    assert.match(ta, /\.focus\(\)/, "must move focus into the modal on open");
+    assert.match(ta, /e\.key === "Escape"/, "Escape must dismiss (acknowledge) the modal");
+    assert.match(ta, /returnFocus/, "must restore focus to the invoker on close");
+  });
+
+  test(`${taPath}: fail closed — a single Acknowledge action, no "continue"`, () => {
+    // The ONLY interactive action is Acknowledge/stop. Structurally: exactly one
+    // <button> in the whole component (the ack), so there is no second control
+    // that could resume the blocked action ("continue"/"proceed"/"anyway").
+    assert.match(ta, /id="ta-ack"/, "must have an Acknowledge button");
+    const buttonCount = (ta.match(/<button/g) ?? []).length;
+    assert.equal(
+      buttonCount,
+      1,
+      "trust-alarm must expose exactly one action (Acknowledge) — no continue/proceed control",
+    );
+  });
+
+  test(`${taPath}: no unescaped innerHTML interpolation (XSS guard)`, () => {
+    assert.doesNotMatch(
+      ta,
+      /\.innerHTML\s*=\s*`[^`]*\$\{(?!esc\()/,
+      "trust-alarm must not interpolate unescaped dynamic data into innerHTML",
+    );
+  });
+}
+
