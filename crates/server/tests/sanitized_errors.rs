@@ -45,12 +45,13 @@ use maxsecu_encoding::types::{
     Bytes32, Compression, FileScope, FileType, Id, Role, RoleSet, StreamType, Suite, Text,
     Timestamp,
 };
+use maxsecu_encoding::structs::MLKEM768_PUB_LEN;
 use maxsecu_server::{
     router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteWrapError,
     DiscardError, FileListEntry, FileView, FinalizeError, ListFilter, MemoryBlobStore, MemoryStore,
-    NullAuditSink, ParsedStage, PendingUser, RecipientView, SessionRecord, StageError, Store,
-    StoreError, StoredBinding, StoredControlRecord, TlsExporter, UserRecord, VersionMeta,
-    VersionSelector, WrapInput,
+    NullAuditSink, ParsedStage, PendingUser, RecipientView, RecoveryAccount, SessionRecord,
+    StageError, Store, StoreError, StoredBinding, StoredControlRecord, TlsExporter, UserRecord,
+    VersionMeta, VersionSelector, WrapInput,
 };
 
 const EXPORTER: [u8; 32] = [0xE7; 32];
@@ -175,10 +176,11 @@ impl Store for FaultyStore {
         &self,
         _e: [u8; 32],
         _s: [u8; 32],
+        _m: Option<[u8; MLKEM768_PUB_LEN]>,
     ) -> Result<bool, StoreError> {
         Err(bait("set_recovery_account"))
     }
-    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError> {
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError> {
         Err(bait("recovery_account"))
     }
     async fn append_control(
@@ -334,10 +336,15 @@ impl Store for FileFaultyStore {
     async fn any_user_exists(&self) -> Result<bool, StoreError> {
         self.inner.any_user_exists().await
     }
-    async fn set_recovery_account(&self, e: [u8; 32], s: [u8; 32]) -> Result<bool, StoreError> {
-        self.inner.set_recovery_account(e, s).await
+    async fn set_recovery_account(
+        &self,
+        e: [u8; 32],
+        s: [u8; 32],
+        m: Option<[u8; MLKEM768_PUB_LEN]>,
+    ) -> Result<bool, StoreError> {
+        self.inner.set_recovery_account(e, s, m).await
     }
-    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError> {
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError> {
         self.inner.recovery_account().await
     }
     async fn control_head(&self) -> Result<[u8; 32], StoreError> {

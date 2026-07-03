@@ -8,15 +8,17 @@
 
 use maxsecu_crypto::{random_array, sha256, SigningKey};
 use maxsecu_encoding::labels;
-use maxsecu_encoding::structs::{AuthProofContext, DirBinding, Genesis, Manifest, Stream};
+use maxsecu_encoding::structs::{
+    AuthProofContext, DirBinding, Genesis, Manifest, Stream, MLKEM768_PUB_LEN,
+};
 use maxsecu_encoding::types::{
     Bytes32, Compression, FileType, Id, Role, RoleSet, StreamType, Suite, Text, Timestamp,
 };
 use maxsecu_encoding::{encode, RECOVERY_ID};
 use maxsecu_server::{
     parse_stage, AddWrapError, AuthConfig, AuthService, DeleteWrapError, FinalizeError,
-    GenesisInput, ListFilter, PgStore, SessionRecord, StageError, StageInput, Store,
-    VersionSelector, WrapInput,
+    GenesisInput, ListFilter, PgStore, RecoveryAccount, SessionRecord, StageError, StageInput,
+    Store, VersionSelector, WrapInput,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -285,7 +287,7 @@ async fn voucher_is_single_use_and_unknown_is_false() {
 }
 
 #[tokio::test]
-async fn recovery_account_registers_once_over_postgres() {
+async fn recovery_account_registers_once_with_mlkem_over_postgres() {
     let db = db_or_skip!();
     assert!(
         db.store.recovery_account().await.unwrap().is_none(),
@@ -293,28 +295,59 @@ async fn recovery_account_registers_once_over_postgres() {
     );
     let enc = [0x11u8; 32];
     let sig = [0x22u8; 32];
+    let mlkem = [0x33u8; MLKEM768_PUB_LEN];
     assert!(
-        db.store.set_recovery_account(enc, sig).await.unwrap(),
+        db.store
+            .set_recovery_account(enc, sig, Some(mlkem))
+            .await
+            .unwrap(),
         "first registration lands the singleton row"
     );
     assert_eq!(
         db.store.recovery_account().await.unwrap(),
-        Some((enc, sig)),
-        "the stored pubkeys round-trip verbatim"
+        Some(RecoveryAccount {
+            enc_pub: enc,
+            sig_pub: sig,
+            mlkem_pub: Some(mlkem),
+        }),
+        "the PQ-hybrid pubkeys (incl. the 1184-byte ML-KEM key) round-trip verbatim"
     );
     // A second attempt with DIFFERENT keys loses (ON CONFLICT DO NOTHING) and
     // does NOT overwrite — the singleton PK enforces once-only.
     assert!(
         !db.store
-            .set_recovery_account([0xAAu8; 32], [0xBBu8; 32])
+            .set_recovery_account([0xAAu8; 32], [0xBBu8; 32], None)
             .await
             .unwrap(),
         "second registration is rejected (once-only)"
     );
     assert_eq!(
         db.store.recovery_account().await.unwrap(),
-        Some((enc, sig)),
-        "the ORIGINAL keys are preserved after a losing second set"
+        Some(RecoveryAccount {
+            enc_pub: enc,
+            sig_pub: sig,
+            mlkem_pub: Some(mlkem),
+        }),
+        "the ORIGINAL keys (incl. ML-KEM) are preserved after a losing second set"
+    );
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn recovery_account_classical_only_persists_null_mlkem_over_postgres() {
+    let db = db_or_skip!();
+    let enc = [0x44u8; 32];
+    let sig = [0x55u8; 32];
+    // No ML-KEM key: the nullable `mlkem_pub` column stays NULL and reads back None.
+    assert!(db.store.set_recovery_account(enc, sig, None).await.unwrap());
+    assert_eq!(
+        db.store.recovery_account().await.unwrap(),
+        Some(RecoveryAccount {
+            enc_pub: enc,
+            sig_pub: sig,
+            mlkem_pub: None,
+        }),
+        "classical-only recovery persists with a NULL mlkem_pub"
     );
     db.teardown().await;
 }

@@ -16,6 +16,7 @@ use crate::files::{
 };
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
+use maxsecu_encoding::structs::MLKEM768_PUB_LEN;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -25,6 +26,22 @@ pub struct UserRecord {
     pub user_id: [u8; 16],
     pub enc_pub: [u8; 32],
     pub sig_pub: [u8; 32],
+}
+
+/// The single escrow **recovery account**'s PUBLIC keys (schema.sql
+/// `recovery_account`; T3). The recovery identity uses the same key types as a
+/// normal Identity (spec §3), which today is PQ-hybrid: an X25519 `enc_pub`
+/// **and** an optional ML-KEM-768 `mlkem_pub`. Wraps to recovery encapsulate to
+/// both so an upload stays `Suite::V2` (dropping `mlkem_pub` would silently
+/// downgrade every recovery-wrapped upload to classical V1). `mlkem_pub` is
+/// `None` only for a classical-only recovery account. Mirrors
+/// [`DirBinding.mlkem_pub`](maxsecu_encoding::structs::DirBinding). No private
+/// key is ever stored (D4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryAccount {
+    pub enc_pub: [u8; 32],
+    pub sig_pub: [u8; 32],
+    pub mlkem_pub: Option<[u8; MLKEM768_PUB_LEN]>,
 }
 
 /// A single-use login challenge (schema.sql `auth_nonces`).
@@ -280,20 +297,23 @@ pub trait Store: Send + Sync {
     // ---- Recovery account (the single escrow identity; T3) ----
 
     /// Register the ONE recovery account by its PUBLIC keys — an X25519 `enc_pub`
-    /// (recovery challenges wrap to it; clients compare it to their embedded pin)
-    /// and an Ed25519 `sig_pub`. **Once-only**: `Ok(true)` iff this call stored
-    /// the account; `Ok(false)` iff one already exists (the stored keys are left
-    /// UNCHANGED — no overwrite). Race-safe: a single-row table means exactly one
-    /// of any concurrent setters wins. `Err` is a backend fault. Never stores a
-    /// private key (public material only, D4).
+    /// (recovery challenges wrap to it; clients compare it to their embedded pin),
+    /// an Ed25519 `sig_pub`, and an OPTIONAL ML-KEM-768 `mlkem_pub` (the PQ-hybrid
+    /// encapsulation half; `None` = classical-only recovery). **Once-only**:
+    /// `Ok(true)` iff this call stored the account; `Ok(false)` iff one already
+    /// exists (the stored keys are left UNCHANGED — no overwrite). Race-safe: a
+    /// single-row table means exactly one of any concurrent setters wins. `Err`
+    /// is a backend fault. Never stores a private key (public material only, D4).
     async fn set_recovery_account(
         &self,
         enc_pub: [u8; 32],
         sig_pub: [u8; 32],
+        mlkem_pub: Option<[u8; MLKEM768_PUB_LEN]>,
     ) -> Result<bool, StoreError>;
-    /// The registered recovery account's `(enc_pub, sig_pub)`, or `Ok(None)` if
-    /// none has been registered yet (`GET`-served to clients for the pin compare).
-    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError>;
+    /// The registered recovery account's public keys, or `Ok(None)` if none has
+    /// been registered yet (`GET`-served to clients for the pin compare + used as
+    /// the PQ-hybrid recovery wrap target).
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError>;
 
     // ---- Phase 2: revocation control-log (DESIGN §7.6/§11.5, api.md §7) ----
 
@@ -461,9 +481,9 @@ struct Inner {
     sessions: HashMap<[u8; 32], SessionRecord>,
     vouchers: HashSet<[u8; 32]>, // unused enrollment voucher hashes
     reg_keys: HashSet<[u8; 32]>, // unused single-use registration-key hashes (T2)
-    // The single recovery account's PUBLIC keys (enc_pub, sig_pub); once set,
-    // never overwritten (T3). `None` until registered.
-    recovery_account: Option<([u8; 32], [u8; 32])>,
+    // The single recovery account's PUBLIC keys (X25519 + optional ML-KEM-768);
+    // once set, never overwritten (T3). `None` until registered.
+    recovery_account: Option<RecoveryAccount>,
     // Latest signed binding per user_id, with its key_version (newer replaces older).
     bindings: HashMap<[u8; 16], (u64, StoredBinding)>,
     // The single append-only control-log chain (in order) + its running head.
@@ -746,6 +766,7 @@ impl Store for MemoryStore {
         &self,
         enc_pub: [u8; 32],
         sig_pub: [u8; 32],
+        mlkem_pub: Option<[u8; MLKEM768_PUB_LEN]>,
     ) -> Result<bool, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         // Once-only under the single lock: a second setter observes `Some` and
@@ -754,12 +775,16 @@ impl Store for MemoryStore {
         if inner.recovery_account.is_some() {
             return Ok(false);
         }
-        inner.recovery_account = Some((enc_pub, sig_pub));
+        inner.recovery_account = Some(RecoveryAccount {
+            enc_pub,
+            sig_pub,
+            mlkem_pub,
+        });
         Ok(true)
     }
 
-    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError> {
-        Ok(self.inner.lock().unwrap().recovery_account)
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError> {
+        Ok(self.inner.lock().unwrap().recovery_account.clone())
     }
 
     async fn append_control(
@@ -1278,10 +1303,11 @@ impl Store for FaultyStore {
         &self,
         _enc_pub: [u8; 32],
         _sig_pub: [u8; 32],
+        _mlkem_pub: Option<[u8; MLKEM768_PUB_LEN]>,
     ) -> Result<bool, StoreError> {
         Err(Self::fault("set_recovery_account"))
     }
-    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError> {
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError> {
         Err(Self::fault("recovery_account"))
     }
     async fn append_control(

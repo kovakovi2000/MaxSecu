@@ -22,7 +22,7 @@
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
 use maxsecu_encoding::decode;
-use maxsecu_encoding::structs::DirBinding;
+use maxsecu_encoding::structs::{DirBinding, MLKEM768_PUB_LEN};
 use maxsecu_encoding::GENESIS_HEAD;
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::Row;
@@ -35,8 +35,9 @@ use crate::files::{
     VersionSelector, WrapInput,
 };
 use crate::store::{
-    ancestor_chain, ChunkSlot, FileListEntry, FileView, PendingUser, RecipientView, SessionRecord,
-    StoredBinding, StoredControlRecord, Store, StreamView, UserRecord, VersionMeta, WrapView,
+    ancestor_chain, ChunkSlot, FileListEntry, FileView, PendingUser, RecipientView,
+    RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
+    UserRecord, VersionMeta, WrapView,
 };
 
 /// Postgres [`Store`]. Cheap to clone (the pool is an `Arc` internally).
@@ -436,33 +437,52 @@ impl Store for PgStore {
         &self,
         enc_pub: [u8; 32],
         sig_pub: [u8; 32],
+        mlkem_pub: Option<[u8; MLKEM768_PUB_LEN]>,
     ) -> Result<bool, StoreError> {
         // Once-only via the singleton PK (`id = true`): a second INSERT hits
         // `ON CONFLICT DO NOTHING`, so exactly one of any racing setters lands a
-        // row and the stored keys are never overwritten. Public keys only (D4).
+        // row and the stored keys are never overwritten. Public keys only (D4);
+        // `mlkem_pub` NULL = classical-only recovery.
         let res = sqlx::query(
-            "INSERT INTO recovery_account (id, enc_pub, sig_pub) VALUES (true, $1, $2) \
+            "INSERT INTO recovery_account (id, enc_pub, sig_pub, mlkem_pub) VALUES (true, $1, $2, $3) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(&enc_pub[..])
         .bind(&sig_pub[..])
+        .bind(mlkem_pub.as_ref().map(|k| &k[..]))
         .execute(&self.pool)
         .await
         .map_err(store_err("set_recovery_account"))?;
         Ok(res.rows_affected() == 1)
     }
 
-    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError> {
-        let Some(row) = sqlx::query("SELECT enc_pub, sig_pub FROM recovery_account WHERE id = true")
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(store_err("recovery_account"))?
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError> {
+        let Some(row) =
+            sqlx::query("SELECT enc_pub, sig_pub, mlkem_pub FROM recovery_account WHERE id = true")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(store_err("recovery_account"))?
         else {
             return Ok(None);
         };
-        let enc = col_fixed::<32>(&row, "recovery_account", "enc_pub")?;
-        let sig = col_fixed::<32>(&row, "recovery_account", "sig_pub")?;
-        Ok(Some((enc, sig)))
+        let enc_pub = col_fixed::<32>(&row, "recovery_account", "enc_pub")?;
+        let sig_pub = col_fixed::<32>(&row, "recovery_account", "sig_pub")?;
+        // `mlkem_pub` is nullable (classical-only recovery); when present the DB
+        // CHECK guarantees the width, but we re-validate on read-back (D4).
+        let mlkem_raw: Option<Vec<u8>> = row
+            .try_get("mlkem_pub")
+            .map_err(store_err("recovery_account"))?;
+        let mlkem_pub = match mlkem_raw {
+            None => None,
+            Some(v) => Some(v.try_into().map_err(|_| {
+                StoreError::new("recovery_account", "mlkem_pub has unexpected width")
+            })?),
+        };
+        Ok(Some(RecoveryAccount {
+            enc_pub,
+            sig_pub,
+            mlkem_pub,
+        }))
     }
 
     async fn append_control(

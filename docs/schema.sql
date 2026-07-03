@@ -121,6 +121,7 @@ CREATE TABLE recovery_account (                  -- the ONE escrow identity's PU
   id            BOOLEAN PRIMARY KEY DEFAULT true CHECK (id = true),      -- singleton row: at most one recovery account
   enc_pub       BYTEA NOT NULL CHECK (octet_length(enc_pub) = 32),       -- X25519; recovery challenges wrap to it / clients pin-compare it
   sig_pub       BYTEA NOT NULL CHECK (octet_length(sig_pub) = 32),       -- Ed25519; recovery signing key. NO private key is ever stored (D4)
+  mlkem_pub     BYTEA CHECK (mlkem_pub IS NULL OR octet_length(mlkem_pub) = 1184),  -- optional ML-KEM-768 (MLKEM768_PUB_LEN=1184); NULL=classical-only. PQ-hybrid wrap target so recovery uploads stay Suite::V2 (mirrors directory_bindings.mlkem_pub)
   registered_at TIMESTAMPTZ NOT NULL DEFAULT now()                       -- set once; a second INSERT hits ON CONFLICT (id) DO NOTHING
 );
 

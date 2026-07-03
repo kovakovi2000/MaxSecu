@@ -57,6 +57,6 @@ pub use files::{
 };
 pub use store::{
     ChunkSlot, FileListEntry, FileView, MemoryStore, NonceRecord, PendingUser, RecipientView,
-    SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView, UserRecord, VersionMeta,
-    WrapView,
+    RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
+    UserRecord, VersionMeta, WrapView,
 };
