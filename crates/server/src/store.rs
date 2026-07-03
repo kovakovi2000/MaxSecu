@@ -293,6 +293,18 @@ pub trait Store: Send + Sync {
     /// `true` iff at least one user account exists — the first-admin gate: the
     /// first registrant (while this is `false`) is enrolled as admin (§ T4).
     async fn any_user_exists(&self) -> Result<bool, StoreError>;
+    /// Atomically claim the ONE-TIME "first admin" slot: `Ok(true)` for exactly
+    /// the first caller ever (→ enrolled `{User, Admin}`), `Ok(false)` for every
+    /// caller thereafter (→ `{User}`). This is the race-safe replacement for a
+    /// read-then-decide on [`any_user_exists`](Store::any_user_exists): the admin
+    /// decision is a single atomic mutation (a singleton row claimed via `ON
+    /// CONFLICT DO NOTHING`, the same pattern as [`set_recovery_account`]), so two
+    /// concurrent first-registrants can never both become admin — exactly one
+    /// wins, closing the first-admin TOCTOU. Called only after a user is
+    /// successfully created. `Err` = backend fault.
+    ///
+    /// [`set_recovery_account`]: Store::set_recovery_account
+    async fn claim_first_admin(&self) -> Result<bool, StoreError>;
 
     // ---- Recovery account (the single escrow identity; T3) ----
 
@@ -481,6 +493,9 @@ struct Inner {
     sessions: HashMap<[u8; 32], SessionRecord>,
     vouchers: HashSet<[u8; 32]>, // unused enrollment voucher hashes
     reg_keys: HashSet<[u8; 32]>, // unused single-use registration-key hashes (T2)
+    // The one-time first-admin claim (T4): `true` once the first registrant has
+    // claimed admin; every later `claim_first_admin` observes `true` and loses.
+    first_admin_claimed: bool,
     // The single recovery account's PUBLIC keys (X25519 + optional ML-KEM-768);
     // once set, never overwritten (T3). `None` until registered.
     recovery_account: Option<RecoveryAccount>,
@@ -541,6 +556,11 @@ impl MemoryStore {
     /// Seed a usable enrollment voucher by its `SHA-256` hash (issued in person).
     pub fn add_voucher(&self, voucher_hash: [u8; 32]) {
         self.inner.lock().unwrap().vouchers.insert(voucher_hash);
+    }
+
+    /// Seed a usable single-use registration key by its `SHA-256` hash (T4 tests).
+    pub fn add_reg_key(&self, key_hash: [u8; 32]) {
+        self.inner.lock().unwrap().reg_keys.insert(key_hash);
     }
 
     /// Override a user's recorded creation time (tests only — `add_user`/
@@ -760,6 +780,18 @@ impl Store for MemoryStore {
 
     async fn any_user_exists(&self) -> Result<bool, StoreError> {
         Ok(!self.inner.lock().unwrap().users.is_empty())
+    }
+
+    async fn claim_first_admin(&self) -> Result<bool, StoreError> {
+        // Once-only under the single lock: the first caller flips the flag and
+        // wins (→ admin); every later caller observes `true` and loses. The
+        // MemoryStore analogue of the singleton PK's `ON CONFLICT DO NOTHING`.
+        let mut inner = self.inner.lock().unwrap();
+        if inner.first_admin_claimed {
+            return Ok(false);
+        }
+        inner.first_admin_claimed = true;
+        Ok(true)
     }
 
     async fn set_recovery_account(
@@ -1298,6 +1330,9 @@ impl Store for FaultyStore {
     }
     async fn any_user_exists(&self) -> Result<bool, StoreError> {
         Err(Self::fault("any_user_exists"))
+    }
+    async fn claim_first_admin(&self) -> Result<bool, StoreError> {
+        Err(Self::fault("claim_first_admin"))
     }
     async fn set_recovery_account(
         &self,

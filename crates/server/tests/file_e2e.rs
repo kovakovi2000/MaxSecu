@@ -228,9 +228,14 @@ async fn phase3_exit_gates_over_real_tls() {
     // ---- Server: secret-free, records in memory, ciphertext blobs on disk ----
     let blob_dir = std::env::temp_dir().join(format!("mxe2e_{}", hex(&maxsecu_crypto::random_array::<8>())));
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER.as_bytes()));
+    let signer = Arc::new(maxsecu_crypto::SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
@@ -253,7 +258,7 @@ async fn phase3_exit_gates_over_real_tls() {
             "username": "alice",
             "enc_pub_b64": B64.encode(owner.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(owner.sig_pub_bytes()),
-            "enrollment_voucher": VOUCHER,
+            "registration_key": VOUCHER,
         }),
     )
     .await;
@@ -506,14 +511,19 @@ async fn phase4b_media_exit_gates_over_real_tls() {
     let cache_dir = std::env::temp_dir().join(format!("mxmedia_cache_{tag}"));
     let cold_dir = std::env::temp_dir().join(format!("mxmedia_cold_{tag}"));
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER.as_bytes()));
+    let signer = Arc::new(maxsecu_crypto::SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
     let tiered = TieredBlobStore::new(
         Arc::new(FsBlobStore::new(&cache_dir)),
         Arc::new(FsColdTier::new(&cold_dir)),
         64 * 1024 * 1024,
     );
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer),
+        ),
         blobs: Arc::new(tiered),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
@@ -535,7 +545,7 @@ async fn phase4b_media_exit_gates_over_real_tls() {
             "username": "mira",
             "enc_pub_b64": B64.encode(owner.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(owner.sig_pub_bytes()),
-            "enrollment_voucher": VOUCHER,
+            "registration_key": VOUCHER,
         }),
     )
     .await;

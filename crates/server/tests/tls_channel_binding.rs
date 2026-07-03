@@ -29,7 +29,7 @@ use tokio_rustls::TlsConnector;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
-const VOUCHER: &str = "in-person-code-001";
+const REG_KEY: &str = "reg-key-001";
 const TS: u64 = 1_719_500_000_000;
 
 /// A self-signed cert/key for `localhost`, plus the client roots that trust it.
@@ -66,12 +66,18 @@ fn test_pki() -> TestPki {
     }
 }
 
-/// Stand up the auth router backed by a `MemoryStore` seeded with one voucher.
+/// Stand up the auth router backed by a `MemoryStore` seeded with one
+/// registration key + a directory signer (so enrollment can sign the binding).
 fn router() -> axum::Router {
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(REG_KEY.as_bytes()));
+    let signer = Arc::new(SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer),
+        ),
         blobs: Arc::new(maxsecu_server::MemoryBlobStore::new()),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
@@ -160,7 +166,7 @@ async fn full_login_over_real_tls_then_relay_to_new_channel_is_401() {
     // ---- Connection A: the legitimate channel ----
     let mut a = connect(addr, pki.client_config.clone()).await;
 
-    // register (voucher-gated; not channel-bound)
+    // register (registration-key-gated; not channel-bound)
     let sk = SigningKey::generate();
     let (_esk, epk) = generate_enc_keypair();
     let (st, _res) = post(
@@ -171,7 +177,7 @@ async fn full_login_over_real_tls_then_relay_to_new_channel_is_401() {
             "username": "bob",
             "enc_pub_b64": B64.encode(epk.to_bytes()),
             "sig_pub_b64": B64.encode(sk.verifying_key().to_bytes()),
-            "enrollment_voucher": VOUCHER,
+            "registration_key": REG_KEY,
         }),
     )
     .await;

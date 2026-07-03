@@ -58,6 +58,18 @@ pub fn ensure_dev_d5(layout: &Layout) -> std::io::Result<[u8; 32]> {
     Ok(pubkey)
 }
 
+/// Read the persisted 32-byte dev D5 seed (must exist — call after
+/// [`ensure_dev_d5`]). The server signs enrollment bindings with the key derived
+/// from this seed; its public half is the pinned `directory_pub`. DEV-only: in
+/// production the signing key is the offline ceremony key, never on the server.
+pub fn dev_d5_seed(layout: &Layout) -> std::io::Result<[u8; 32]> {
+    match std::fs::read(layout.d5_secret_path()) {
+        Ok(b) if b.len() == 32 => Ok(b.try_into().unwrap()),
+        Ok(_) => Err(std::io::Error::other("d5 seed malformed")),
+        Err(e) => Err(e),
+    }
+}
+
 /// Copy the dev D5 public key to `<client_config_dir>/directory_pub.der` (where the
 /// client pins it). Call after `ensure_dev_d5`.
 pub fn export_client_pin_d5(

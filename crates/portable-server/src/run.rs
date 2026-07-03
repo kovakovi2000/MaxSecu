@@ -86,6 +86,12 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
     let bootstrap_secret = bootstrap::ensure_bootstrap_secret(&layout)?;
     let hash = bootstrap::bootstrap_secret_hash(&layout)?
         .ok_or_else(|| std::io::Error::other("bootstrap hash missing after ensure"))?;
+    // The server is the enrollment authority (§5, T4): it signs enrollment
+    // bindings with the DEV D5 key (the private half of `directory_pub`). The
+    // seed never leaves this process (DEV-only; production signs offline).
+    let dir_signer = Arc::new(maxsecu_crypto::SigningKey::from_seed(
+        &bootstrap::dev_d5_seed(&layout)?,
+    ));
 
     let server_config = pki::load_server_config(&layout)?;
     let auth_cfg = AuthConfig::default()
@@ -99,7 +105,9 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
     let app_router = match cfg.profile {
         Profile::Dev => {
             let state = AppState {
-                auth: Arc::new(AuthService::new(MemoryStore::new(), auth_cfg)),
+                auth: Arc::new(
+                    AuthService::new(MemoryStore::new(), auth_cfg).with_dir_signer(dir_signer),
+                ),
                 blobs,
                 audit: Arc::new(NullAuditSink),
                 direct_links_enabled: cfg.direct_links_enabled,
@@ -118,7 +126,9 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
                 .await
                 .map_err(|e| std::io::Error::other(format!("postgres connect: {e}")))?;
             let state = AppState {
-                auth: Arc::new(AuthService::new(PgStore::new(pool), auth_cfg)),
+                auth: Arc::new(
+                    AuthService::new(PgStore::new(pool), auth_cfg).with_dir_signer(dir_signer),
+                ),
                 blobs,
                 audit: Arc::new(NullAuditSink),
                 direct_links_enabled: cfg.direct_links_enabled,

@@ -433,6 +433,20 @@ impl Store for PgStore {
             .map_err(store_err("any_user_exists"))
     }
 
+    async fn claim_first_admin(&self) -> Result<bool, StoreError> {
+        // Atomic once-only claim, mirroring `set_recovery_account`: the singleton
+        // PK + `ON CONFLICT DO NOTHING` serializes concurrent claimers so exactly
+        // one INSERT affects a row (→ admin) — the first-admin decision cannot be
+        // split across a racing read + create.
+        let res = sqlx::query(
+            "INSERT INTO first_admin_claim (id) VALUES (true) ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(store_err("claim_first_admin"))?;
+        Ok(res.rows_affected() == 1)
+    }
+
     async fn set_recovery_account(
         &self,
         enc_pub: [u8; 32],

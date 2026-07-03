@@ -35,7 +35,7 @@ use serde_json::json;
 use tower::ServiceExt; // oneshot
 
 use maxsecu_admin_core::DirectorySigner;
-use maxsecu_crypto::{sha256, SigningKey};
+use maxsecu_crypto::SigningKey;
 use maxsecu_encoding::encode;
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::{
@@ -171,6 +171,9 @@ impl Store for FaultyStore {
     }
     async fn any_user_exists(&self) -> Result<bool, StoreError> {
         Err(bait("any_user_exists"))
+    }
+    async fn claim_first_admin(&self) -> Result<bool, StoreError> {
+        Err(bait("claim_first_admin"))
     }
     async fn set_recovery_account(
         &self,
@@ -336,6 +339,9 @@ impl Store for FileFaultyStore {
     async fn any_user_exists(&self) -> Result<bool, StoreError> {
         self.inner.any_user_exists().await
     }
+    async fn claim_first_admin(&self) -> Result<bool, StoreError> {
+        self.inner.claim_first_admin().await
+    }
     async fn set_recovery_account(
         &self,
         e: [u8; 32],
@@ -436,8 +442,16 @@ fn b64_fixed32(s: &str) -> [u8; 32] {
 }
 
 fn state_router<S: Store + 'static>(store: S) -> Router {
+    // Configure the directory signer so enrollment (`POST /v1/users`) reaches the
+    // store rather than short-circuiting on "enrollment disabled" — the 500-on-
+    // fault tests need the request to reach the faulting store.
+    let signer = Arc::new(SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer),
+        ),
         blobs: Arc::new(MemoryBlobStore::new()),
         audit: Arc::new(NullAuditSink),
         direct_links_enabled: false,
@@ -746,7 +760,7 @@ async fn error_responses_never_leak_internals() {
     .await;
     assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
     assert_generic("500 challenge", &body);
-    // register → consume_voucher faults
+    // register → consume_registration_key faults
     let sk = SigningKey::generate();
     let (st, _, body) = send(
         &faulty,
@@ -757,7 +771,7 @@ async fn error_responses_never_leak_internals() {
                 "username": "x",
                 "enc_pub_b64": B64.encode([0x11; 32]),
                 "sig_pub_b64": B64.encode(sk.verifying_key().to_bytes()),
-                "enrollment_voucher": "code",
+                "registration_key": "code",
             }),
             None,
         ),
@@ -1005,58 +1019,29 @@ async fn no_existence_oracle() {
     assert_generic("chunk get no-oracle", &ub);
 }
 
-// ===== Phase-2 endpoints (bootstrap / publish / pending) =====
+// ===== Phase-2 / T4 endpoints (registration-key mint / publish) =====
 
-/// `POST /v1/bootstrap` over a faulting store: the handler's gating order is
-/// secret-configured? → `has_any_binding()` → secret check, so the injected
-/// `has_any_binding` fault hits the `internal_error` path BEFORE the secret is
-/// ever checked. A backend fault must surface as a bare `500` with an empty body
-/// — never a misleading `401`/`201`/`409`.
+/// `POST /v1/registration-keys` is admin-gated with no cause oracle: a request
+/// with NO session is a uniform `401` (empty body); an AUTHENTIC session that
+/// lacks a D5-verified admin binding is `403` (empty body). Neither carries a
+/// reason.
 #[tokio::test]
-async fn bootstrap_backend_fault_is_bare_500() {
-    let app = router_with_config(
-        FaultyStore,
-        AuthConfig::default().with_bootstrap_secret_hash(sha256(b"X")),
-    );
-    // Well-formed body with the CORRECT secret — proves the 500 comes from the
-    // store fault, not from a body/secret rejection.
-    let (st, _, body) = send(
-        &app,
-        req_json(
-            "POST",
-            "/v1/bootstrap",
-            &json!({
-                "username": "root",
-                "enc_pub_b64": B64.encode([0x11; 32]),
-                "sig_pub_b64": B64.encode([0x22; 32]),
-                "bootstrap_secret": "X",
-            }),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_generic("500 bootstrap has_any_binding fault", &body);
-}
-
-/// `GET /v1/pending` is admin-gated with no cause oracle: a request with NO
-/// session is a uniform `401` (empty body); an AUTHENTIC session that lacks a
-/// D5-verified admin binding is `403` (empty body). Neither carries a reason.
-#[tokio::test]
-async fn pending_requires_admin_no_oracle() {
+async fn mint_requires_admin_no_oracle() {
     let (router, _admin, bob) = app().await;
 
     // No Authorization header → uniform 401, empty body (no "missing token" hint).
-    let (st, _, body) = send(&router, req_get("/v1/pending", None)).await;
+    let (st, _, body) =
+        send(&router, req_json("POST", "/v1/registration-keys", &json!({}), None)).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
-    assert_generic("401 pending no-token", &body);
+    assert_generic("401 mint no-token", &body);
 
     // bob is an authentic session but has no published binding ⇒ not an admin →
     // 403, empty body (no "not an admin" hint).
     let bob_tok = login(&router, "bob", &bob).await;
-    let (st, _, body) = send(&router, req_get("/v1/pending", Some(&bob_tok))).await;
+    let (st, _, body) =
+        send(&router, req_json("POST", "/v1/registration-keys", &json!({}), Some(&bob_tok))).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
-    assert_generic("403 pending non-admin", &body);
+    assert_generic("403 mint non-admin", &body);
 }
 
 /// `POST /v1/directory` with a canonical binding but a forged (all-zero)

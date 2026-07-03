@@ -256,7 +256,7 @@ async fn register(c: &mut Conn, username: &str, id: &Identity) -> [u8; 16] {
             "username": username,
             "enc_pub_b64": B64.encode(id.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(id.sig_pub_bytes()),
-            "enrollment_voucher": VOUCHER,
+            "registration_key": VOUCHER,
         }),
     )
     .await;
@@ -617,13 +617,18 @@ async fn phase7_exit_gates_over_real_tls() {
     // (so a file create anchors a genesis at a real, global sink position).
     // ============================================================
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER.as_bytes()));
+    let signer = Arc::new(SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
     let publisher =
         HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
     let blob_dir =
         std::env::temp_dir().join(format!("mxp7_{}", hex(&maxsecu_crypto::random_array::<8>())));
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(publisher),
         direct_links_enabled: false,
@@ -933,7 +938,7 @@ async fn r27_cutoff_over_real_sink() {
     let a1_id = [0xA1u8; 16];
     let a2_id = [0xA2u8; 16];
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER.as_bytes()));
     store.add_user(
         "admin1",
         UserRecord {
@@ -943,8 +948,13 @@ async fn r27_cutoff_over_real_sink() {
         },
     );
     // Admin authority flows from a D5-signed {User, Admin} binding (D-K), verified
-    // server-side by the AdminSession gate — not an advisory roles table.
-    let d5 = DirectorySigner::generate();
+    // server-side by the AdminSession gate — not an advisory roles table. The
+    // server IS the D5 (registration-key enrollment signs bindings): derive the
+    // ceremony signer and the server's enrollment signer from ONE seed so
+    // `directory_pub` matches both.
+    let d5_seed: [u8; 32] = maxsecu_crypto::random_array();
+    let d5 = DirectorySigner::from_seed(&d5_seed);
+    let enroll_signer = Arc::new(SigningKey::from_seed(&d5_seed));
     let admin1_binding = DirBinding {
         username: Text::new("admin1").unwrap(),
         user_id: Id(a1_id),
@@ -961,16 +971,19 @@ async fn r27_cutoff_over_real_sink() {
         .put_binding(a1_id, 1, encode(&signed_a1.binding), signed_a1.signature)
         .await
         .unwrap();
+    // admin1 is the genesis admin: claim the first-admin slot so the later
+    // registration-key enrollment of `owner` is {User}-only.
+    assert!(store.claim_first_admin().await.unwrap());
 
     let publisher =
         HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
     let blob_dir =
         std::env::temp_dir().join(format!("mxr27_{}", hex(&maxsecu_crypto::random_array::<8>())));
     let state = AppState {
-        auth: Arc::new(AuthService::new(
-            store,
-            AuthConfig::default().with_directory_pub(d5.public_key()),
-        )),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(d5.public_key()))
+                .with_dir_signer(enroll_signer),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(publisher),
         direct_links_enabled: false,

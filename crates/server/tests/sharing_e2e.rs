@@ -48,7 +48,9 @@ use maxsecu_admin_core::{
     ControlChain, CoSign, DirectorySigner, KeyCompromiseParams, ReinstateParams, RevokeParams,
     SignedControlRecord,
 };
-use maxsecu_crypto::{generate_enc_keypair, sha256, unwrap_dek, Dek, EncPublicKey, WrappedDek};
+use maxsecu_crypto::{
+    generate_enc_keypair, sha256, unwrap_dek, Dek, EncPublicKey, SigningKey, WrappedDek,
+};
 use maxsecu_encoding::structs::{DirBinding, WrapContext};
 use maxsecu_encoding::types::{
     Bytes32, FileScope, FileType, Id, RecipientType, Role, RoleSet, StreamType, Suite, Text,
@@ -248,7 +250,7 @@ fn wrap_from_bytes(b: &[u8]) -> WrappedDek {
 
 // ---- enrollment + sharing helpers ----
 
-async fn register(conn: &mut Conn, username: &str, voucher: &str, id: &Identity) -> [u8; 16] {
+async fn register(conn: &mut Conn, username: &str, reg_key: &str, id: &Identity) -> [u8; 16] {
     let (st, res) = post(
         conn,
         "/v1/users",
@@ -257,7 +259,7 @@ async fn register(conn: &mut Conn, username: &str, voucher: &str, id: &Identity)
             "username": username,
             "enc_pub_b64": B64.encode(id.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(id.sig_pub_bytes()),
-            "enrollment_voucher": voucher,
+            "registration_key": reg_key,
         }),
     )
     .await;
@@ -432,10 +434,15 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
     let blob_dir = std::env::temp_dir().join(format!("mxs4_{}", hex(&maxsecu_crypto::random_array::<8>())));
     let store = MemoryStore::new();
     for code in ["v-alice", "v-bob", "v-carol"] {
-        store.add_voucher(sha256(code.as_bytes()));
+        store.add_reg_key(sha256(code.as_bytes()));
     }
+    let signer = Arc::new(SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(NullAuditSink),
         direct_links_enabled: false,
@@ -807,7 +814,7 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
     let blob_dir = std::env::temp_dir().join(format!("mxs5_{}", hex(&maxsecu_crypto::random_array::<8>())));
     let store = MemoryStore::new();
     for code in ["v-owner", "v-victim"] {
-        store.add_voucher(sha256(code.as_bytes()));
+        store.add_reg_key(sha256(code.as_bytes()));
     }
     // Two admins. admin1 logs in to POST control records (coarse gate needs the
     // Admin role); admin2 only co-signs offline (dual control), never seen by the
@@ -825,8 +832,14 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
         },
     );
     // Admin authority flows from a D5-signed {User, Admin} binding (D-K), verified
-    // server-side by the AdminSession gate — not an advisory roles table.
-    let d5 = DirectorySigner::generate();
+    // server-side by the AdminSession gate — not an advisory roles table. The
+    // server IS the D5 here (registration-key enrollment signs bindings): derive
+    // both the ceremony signer and the server's enrollment signer from ONE seed so
+    // `directory_pub` matches both the admin's ceremony binding and the
+    // server-signed enrollment bindings.
+    let d5_seed: [u8; 32] = maxsecu_crypto::random_array();
+    let d5 = DirectorySigner::from_seed(&d5_seed);
+    let enroll_signer = Arc::new(SigningKey::from_seed(&d5_seed));
     let admin1_binding = DirBinding {
         username: Text::new("admin1").unwrap(),
         user_id: Id(a1_id),
@@ -843,13 +856,16 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
         .put_binding(a1_id, 1, encode(&signed_a1.binding), signed_a1.signature)
         .await
         .unwrap();
+    // admin1 is the genesis admin: claim the first-admin slot so the later
+    // registration-key enrollments of owner/victim are {User}-only.
+    assert!(store.claim_first_admin().await.unwrap());
 
     let audit = Arc::new(MemoryAuditSink::new());
     let state = AppState {
-        auth: Arc::new(AuthService::new(
-            store,
-            AuthConfig::default().with_directory_pub(d5.public_key()),
-        )),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(d5.public_key()))
+                .with_dir_signer(enroll_signer),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: audit.clone(),
         direct_links_enabled: false,

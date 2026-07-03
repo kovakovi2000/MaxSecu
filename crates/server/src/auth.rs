@@ -6,7 +6,8 @@
 use crate::error::{AuthError, ChallengeError, ProveError, StoreError};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::store::{SessionRecord, Store};
-use maxsecu_crypto::{random_array, sha256, VerifyingKey};
+use maxsecu_crypto::{random_array, sha256, SigningKey, VerifyingKey};
+use std::sync::Arc;
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::AuthProofContext;
 use maxsecu_encoding::types::{Bytes32, Text, Timestamp};
@@ -84,6 +85,12 @@ pub struct AuthService<S: Store> {
     store: S,
     cfg: AuthConfig,
     limiter: RateLimiter,
+    /// The directory-signing PRIVATE key the server signs enrollment bindings
+    /// with (registration-key enrollment, DESIGN §5). `None` = enrollment
+    /// disabled (`POST /v1/users` → 403). Its public half is `cfg.directory_pub`
+    /// (the value clients pin); the private seed lives ONLY here and is never put
+    /// into any DTO, response, or log. `Arc` so cloning `AppState` is a bump.
+    dir_signer: Option<Arc<SigningKey>>,
 }
 
 impl<S: Store> AuthService<S> {
@@ -93,7 +100,24 @@ impl<S: Store> AuthService<S> {
             store,
             cfg,
             limiter,
+            dir_signer: None,
         }
+    }
+
+    /// Give the service the directory-signing key so it can sign enrollment
+    /// bindings server-side (§5). The caller must pass the key whose public half
+    /// equals `cfg.directory_pub` — the server verifies bindings against that pub
+    /// and signs new ones with this private key. Builder form so existing
+    /// `AuthService::new(..)` call sites are unaffected.
+    pub fn with_dir_signer(mut self, signer: Arc<SigningKey>) -> Self {
+        self.dir_signer = Some(signer);
+        self
+    }
+
+    /// The directory-signing key, if enrollment signing is enabled (§5). Returns
+    /// a clone of the `Arc` (a refcount bump); the private seed never escapes.
+    pub fn dir_signer(&self) -> Option<Arc<SigningKey>> {
+        self.dir_signer.clone()
     }
 
     pub fn store(&self) -> &S {
