@@ -9,6 +9,7 @@ pub mod connection;
 pub mod dialog;
 pub mod feed;
 pub mod recovery_login;
+pub mod register;
 pub mod search;
 pub mod settings;
 pub mod share;

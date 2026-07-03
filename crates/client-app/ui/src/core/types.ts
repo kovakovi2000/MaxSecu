@@ -11,6 +11,11 @@ export interface AccountStateMsg { state: "unknown" | "pending" | "active" }
 export interface RecoveryChallengeDto { status: string; server_id: string }
 export interface RecoveryLoginDto { status: string; server_id: string }
 
+// --- Registration-key enrollment (spec §5) DTO mirror ---
+// The single-use key is read from the local register.key file in Rust, never on
+// the seam. Only the enrolled username + the opaque server-assigned user_id return.
+export interface RegisteredDto { username: string; user_id: string }
+
 // --- Phase 3 (browse + view) DTO mirrors of the Rust serde shapes ---
 // kebab-case enum values, snake_case fields — match server/core serde exactly.
 export type FeedFilter = "all" | "image" | "video" | "blog";

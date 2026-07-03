@@ -61,6 +61,23 @@ pub struct AccountStatusRequest {
     pub username: String,
 }
 
+/// Registration-key enrollment (spec §5). The single-use key itself is NOT on the
+/// seam — it is read from the local `register.key` file entirely in Rust — so only
+/// the chosen username + the keystore passphrase cross the boundary.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegisterWithKeyRequest {
+    pub username: String,
+    pub passphrase: String,
+}
+
+/// The outcome of a successful `register_with_key`: the enrolled username + the
+/// server-assigned opaque `user_id` (hex16). NO key material, NO registration key.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RegisteredDto {
+    pub username: String,
+    pub user_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PendingUserDto {
     pub user_id: String,

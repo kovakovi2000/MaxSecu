@@ -56,6 +56,7 @@ fn main() {
             maxsecu_client_app::commands::bootstrap::create_first_admin,
             maxsecu_client_app::commands::bootstrap::register_user,
             maxsecu_client_app::commands::bootstrap::account_status,
+            maxsecu_client_app::commands::register::register_with_key,
             maxsecu_client_app::commands::admin::list_pending,
             maxsecu_client_app::commands::admin::issue_voucher,
             maxsecu_client_app::commands::admin::request_approval,
