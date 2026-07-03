@@ -92,10 +92,16 @@ impl std::error::Error for SetupError {}
 
 /// Bootstrap the system against `t` (a pinned-TLS transport to the fresh server).
 ///
-/// Ordering matters for the "409 writes nothing" contract: all pre-flight guards run
-/// FIRST (no network, no key material touched), then register/login/mint, and ONLY
-/// on full success are the three cold artifacts written. A 409 (or any failure)
-/// returns before the first write.
+/// Ordering matters for two contracts:
+///   * "409 writes nothing" — all pre-flight guards run FIRST (no network, no key
+///     material touched), and NOTHING is written to disk before `register` commits,
+///     so a 409 (or any earlier failure) leaves the operator's paths untouched.
+///   * "the once-only register never orphans the recovery key" — the pure-CPU
+///     Argon2id seal is computed BEFORE `register`, so a seal/OOM/CPU failure surfaces
+///     PRE-commit (still zero disk writes). Only AFTER register + mint succeed are the
+///     three cold artifacts written; if a post-commit write then fails, an EMERGENCY
+///     block (base64 sealed blob + first key) is dumped to stderr so the irreplaceable
+///     material is never lost, and the call still returns an error.
 pub async fn run(t: &Transport, opts: &SetupOpts) -> Result<SetupReport, SetupError> {
     // (0) Pre-flight — before any network or key generation. Never clobber an
     // existing artifact, and reject a weak seal passphrase up front so we don't
@@ -109,28 +115,37 @@ pub async fn run(t: &Transport, opts: &SetupOpts) -> Result<SetupReport, SetupEr
     let enc_pub = recovery.enc_pub_bytes();
     let mlkem_pub = recovery.mlkem_pub_bytes(); // always Some for a fresh identity
 
-    // (2) One pinned-TLS connection for the whole flow: the recovery challenge/verify
+    // (2) Compute the sealed recovery blob NOW (pure CPU: Argon2id + AEAD), BEFORE the
+    // once-only register commits. A seal / OOM / CPU failure here fails the whole run
+    // with nothing on disk and nothing committed server-side, so a re-run is clean. The
+    // bytes are held (Zeroizing) until the post-register write. Also precompute the pin.
+    let sealed = seal_recovery_blob(opts.passphrase.as_str(), &recovery)?;
+    let pin = canonical_pin(&enc_pub, mlkem_pub.as_ref().map(|m| &m[..]));
+
+    // (3) One pinned-TLS connection for the whole flow: the recovery challenge/verify
     // are channel-bound to THIS connection's RFC-5705 exporter, so they must share it.
     let (mut conn, exporter) = open(t).await?;
 
-    // (3) Register the recovery PUBLIC keys. 409 → already registered → write nothing.
+    // (4) Register the recovery PUBLIC keys. 409 → already registered → write nothing.
     register(&mut conn, &opts.host, &recovery).await?;
 
-    // (4) Log in AS the recovery account (channel-bound challenge/response) → an
+    // (5) Log in AS the recovery account (channel-bound challenge/response) → an
     // admin session token.
     let token = recovery_login(&mut conn, &opts.host, &recovery, &exporter).await?;
 
-    // (5) Mint the FIRST registration key with the recovery admin session. Whoever
+    // (6) Mint the FIRST registration key with the recovery admin session. Whoever
     // enrolls with it first becomes admin via the server's atomic first-admin claim.
     let first_key = mint_first_key(&mut conn, &opts.host, &token).await?;
 
-    // (6) Write the three cold artifacts — only now that register + mint succeeded.
-    seal_recovery_key(&opts.out, opts.passphrase.as_str(), &recovery)?;
-    write_new(
-        &opts.pin_out,
-        &canonical_pin(&enc_pub, mlkem_pub.as_ref().map(|m| &m[..])),
-    )?;
-    write_new(&opts.first_key_out, first_key.as_bytes())?;
+    // (7) Write the three cold artifacts — only now that register + mint committed.
+    // register/mint are IRREVERSIBLE (a re-run 409s), so a write failure here would
+    // otherwise strand the irreplaceable recovery key + first key. On ANY write error,
+    // dump an emergency recovery block to stderr before returning the error.
+    if let Err(e) = write_all_artifacts(opts, &sealed, &pin, first_key.as_str()) {
+        emergency_dump(&sealed, first_key.as_str());
+        return Err(e);
+    }
+    // `sealed` (Zeroizing<Vec<u8>>) is dropped/zeroized here on the success path.
 
     Ok(SetupReport {
         recovery_enc_pub: enc_pub,
@@ -354,13 +369,56 @@ async fn mint_first_key(
 // ---- cold artifacts ----
 
 /// Argon2id-seal the WHOLE recovery identity (never bare key bytes) with the same
-/// `keyblob` the client keystore uses, then write it create-new. The blob is
-/// byte-shaped exactly like a client `local_key_blob`, so the cold copy can later be
-/// restored as an ordinary keystore.
-fn seal_recovery_key(out: &Path, passphrase: &str, id: &Identity) -> Result<(), SetupError> {
+/// `keyblob` the client keystore uses, returning the sealed BYTES (held `Zeroizing`).
+/// The blob is byte-shaped exactly like a client `local_key_blob`, so the cold copy
+/// can later be restored as an ordinary keystore. Pure CPU (no I/O): computed BEFORE
+/// the once-only register so a seal failure never orphans a committed recovery key.
+fn seal_recovery_blob(passphrase: &str, id: &Identity) -> Result<Zeroizing<Vec<u8>>, SetupError> {
     let blob = keyblob::seal(passphrase, id, ARGON2_DESKTOP_TARGET)
         .map_err(|_| SetupError::Io("could not seal recovery key".into()))?;
-    write_new(out, &blob)
+    Ok(Zeroizing::new(blob))
+}
+
+/// Write the three cold artifacts create-new. Called ONLY after register + mint have
+/// committed. On the first failure, returns the error (the caller then emergency-dumps).
+fn write_all_artifacts(
+    opts: &SetupOpts,
+    sealed: &[u8],
+    pin: &[u8],
+    first_key: &str,
+) -> Result<(), SetupError> {
+    write_new(&opts.out, sealed)?;
+    write_new(&opts.pin_out, pin)?;
+    write_new(&opts.first_key_out, first_key.as_bytes())?;
+    Ok(())
+}
+
+/// Last-resort recovery of the two IRREPLACEABLE secrets when a post-commit write
+/// fails. The sealed blob is passphrase-encrypted (safe-ish to print); the first key is
+/// a bootstrap secret dumped only because register/mint already committed and a re-run
+/// 409s. NEVER prints the passphrase or any bare private key. The pin is omitted (it is
+/// recomputable from the sealed blob).
+fn emergency_dump(sealed: &[u8], first_key: &str) {
+    let bar = "!".repeat(72);
+    eprintln!();
+    eprintln!("{bar}");
+    eprintln!("!!!  EMERGENCY: SETUP COMMITTED SERVER-SIDE BUT COULD NOT WRITE FILES  !!!");
+    eprintln!("{bar}");
+    eprintln!();
+    eprintln!("The recovery account is REGISTERED and the first registration key is MINTED,");
+    eprintln!("but one or more artifact files could NOT be written to disk. These two values");
+    eprintln!("are IRREPLACEABLE and re-running this tool will 409. SAVE THEM NOW, BY HAND.");
+    eprintln!();
+    eprintln!("--- SEALED RECOVERY KEY BLOB (base64; passphrase-encrypted, == the --out file) ---");
+    eprintln!("Recreate with e.g.:  echo '<line-below>' | base64 -d > recovery_key_blob");
+    eprintln!("{}", B64.encode(sealed));
+    eprintln!();
+    eprintln!("--- FIRST REGISTRATION KEY (bootstrap secret; whoever enrolls FIRST is admin) ---");
+    eprintln!("{first_key}");
+    eprintln!();
+    eprintln!("(The recovery_pin.bin is NOT dumped — it is recomputable from the sealed blob.)");
+    eprintln!("{bar}");
+    eprintln!();
 }
 
 /// Write `bytes` to `path`, creating parent dirs, and FAILING if the file already

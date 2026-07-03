@@ -9,6 +9,7 @@
 //!     recovery enc-pub + ML-KEM (fetched from `GET /v1/recovery/pubkey`);
 //!   * emit a first registration key that actually enrolls a user (201) whose
 //!     directory binding is ADMIN;
+//!
 //! and a SECOND run against the same (now-registered) server must fail with
 //! `AlreadyRegistered` and write NOTHING new (fresh output paths stay absent).
 
@@ -249,4 +250,71 @@ async fn setup_bootstraps_recovery_first_key_and_pin_then_409_on_rerun() {
     assert!(!opts2.out.exists(), "409 wrote no key blob");
     assert!(!opts2.pin_out.exists(), "409 wrote no pin");
     assert!(!opts2.first_key_out.exists(), "409 wrote no first key");
+}
+
+/// Robustness gap: if a cold-artifact WRITE fails AFTER the once-only register has
+/// committed, `run` must surface an `Io` error (and, in the binary, emergency-dump the
+/// sealed blob + first key to stderr) rather than silently losing the irreplaceable
+/// recovery key. The registration nevertheless stands server-side, so the operator can
+/// recover from the dump. Here we force the FIRST write to fail by pointing `--out`
+/// under a parent that is a regular file (so `create_dir_all` fails) — preflight passes
+/// (the path does not yet exist) but the write fails only post-commit — and we prove
+/// register stuck via a 409 on a clean re-run.
+#[tokio::test]
+async fn post_register_write_failure_is_io_error_but_registration_commits() {
+    let (addr, cert) = start().await;
+    let transport = transport_to(addr, cert.clone());
+    let dir = tempdir();
+
+    // A regular file masquerading as the parent directory of `--out`.
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+
+    let opts = SetupOpts {
+        host: "localhost".to_owned(),
+        out: blocker.join("recovery_key_blob"), // parent is a FILE → create_dir_all fails
+        pin_out: dir.join("recovery_pin.bin"),
+        first_key_out: dir.join("first_registration_key.txt"),
+        passphrase: Zeroizing::new("correct horse battery staple 9!".to_owned()),
+    };
+
+    let err = run(&transport, &opts)
+        .await
+        .expect_err("post-commit write must fail");
+    assert!(
+        matches!(err, SetupError::Io(_)),
+        "write failure surfaces as Io, got {err:?}"
+    );
+    // The failing first write aborts before the other two artifacts are touched.
+    assert!(!opts.pin_out.exists(), "no pin written once the out-write failed");
+    assert!(
+        !opts.first_key_out.exists(),
+        "no first key written once the out-write failed"
+    );
+
+    // Register nevertheless COMMITTED: the server serves a recovery pubkey now ...
+    let mut c = open(&transport).await;
+    let (st, _pk) = get(&mut c, "/v1/recovery/pubkey").await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "recovery account is registered despite the write failure"
+    );
+
+    // ... and a clean re-run is rejected 409 (the once-only register stuck).
+    let dir2 = tempdir();
+    let opts2 = SetupOpts {
+        host: "localhost".to_owned(),
+        out: dir2.join("recovery_key_blob"),
+        pin_out: dir2.join("recovery_pin.bin"),
+        first_key_out: dir2.join("first_registration_key.txt"),
+        passphrase: Zeroizing::new("correct horse battery staple 9!".to_owned()),
+    };
+    let err2 = run(&transport, &opts2)
+        .await
+        .expect_err("clean re-run must 409");
+    assert!(
+        matches!(err2, SetupError::AlreadyRegistered),
+        "re-run is AlreadyRegistered, got {err2:?}"
+    );
 }

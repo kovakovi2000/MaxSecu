@@ -22,6 +22,29 @@ use zeroize::Zeroizing;
 use maxsecu_client_app::transport::{pinned_client_config, Transport};
 use maxsecu_setup::{run, SetupError, SetupOpts};
 
+/// Typed outcome of [`real_main`], mapped to a process exit code in [`main`] — replaces
+/// smuggling a magic sentinel string through the error channel.
+enum SetupExit {
+    /// The once-only recovery account already exists (409). Distinct exit code 3 so
+    /// scripts can tell "already done" from a real fault.
+    AlreadyRegistered,
+    /// Any other fault (config / cert / network / protocol / io). Exit code 1.
+    Failed(String),
+}
+
+// `?` on the config-plumbing errors (missing flag &str, formatted String) folds them
+// into `Failed` automatically.
+impl From<String> for SetupExit {
+    fn from(m: String) -> Self {
+        SetupExit::Failed(m)
+    }
+}
+impl From<&str> for SetupExit {
+    fn from(m: &str) -> Self {
+        SetupExit::Failed(m.to_owned())
+    }
+}
+
 /// Parse `--key value` / `--flag` pairs into a map (flags win over env).
 fn parse_flags() -> HashMap<String, String> {
     let mut out = HashMap::new();
@@ -68,7 +91,7 @@ fn prompt_passphrase() -> Result<Zeroizing<String>, String> {
     Ok(Zeroizing::new(line))
 }
 
-async fn real_main() -> Result<(), String> {
+async fn real_main() -> Result<(), SetupExit> {
     let flags = parse_flags();
 
     let dial = opt(&flags, "server", "SETUP_SERVER", Some("127.0.0.1:8443")).unwrap();
@@ -138,11 +161,10 @@ async fn real_main() -> Result<(), String> {
             println!("=======================================================");
             Ok(())
         }
-        Err(e) => Err(match e {
-            // AlreadyRegistered is handled by the caller for a distinct exit code.
-            SetupError::AlreadyRegistered => "__already_registered__".to_owned(),
-            other => other.to_string(),
-        }),
+        // Map the one "expected once-only" outcome to its typed variant; everything
+        // else is a plain failure. No sentinel strings.
+        Err(SetupError::AlreadyRegistered) => Err(SetupExit::AlreadyRegistered),
+        Err(other) => Err(SetupExit::Failed(other.to_string())),
     }
 }
 
@@ -150,7 +172,7 @@ async fn real_main() -> Result<(), String> {
 async fn main() -> ExitCode {
     match real_main().await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(msg) if msg == "__already_registered__" => {
+        Err(SetupExit::AlreadyRegistered) => {
             eprintln!(
                 "[setup] the server already has a recovery account registered (409). \
                  Nothing was written. This tool is one-shot; run it only against a FRESH server."
@@ -158,7 +180,7 @@ async fn main() -> ExitCode {
             // Distinct non-zero code so scripts can tell "already done" from a fault.
             ExitCode::from(3)
         }
-        Err(msg) => {
+        Err(SetupExit::Failed(msg)) => {
             eprintln!("[setup] error: {msg}");
             ExitCode::FAILURE
         }
