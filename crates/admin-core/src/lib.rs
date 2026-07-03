@@ -17,7 +17,6 @@
 mod control;
 mod directory;
 mod recovery;
-pub mod recovery_seal;
 mod subtree;
 pub mod sweep;
 
@@ -27,8 +26,8 @@ pub use control::{
 };
 pub use directory::{DirectorySigner, SignedBinding};
 pub use recovery::{
-    build_recovery_grant, reconstruct_recovery_key, split_recovery_key, validate_recovery_wrap,
-    RecoveryError, RecoveryGrantOut, RecoveryGrantParams, RecoveryWrapCtx, SweepError,
+    build_recovery_grant, validate_recovery_wrap, RecoveryError, RecoveryGrantOut,
+    RecoveryGrantParams, RecoveryWrapCtx, SweepError,
 };
 pub use subtree::{revocation_subtree, GrantEdge};
 

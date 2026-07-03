@@ -3181,7 +3181,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "image",
- "maxsecu-admin-core",
  "maxsecu-client-core",
  "maxsecu-crypto",
  "maxsecu-encoding",

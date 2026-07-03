@@ -4,7 +4,6 @@
 //! modules directly.
 pub mod admin;
 pub mod bootstrap;
-pub mod ceremony;
 pub mod commands;
 pub mod config;
 pub mod content_cache;
@@ -22,7 +21,6 @@ pub mod keystore;
 pub mod layout;
 pub mod ram;
 pub mod recipients;
-pub mod recovery_share;
 pub mod revocations;
 pub mod session;
 pub mod sink;
