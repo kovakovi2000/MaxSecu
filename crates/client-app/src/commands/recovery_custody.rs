@@ -9,7 +9,9 @@
 //!   reconstructed key never crosses the seam (T6, this file).
 //!
 //! **Synchronous, local-only — no network, no disk write.** This module
-//! deliberately imports NO `hyper`/`http_client`/networking (spec §3). The split
+//! deliberately imports no HTTP client crate and no async networking runtime
+//! type (spec §3; the module-source grep gate in `discard_tests` enforces this
+//! at test time). The split
 //! operation is (1) read the sealed file the caller named, (2) unseal it with the
 //! passphrase (`admin_core::recovery_seal::open_recovery_secret`, T1), (3)
 //! Shamir-split the recovery scalar (`admin_core::recovery::split_recovery_key`),
@@ -443,6 +445,140 @@ fn prove_in_session(
     // whole ceremony hinges on. Nothing here logs or `Debug`s `secret`/the wrap.
     let verified = validate_recovery_wrap(secret, &wrap, dek_commit, &ctx).is_ok();
     Ok(ProveResponse { verified })
+}
+
+// ---- discard ----
+
+/// `discard_ceremony_session` — end the in-progress ceremony and wipe every
+/// secret it was holding (spec §8 / §11): the collected share bodies and any
+/// reconstructed [`EncSecretKey`]s. Synchronous, local-only, no network.
+///
+/// This is the operator's explicit "cancel/done" action, and also the type
+/// this state's own `Drop` impl calls on app exit (`ceremony.rs`'s
+/// `CeremonySessionInner::reset`/`Drop`) — so a custodian's shares/keys never
+/// outlive either an explicit discard or the process itself.
+#[tauri::command]
+pub fn discard_ceremony_session(state: State<'_, CeremonySession>) -> Result<(), UiError> {
+    discard_in_session(&state);
+    Ok(())
+}
+
+/// The testable logic behind [`discard_ceremony_session`], decoupled from
+/// `tauri::State` so it can run against a plain [`CeremonySession`] in tests.
+/// One lock, one call to `reset()` — draining+zeroizing the share bodies and
+/// clearing the reconstructed-key map (`ceremony.rs::CeremonySessionInner::reset`).
+fn discard_in_session(session: &CeremonySession) {
+    let mut inner = session.0.lock().unwrap();
+    inner.reset();
+}
+
+#[cfg(test)]
+mod discard_tests {
+    use super::*;
+    use maxsecu_admin_core::split_recovery_key as split_real_recovery_key;
+    use maxsecu_crypto::generate_enc_keypair;
+
+    /// Build a real `k`-of-`n` recovery split under `label`, wire-encoded as
+    /// MSHARE1 strings — a local copy of `reconstruct_tests::split_real_key`
+    /// (that helper is private to its own `mod`, so this test module keeps its
+    /// own small copy rather than reaching into a sibling `mod`'s privates).
+    fn split_real_key(k: u8, n: u8, label: &str) -> Vec<String> {
+        let (rsk, _rpk) = generate_enc_keypair();
+        let shares = split_real_recovery_key(&rsk, k, n).expect("split");
+        shares
+            .iter()
+            .map(|s| crate::recovery_share::encode(s, label, k, n))
+            .collect()
+    }
+
+    #[test]
+    fn discard_zeroizes_and_a_subsequent_reconstruct_fails_closed() {
+        let texts = split_real_key(3, 5, "recovery-2026-07");
+        let session = CeremonySession::new();
+        for &i in &[0usize, 1, 2] {
+            add_share_to_session(&texts[i], &session).expect("add share ok");
+        }
+        let resp = reconstruct_in_session(&session).expect("reconstruct ok");
+
+        {
+            let inner = session.0.lock().unwrap();
+            assert_eq!(inner.have(), 3, "sanity: shares present before discard");
+            assert!(
+                inner.reconstructed(&resp.ceremony_handle).is_some(),
+                "sanity: a reconstructed key is present before discard"
+            );
+        }
+
+        discard_in_session(&session);
+
+        let inner = session.0.lock().unwrap();
+        assert_eq!(inner.have(), 0, "shares must be gone after discard");
+        assert_eq!(inner.need(), 0, "threshold must be reset after discard");
+        assert_eq!(inner.label(), None, "label must be cleared after discard");
+        assert!(
+            inner.shares().is_empty(),
+            "share bodies must be gone (zeroized+drained) after discard"
+        );
+        assert!(
+            inner.reconstructed(&resp.ceremony_handle).is_none(),
+            "reconstructed key map must be cleared after discard"
+        );
+        drop(inner);
+
+        // A subsequent reconstruct against the now-empty session fails closed —
+        // there is nothing left to combine.
+        let err = reconstruct_in_session(&session)
+            .expect_err("reconstruct after discard must fail closed");
+        assert_eq!(err.code, "insufficient_shares");
+    }
+
+    #[test]
+    fn discard_on_a_fresh_session_is_a_harmless_noop() {
+        let session = CeremonySession::new();
+        discard_in_session(&session);
+        let inner = session.0.lock().unwrap();
+        assert_eq!(inner.have(), 0);
+        assert_eq!(inner.need(), 0);
+        assert_eq!(inner.label(), None);
+    }
+
+    /// Spec §11 no-network gate: this WHOLE module (the T6 offline ceremony
+    /// command set) must perform zero network I/O. Read the module's own
+    /// source and assert it contains none of a handful of networking-crate /
+    /// networking-type tokens.
+    ///
+    /// CAVEAT (read before "simplifying" this): each needle below is built
+    /// with `concat!` from two half-fragments, split so that the FULL token
+    /// never sits contiguously as literal text anywhere in this file — not in
+    /// the needle definitions, and (deliberately) not written out here in
+    /// this doc comment either. `include_str!` reads THIS file's own source
+    /// at compile time; if a needle were instead a single plain string
+    /// literal, `include_str!` would see that exact literal sitting right in
+    /// this test and `assert!(!src.contains(needle))` would trivially fail on
+    /// itself — a false positive that a future editor could "fix" by
+    /// deleting the assertion instead of catching a real offending import.
+    /// `concat!` joins its two fragments into one string ONLY at compile
+    /// time, for the `contains` check — the fragments themselves never sit
+    /// adjacent as source text. Do not collapse a needle back into one
+    /// string literal, and do not spell a forbidden token out in a comment.
+    #[test]
+    fn module_source_performs_zero_network_io() {
+        let src = include_str!("recovery_custody.rs");
+        let needles = [
+            concat!("hy", "per"),
+            concat!("http_", "client"),
+            concat!("req", "west"),
+            concat!("tokio::", "net"),
+            concat!("Tcp", "Stream"),
+        ];
+        for needle in needles {
+            assert!(
+                !src.contains(needle),
+                "recovery_custody.rs must perform zero network I/O (spec §11) — \
+                 found forbidden token fragment reconstructing to {needle:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
