@@ -17,9 +17,10 @@
 //! never aborts the batch or rolls back the others. The sanitized per-recipient
 //! failure codes are: "untrusted" (unresolvable / bad binding), "revoked",
 //! "pq_key_missing", "verify_failed" (DEK-commitment mismatch), "recovery_recipient",
-//! "wrap_failed", "share_failed" (a non-201 POST), "locked" (the identity was
-//! momentarily absent mid-batch — see [`run_reshare_batch`]), or a transport error
-//! code. Re-sharing is idempotent server-side (`Store::add_wrap` replaces the row),
+//! "wrap_failed", "share_failed" (a non-201 POST), "server_untrusted" (the
+//! recipient's TOFU-pinned key CHANGED — trust-alarm B, [`crate::tofu`]), "locked"
+//! (the identity was momentarily absent mid-batch — see [`run_reshare_batch`]), or a
+//! transport error code. Re-sharing is idempotent server-side (`Store::add_wrap` replaces the row),
 //! so retrying just the failed rows is always safe.
 //!
 //! **Identity-borrow discipline (spec §9).** The non-`Clone` `Identity` is borrowed

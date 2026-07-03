@@ -124,8 +124,13 @@ impl TofuStore {
         let fp = key_fingerprint(enc_pub, sig_pub);
         match self.map.get(username) {
             None => {
-                self.map.insert(username.to_owned(), fp);
-                self.persist()?;
+                // Persist the CANDIDATE map first; only commit to `self.map` after the
+                // atomic on-disk write succeeds, so a persist failure never leaves an
+                // in-RAM pin that was never written to disk.
+                let mut candidate = self.map.clone();
+                candidate.insert(username.to_owned(), fp);
+                self.persist(&candidate)?;
+                self.map = candidate;
                 Ok(TofuOutcome::Pinned)
             }
             Some(pinned) if *pinned == fp => Ok(TofuOutcome::Match),
@@ -138,16 +143,19 @@ impl TofuStore {
         self.map.get(username).copied()
     }
 
-    /// Encrypt + persist the map to `<dir>/tofu/pins.tofu` (creates `tofu/`).
-    fn persist(&self) -> Result<(), UiError> {
+    /// Encrypt + persist `map` to `<dir>/tofu/pins.tofu` (creates `tofu/`).
+    ///
+    /// **Atomic replace** (mirrors `keystore.rs`): seal into a sibling `.tmp`,
+    /// `sync_all` to flush it to disk, then `rename` over the live path. A crash /
+    /// power-loss mid-write therefore leaves the OLD sealed blob intact — never a
+    /// torn `pins.tofu` that would fail-closed on the next `open` and brick sharing.
+    /// This store is security-sensitive, so it must not use the non-atomic write
+    /// `index.rs` gets away with (a lost search index is merely rebuilt).
+    fn persist(&self, map: &BTreeMap<String, [u8; 32]>) -> Result<(), UiError> {
         let dir = self.path.parent().ok_or_else(untrusted_write)?;
         std::fs::create_dir_all(dir).map_err(|_| untrusted_write())?;
         let on_disk = TofuMap {
-            pins: self
-                .map
-                .iter()
-                .map(|(u, fp)| (u.clone(), hex32(fp)))
-                .collect(),
+            pins: map.iter().map(|(u, fp)| (u.clone(), hex32(fp))).collect(),
         };
         let plain = serde_json::to_vec(&on_disk).map_err(|_| untrusted_write())?;
         let nonce = maxsecu_crypto::random_array::<12>();
@@ -155,7 +163,16 @@ impl TofuStore {
         let mut out = Vec::with_capacity(12 + ct.len());
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ct);
-        std::fs::write(&self.path, out).map_err(|_| untrusted_write())
+
+        // Write to a sibling temp file, fsync it, then atomically rename over the
+        // original within the same directory.
+        let tmp = self.path.with_extension("tofu.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(|_| untrusted_write())?;
+            std::io::Write::write_all(&mut f, &out).map_err(|_| untrusted_write())?;
+            f.sync_all().map_err(|_| untrusted_write())?;
+        }
+        std::fs::rename(&tmp, &self.path).map_err(|_| untrusted_write())
     }
 }
 
@@ -321,6 +338,28 @@ mod tests {
         let other = Identity::generate();
         assert!(TofuStore::open(&dir, &other).is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_or_torn_store_fails_closed_on_open() {
+        let dir = tmp_dir();
+        let id = Identity::generate();
+        // Simulate a torn / garbage `pins.tofu` (e.g. a crash mid-write, or bytes not
+        // produced by our seal): open must fail closed, never silently discard pins.
+        let tofu_dir = dir.join("tofu");
+        std::fs::create_dir_all(&tofu_dir).unwrap();
+        std::fs::write(tofu_dir.join("pins.tofu"), b"not-a-sealed-blob").unwrap();
+        // `.err().unwrap()` (not `unwrap_err`) so `TofuStore` need not be `Debug` —
+        // it holds the derived sealing key, which must not be printable.
+        let err = TofuStore::open(&dir, &id).err().unwrap();
+        assert_eq!(err.code, "untrusted");
+        // A too-short file (fewer than the 12-byte nonce) is likewise fail-closed.
+        std::fs::write(tofu_dir.join("pins.tofu"), b"short").unwrap();
+        assert_eq!(
+            TofuStore::open(&dir, &id).err().unwrap().code,
+            "untrusted"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
