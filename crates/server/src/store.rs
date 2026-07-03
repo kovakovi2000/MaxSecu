@@ -194,6 +194,25 @@ pub struct VersionMeta {
 /// transient DB error is surfaced (→ 500, logged) rather than swallowed into a
 /// fail-closed "not found" that silently denies (see [`StoreError`]). Callers
 /// still fail *closed* — they map `Err` to denial — but now *observably*.
+/// The outcome of the atomic registration-key [`enroll`](Store::enroll) unit of
+/// work (T4). A backend fault is the separate `Err` arm — these are the clean
+/// business outcomes, each leaving the store in a fully-consistent state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollOutcome {
+    /// The registration key was unknown / already used / expired. NOTHING was
+    /// written — the key is not consumed, no user created (→ 403). A retry with a
+    /// valid key still works.
+    KeyInvalid,
+    /// The username is taken. The whole unit rolled back — the key is NOT consumed
+    /// and no partial row remains (→ 409). A retry with a free username + the same
+    /// key works.
+    UsernameTaken,
+    /// The user was created, the first-admin slot resolved, and the matching
+    /// server-signed binding stored — ALL atomically (→ 201). `is_admin` reports
+    /// whether this registrant claimed the one-time admin slot.
+    Enrolled { is_admin: bool },
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     /// Create an unsigned user, assigning a fresh 16-byte `user_id` (api.md
@@ -290,21 +309,48 @@ pub trait Store: Send + Sync {
     /// [`consume_voucher`]: Store::consume_voucher
     async fn consume_registration_key(&self, key_hash: &[u8; 32])
         -> Result<bool, StoreError>;
-    /// `true` iff at least one user account exists — the first-admin gate: the
-    /// first registrant (while this is `false`) is enrolled as admin (§ T4).
+    /// `true` iff at least one user account exists.
+    ///
+    /// **T15: production-dead.** Superseded by the atomic first-admin claim inside
+    /// [`enroll`](Store::enroll); retained only for the `reg_keys` unit test.
+    /// Remove in the bootstrap cleanup sweep.
     async fn any_user_exists(&self) -> Result<bool, StoreError>;
     /// Atomically claim the ONE-TIME "first admin" slot: `Ok(true)` for exactly
-    /// the first caller ever (→ enrolled `{User, Admin}`), `Ok(false)` for every
-    /// caller thereafter (→ `{User}`). This is the race-safe replacement for a
-    /// read-then-decide on [`any_user_exists`](Store::any_user_exists): the admin
-    /// decision is a single atomic mutation (a singleton row claimed via `ON
-    /// CONFLICT DO NOTHING`, the same pattern as [`set_recovery_account`]), so two
-    /// concurrent first-registrants can never both become admin — exactly one
-    /// wins, closing the first-admin TOCTOU. Called only after a user is
-    /// successfully created. `Err` = backend fault.
+    /// the first caller ever, `Ok(false)` thereafter. The race-safe primitive
+    /// backing [`enroll`](Store::enroll)'s admin decision — a singleton row claimed
+    /// via `ON CONFLICT DO NOTHING` (the same pattern as [`set_recovery_account`]),
+    /// so two concurrent first-registrants can never both become admin. Exposed on
+    /// the trait so tests can pre-claim the slot (mark a genesis admin) before
+    /// exercising later enrollments; the enrollment path itself performs the claim
+    /// *inside* [`enroll`](Store::enroll)'s transaction, not via this method.
     ///
     /// [`set_recovery_account`]: Store::set_recovery_account
     async fn claim_first_admin(&self) -> Result<bool, StoreError>;
+    /// **Atomic registration-key enrollment (T4).** Performs the entire unit of
+    /// work — consume the single-use key, create the user, resolve the one-time
+    /// first-admin slot, and store the matching **already-signed** binding — in ONE
+    /// transaction (PgStore) / under the single lock (MemoryStore), so a fault
+    /// mid-way leaves NO partial state: the key is not consumed, no orphan user, no
+    /// dangling admin claim, and a retry with the same key works. Signing is pure
+    /// and done by the caller *before* this call; the two candidate bindings
+    /// (`user_binding` = `{User}`, `admin_binding` = `{User, Admin}`) are signed
+    /// for the SAME `user_id`, and this method stores exactly the one matching the
+    /// atomic first-admin decision. `key_version` is always 1 (enrollment).
+    ///
+    /// Returns [`EnrollOutcome`]; `Err` is a backend fault (→ 500). Closes the
+    /// first-enrollment "zero-admins" hole that a non-transactional
+    /// consume→create→claim→put sequence left on a mid-sequence fault.
+    #[allow(clippy::too_many_arguments)]
+    async fn enroll(
+        &self,
+        reg_key_hash: [u8; 32],
+        user_id: [u8; 16],
+        username: &str,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+        user_binding: &StoredBinding,
+        admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError>;
 
     // ---- Recovery account (the single escrow identity; T3) ----
 
@@ -792,6 +838,57 @@ impl Store for MemoryStore {
         }
         inner.first_admin_claimed = true;
         Ok(true)
+    }
+
+    async fn enroll(
+        &self,
+        reg_key_hash: [u8; 32],
+        user_id: [u8; 16],
+        username: &str,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+        user_binding: &StoredBinding,
+        admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError> {
+        // Everything happens under the single `Inner` lock. Preconditions are
+        // checked FIRST and the maps are only mutated once all pass, so an early
+        // return leaves the store byte-for-byte unchanged (the MemoryStore analogue
+        // of a Pg transaction rolled back before any write).
+        let mut inner = self.inner.lock().unwrap();
+        // 1. Single-use key (the dev store tracks membership only, no expiry).
+        if !inner.reg_keys.contains(&reg_key_hash) {
+            return Ok(EnrollOutcome::KeyInvalid); // nothing consumed
+        }
+        // 2. Username uniqueness — bail BEFORE consuming the key.
+        if inner.users.contains_key(username) {
+            return Ok(EnrollOutcome::UsernameTaken); // key NOT consumed
+        }
+        // 3. First-admin slot (same flag as `claim_first_admin`).
+        let is_admin = !inner.first_admin_claimed;
+        let binding = if is_admin { admin_binding } else { user_binding };
+        // All preconditions passed — commit every mutation together.
+        inner.reg_keys.remove(&reg_key_hash);
+        inner.first_admin_claimed = true;
+        inner.users.insert(
+            username.to_owned(),
+            UserRecord {
+                user_id,
+                enc_pub,
+                sig_pub,
+            },
+        );
+        inner.created_ms.insert(username.to_owned(), now_ms_wall());
+        inner.bindings.insert(
+            user_id,
+            (
+                1,
+                StoredBinding {
+                    binding_bytes: binding.binding_bytes.clone(),
+                    signature: binding.signature,
+                },
+            ),
+        );
+        Ok(EnrollOutcome::Enrolled { is_admin })
     }
 
     async fn set_recovery_account(
@@ -1333,6 +1430,18 @@ impl Store for FaultyStore {
     }
     async fn claim_first_admin(&self) -> Result<bool, StoreError> {
         Err(Self::fault("claim_first_admin"))
+    }
+    async fn enroll(
+        &self,
+        _reg_key_hash: [u8; 32],
+        _user_id: [u8; 16],
+        _username: &str,
+        _enc_pub: [u8; 32],
+        _sig_pub: [u8; 32],
+        _user_binding: &StoredBinding,
+        _admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError> {
+        Err(Self::fault("enroll"))
     }
     async fn set_recovery_account(
         &self,

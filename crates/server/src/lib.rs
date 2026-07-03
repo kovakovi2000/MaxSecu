@@ -56,7 +56,7 @@ pub use files::{
     ListFilter, ParsedStage, StageError, StageInput, VersionSelector, WrapInput,
 };
 pub use store::{
-    ChunkSlot, FileListEntry, FileView, MemoryStore, NonceRecord, PendingUser, RecipientView,
-    RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
-    UserRecord, VersionMeta, WrapView,
+    ChunkSlot, EnrollOutcome, FileListEntry, FileView, MemoryStore, NonceRecord, PendingUser,
+    RecipientView, RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store,
+    StreamView, UserRecord, VersionMeta, WrapView,
 };

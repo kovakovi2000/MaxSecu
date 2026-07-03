@@ -16,9 +16,9 @@ use maxsecu_encoding::types::{
 };
 use maxsecu_encoding::{encode, RECOVERY_ID};
 use maxsecu_server::{
-    parse_stage, AddWrapError, AuthConfig, AuthService, DeleteWrapError, FinalizeError,
-    GenesisInput, ListFilter, PgStore, RecoveryAccount, SessionRecord, StageError, StageInput,
-    Store, VersionSelector, WrapInput,
+    parse_stage, AddWrapError, AuthConfig, AuthService, DeleteWrapError, EnrollOutcome,
+    FinalizeError, GenesisInput, ListFilter, PgStore, RecoveryAccount, SessionRecord, StageError,
+    StageInput, StoredBinding, Store, VersionSelector, WrapInput,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -201,6 +201,127 @@ fn make_proof(sk: &SigningKey, server_id: &str, nonce: &[u8; 32], ts: u64) -> [u
         timestamp: Timestamp(ts),
     };
     sk.sign_canonical(labels::AUTH, &ctx)
+}
+
+/// Build a canonical, D5-signed binding for `user_id` with the given roles — the
+/// exact wire form `enroll` decodes to populate the projection columns.
+fn signed_binding(
+    d5: &SigningKey,
+    user_id: [u8; 16],
+    username: &str,
+    enc_pub: [u8; 32],
+    sig_pub: [u8; 32],
+    admin: bool,
+) -> StoredBinding {
+    let roles = if admin {
+        RoleSet::new([Role::User, Role::Admin])
+    } else {
+        RoleSet::new([Role::User])
+    };
+    let b = DirBinding {
+        username: Text::new(username).unwrap(),
+        user_id: Id(user_id),
+        enc_pub: Bytes32(enc_pub),
+        sig_pub: Bytes32(sig_pub),
+        key_version: 1,
+        roles,
+        not_before: Timestamp(0),
+        not_after: Timestamp(4_102_444_800_000),
+        mlkem_pub: None,
+    };
+    StoredBinding {
+        signature: d5.sign_canonical(labels::DIRBINDING, &b),
+        binding_bytes: encode(&b),
+    }
+}
+
+/// `enroll` over REAL Postgres is a single all-or-nothing transaction: an invalid
+/// key writes nothing; the first enrollee is `{User, Admin}` and later ones
+/// `{User}`; and a username collision rolls the whole unit back (key unspent).
+#[tokio::test]
+async fn enroll_is_atomic_and_first_is_admin_over_pg() {
+    let db = db_or_skip!();
+    let store = &db.store;
+    let d5 = SigningKey::generate();
+    const NEVER: u64 = 4_102_444_800_000;
+
+    // (a) An UNSEEDED key: KeyInvalid, and nothing is written (transaction rolls back).
+    let kh = sha256(b"rk-1");
+    let uid1: [u8; 16] = random_array();
+    let ub = signed_binding(&d5, uid1, "alice", [0x11; 32], [0x22; 32], false);
+    let ab = signed_binding(&d5, uid1, "alice", [0x11; 32], [0x22; 32], true);
+    assert_eq!(
+        store
+            .enroll(kh, uid1, "alice", [0x11; 32], [0x22; 32], &ub, &ab)
+            .await
+            .unwrap(),
+        EnrollOutcome::KeyInvalid
+    );
+    assert!(!store.any_user_exists().await.unwrap(), "KeyInvalid created no user");
+    assert!(store.binding_by_username("alice").await.unwrap().is_none());
+
+    // (b) Seed the key; the FIRST enrollment claims admin + stores the admin
+    // binding, atomically consuming the key. Verify over a FRESH pool (it's in the
+    // DB, not one process's memory).
+    store.issue_registration_key(kh, NEVER).await.unwrap();
+    assert_eq!(
+        store
+            .enroll(kh, uid1, "alice", [0x11; 32], [0x22; 32], &ub, &ab)
+            .await
+            .unwrap(),
+        EnrollOutcome::Enrolled { is_admin: true }
+    );
+    assert!(
+        !store.consume_registration_key(&kh).await.unwrap(),
+        "the key was consumed inside enroll"
+    );
+    let fresh = db.reopen().await;
+    let stored = fresh.binding_by_username("alice").await.unwrap().unwrap();
+    let decoded: DirBinding = maxsecu_encoding::decode(&stored.binding_bytes).unwrap();
+    assert!(
+        decoded.roles.roles().contains(&Role::Admin),
+        "first registrant persisted as admin"
+    );
+
+    // (c) A SECOND enrollment is User-only.
+    let kh2 = sha256(b"rk-2");
+    let uid2: [u8; 16] = random_array();
+    let ub2 = signed_binding(&d5, uid2, "bob", [0x33; 32], [0x44; 32], false);
+    let ab2 = signed_binding(&d5, uid2, "bob", [0x33; 32], [0x44; 32], true);
+    store.issue_registration_key(kh2, NEVER).await.unwrap();
+    assert_eq!(
+        store
+            .enroll(kh2, uid2, "bob", [0x33; 32], [0x44; 32], &ub2, &ab2)
+            .await
+            .unwrap(),
+        EnrollOutcome::Enrolled { is_admin: false }
+    );
+    let stored = store.binding_by_username("bob").await.unwrap().unwrap();
+    let decoded: DirBinding = maxsecu_encoding::decode(&stored.binding_bytes).unwrap();
+    assert!(
+        !decoded.roles.roles().contains(&Role::Admin),
+        "second registrant is user-only"
+    );
+
+    // (d) A username collision rolls the whole unit back — the key is NOT burned.
+    let kh3 = sha256(b"rk-3");
+    let uid3: [u8; 16] = random_array();
+    let ub3 = signed_binding(&d5, uid3, "alice", [0x55; 32], [0x66; 32], false);
+    let ab3 = signed_binding(&d5, uid3, "alice", [0x55; 32], [0x66; 32], true);
+    store.issue_registration_key(kh3, NEVER).await.unwrap();
+    assert_eq!(
+        store
+            .enroll(kh3, uid3, "alice", [0x55; 32], [0x66; 32], &ub3, &ab3)
+            .await
+            .unwrap(),
+        EnrollOutcome::UsernameTaken
+    );
+    assert!(
+        store.consume_registration_key(&kh3).await.unwrap(),
+        "the key survived the rolled-back enrollment (still consumable)"
+    );
+
+    db.teardown().await;
 }
 
 #[tokio::test]

@@ -35,7 +35,7 @@ use crate::files::{
     VersionSelector, WrapInput,
 };
 use crate::store::{
-    ancestor_chain, ChunkSlot, FileListEntry, FileView, PendingUser, RecipientView,
+    ancestor_chain, ChunkSlot, EnrollOutcome, FileListEntry, FileView, PendingUser, RecipientView,
     RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
     UserRecord, VersionMeta, WrapView,
 };
@@ -445,6 +445,108 @@ impl Store for PgStore {
         .await
         .map_err(store_err("claim_first_admin"))?;
         Ok(res.rows_affected() == 1)
+    }
+
+    async fn enroll(
+        &self,
+        reg_key_hash: [u8; 32],
+        user_id: [u8; 16],
+        username: &str,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+        user_binding: &StoredBinding,
+        admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError> {
+        // ONE transaction: every step runs on `&mut *tx`, so a fault (or an early
+        // KeyInvalid/UsernameTaken) rolls the whole unit back — no burned key, no
+        // orphan user, no dangling admin claim.
+        let mut tx = self.pool.begin().await.map_err(store_err("enroll"))?;
+
+        // 1. Consume the single-use key atomically (same predicate as
+        // `consume_registration_key`). Not consumed ⇒ nothing was written ⇒ roll
+        // back and report KeyInvalid.
+        let consumed = sqlx::query(
+            "UPDATE registration_keys SET used_at = now() \
+             WHERE key_hash = $1 AND used_at IS NULL AND expires_at > now()",
+        )
+        .bind(&reg_key_hash[..])
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err("enroll"))?;
+        if consumed.rows_affected() != 1 {
+            tx.rollback().await.map_err(store_err("enroll"))?;
+            return Ok(EnrollOutcome::KeyInvalid);
+        }
+
+        // 2. Create the user with the caller-provided (already-bound) user_id. A
+        // unique violation (username OR id taken) rolls back — the key is unspent.
+        let ins = sqlx::query(
+            "INSERT INTO users (user_id, username, enc_pub, sig_pub) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&user_id[..])
+        .bind(username)
+        .bind(&enc_pub[..])
+        .bind(&sig_pub[..])
+        .execute(&mut *tx)
+        .await;
+        match ins {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                tx.rollback().await.map_err(store_err("enroll"))?;
+                return Ok(EnrollOutcome::UsernameTaken);
+            }
+            Err(e) => return Err(store_err("enroll")(e)),
+        }
+
+        // 3. Resolve the one-time first-admin slot inside the txn.
+        let claim = sqlx::query(
+            "INSERT INTO first_admin_claim (id) VALUES (true) ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err("enroll"))?;
+        let is_admin = claim.rows_affected() == 1;
+
+        // 4. Store the matching already-signed binding (+ the advisory projection
+        // columns / users mirror, exactly as `put_binding` does), all on the txn.
+        let binding = if is_admin { admin_binding } else { user_binding };
+        let b: DirBinding = decode(&binding.binding_bytes)
+            .map_err(|_| StoreError::new("enroll", "binding bytes are not canonical"))?;
+        let roles: Vec<String> = b.roles.roles().iter().map(role_text).collect();
+        sqlx::query(
+            "INSERT INTO directory_bindings \
+             (user_id, key_version, enc_pub, sig_pub, roles, not_before, not_after, \
+              binding_bytes, directory_signature) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        )
+        .bind(&user_id[..])
+        .bind(1i64)
+        .bind(&b.enc_pub.0[..])
+        .bind(&b.sig_pub.0[..])
+        .bind(&roles)
+        .bind(try_ms_to_ts(b.not_before.0, "enroll")?)
+        .bind(try_ms_to_ts(b.not_after.0, "enroll")?)
+        .bind(&binding.binding_bytes)
+        .bind(&binding.signature[..])
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err("enroll"))?;
+        sqlx::query(
+            "UPDATE users SET signed_at = now(), enc_pub = $2, sig_pub = $3, \
+             key_version = $4, roles = $5 WHERE user_id = $1",
+        )
+        .bind(&user_id[..])
+        .bind(&b.enc_pub.0[..])
+        .bind(&b.sig_pub.0[..])
+        .bind(1i64)
+        .bind(&roles)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err("enroll"))?;
+
+        // 5. Commit — the enrollment becomes visible all at once.
+        tx.commit().await.map_err(store_err("enroll"))?;
+        Ok(EnrollOutcome::Enrolled { is_admin })
     }
 
     async fn set_recovery_account(

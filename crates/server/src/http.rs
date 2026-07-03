@@ -222,25 +222,25 @@ struct RegisterRes {
 ///
 /// 1. validate the request (decode keys, well-formed username, signer available)
 ///    — all side-effect-free, so a malformed request never burns a key;
-/// 2. **consume the single-use registration key FIRST** — on failure reject and
-///    create no user (the key is the anti-spam + admission gate);
-/// 3. create the user;
-/// 4. decide the role ATOMICALLY via [`claim_first_admin`] — the first-ever
-///    registrant is `{User, Admin}`, everyone else `{User}` (no read-then-decide
-///    race);
-/// 5. build the binding and SIGN it server-side, then store it so
-///    `GET /v1/directory/<user>` serves a client-verifiable identity.
+/// 2. build BOTH candidate bindings for a fresh `user_id` and SIGN them
+///    server-side — pure, no store I/O (the private seed stays in the signer;
+///    only signature bytes cross into the store);
+/// 3. hand the whole unit of work to the ATOMIC [`enroll`]: it consumes the
+///    single-use key, creates the user, resolves the one-time first-admin slot,
+///    and stores the matching binding in ONE transaction. A fault leaves NO
+///    partial state — no burned key, no orphan user, no dangling admin claim —
+///    so a retry with the same key works. The first-ever registrant is
+///    `{User, Admin}`; everyone else `{User}`.
 ///
-/// (T6 will append the enrollment to the transparency log at step 5's success
-/// point — the signed-and-stored path is the clean hook.)
+/// (T6 will append the enrollment to the transparency log at the `Enrolled`
+/// success point — the signed-and-stored path is the clean hook.)
 ///
-/// [`claim_first_admin`]: crate::store::Store::claim_first_admin
+/// [`enroll`]: crate::store::Store::enroll
 async fn register<S: Store>(
     State(st): State<AppState<S>>,
     Json(req): Json<RegisterReq>,
 ) -> Response {
-    // (1) Pure validation — no store mutation yet, so a bad request cannot
-    // consume a registration key.
+    // (1) Pure validation — no store I/O yet, so a bad request cannot burn a key.
     let (Some(enc_pub), Some(sig_pub)) = (
         b64_fixed::<32>(&req.enc_pub_b64),
         b64_fixed::<32>(&req.sig_pub_b64),
@@ -251,68 +251,65 @@ async fn register<S: Store>(
         return StatusCode::BAD_REQUEST.into_response(); // over-long / non-canonical
     };
     // Enrollment requires the server to hold its directory-signing key; if it is
-    // not configured, enrollment is disabled (checked BEFORE consuming a key).
+    // not configured, enrollment is disabled (checked BEFORE any store I/O).
     let Some(signer) = st.auth.dir_signer() else {
         return StatusCode::FORBIDDEN.into_response(); // enrollment signing disabled
     };
 
-    // (2) Consume the single-use key FIRST. `false` ⇒ unknown/used/expired ⇒
-    // reject and do nothing else (no user is created).
+    // (2) The server assigns the id, then signs BOTH role variants for it (pure).
+    // The atomic `enroll` stores exactly the one that matches its first-admin
+    // decision — so the role decision and the signed binding can never diverge,
+    // and signing never needs to happen inside the store (no key in the store).
+    let user_id: [u8; 16] = random_array();
+    let sign_for = |roles: RoleSet| -> crate::store::StoredBinding {
+        let binding = DirBinding {
+            username: username.clone(),
+            user_id: Id(user_id),
+            enc_pub: Bytes32(enc_pub),
+            sig_pub: Bytes32(sig_pub),
+            key_version: 1,
+            roles,
+            not_before: Timestamp(BINDING_NOT_BEFORE_MS),
+            not_after: Timestamp(BINDING_NOT_AFTER_MS),
+            mlkem_pub: None,
+        };
+        let signature = signer.sign_canonical(DIRBINDING, &binding);
+        crate::store::StoredBinding {
+            binding_bytes: encode(&binding),
+            signature,
+        }
+    };
+    let user_binding = sign_for(RoleSet::new([Role::User]));
+    let admin_binding = sign_for(RoleSet::new([Role::User, Role::Admin]));
+
+    // (3) Atomic unit of work: consume-key → create-user → claim-admin →
+    // store-binding, all-or-nothing (see `Store::enroll`).
     let key_hash = maxsecu_crypto::sha256(req.registration_key.as_bytes());
-    match st.auth.store().consume_registration_key(&key_hash).await {
-        Ok(true) => {}                                          // admission granted
-        Ok(false) => return StatusCode::FORBIDDEN.into_response(), // invalid/used key
-        Err(e) => return internal_error(e),                    // backend fault, not "bad key"
-    }
-
-    // (3) Create the user (the key is already spent — one attempt per key).
-    let user_id = match st.auth.store().create_user(&req.username, enc_pub, sig_pub).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return StatusCode::CONFLICT.into_response(), // username taken
-        Err(e) => return internal_error(e),
-    };
-
-    // (4) Atomic first-admin decision (closes the TOCTOU — see `claim_first_admin`).
-    let is_first_admin = match st.auth.store().claim_first_admin().await {
-        Ok(b) => b,
-        Err(e) => return internal_error(e),
-    };
-    let roles = if is_first_admin {
-        RoleSet::new([Role::User, Role::Admin])
-    } else {
-        RoleSet::new([Role::User])
-    };
-
-    // (5) Build + SERVER-SIGN the binding, then store it (§5). The private seed
-    // stays inside the signer — only the signature crosses into the store.
-    let binding = DirBinding {
-        username,
-        user_id: Id(user_id),
-        enc_pub: Bytes32(enc_pub),
-        sig_pub: Bytes32(sig_pub),
-        key_version: 1,
-        roles,
-        not_before: Timestamp(BINDING_NOT_BEFORE_MS),
-        not_after: Timestamp(BINDING_NOT_AFTER_MS),
-        mlkem_pub: None,
-    };
-    let signature = signer.sign_canonical(DIRBINDING, &binding);
-    let binding_bytes = encode(&binding);
-    if let Err(e) = st
+    match st
         .auth
         .store()
-        .put_binding(user_id, 1, binding_bytes, signature)
+        .enroll(
+            key_hash,
+            user_id,
+            &req.username,
+            enc_pub,
+            sig_pub,
+            &user_binding,
+            &admin_binding,
+        )
         .await
     {
-        return internal_error(e);
+        Ok(crate::store::EnrollOutcome::Enrolled { .. }) => (
+            StatusCode::CREATED,
+            Json(RegisterRes {
+                user_id: hex_encode(&user_id),
+            }),
+        )
+            .into_response(),
+        Ok(crate::store::EnrollOutcome::KeyInvalid) => StatusCode::FORBIDDEN.into_response(),
+        Ok(crate::store::EnrollOutcome::UsernameTaken) => StatusCode::CONFLICT.into_response(),
+        Err(e) => internal_error(e),
     }
-    (
-        StatusCode::CREATED,
-        Json(RegisterRes {
-            user_id: hex_encode(&user_id),
-        }),
-    )
-        .into_response()
 }
 
 // ---- POST /v1/registration-keys — admin-minted single-use keys (§5) ----

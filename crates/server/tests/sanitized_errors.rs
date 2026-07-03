@@ -48,10 +48,10 @@ use maxsecu_encoding::types::{
 use maxsecu_encoding::structs::MLKEM768_PUB_LEN;
 use maxsecu_server::{
     router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteWrapError,
-    DiscardError, FileListEntry, FileView, FinalizeError, ListFilter, MemoryBlobStore, MemoryStore,
-    NullAuditSink, ParsedStage, PendingUser, RecipientView, RecoveryAccount, SessionRecord,
-    StageError, Store, StoreError, StoredBinding, StoredControlRecord, TlsExporter, UserRecord,
-    VersionMeta, VersionSelector, WrapInput,
+    DiscardError, EnrollOutcome, FileListEntry, FileView, FinalizeError, ListFilter,
+    MemoryBlobStore, MemoryStore, NullAuditSink, ParsedStage, PendingUser, RecipientView,
+    RecoveryAccount, SessionRecord, StageError, Store, StoreError, StoredBinding,
+    StoredControlRecord, TlsExporter, UserRecord, VersionMeta, VersionSelector, WrapInput,
 };
 
 const EXPORTER: [u8; 32] = [0xE7; 32];
@@ -174,6 +174,18 @@ impl Store for FaultyStore {
     }
     async fn claim_first_admin(&self) -> Result<bool, StoreError> {
         Err(bait("claim_first_admin"))
+    }
+    async fn enroll(
+        &self,
+        _reg_key_hash: [u8; 32],
+        _user_id: [u8; 16],
+        _username: &str,
+        _enc_pub: [u8; 32],
+        _sig_pub: [u8; 32],
+        _user_binding: &StoredBinding,
+        _admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError> {
+        Err(bait("enroll"))
     }
     async fn set_recovery_account(
         &self,
@@ -341,6 +353,28 @@ impl Store for FileFaultyStore {
     }
     async fn claim_first_admin(&self) -> Result<bool, StoreError> {
         self.inner.claim_first_admin().await
+    }
+    async fn enroll(
+        &self,
+        reg_key_hash: [u8; 32],
+        user_id: [u8; 16],
+        username: &str,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+        user_binding: &StoredBinding,
+        admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError> {
+        self.inner
+            .enroll(
+                reg_key_hash,
+                user_id,
+                username,
+                enc_pub,
+                sig_pub,
+                user_binding,
+                admin_binding,
+            )
+            .await
     }
     async fn set_recovery_account(
         &self,
