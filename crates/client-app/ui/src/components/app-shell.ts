@@ -6,6 +6,7 @@ import "./connect-screen.ts";
 import "./bootstrap-screen.ts";
 import "./pending-screen.ts";
 import "./admin-screen.ts";
+import "./recovery-split-screen.ts";
 import "./feed-screen.ts";
 import "./media-viewer.ts";
 import "./upload-screen.ts";
@@ -26,6 +27,7 @@ const NAV: Array<{ route: Route; label: string }> = [
   { route: "mine", label: "My Content" },
   { route: "upload", label: "Upload" },
   { route: "admin", label: "Admin" },
+  { route: "recovery-split", label: "Recovery custody" },
   { route: "settings", label: "Settings" },
 ];
 
@@ -123,6 +125,8 @@ export class AppShell extends HTMLElement {
           ? "<settings-screen></settings-screen>"
           : r === "admin"
           ? "<admin-screen></admin-screen>"
+          : r === "recovery-split"
+          ? "<recovery-split-screen></recovery-split-screen>"
           : r === "bootstrap"
           ? "<bootstrap-screen></bootstrap-screen>"
           : "<connect-screen></connect-screen>";

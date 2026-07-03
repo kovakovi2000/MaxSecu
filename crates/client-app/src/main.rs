@@ -65,6 +65,7 @@ fn main() {
             maxsecu_client_app::commands::recovery_custody::prove_reconstructed_key,
             maxsecu_client_app::commands::recovery_custody::discard_ceremony_session,
             maxsecu_client_app::commands::recovery_custody::record_split_ceremony,
+            maxsecu_client_app::commands::recovery_custody::save_recovery_share,
             maxsecu_client_app::commands::upload::stage_upload,
             maxsecu_client_app::commands::upload::confirm_upload,
             maxsecu_client_app::commands::upload::cancel_upload,

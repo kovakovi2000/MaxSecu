@@ -141,3 +141,16 @@ export interface RamLimits { default_mb: number; min_mb: number; max_mb: number 
 // Live process + budget memory figures from the `memory_stats` command.
 // `used_bytes` is null when the OS process-RSS query is unavailable (fail-soft).
 export interface MemoryStats { used_bytes: number | null; budget_bytes: number }
+
+// --- T6 (Shamir K-of-N recovery-key custody ceremony) DTO mirrors ---
+// `split_recovery_key`'s response: `n` wire-encoded MSHARE1 share strings (the
+// interchange unit, spec §5/§8 — deliberately allowed to cross the seam) plus
+// the non-secret label/k/n. The frontend holds `shares` only transiently for
+// the one-at-a-time reveal wizard and drops the reference once every share has
+// been shown (spec §4.4/§11).
+export interface SplitRecoveryKeyResponse {
+  shares: string[];
+  label: string;
+  k: number;
+  n: number;
+}

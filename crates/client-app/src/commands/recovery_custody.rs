@@ -500,6 +500,39 @@ pub fn record_split_ceremony(req: SplitCeremonyLogRequest) -> Result<(), UiError
     Ok(())
 }
 
+// ---- save_recovery_share ----
+
+/// `save_recovery_share` — write ONE share's already-encoded MSHARE1 text to an
+/// operator-chosen path (T6 split wizard's "save to file" secondary affordance,
+/// spec §4 step 4). Synchronous, no network.
+///
+/// Unlike [`record_split_ceremony`] (which APPENDS a non-secret log line), this
+/// WRITES/TRUNCATES the single named file to contain exactly this one share's
+/// text — a share file is a one-shot export, not an append-only log, so a
+/// second save to the same path deliberately overwrites rather than
+/// accumulating multiple shares in one file (which would defeat the "one
+/// share, one custodian, one file" custody discipline the wizard's one-at-a-
+/// time flow enforces). An IO failure maps to a generic, non-oracle `UiError`
+/// — no path echoed back, mirroring `record_split_ceremony`'s hygiene.
+#[tauri::command]
+pub fn save_recovery_share(path: String, share_text: String) -> Result<(), UiError> {
+    use std::io::Write;
+    let err = || {
+        UiError::new(
+            "share_write_failed",
+            "Could not save the share to that file.",
+        )
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|_| err())?;
+    f.write_all(share_text.as_bytes()).map_err(|_| err())?;
+    Ok(())
+}
+
 // ---- discard ----
 
 /// `discard_ceremony_session` — end the in-progress ceremony and wipe every
@@ -1385,5 +1418,71 @@ mod ceremony_log_tests {
         let err = record_split_ceremony(req("/no/such/dir/ceremony.log", vec![1]))
             .expect_err("an unwritable path must fail closed");
         assert_eq!(err.code, "log_write_failed");
+    }
+}
+
+#[cfg(test)]
+mod save_share_tests {
+    use super::*;
+
+    /// A unique throwaway file path (not created up front — `save_recovery_share`
+    /// creates it itself). Random suffix for the same collision-avoidance reason
+    /// as the other test modules in this file.
+    fn temp_share_path() -> std::path::PathBuf {
+        let rand = crate::commands::feed::hex(&maxsecu_crypto::random_array::<8>());
+        std::env::temp_dir().join(format!(
+            "maxsecu-rc-share-{}-{}.txt",
+            std::process::id(),
+            rand
+        ))
+    }
+
+    #[test]
+    fn writes_exactly_the_given_share_text() {
+        let path = temp_share_path();
+        let path_str = path.to_string_lossy().into_owned();
+        let text = "MSHARE1:bGFiZWw:3:5:2:c2VjcmV0Ym9keQ:deadbeef";
+
+        save_recovery_share(path_str.clone(), text.to_owned()).expect("save ok");
+
+        let contents = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            contents, text,
+            "file must contain exactly this share's text"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_second_save_to_the_same_path_overwrites_not_appends() {
+        // A save-to-file is a one-shot export of ONE share, not an append-only
+        // log — a repeat save (e.g. the operator re-exporting the same share)
+        // must truncate, never accumulate two shares' text in one file.
+        let path = temp_share_path();
+        let path_str = path.to_string_lossy().into_owned();
+
+        save_recovery_share(path_str.clone(), "first-share-text".to_owned())
+            .expect("first save ok");
+        save_recovery_share(path_str.clone(), "second-share-text".to_owned())
+            .expect("second save ok");
+
+        let contents = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            contents, "second-share-text",
+            "second save must overwrite, not append"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unwritable_path_maps_to_a_sanitized_error() {
+        let err = save_recovery_share(
+            "/no/such/dir/share.txt".to_owned(),
+            "whatever-share-text".to_owned(),
+        )
+        .expect_err("an unwritable path must fail closed");
+        assert_eq!(err.code, "share_write_failed");
     }
 }
