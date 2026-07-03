@@ -62,6 +62,11 @@ pub enum TrustAlarm {
     /// the pin compiled into this client (alarm-A). Either half (X25519 or
     /// ML-KEM) differing trips this.
     RecoveryPinMismatch,
+    /// A previously TOFU-pinned OTHER user's directory key now resolves to a
+    /// DIFFERENT key (alarm-B, [`crate::tofu`]). Carries the affected `username`
+    /// so the UI can render a `server_untrusted`-class message naming it. Raised
+    /// on a change only — a first sighting is normal TOFU and never trips this.
+    UserKeyChanged { username: String },
 }
 
 /// The recovery-account encryption pubkey pin compiled into this binary.

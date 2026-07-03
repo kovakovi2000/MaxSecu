@@ -26,6 +26,7 @@ pub mod revocations;
 pub mod session;
 pub mod sink;
 pub mod state;
+pub mod tofu;
 pub mod tor;
 pub mod transport;
 pub mod upload;
