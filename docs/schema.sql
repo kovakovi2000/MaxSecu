@@ -105,7 +105,7 @@ CREATE TABLE registration_keys (                 -- single-use registration keys
   -- No issued_by/used_by_user FK: operator-issued out of band, not by an in-app admin.
   issued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at    TIMESTAMPTZ NOT NULL,
-  used_at       TIMESTAMPTZ                        -- set on first successful consume; single-use (deleted-on-consume semantics)
+  used_at       TIMESTAMPTZ                        -- single-use: PgStore MARKS this on first consume (row retained for audit); the in-memory dev store instead DELETES the row
 );
 
 CREATE TABLE first_admin_claim (                 -- one-time "first registrant = admin" slot (T4)

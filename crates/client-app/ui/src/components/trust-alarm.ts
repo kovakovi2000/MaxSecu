@@ -65,6 +65,11 @@ export class TrustAlarm extends HTMLElement {
   }
 
   private open(e: TrustAlarmEvent) {
+    // Re-entrancy guard: a second alarm firing while the modal is already open must
+    // NOT clobber `returnFocus` with the modal's own Acknowledge button (which would
+    // trap focus inside the modal after it closes). The modal is already blocking,
+    // so the first alarm's guidance stands.
+    if (!this.hidden) return;
     // Remember where focus was so it can be restored on acknowledge.
     this.returnFocus = (document.activeElement as HTMLElement) ?? null;
     const detail = this.querySelector("#ta-detail") as HTMLElement;

@@ -161,11 +161,15 @@ export class AppShell extends HTMLElement {
   // Only overrides the default connect landing; an explicit route (reload/deep-link)
   // is left untouched so the gate never hijacks in-app navigation.
   private async applyStartupMode() {
-    const landing = location.hash === "" || location.hash === "#/"
-      || location.hash === "#/connect";
-    if (!landing) return;
+    const isLanding = () =>
+      location.hash === "" || location.hash === "#/" || location.hash === "#/connect";
+    if (!isLanding()) return;
     try {
       const mode = await call<string>("startup_mode");
+      // The command is async; the user may have navigated away (or a deep-link may
+      // have set the hash) while it was in flight. Re-check BEFORE overriding so a
+      // stale startup mode never hijacks an intentional in-app navigation.
+      if (!isLanding()) return;
       if (mode === "recovery") location.hash = "#/recovery";
       else if (mode === "register") location.hash = "#/register";
       // "normal" → keep the default connect landing.

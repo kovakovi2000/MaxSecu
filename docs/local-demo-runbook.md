@@ -127,9 +127,10 @@ drop+recreate the public schema first).
 
 ### S7 — Stage `dist/` **[DONE]**
 Copy exes + `ui/` + scripts into the three folders; write each client's
-`config/connection.json` = `{"server":"localhost:8443","use_tor":false,"auto_connect":true}`;
-write `config/recovery_recipient.txt` (`root`→`bob`, `bob`→`root`); pins are
-copied in S9 after the server prints them.
+`config/connection.json` = `{"server":"localhost:8443","use_tor":false,"auto_connect":true}`.
+(The retired `config/recovery_recipient.txt` buddy file is gone — the recovery
+wrap target is now the embedded recovery pin, T8.) Pins are copied in S9 after
+the server prints them.
 
 ### S8 — Start the persistent server **[UPDATED]**
 `DATABASE_URL=… MAXSECU_DATA_DIR=…/maxsecu-server-data maxsecu-portable-server.exe`,

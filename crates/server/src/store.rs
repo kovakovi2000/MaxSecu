@@ -487,12 +487,6 @@ struct Inner {
     users: HashMap<String, UserRecord>,
     nonces: HashMap<[u8; 32], NonceRecord>,
     sessions: HashMap<[u8; 32], SessionRecord>,
-    // Seeded enrollment-voucher hashes. The trait's voucher methods are gone
-    // (registration-key-only enrollment, T15); this field + `add_voucher` are
-    // retained ONLY so the not-yet-migrated client-e2e voucher tests still
-    // compile — remove both once T16 migrates them to registration keys.
-    #[allow(dead_code)]
-    vouchers: HashSet<[u8; 32]>,
     reg_keys: HashSet<[u8; 32]>, // unused single-use registration-key hashes (T2)
     // The one-time first-admin claim (T4): `true` once the first registrant has
     // claimed admin; every later `claim_first_admin` observes `true` and loses.
@@ -548,13 +542,6 @@ impl MemoryStore {
     pub fn add_user(&self, username: &str, rec: UserRecord) {
         let mut inner = self.inner.lock().unwrap();
         inner.users.insert(username.to_owned(), rec);
-    }
-
-    /// Seed a usable enrollment voucher by its `SHA-256` hash (issued in person).
-    /// Retained only for the not-yet-migrated client-e2e voucher tests (T16); the
-    /// server no longer consumes vouchers (registration-key-only enrollment).
-    pub fn add_voucher(&self, voucher_hash: [u8; 32]) {
-        self.inner.lock().unwrap().vouchers.insert(voucher_hash);
     }
 
     /// Seed a usable single-use registration key by its `SHA-256` hash (T4 tests).
