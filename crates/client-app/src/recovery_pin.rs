@@ -70,6 +70,12 @@ pub enum TrustAlarm {
     /// checkpoint, or the binding is not provably included — i.e. the server
     /// equivocated about keys. Surfaced as `server_untrusted` and BLOCKS the
     /// browse/open (no content shown).
+    ///
+    /// Unlike alarms A/B this variant is not itself constructed on the block path
+    /// (the KT gate maps every `KtError` straight to a `server_untrusted` [`crate::error::UiError`],
+    /// the same stable code T13's shared trust-alarm modal keys off); it names
+    /// alarm-C in the trust taxonomy for that modal + future structured surfacing.
+    #[allow(dead_code)]
     TransparencyFailure,
 }
 

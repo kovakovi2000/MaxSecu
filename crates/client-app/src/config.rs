@@ -176,7 +176,14 @@ pub fn load_sink_pins(dir: &Path) -> Result<SinkPins, UiError> {
 /// today's D5-only browse/open verification rather than failing every open closed.
 /// A malformed (non-multiple-of-32) file still fails closed.
 pub fn load_kt_log_pubs(dir: &Path) -> Result<Vec<[u8; 32]>, UiError> {
-    read_pinned_keys(&dir.join("config").join("kt_log.der"), false)
+    // Absent ⇒ Ok(empty) (opt-in, not required). A malformed file fails closed with
+    // a KT-specific code (not the sink's `sink_unpinned` misnomer).
+    read_pinned_keys(&dir.join("config").join("kt_log.der"), false).map_err(|_| {
+        UiError::new(
+            "kt_log_unpinned",
+            "The pinned key-transparency log key is malformed.",
+        )
+    })
 }
 
 // Loaded by the UI in a later phase (Task 10) to prefill the connect form /

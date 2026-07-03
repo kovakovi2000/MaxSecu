@@ -308,3 +308,116 @@ async fn client_polices_the_directory_kt_log_over_real_tls() {
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
+
+/// A MALICIOUS stub sink that does NOT hold the pinned KT key: it serves a
+/// checkpoint claiming `tree_size = u64::MAX` signed with garbage, and COUNTS every
+/// `/v1/dir-log/inclusion` request. Runs on its own thread + current-thread runtime
+/// so the (blocking) client verify can drive it without a nested-runtime panic.
+/// Returns `(addr, cert_der, inclusion_hits)`.
+fn spawn_hostile_sink(
+    server_config: Arc<ServerConfig>,
+) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let hits_srv = hits.clone();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tx.send(listener.local_addr().unwrap()).unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            loop {
+                let (tcp, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let acceptor = acceptor.clone();
+                let hits = hits_srv.clone();
+                tokio::spawn(async move {
+                    use hyper::service::service_fn;
+                    let tls = match acceptor.accept(tcp).await {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    };
+                    let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let hits = hits.clone();
+                        async move {
+                            let path = req.uri().path().to_owned();
+                            let _ = req.into_body().collect().await;
+                            let body = if path == "/v1/dir-log/checkpoint" {
+                                serde_json::json!({
+                                    "tree_size": u64::MAX,
+                                    "root_b64": B64.encode([0x11u8; 32]),
+                                    "sig_b64": B64.encode([0u8; 64]), // garbage: never verifies
+                                })
+                                .to_string()
+                            } else {
+                                if path.starts_with("/v1/dir-log/inclusion") {
+                                    hits.fetch_add(1, Ordering::SeqCst);
+                                }
+                                "{}".to_owned()
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .body(Full::<Bytes>::from(body))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls), svc)
+                        .await;
+                });
+            }
+        });
+    });
+    (rx.recv().unwrap(), hits)
+}
+
+/// A checkpoint whose signature does not verify under the pinned KT key is blocked
+/// as `server_untrusted` BEFORE any index-discovery scan — so a forged
+/// `tree_size = u64::MAX` cannot drive an unbounded sequence of inclusion fetches
+/// (the DoS the sig-first guard closes).
+#[tokio::test]
+async fn forged_checkpoint_is_blocked_without_scanning() {
+    let sink_pki = pki();
+    let (sink_addr, hits) = spawn_hostile_sink(sink_pki.server_config.clone());
+
+    let kt_dir = std::env::temp_dir().join(format!(
+        "mxkt_hostile_{}_{}",
+        std::process::id(),
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
+    std::fs::create_dir_all(&kt_dir).unwrap();
+    let identity = Identity::generate();
+    let mut store = DiskKtCheckpointStore::open(&kt_dir, &identity).unwrap();
+
+    // Pin a key the hostile sink does NOT hold (its garbage sig cannot verify).
+    let pin = vec![SigningKey::generate().verifying_key().to_bytes()];
+    let pins = sink_pins(sink_addr, &sink_pki.cert_der);
+    let leaf = vec![0x42u8; 48];
+    let (res, _store) = tokio::task::spawn_blocking(move || {
+        let r = verify_binding_transparency(&pins, &pin, &mut store, &leaf);
+        (r, store)
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        res.expect_err("a forged checkpoint must be blocked").code,
+        "server_untrusted"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the sig-first guard blocked BEFORE any inclusion fetch (no scan)"
+    );
+
+    let _ = std::fs::remove_dir_all(&kt_dir);
+}

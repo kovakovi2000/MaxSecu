@@ -7,14 +7,13 @@
 //!
 //! At the resolve boundary (`commands::feed`/viewer) where a served directory
 //! binding is D5-verified for browse/open of ANOTHER user's content, the client
-//! ALSO fetches — from the pinned SINK, not the app server —:
-//!   * the current KT `checkpoint` (`{tree_size, root, sig}`),
-//!   * an `inclusion` proof for that binding's leaf, and
-//!   * (when a prior checkpoint is persisted) a `consistency` proof,
-//! and runs the shipped [`maxsecu_client_core::transparency::verify_binding_in_log`]
-//! gate under the PINNED KT log key(s) + the PERSISTED gossip store. On any
-//! [`KtError`] the open is BLOCKED with a `server_untrusted`-class [`UiError`]
-//! ([`crate::recovery_pin::TrustAlarm::TransparencyFailure`]); on success the gate
+//! ALSO fetches three proofs from the pinned SINK (not the app server): the current
+//! KT `checkpoint` (`{tree_size, root, sig}`), an `inclusion` proof for that
+//! binding's leaf, and — when a prior checkpoint is persisted — a `consistency`
+//! proof. It then runs the shipped
+//! [`maxsecu_client_core::transparency::verify_binding_in_log`] gate under the
+//! PINNED KT log key(s) + the PERSISTED gossip store. On any [`KtError`] the open
+//! is BLOCKED with a `server_untrusted`-class [`UiError`]; on success the gate
 //! advances (TOFU-pins) the checkpoint and it is persisted so a later split-view /
 //! rollback is detectable across sessions.
 //!
@@ -29,18 +28,25 @@ use zeroize::Zeroizing;
 
 use maxsecu_client_core::sink::HttpSinkClient;
 use maxsecu_client_core::transparency::{
-    verify_binding_in_log, InclusionProof, KtCheckpoint, KtCheckpointStore, KtError,
+    verify_binding_in_log, verify_checkpoint_sig, InclusionProof, KtCheckpoint, KtCheckpointStore,
+    KtError,
 };
 use maxsecu_client_core::Identity;
 use maxsecu_crypto::merkle::verify_inclusion;
 
 use crate::config::SinkPins;
 use crate::error::UiError;
-use crate::recovery_pin::TrustAlarm;
 
 /// Domain-separation label for the KT gossip-store sealing key + AEAD aad. Distinct
 /// from the TOFU / search-index labels so the sealed stores use unrelated keys.
 const KT_LABEL: &[u8] = b"MaxSecu-kt-checkpoint-v1";
+
+/// A large-but-finite defense-in-depth cap on the KT tree size the index-discovery
+/// scan will walk. The primary guard is the checkpoint-signature check (a forged
+/// `tree_size` never gets this far); this is a second belt so even a pinned-key
+/// checkpoint claiming an absurd size is refused rather than scanned. 2^24 (~16.7M)
+/// leaves is far beyond any realistic directory yet bounds the scan.
+const MAX_KT_TREE_SIZE: u64 = 1 << 24;
 
 /// The persisted KT **gossip** store: the latest KT checkpoint the client has
 /// accepted, sealed on disk under an identity-derived key at
@@ -159,13 +165,34 @@ pub fn verify_binding_transparency(
     let client = HttpSinkClient::new(pins.addr, pins.server_name.clone(), pins.tls.clone());
     let checkpoint = client.fetch_kt_checkpoint().map_err(|_| sink_unreachable())?;
 
+    // GUARD: verify the checkpoint signature under the PINNED KT key BEFORE trusting
+    // any of its sink-controlled fields — notably `tree_size`, which bounds the
+    // index-discovery scan below. A checkpoint not signed by a pinned key is a
+    // forged/equivocating head (exactly the actor KT defends against): reject it
+    // immediately as `server_untrusted`, with NO scan, so a forged `tree_size` can
+    // never drive an unbounded sequence of inclusion fetches (a DoS). The
+    // authoritative `verify_binding_in_log` still runs afterward as the real gate.
+    if !verify_checkpoint_sig(&checkpoint, log_pubs) {
+        return Err(block_transparency(KtError::BadCheckpoint));
+    }
+    // Defense-in-depth: refuse even a validly-signed checkpoint whose tree size
+    // exceeds a sane finite cap (the scan is O(tree_size) sink round-trips).
+    if checkpoint.tree_size > MAX_KT_TREE_SIZE {
+        return Err(block_transparency(KtError::NotIncluded));
+    }
+
     // The consistency proof is prev→current; empty when there is no prior pinned
-    // checkpoint (first use) or the tree size is unchanged (§7.4).
+    // checkpoint (first use) or the tree size is not strictly larger (§7.4). When
+    // `prev.tree_size > checkpoint.tree_size` (a ROLLBACK) we must NOT ask the sink
+    // for a `from` it cannot answer — that would surface as `sink_unreachable` and
+    // shadow the real `Regression` verdict; pass an EMPTY proof through so
+    // `verify_binding_in_log` reaches its rollback branch and blocks as
+    // `server_untrusted`.
     let from = store.latest().map(|c| c.tree_size).unwrap_or(0);
-    let consistency = if from == 0 || from == checkpoint.tree_size {
-        Vec::new()
-    } else {
+    let consistency = if from != 0 && from < checkpoint.tree_size {
         client.fetch_kt_consistency(from).map_err(|_| sink_unreachable())?
+    } else {
+        Vec::new()
     };
 
     // Discover the binding's leaf index (the log exposes proofs by index, not by
@@ -226,11 +253,10 @@ fn discover_inclusion(
 /// Map any [`KtError`] to the fail-closed trust-alarm-C surface. Every KT failure
 /// (bad checkpoint / split-view / rollback / not-included) means the server
 /// equivocated about keys, so all render as one `server_untrusted` block — the
-/// [`TrustAlarm::TransparencyFailure`] the UI treats as a hard stop.
+/// stable code T13's shared trust-alarm modal keys off (alarm-C,
+/// [`crate::recovery_pin::TrustAlarm::TransparencyFailure`]), exactly as alarms A/B
+/// surface via their own `server_untrusted` codes.
 fn block_transparency(_e: KtError) -> UiError {
-    // Constructed so the alarm-C variant is a live part of the trust taxonomy.
-    let alarm = TrustAlarm::TransparencyFailure;
-    debug_assert!(matches!(alarm, TrustAlarm::TransparencyFailure));
     UiError::new(
         "server_untrusted",
         "This server failed key-transparency verification; the item was blocked.",
