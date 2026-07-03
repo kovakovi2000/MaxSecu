@@ -248,7 +248,11 @@ pub fn add_recovery_share(
 /// `tauri::State` (which has no public constructor outside a running Tauri
 /// app) so it can be exercised directly against a plain [`CeremonySession`]
 /// in unit tests.
-fn add_share_to_session(
+///
+/// `pub` so the `tests/recovery_custody_e2e.rs` integration test can drive the
+/// command logic without a Tauri `State`; the `#[tauri::command]` wrapper is
+/// the app entry point.
+pub fn add_share_to_session(
     share_text: &str,
     session: &CeremonySession,
 ) -> Result<AddShareResponse, UiError> {
@@ -317,7 +321,11 @@ pub fn reconstruct_recovery_key(
 
 /// The testable logic behind [`reconstruct_recovery_key`], decoupled from
 /// `tauri::State` so it can run against a plain [`CeremonySession`] in tests.
-fn reconstruct_in_session(session: &CeremonySession) -> Result<ReconstructResponse, UiError> {
+///
+/// `pub` so the `tests/recovery_custody_e2e.rs` integration test can drive the
+/// command logic without a Tauri `State`; the `#[tauri::command]` wrapper is
+/// the app entry point.
+pub fn reconstruct_in_session(session: &CeremonySession) -> Result<ReconstructResponse, UiError> {
     // One lock for the whole synchronous reconstruct + insert — reconstruct is a
     // fast in-RAM Lagrange interpolation with no `.await`, so holding the sync
     // mutex across it is correct (spec §8 / `ceremony.rs` module doc).
@@ -407,7 +415,11 @@ pub fn prove_reconstructed_key(
 
 /// The testable logic behind [`prove_reconstructed_key`], decoupled from
 /// `tauri::State` so it can run against a plain [`CeremonySession`] in tests.
-fn prove_in_session(
+///
+/// `pub` so the `tests/recovery_custody_e2e.rs` integration test can drive the
+/// command logic without a Tauri `State`; the `#[tauri::command]` wrapper is
+/// the app entry point.
+pub fn prove_in_session(
     req: ProveRequest,
     session: &CeremonySession,
 ) -> Result<ProveResponse, UiError> {
@@ -553,7 +565,11 @@ pub fn discard_ceremony_session(state: State<'_, CeremonySession>) -> Result<(),
 /// `tauri::State` so it can run against a plain [`CeremonySession`] in tests.
 /// One lock, one call to `reset()` — draining+zeroizing the share bodies and
 /// clearing the reconstructed-key map (`ceremony.rs::CeremonySessionInner::reset`).
-fn discard_in_session(session: &CeremonySession) {
+///
+/// `pub` so the `tests/recovery_custody_e2e.rs` integration test can drive the
+/// command logic without a Tauri `State`; the `#[tauri::command]` wrapper is
+/// the app entry point.
+pub fn discard_in_session(session: &CeremonySession) {
     let mut inner = session.0.lock().unwrap();
     inner.reset();
 }
