@@ -271,8 +271,12 @@ async fn stage(c: &mut Conn, token: &str, file_type: &str, file_id: Id, bundle: 
 
 #[tokio::test]
 async fn phase3_browse_view_over_real_tls() {
-    // ---- (1) Server + pinned ceremony D5 ----
-    let ceremony = Ceremony::generate();
+    // ---- (1) Server + pinned ceremony D5 (server holds the private half so
+    // registration-key enrollment signs the binding; the scripted ceremony is
+    // reconstructed from the same seed so its published binding verifies under the
+    // same pinned pubkey) ----
+    let d5_seed = maxsecu_crypto::random_array::<32>();
+    let ceremony = Ceremony::from_seed(&d5_seed);
     let pinned = ceremony.directory_pub();
 
     let blob_dir = std::env::temp_dir().join(format!(
@@ -280,12 +284,12 @@ async fn phase3_browse_view_over_real_tls() {
         hex(&maxsecu_crypto::random_array::<8>())
     ));
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER.as_bytes()));
     let state = AppState {
-        auth: Arc::new(AuthService::new(
-            store,
-            AuthConfig::default().with_directory_pub(pinned),
-        )),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(pinned))
+                .with_dir_signer(Arc::new(SigningKey::from_seed(&d5_seed))),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
@@ -312,7 +316,7 @@ async fn phase3_browse_view_over_real_tls() {
             "username": "alice",
             "enc_pub_b64": B64.encode(owner.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(owner.sig_pub_bytes()),
-            "enrollment_voucher": VOUCHER,
+            "registration_key": VOUCHER,
         }),
     )
     .await;

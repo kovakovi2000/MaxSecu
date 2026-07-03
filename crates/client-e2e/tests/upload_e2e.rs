@@ -40,15 +40,15 @@ use maxsecu_client_core::{
     build_upload, verify_and_open, DownloadBundle, Identity,
     StreamChunks, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
-use maxsecu_crypto::{sha256, EncPublicKey, WrappedDek};
+use maxsecu_crypto::{sha256, EncPublicKey, SigningKey, WrappedDek};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::types::{FileType, Id, Role, StreamType, Timestamp};
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuthConfig, AuthService, FsBlobStore, MemoryStore,
 };
 
-const VOUCHER: &str = "in-person-code-001";
-const VOUCHER2: &str = "in-person-code-002";
+const REG_KEY: &str = "in-person-code-001";
+const REG_KEY2: &str = "in-person-code-002";
 const TS: u64 = 1_719_500_000_000;
 const BLOG_BODY: &[u8] = b"Dear diary, a Phase-4 upload that must round-trip exactly.";
 
@@ -231,7 +231,7 @@ async fn register_and_login(
     c: &mut Conn,
     owner: &Identity,
     username: &str,
-    voucher: &str,
+    reg_key: &str,
 ) -> ([u8; 16], String) {
     let (st, res) = post(
         c,
@@ -241,7 +241,7 @@ async fn register_and_login(
             "username": username,
             "enc_pub_b64": B64.encode(owner.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(owner.sig_pub_bytes()),
-            "enrollment_voucher": voucher,
+            "registration_key": reg_key,
         }),
     )
     .await;
@@ -354,8 +354,12 @@ async fn download_bundle(c: &mut Conn, token: &str, fid_hex: &str) -> DownloadBu
 
 #[tokio::test]
 async fn phase4_upload_over_real_tls() {
-    // ---- (1) Server + pinned ceremony D5 ----
-    let ceremony = Ceremony::generate();
+    // ---- (1) Server + pinned ceremony D5 (the server holds the private half so
+    // registration-key enrollment can sign the binding; the scripted ceremony is
+    // reconstructed from the same seed so its published bindings verify under the
+    // same pinned pubkey) ----
+    let d5_seed = maxsecu_crypto::random_array::<32>();
+    let ceremony = Ceremony::from_seed(&d5_seed);
     let pinned = ceremony.directory_pub();
 
     let blob_dir = std::env::temp_dir().join(format!(
@@ -363,13 +367,13 @@ async fn phase4_upload_over_real_tls() {
         hex(&maxsecu_crypto::random_array::<8>())
     ));
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
-    store.add_voucher(sha256(VOUCHER2.as_bytes()));
+    store.add_reg_key(sha256(REG_KEY.as_bytes()));
+    store.add_reg_key(sha256(REG_KEY2.as_bytes()));
     let state = AppState {
-        auth: Arc::new(AuthService::new(
-            store,
-            AuthConfig::default().with_directory_pub(pinned),
-        )),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(pinned))
+                .with_dir_signer(Arc::new(SigningKey::from_seed(&d5_seed))),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
@@ -387,14 +391,14 @@ async fn phase4_upload_over_real_tls() {
 
     // ---- (2) Register + login the author; publish author + recovery bindings ----
     let owner = Identity::generate();
-    let (user_id, token) = register_and_login(&mut c, &owner, "alice", VOUCHER).await;
+    let (user_id, token) = register_and_login(&mut c, &owner, "alice", REG_KEY).await;
     publish_binding(&mut c, &ceremony, "alice", user_id, &owner).await;
 
     // The recovery recipient is a real registered user (so the username→user_id
     // directory lookup resolves), with its own D5-signed binding.
     let recovery = Identity::generate();
     let (recovery_uid, _recovery_token) =
-        register_and_login(&mut c, &recovery, "recovery-1", VOUCHER2).await;
+        register_and_login(&mut c, &recovery, "recovery-1", REG_KEY2).await;
     publish_binding(&mut c, &ceremony, "recovery-1", recovery_uid, &recovery).await;
 
     let owner_sig_pub = owner.sig_pub_bytes();

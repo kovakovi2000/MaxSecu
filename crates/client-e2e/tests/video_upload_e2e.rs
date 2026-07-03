@@ -53,7 +53,7 @@ use maxsecu_client_core::{
     build_upload, verify_and_open, DownloadBundle, Identity,
     PlaintextStreams, StreamChunks, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
-use maxsecu_crypto::{sha256, EncPublicKey, WrappedDek};
+use maxsecu_crypto::{sha256, EncPublicKey, SigningKey, WrappedDek};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::types::{FileType, Id, Role, StreamType, Timestamp};
 use maxsecu_media_launcher::TranscodeOptions;
@@ -282,7 +282,7 @@ async fn register_and_login(
     c: &mut Conn,
     owner: &Identity,
     username: &str,
-    voucher: &str,
+    reg_key: &str,
 ) -> ([u8; 16], String) {
     let (st, res) = post(
         c,
@@ -292,7 +292,7 @@ async fn register_and_login(
             "username": username,
             "enc_pub_b64": B64.encode(owner.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(owner.sig_pub_bytes()),
-            "enrollment_voucher": voucher,
+            "registration_key": reg_key,
         }),
     )
     .await;
@@ -500,20 +500,21 @@ async fn phase7_video_upload_over_real_tls() {
     );
 
     // ---- Server + pinned ceremony D5 (for the confirm pipeline) ----
-    let ceremony = Ceremony::generate();
+    let d5_seed = maxsecu_crypto::random_array::<32>();
+    let ceremony = Ceremony::from_seed(&d5_seed);
     let pinned = ceremony.directory_pub();
     let blob_dir = std::env::temp_dir().join(format!(
         "mxvidup_{}",
         hex(&maxsecu_crypto::random_array::<8>())
     ));
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
-    store.add_voucher(sha256(VOUCHER2.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER2.as_bytes()));
     let state = AppState {
-        auth: Arc::new(AuthService::new(
-            store,
-            AuthConfig::default().with_directory_pub(pinned),
-        )),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(pinned))
+                .with_dir_signer(Arc::new(SigningKey::from_seed(&d5_seed))),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,

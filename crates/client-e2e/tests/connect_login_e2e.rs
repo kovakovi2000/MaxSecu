@@ -25,10 +25,10 @@ use tokio_rustls::rustls::ServerConfig;
 use maxsecu_client_app::session::make_proof;
 use maxsecu_client_app::transport::{pinned_client_config, Transport};
 use maxsecu_client_core::Identity;
-use maxsecu_crypto::sha256;
+use maxsecu_crypto::{sha256, SigningKey};
 use maxsecu_server::{serve, AppState, AuthConfig, AuthService, MemoryStore};
 
-const VOUCHER: &str = "in-person-code-001";
+const REG_KEY: &str = "in-person-code-001";
 const TS: u64 = 1_719_500_000_000;
 
 /// A self-signed `localhost` cert: the server presents it; the client pins it.
@@ -58,14 +58,21 @@ fn test_pki() -> TestPki {
 
 /// Stand up the server on an ephemeral loopback port; return its address and the
 /// pinned cert DER the client must trust. The auth router is backed by a
-/// `MemoryStore` seeded with one enrollment voucher (no PostgreSQL).
+/// `MemoryStore` seeded with one single-use registration key (no PostgreSQL).
+/// The server holds its directory-signing key so `POST /v1/users` can sign the
+/// enrolled binding (registration-key-only enrollment).
 async fn spawn_server() -> (std::net::SocketAddr, CertificateDer<'static>) {
     let pki = test_pki();
 
+    let signer = Arc::new(SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(REG_KEY.as_bytes()));
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer),
+        ),
         blobs: Arc::new(maxsecu_server::MemoryBlobStore::new()),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
@@ -127,7 +134,8 @@ async fn open(transport: &Transport) -> (SendRequest<Full<Bytes>>, [u8; 32]) {
 }
 
 /// Register `username` with `id`'s public keys over an established sender
-/// (registration is voucher-gated, not channel-bound, so any connection works).
+/// (registration is registration-key-gated, not channel-bound, so any connection
+/// works).
 async fn register(sender: &mut SendRequest<Full<Bytes>>, username: &str, id: &Identity) {
     let (st, _) = post(
         sender,
@@ -136,7 +144,7 @@ async fn register(sender: &mut SendRequest<Full<Bytes>>, username: &str, id: &Id
             "username": username,
             "enc_pub_b64": B64.encode(id.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(id.sig_pub_bytes()),
-            "enrollment_voucher": VOUCHER,
+            "registration_key": REG_KEY,
         }),
     )
     .await;
