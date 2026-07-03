@@ -42,6 +42,7 @@ fn main() {
         .manage(maxsecu_client_app::jobs::VideoJobs::new())
         .manage(maxsecu_client_app::jobs::VideoPrepareCancel::default())
         .manage(ContentCache::new(cap_bytes))
+        .manage(maxsecu_client_app::ceremony::CeremonySession::new())
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
             maxsecu_client_app::commands::auth::unlock_keystore,
@@ -58,6 +59,14 @@ fn main() {
             maxsecu_client_app::commands::admin::list_pending,
             maxsecu_client_app::commands::admin::issue_voucher,
             maxsecu_client_app::commands::admin::request_approval,
+            maxsecu_client_app::commands::recovery_custody::split_recovery_key,
+            maxsecu_client_app::commands::recovery_custody::add_recovery_share,
+            maxsecu_client_app::commands::recovery_custody::reconstruct_recovery_key,
+            maxsecu_client_app::commands::recovery_custody::prove_reconstructed_key,
+            maxsecu_client_app::commands::recovery_custody::discard_ceremony_session,
+            maxsecu_client_app::commands::recovery_custody::record_split_ceremony,
+            maxsecu_client_app::commands::recovery_custody::save_recovery_share,
+            maxsecu_client_app::commands::recovery_custody::read_recovery_share_file,
             maxsecu_client_app::commands::upload::stage_upload,
             maxsecu_client_app::commands::upload::confirm_upload,
             maxsecu_client_app::commands::upload::cancel_upload,

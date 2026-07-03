@@ -22,6 +22,13 @@ const screens = [
   "src/components/bootstrap-screen.ts",
   "src/components/pending-screen.ts",
   "src/components/admin-screen.ts",
+  // T6 recovery ceremony wizards (spec §10) — routed screens (shell nav +
+  // router entries) like bootstrap-/pending-screen above, so they get the
+  // same baseline landmark/focus/XSS checks here; their wizard-specific
+  // affordances (role=status/alert split, per-step focus, button labels) get
+  // their own dedicated blocks below, matching video-player/share-dialog.
+  "src/components/recovery-split-screen.ts",
+  "src/components/recovery-reconstruct-screen.ts",
 ];
 
 for (const f of screens) {
@@ -329,6 +336,116 @@ test("screens use a live region for feedback", () => {
       st,
       /\.innerHTML\s*=\s*`[^`]*\$\{(?!esc\()/,
       "share-tray must not interpolate unescaped dynamic data into innerHTML",
+    );
+  });
+}
+
+// --- T6 Shamir K-of-N recovery ceremonies: <recovery-split-screen> /
+// <recovery-reconstruct-screen> (spec §10) ----------------------------------
+// Both are routed screens (shell nav + router entries), already covered above
+// by the `screens` array for the baseline landmark/focus-on-mount/XSS checks.
+// What's specific to these two — the role=status/role=alert split between
+// transient guidance and errors, the wizard's per-step focus move to its step
+// heading, and that every button carries a real text label (no icon-only
+// controls) — gets its own dedicated block here, matching how <video-player>
+// and <share-dialog>/<share-tray> get dedicated blocks for their own
+// component-specific affordances above.
+{
+  const rsPath = "src/components/recovery-split-screen.ts";
+  const rs = readFileSync(rsPath, "utf8");
+
+  test(`${rsPath}: role=status / role=alert split is present`, () => {
+    // Transient guidance/progress (k/n live guidance, copy/save status, the
+    // completion summary) is role="status" (polite); errors and the
+    // persistent, non-dismissable "shown once" banner are role="alert" —
+    // spec §4/§10.
+    assert.match(rs, /role="status"/, `${rsPath} needs a role="status" region for guidance/progress`);
+    assert.match(rs, /role="alert"/, `${rsPath} needs a role="alert" region for errors/the shown-once banner`);
+  });
+
+  test(`${rsPath}: wizard focus order — focus moves to the step heading on transitions`, () => {
+    // goToStep() re-renders the step then moves focus to #rc-step-h, so a
+    // screen-reader/keyboard user always lands on the new step's content
+    // (WCAG 2.4.3) instead of being stranded on stale DOM.
+    assert.match(rs, /id="rc-step-h"\s+tabindex="-1"/, `${rsPath} step heading must be focusable (tabindex="-1")`);
+    assert.match(
+      rs,
+      /querySelector\("#rc-step-h"\)[\s\S]{0,60}\.focus\(\)/,
+      `${rsPath} must move focus to #rc-step-h on each step transition`,
+    );
+  });
+
+  test(`${rsPath}: no icon-only buttons (every button has a text label)`, () => {
+    // Buttons either carry literal text in the template, or (rc-copy /
+    // rc-save, whose label carries the running share number, e.g. "Copy share
+    // 2 text") have their textContent set from script immediately after
+    // render — either way, never icon-only.
+    const buttonRe = /<button\b[^>]*\bid="([a-zA-Z0-9_-]+)"[^>]*>([^<]*)<\/button>/g;
+    const ids: string[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = buttonRe.exec(rs))) {
+      const [, id, text] = m;
+      ids.push(id);
+      if (text.trim() === "") {
+        assert.match(
+          rs,
+          new RegExp(`querySelector\\("#${id}"\\)[\\s\\S]{0,80}\\.textContent\\s*=`),
+          `button #${id} in ${rsPath} has no literal text and no textContent assignment — would render icon/empty-only`,
+        );
+      }
+    }
+    // Sanity: confirm the scan actually found the wizard's buttons (a broken
+    // selector that matched nothing would otherwise pass vacuously).
+    assert.ok(ids.length >= 7, `expected to find the wizard's buttons in ${rsPath}, found ${ids.length}`);
+  });
+
+  const rrPath = "src/components/recovery-reconstruct-screen.ts";
+  const rr = readFileSync(rrPath, "utf8");
+
+  test(`${rrPath}: role=status / role=alert split is present`, () => {
+    // Running share count / reconstruct readiness is role="status" (polite);
+    // per-class share rejections and a failed ("verified: false") proof are
+    // role="alert" — spec §6/§10.
+    assert.match(rr, /role="status"/, `${rrPath} needs a role="status" region for count/progress`);
+    assert.match(rr, /role="alert"/, `${rrPath} needs a role="alert" region for rejections/failed proof`);
+  });
+
+  test(`${rrPath}: wizard focus order — focus moves to the step heading on transitions`, () => {
+    assert.match(rr, /id="rr-step-h"\s+tabindex="-1"/, `${rrPath} step heading must be focusable (tabindex="-1")`);
+    assert.match(
+      rr,
+      /querySelector\("#rr-step-h"\)[\s\S]{0,60}\.focus\(\)/,
+      `${rrPath} must move focus to #rr-step-h on each step transition`,
+    );
+  });
+
+  test(`${rrPath}: no icon-only buttons (every button has a text label)`, () => {
+    const buttonRe = /<button\b[^>]*\bid="([a-zA-Z0-9_-]+)"[^>]*>([^<]*)<\/button>/g;
+    const ids: string[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = buttonRe.exec(rr))) {
+      const [, id, text] = m;
+      ids.push(id);
+      if (text.trim() === "") {
+        assert.match(
+          rr,
+          new RegExp(`querySelector\\("#${id}"\\)[\\s\\S]{0,80}\\.textContent\\s*=`),
+          `button #${id} in ${rrPath} has no literal text and no textContent assignment — would render icon/empty-only`,
+        );
+      }
+    }
+    assert.ok(ids.length >= 5, `expected to find the wizard's buttons in ${rrPath}, found ${ids.length}`);
+  });
+
+  test(`${rrPath}: non-color-only success state (state-badge + text label)`, () => {
+    // The prove-verified success state renders via <state-badge> with an
+    // explicit text label, never a bare colour swatch (WCAG 1.4.1) — mirrors
+    // share-dialog's recipient-status pattern.
+    assert.match(rr, /createElement\("state-badge"\)/, "prove success must render a <state-badge>");
+    assert.match(
+      rr,
+      /badge\.setAttribute\("label",\s*"[^"]+"\)/,
+      "the state-badge must be given a text label, not just a state/colour",
     );
   });
 }
