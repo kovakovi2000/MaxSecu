@@ -162,6 +162,23 @@ pub fn load_sink_pins(dir: &Path) -> Result<SinkPins, UiError> {
     })
 }
 
+/// Load the offline-pinned **directory key-transparency (KT) log** public keys
+/// from `<dir>/config/kt_log.der` (a raw concatenation of 32-byte Ed25519 keys) —
+/// held to the SAME build-/deploy-time pinned trust model as the D5 directory pin
+/// and the sink pins, NEVER server-served (the whole point of KT is that a
+/// compromised operator cannot influence which key signs the checkpoint the client
+/// trusts). These are the keys a KT checkpoint signature must verify under
+/// ([`crate::transparency::verify_binding_transparency`]); a checkpoint not signed
+/// by a pinned key is equivocation and fails closed.
+///
+/// Absent ⇒ an EMPTY allowlist: the KT gate is OPT-IN (mirroring the optional
+/// `sink_transparency.der` list), so a deployment that has not pinned a KT key runs
+/// today's D5-only browse/open verification rather than failing every open closed.
+/// A malformed (non-multiple-of-32) file still fails closed.
+pub fn load_kt_log_pubs(dir: &Path) -> Result<Vec<[u8; 32]>, UiError> {
+    read_pinned_keys(&dir.join("config").join("kt_log.der"), false)
+}
+
 // Loaded by the UI in a later phase (Task 10) to prefill the connect form /
 // drive auto-connect; Phase-1 `connect` takes its parameters straight from the
 // ConnectRequest, so this type is not yet read by the binary.

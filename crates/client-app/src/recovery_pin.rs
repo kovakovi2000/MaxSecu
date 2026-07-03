@@ -63,6 +63,14 @@ pub enum TrustAlarm {
     /// so the UI can render a `server_untrusted`-class message naming it. Raised
     /// on a change only — a first sighting is normal TOFU and never trips this.
     UserKeyChanged { username: String },
+    /// A served directory binding could not be proven present in the directory
+    /// key-transparency log under a pinned, non-equivocating checkpoint (alarm-C,
+    /// [`crate::transparency`]). Raised when the KT checkpoint is not signed by a
+    /// pinned KT log key, equivocates/rolls back against the persisted gossip
+    /// checkpoint, or the binding is not provably included — i.e. the server
+    /// equivocated about keys. Surfaced as `server_untrusted` and BLOCKS the
+    /// browse/open (no content shown).
+    TransparencyFailure,
 }
 
 /// The recovery-account encryption pubkey pin compiled into this binary.

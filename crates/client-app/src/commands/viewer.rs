@@ -102,7 +102,6 @@ use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
 use crate::commands::feed::{file_type_name, hex, hex16, now_ms, parse_title_tags};
 use crate::config::load_directory_pub;
-use crate::directory::resolve_and_verify_author;
 use crate::download::{build_download_bundle, build_stream_header, parse_file_view};
 use crate::dto::{OpenContentRequest, OpenedContentDto};
 use crate::http_client::get_json;
@@ -198,7 +197,7 @@ async fn open_content_inner(
     }
     let manifest: Manifest =
         decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
-    let author = resolve_and_verify_author(
+    let (author, author_binding) = crate::directory::resolve_and_verify_author_logged(
         &mut sender,
         &host,
         &hex(&manifest.author_id.0),
@@ -207,6 +206,11 @@ async fn open_content_inner(
         now,
     )
     .await?;
+    // Trust-alarm C (spec §0-C/§7): block the OPEN unless the served author binding
+    // is provably present in the directory key-transparency log under a pinned,
+    // non-equivocating checkpoint (opt-in; see `enforce_author_transparency`).
+    crate::commands::feed::enforce_author_transparency(&dir.0, session.inner(), author_binding)
+        .await?;
     let my_id = crate::directory::resolve_my_user_id(
         &mut sender,
         &host,

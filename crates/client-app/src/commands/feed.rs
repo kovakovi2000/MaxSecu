@@ -131,6 +131,47 @@ pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Trust-alarm C (spec §0-C/§7): police the directory key-transparency (KT) log
+/// for a served, D5-verified author binding at the browse/open resolve boundary.
+///
+/// **Opt-in.** If no KT log key is pinned (`config::load_kt_log_pubs` empty), or the
+/// sink is not pinned, this is a no-op and the caller runs today's D5-only
+/// verification — so a deployment without a pinned KT key still browses. When a KT
+/// key IS pinned, fetch the checkpoint / inclusion / consistency proofs from the
+/// pinned SINK (never the app server) and verify `binding_bytes` is provably logged
+/// under a pinned, non-equivocating checkpoint via
+/// [`crate::transparency::verify_binding_transparency`]; ANY failure BLOCKS the
+/// open with a `server_untrusted` error (no content shown). The persisted gossip
+/// checkpoint advances on success (TOFU-pins), making cross-session split-view /
+/// rollback detectable. `HttpSinkClient` is blocking, so the verify runs on a
+/// `spawn_blocking` worker (never inside this async task's runtime).
+pub(crate) async fn enforce_author_transparency(
+    dir: &std::path::Path,
+    session: &Session,
+    binding_bytes: Vec<u8>,
+) -> Result<(), UiError> {
+    let kt_pubs = crate::config::load_kt_log_pubs(dir)?;
+    if kt_pubs.is_empty() {
+        return Ok(()); // KT gate not configured (opt-in) — D5-only, as today.
+    }
+    let pins = crate::config::load_sink_pins(dir)?;
+    // Open the persisted gossip store under the unlocked identity (sealed at rest);
+    // the borrow is confined to this block, released before the blocking verify.
+    let mut store = {
+        let guard = session.0.lock().await;
+        let identity = guard
+            .identity
+            .as_ref()
+            .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+        crate::transparency::DiskKtCheckpointStore::open(dir, identity)?
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::transparency::verify_binding_transparency(&pins, &kt_pubs, &mut store, &binding_bytes)
+    })
+    .await
+    .map_err(|_| UiError::new("server_untrusted", "The key-transparency check could not run."))?
+}
+
 /// Run the §12.5 header ladder for MY wrap with a transiently-borrowed identity.
 /// Factored out so the `&identity` borrow (the `ctx` holds `enc_secret()`) is
 /// confined to this call — the caller restores the identity into the session on
@@ -228,7 +269,7 @@ pub async fn decrypt_card(
         decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
 
     // Resolve the author (Phase 3: author == owner) + my own id, under the pinned D5.
-    let author = crate::directory::resolve_and_verify_author(
+    let (author, author_binding) = crate::directory::resolve_and_verify_author_logged(
         &mut sender,
         &host,
         &hex(&manifest.author_id.0),
@@ -237,6 +278,11 @@ pub async fn decrypt_card(
         now,
     )
     .await?;
+    // Trust-alarm C (spec §0-C/§7): the D5-verified author binding must ALSO be
+    // provably present in the directory key-transparency log under a pinned,
+    // non-equivocating checkpoint. Opt-in (see `enforce_author_transparency`); when
+    // a KT key is pinned, ANY failure blocks the card as `server_untrusted`.
+    enforce_author_transparency(&dir.0, session.inner(), author_binding).await?;
     let my_id = crate::directory::resolve_my_user_id(
         &mut sender,
         &host,

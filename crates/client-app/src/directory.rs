@@ -168,6 +168,28 @@ pub async fn resolve_and_verify_author(
     trust: &mut (dyn TrustStore + Send),
     now_ms: u64,
 ) -> Result<VerifiedAuthor, UiError> {
+    Ok(resolve_and_verify_author_logged(sender, host, user_id_hex, verifier, trust, now_ms)
+        .await?
+        .0)
+}
+
+/// Like [`resolve_and_verify_author`] but ALSO returns the canonical served
+/// `DirBinding` leaf bytes — the EXACT bytes the directory KT log records for this
+/// author (`crates/server/src/http.rs` publishes them on enrollment). The
+/// browse/open resolve boundary feeds these to the trust-alarm-C gate
+/// ([`crate::transparency::verify_binding_transparency`]) so the client can prove
+/// the served binding is provably included in the KT log under a pinned,
+/// non-equivocating checkpoint — catching a server that serves a key it never
+/// logged. The bytes are the SAME ones D5-verified here (never re-fetched), so the
+/// KT-proven leaf and the D5-trusted keys cannot diverge.
+pub async fn resolve_and_verify_author_logged(
+    sender: &mut SendRequest<Full<Bytes>>,
+    host: &str,
+    user_id_hex: &str,
+    verifier: &DirectoryVerifier,
+    trust: &mut (dyn TrustStore + Send),
+    now_ms: u64,
+) -> Result<(VerifiedAuthor, Vec<u8>), UiError> {
     let (status, json) = get_json(
         sender,
         &format!("/v1/directory/by-id/{user_id_hex}"),
@@ -182,7 +204,8 @@ pub async fn resolve_and_verify_author(
         ));
     }
     let (bytes, sig) = parse_binding(&json)?;
-    verify_author_binding(verifier, trust, &bytes, &sig, now_ms)
+    let author = verify_author_binding(verifier, trust, &bytes, &sig, now_ms)?;
+    Ok((author, bytes))
 }
 
 /// Resolve MY own `user_id` from my published binding (`GET /v1/directory/{username}`),

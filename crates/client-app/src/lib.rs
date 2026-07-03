@@ -28,6 +28,7 @@ pub mod sink;
 pub mod state;
 pub mod tofu;
 pub mod tor;
+pub mod transparency;
 pub mod transport;
 pub mod upload;
 pub mod upload_staging;

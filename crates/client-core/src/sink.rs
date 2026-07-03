@@ -307,6 +307,65 @@ impl HttpSinkClient {
             .ok_or(SinkError::Unreachable)
     }
 
+    /// `GET /v1/dir-log/checkpoint` — the directory key-transparency log's current
+    /// signed checkpoint `{tree_size, root, sig}` (`sink-interface.md` §8), in the
+    /// exact shape [`crate::transparency::verify_binding_in_log`] verifies. The
+    /// bytes are untrusted until that verifier confirms the signature under a pinned
+    /// KT log key. Any transport/parse failure is fail-closed [`SinkError::Unreachable`].
+    pub fn fetch_kt_checkpoint(&self) -> Result<crate::transparency::KtCheckpoint, SinkError> {
+        let body = self.get("/v1/dir-log/checkpoint")?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| SinkError::Unreachable)?;
+        let tree_size = v.get("tree_size").and_then(|x| x.as_u64()).ok_or(SinkError::Unreachable)?;
+        let root = v
+            .get("root_b64")
+            .and_then(|x| x.as_str())
+            .and_then(b64_fixed::<32>)
+            .ok_or(SinkError::Unreachable)?;
+        let sig = v
+            .get("sig_b64")
+            .and_then(|x| x.as_str())
+            .and_then(b64_fixed::<64>)
+            .ok_or(SinkError::Unreachable)?;
+        Ok(crate::transparency::KtCheckpoint {
+            tree_size,
+            root,
+            sig,
+        })
+    }
+
+    /// `GET /v1/dir-log/inclusion?index=<i>` — an inclusion proof for the `index`-th
+    /// binding leaf against the current KT tree (`sink-interface.md` §8), in the
+    /// shape [`crate::transparency::InclusionProof`]. A `404` (out-of-range index)
+    /// or any parse failure collapses to fail-closed [`SinkError::Unreachable`].
+    pub fn fetch_kt_inclusion(
+        &self,
+        index: u64,
+    ) -> Result<crate::transparency::InclusionProof, SinkError> {
+        let body = self.get(&format!("/v1/dir-log/inclusion?index={index}"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| SinkError::Unreachable)?;
+        let index = v.get("index").and_then(|x| x.as_u64()).ok_or(SinkError::Unreachable)?;
+        let tree_size = v.get("tree_size").and_then(|x| x.as_u64()).ok_or(SinkError::Unreachable)?;
+        let path = parse_hash_path(&v).ok_or(SinkError::Unreachable)?;
+        Ok(crate::transparency::InclusionProof {
+            index,
+            tree_size,
+            path,
+        })
+    }
+
+    /// `GET /v1/dir-log/consistency?from=<n>` — a consistency proof `from → current`
+    /// (`sink-interface.md` §8), so a client holding a persisted size-`from`
+    /// checkpoint can prove the current one is an append-only extension (else it
+    /// detects a split view). Any parse failure is fail-closed [`SinkError::Unreachable`].
+    pub fn fetch_kt_consistency(&self, from: u64) -> Result<Vec<[u8; 32]>, SinkError> {
+        let body = self.get(&format!("/v1/dir-log/consistency?from={from}"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| SinkError::Unreachable)?;
+        parse_hash_path(&v).ok_or(SinkError::Unreachable)
+    }
+
     /// `GET /v1/control-log/position?chain_seq=<n>` — the global sink position of
     /// the `chain_seq`-th control append (1-based). A `404` (no such record at the
     /// sink) is **fail-closed** [`SinkError::Unreachable`], never a silent zero:
@@ -331,6 +390,20 @@ fn b64_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
     use base64::Engine;
     let v = base64::engine::general_purpose::STANDARD.decode(s).ok()?;
     v.try_into().ok()
+}
+
+/// Parse a `path_b64` field (a JSON array of base64 32-byte hashes) into a Merkle
+/// audit/consistency path. `None` on any missing field or ill-formed element (the
+/// caller maps that to a fail-closed [`SinkError::Unreachable`]). An absent-but-
+/// present empty array is a valid empty path (a one-leaf inclusion / a trivial
+/// consistency step).
+#[cfg(feature = "net")]
+fn parse_hash_path(v: &serde_json::Value) -> Option<Vec<[u8; 32]>> {
+    v.get("path_b64")?
+        .as_array()?
+        .iter()
+        .map(|h| b64_fixed::<32>(h.as_str()?))
+        .collect::<Option<Vec<[u8; 32]>>>()
 }
 
 /// Parse the §3.1 head JSON into an [`AnchoredHead`] and BOTH anchor-proof forms.
