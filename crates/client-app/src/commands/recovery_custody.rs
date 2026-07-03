@@ -370,7 +370,11 @@ pub fn reconstruct_in_session(session: &CeremonySession) -> Result<ReconstructRe
 /// closed with `(code, message)`. A wrong length OR a non-hex digit is a
 /// plumbing error — an operator/UI mistake, NOT a cryptographic proof result.
 fn parse_hex<const N: usize>(s: &str, code: &str, message: &str) -> Result<[u8; N], UiError> {
-    if s.len() != 2 * N {
+    // Reject non-ASCII up front: hex is ASCII by definition, and this guarantees
+    // every byte index below lands on a UTF-8 char boundary (each ASCII char is one
+    // byte), so the `&s[2*i..2*i+2]` slicing cannot panic on a multi-byte character
+    // straddling an even index in operator-typed input.
+    if !s.is_ascii() || s.len() != 2 * N {
         return Err(UiError::new(code, message));
     }
     let mut out = [0u8; N];
@@ -1292,6 +1296,30 @@ mod prove_tests {
     }
 
     #[test]
+    fn non_ascii_hex_input_fails_closed_without_panicking() {
+        // Regression: a non-ASCII string whose BYTE length is exactly 2*N but that
+        // contains a multi-byte char straddling an even index must fail closed, not
+        // panic on a non-char-boundary slice. "a" + "é"(2 bytes) + "a"*29 = 32 bytes.
+        let bad = format!("a\u{e9}{}", "a".repeat(29));
+        assert_eq!(bad.len(), 32);
+
+        let (rsk, rpk) = generate_enc_keypair();
+        let (session, handle) = reconstructed_session(&rsk, "label");
+        let dek = Dek::generate();
+        let wire = recovery_wire_wrap(&rpk, &dek, FILE_ID, VERSION);
+
+        let req = ProveRequest {
+            ceremony_handle: handle,
+            file_id_hex: bad.clone(), // non-ASCII, 32 bytes — must fail closed, not panic
+            version: VERSION,
+            dek_commit_hex: hex(&dek.commit()),
+            recovery_wrap_b64: B64.encode(&wire),
+        };
+        let err = prove_in_session(req, &session).expect_err("non-ascii file id must fail closed");
+        assert_eq!(err.code, "bad_file_id");
+    }
+
+    #[test]
     fn malformed_dek_commit_hex_is_a_uierror() {
         let (rsk, rpk) = generate_enc_keypair();
         let (session, handle) = reconstructed_session(&rsk, "label");
@@ -1371,8 +1399,14 @@ mod ceremony_log_tests {
         assert!(contents.contains("k=3"), "k missing: {contents}");
         assert!(contents.contains("n=5"), "n missing: {contents}");
         assert!(contents.contains("alice"), "operator missing: {contents}");
-        assert!(contents.contains("op=split"), "operation kind missing: {contents}");
-        assert!(contents.contains("ts_unix="), "timestamp missing: {contents}");
+        assert!(
+            contents.contains("op=split"),
+            "operation kind missing: {contents}"
+        );
+        assert!(
+            contents.contains("ts_unix="),
+            "timestamp missing: {contents}"
+        );
         for i in [1u8, 2, 3, 4, 5] {
             assert!(
                 contents.contains(&i.to_string()),
