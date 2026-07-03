@@ -70,17 +70,6 @@ pub struct StoredBinding {
     pub signature: [u8; 64],
 }
 
-/// One un-approved account for the admin queue (`GET /v1/pending`, D-G): a user
-/// record with **no** published binding yet. `created_at_ms` is the account's
-/// `enrolled_at` registration time in epoch ms (0 only if a backend somehow
-/// lacks one), which the pending screen surfaces and sorts newest-first.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingUser {
-    pub user_id: [u8; 16],
-    pub username: String,
-    pub created_at_ms: u64,
-}
-
 /// One control-log record as served by `GET /v1/revocations` (api.md §7.1): the
 /// opaque signed bytes, the issuer (and optional co-) signature, and the chain
 /// `head` (advisory — the client recomputes it and checks the anchored head).
@@ -224,10 +213,6 @@ pub trait Store: Send + Sync {
         enc_pub: [u8; 32],
         sig_pub: [u8; 32],
     ) -> Result<Option<[u8; 16]>, StoreError>;
-    /// Consume a one-time enrollment voucher; `Ok(true)` iff it was valid and
-    /// unused (the anti-spam gate for the unauthenticated `POST /v1/users`,
-    /// api.md §5.1). `Ok(false)` = invalid/used; `Err` = backend fault.
-    async fn consume_voucher(&self, voucher_hash: &[u8; 32]) -> Result<bool, StoreError>;
     async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, StoreError>;
     async fn insert_nonce(
         &self,
@@ -273,23 +258,6 @@ pub trait Store: Send + Sync {
         &self,
         user_id: &[u8; 16],
     ) -> Result<Option<StoredBinding>, StoreError>;
-    /// `true` iff at least one signed binding has been published — the first-run
-    /// bootstrap window is **open** only while this is `false` (§4.2).
-    async fn has_any_binding(&self) -> Result<bool, StoreError>;
-
-    /// Users with a record but no published binding — the admin approval queue
-    /// (§4.2 / D-G). Newest-first by `created_at_ms`.
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError>;
-
-    /// Persist a fresh single-use enrollment voucher by its `SHA-256` hash, with
-    /// an absolute expiry (`POST /v1/vouchers`, admin-issued). Idempotent re-issue
-    /// of the same hash is allowed.
-    async fn issue_voucher(
-        &self,
-        voucher_hash: [u8; 32],
-        issued_by: [u8; 16],
-        expires_at_ms: u64,
-    ) -> Result<(), StoreError>;
 
     // ---- Registration keys (single-use enrollment secrets; T2) ----
 
@@ -303,18 +271,10 @@ pub trait Store: Send + Sync {
         expires_at_ms: u64,
     ) -> Result<(), StoreError>;
     /// Consume a registration key by its hash; `Ok(true)` iff it was present,
-    /// unused and unexpired (deleted-on-consume, exactly like [`consume_voucher`]
-    /// — atomic single-use). `Ok(false)` = unknown/used/expired; `Err` = fault.
-    ///
-    /// [`consume_voucher`]: Store::consume_voucher
+    /// unused and unexpired (deleted-on-consume — atomic single-use). `Ok(false)`
+    /// = unknown/used/expired; `Err` = fault.
     async fn consume_registration_key(&self, key_hash: &[u8; 32])
         -> Result<bool, StoreError>;
-    /// `true` iff at least one user account exists.
-    ///
-    /// **T15: production-dead.** Superseded by the atomic first-admin claim inside
-    /// [`enroll`](Store::enroll); retained only for the `reg_keys` unit test.
-    /// Remove in the bootstrap cleanup sweep.
-    async fn any_user_exists(&self) -> Result<bool, StoreError>;
     /// Atomically claim the ONE-TIME "first admin" slot: `Ok(true)` for exactly
     /// the first caller ever, `Ok(false)` thereafter. The race-safe primitive
     /// backing [`enroll`](Store::enroll)'s admin decision — a singleton row claimed
@@ -522,22 +482,17 @@ pub(crate) fn ancestor_chain(
     out
 }
 
-/// Wall-clock epoch-ms (best-effort; the dev `MemoryStore` only).
-fn now_ms_wall() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[derive(Default)]
 struct Inner {
     users: HashMap<String, UserRecord>,
-    // Wall-clock creation time per username (best-effort; dev store only).
-    created_ms: HashMap<String, u64>,
     nonces: HashMap<[u8; 32], NonceRecord>,
     sessions: HashMap<[u8; 32], SessionRecord>,
-    vouchers: HashSet<[u8; 32]>, // unused enrollment voucher hashes
+    // Seeded enrollment-voucher hashes. The trait's voucher methods are gone
+    // (registration-key-only enrollment, T15); this field + `add_voucher` are
+    // retained ONLY so the not-yet-migrated client-e2e voucher tests still
+    // compile — remove both once T16 migrates them to registration keys.
+    #[allow(dead_code)]
+    vouchers: HashSet<[u8; 32]>,
     reg_keys: HashSet<[u8; 32]>, // unused single-use registration-key hashes (T2)
     // The one-time first-admin claim (T4): `true` once the first registrant has
     // claimed admin; every later `claim_first_admin` observes `true` and loses.
@@ -592,14 +547,12 @@ impl MemoryStore {
     /// Seed an already-enrolled user (test/dev convenience).
     pub fn add_user(&self, username: &str, rec: UserRecord) {
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .created_ms
-            .entry(username.to_owned())
-            .or_insert_with(now_ms_wall);
         inner.users.insert(username.to_owned(), rec);
     }
 
     /// Seed a usable enrollment voucher by its `SHA-256` hash (issued in person).
+    /// Retained only for the not-yet-migrated client-e2e voucher tests (T16); the
+    /// server no longer consumes vouchers (registration-key-only enrollment).
     pub fn add_voucher(&self, voucher_hash: [u8; 32]) {
         self.inner.lock().unwrap().vouchers.insert(voucher_hash);
     }
@@ -607,17 +560,6 @@ impl MemoryStore {
     /// Seed a usable single-use registration key by its `SHA-256` hash (T4 tests).
     pub fn add_reg_key(&self, key_hash: [u8; 32]) {
         self.inner.lock().unwrap().reg_keys.insert(key_hash);
-    }
-
-    /// Override a user's recorded creation time (tests only — `add_user`/
-    /// `create_user` stamp wall-clock, which a test cannot control).
-    #[cfg(test)]
-    pub(crate) fn set_created_ms(&self, username: &str, ms: u64) {
-        self.inner
-            .lock()
-            .unwrap()
-            .created_ms
-            .insert(username.to_owned(), ms);
     }
 }
 
@@ -649,12 +591,7 @@ impl Store for MemoryStore {
                 sig_pub,
             },
         );
-        inner.created_ms.insert(username.to_owned(), now_ms_wall());
         Ok(Some(user_id))
-    }
-
-    async fn consume_voucher(&self, voucher_hash: &[u8; 32]) -> Result<bool, StoreError> {
-        Ok(self.inner.lock().unwrap().vouchers.remove(voucher_hash))
     }
 
     async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, StoreError> {
@@ -774,40 +711,6 @@ impl Store for MemoryStore {
             .map(|(_, b)| b.clone()))
     }
 
-    async fn has_any_binding(&self) -> Result<bool, StoreError> {
-        Ok(!self.inner.lock().unwrap().bindings.is_empty())
-    }
-
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
-        let inner = self.inner.lock().unwrap();
-        let mut out: Vec<PendingUser> = inner
-            .users
-            .iter()
-            .filter(|(_, u)| !inner.bindings.contains_key(&u.user_id))
-            .map(|(name, u)| PendingUser {
-                user_id: u.user_id,
-                username: name.clone(),
-                created_at_ms: inner.created_ms.get(name).copied().unwrap_or(0),
-            })
-            .collect();
-        out.sort_by(|a, b| {
-            b.created_at_ms
-                .cmp(&a.created_at_ms)
-                .then(a.user_id.cmp(&b.user_id))
-        });
-        Ok(out)
-    }
-
-    async fn issue_voucher(
-        &self,
-        voucher_hash: [u8; 32],
-        _issued_by: [u8; 16],
-        _expires_at_ms: u64,
-    ) -> Result<(), StoreError> {
-        self.inner.lock().unwrap().vouchers.insert(voucher_hash);
-        Ok(())
-    }
-
     async fn issue_registration_key(
         &self,
         key_hash: [u8; 32],
@@ -822,10 +725,6 @@ impl Store for MemoryStore {
         key_hash: &[u8; 32],
     ) -> Result<bool, StoreError> {
         Ok(self.inner.lock().unwrap().reg_keys.remove(key_hash))
-    }
-
-    async fn any_user_exists(&self) -> Result<bool, StoreError> {
-        Ok(!self.inner.lock().unwrap().users.is_empty())
     }
 
     async fn claim_first_admin(&self) -> Result<bool, StoreError> {
@@ -877,7 +776,6 @@ impl Store for MemoryStore {
                 sig_pub,
             },
         );
-        inner.created_ms.insert(username.to_owned(), now_ms_wall());
         inner.bindings.insert(
             user_id,
             (
@@ -1337,9 +1235,6 @@ impl Store for FaultyStore {
     ) -> Result<Option<[u8; 16]>, StoreError> {
         Err(Self::fault("create_user"))
     }
-    async fn consume_voucher(&self, _voucher_hash: &[u8; 32]) -> Result<bool, StoreError> {
-        Err(Self::fault("consume_voucher"))
-    }
     async fn user_by_name(&self, _username: &str) -> Result<Option<UserRecord>, StoreError> {
         Err(Self::fault("user_by_name"))
     }
@@ -1398,20 +1293,6 @@ impl Store for FaultyStore {
     ) -> Result<Option<StoredBinding>, StoreError> {
         Err(Self::fault("binding_by_user_id"))
     }
-    async fn has_any_binding(&self) -> Result<bool, StoreError> {
-        Err(Self::fault("has_any_binding"))
-    }
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
-        Err(Self::fault("list_pending_users"))
-    }
-    async fn issue_voucher(
-        &self,
-        _voucher_hash: [u8; 32],
-        _issued_by: [u8; 16],
-        _expires_at_ms: u64,
-    ) -> Result<(), StoreError> {
-        Err(Self::fault("issue_voucher"))
-    }
     async fn issue_registration_key(
         &self,
         _key_hash: [u8; 32],
@@ -1424,9 +1305,6 @@ impl Store for FaultyStore {
         _key_hash: &[u8; 32],
     ) -> Result<bool, StoreError> {
         Err(Self::fault("consume_registration_key"))
-    }
-    async fn any_user_exists(&self) -> Result<bool, StoreError> {
-        Err(Self::fault("any_user_exists"))
     }
     async fn claim_first_admin(&self) -> Result<bool, StoreError> {
         Err(Self::fault("claim_first_admin"))
@@ -1532,128 +1410,5 @@ impl Store for FaultyStore {
         _caller_id: [u8; 16],
     ) -> Result<Vec<String>, DiscardError> {
         Err(DiscardError::Store(Self::fault("discard_unfinalized")))
-    }
-}
-
-#[cfg(test)]
-mod phase2_store_tests {
-    use super::*;
-    use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
-    use maxsecu_encoding::{encode, structs::DirBinding};
-
-    fn binding_bytes(uid: u8) -> Vec<u8> {
-        encode(&DirBinding {
-            username: Text::new("u").unwrap(),
-            user_id: Id([uid; 16]),
-            enc_pub: Bytes32([uid; 32]),
-            sig_pub: Bytes32([uid; 32]),
-            key_version: 1,
-            roles: RoleSet::new([Role::User]),
-            not_before: Timestamp(0),
-            not_after: Timestamp(4_102_444_800_000),
-            mlkem_pub: None,
-        })
-    }
-
-    #[tokio::test]
-    async fn has_any_binding_flips_after_first_publish() {
-        let s = MemoryStore::new();
-        assert!(
-            !s.has_any_binding().await.unwrap(),
-            "window open with no bindings"
-        );
-        s.put_binding([0x0A; 16], 1, binding_bytes(0x0A), [0u8; 64])
-            .await
-            .unwrap();
-        assert!(
-            s.has_any_binding().await.unwrap(),
-            "window closes after first publish"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_pending_excludes_users_with_a_binding() {
-        let s = MemoryStore::new();
-        s.add_user(
-            "alice",
-            UserRecord {
-                user_id: [0x0A; 16],
-                enc_pub: [1; 32],
-                sig_pub: [1; 32],
-            },
-        );
-        s.add_user(
-            "bob",
-            UserRecord {
-                user_id: [0x0B; 16],
-                enc_pub: [2; 32],
-                sig_pub: [2; 32],
-            },
-        );
-        // alice gets a binding (approved); bob stays pending.
-        s.put_binding([0x0A; 16], 1, binding_bytes(0x0A), [0u8; 64])
-            .await
-            .unwrap();
-
-        let pending = s.list_pending_users().await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].user_id, [0x0B; 16]);
-        assert_eq!(pending[0].username, "bob");
-    }
-
-    #[tokio::test]
-    async fn list_pending_orders_newest_first_then_user_id() {
-        let s = MemoryStore::new();
-        s.add_user(
-            "a",
-            UserRecord {
-                user_id: [0x01; 16],
-                enc_pub: [1; 32],
-                sig_pub: [1; 32],
-            },
-        );
-        s.add_user(
-            "b",
-            UserRecord {
-                user_id: [0x02; 16],
-                enc_pub: [2; 32],
-                sig_pub: [2; 32],
-            },
-        );
-        s.add_user(
-            "c",
-            UserRecord {
-                user_id: [0x03; 16],
-                enc_pub: [3; 32],
-                sig_pub: [3; 32],
-            },
-        );
-        // Deterministic creation times (wall-clock stamps cannot be controlled).
-        s.set_created_ms("a", 300);
-        s.set_created_ms("b", 100);
-        s.set_created_ms("c", 300);
-
-        let pending = s.list_pending_users().await.unwrap();
-        // Newest-first by created_at_ms; ties broken by ascending user_id, so the
-        // two ms=300 rows (a, c) come before b=100, and a precedes c.
-        let order: Vec<[u8; 16]> = pending.iter().map(|p| p.user_id).collect();
-        assert_eq!(order, vec![[0x01; 16], [0x03; 16], [0x02; 16]]);
-    }
-
-    #[tokio::test]
-    async fn issued_voucher_is_consumable_once() {
-        let s = MemoryStore::new();
-        let h = maxsecu_crypto::sha256(b"invite-code-xyz");
-        s.issue_voucher(h, [0xAD; 16], 4_102_444_800_000)
-            .await
-            .unwrap();
-        assert!(
-            s.consume_voucher(&h).await.unwrap(),
-            "fresh issued voucher consumes"
-        );
-        assert!(
-            !s.consume_voucher(&h).await.unwrap(),
-            "second consume fails (single-use)"
-        );
     }
 }

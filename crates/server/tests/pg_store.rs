@@ -120,35 +120,6 @@ impl TestDb {
         PgStore::new(pool)
     }
 
-    /// Seed an admin user (the in-person voucher issuer; satisfies the
-    /// `enrollment_vouchers.issued_by` FK). Returns its `user_id`.
-    async fn seed_admin(&self) -> [u8; 16] {
-        let id: [u8; 16] = random_array();
-        sqlx::query("INSERT INTO users (user_id, username, enc_pub, sig_pub) VALUES ($1,$2,$3,$4)")
-            .bind(&id[..])
-            .bind("admin")
-            .bind(&[0xAAu8; 32][..])
-            .bind(&[0xBBu8; 32][..])
-            .execute(self.store.pool())
-            .await
-            .unwrap();
-        id
-    }
-
-    /// Seed a usable, unexpired enrollment voucher by its plaintext code.
-    async fn seed_voucher(&self, issued_by: &[u8; 16], code: &str) {
-        let h = sha256(code.as_bytes());
-        sqlx::query(
-            "INSERT INTO enrollment_vouchers (voucher_hash, issued_by, expires_at) \
-             VALUES ($1, $2, now() + interval '1 day')",
-        )
-        .bind(&h[..])
-        .bind(&issued_by[..])
-        .execute(self.store.pool())
-        .await
-        .unwrap();
-    }
-
     /// Seed a user with a chosen `user_id` (for `files.owner_id` FK).
     async fn seed_user(&self, id: [u8; 16], name: &str) {
         sqlx::query("INSERT INTO users (user_id, username, enc_pub, sig_pub) VALUES ($1,$2,$3,$4)")
@@ -257,7 +228,10 @@ async fn enroll_is_atomic_and_first_is_admin_over_pg() {
             .unwrap(),
         EnrollOutcome::KeyInvalid
     );
-    assert!(!store.any_user_exists().await.unwrap(), "KeyInvalid created no user");
+    assert!(
+        store.user_by_name("alice").await.unwrap().is_none(),
+        "KeyInvalid created no user"
+    );
     assert!(store.binding_by_username("alice").await.unwrap().is_none());
 
     // (b) Seed the key; the FIRST enrollment claims admin + stores the admin
@@ -328,14 +302,6 @@ async fn enroll_is_atomic_and_first_is_admin_over_pg() {
 async fn register_then_full_login_persists_in_postgres() {
     let db = db_or_skip!();
 
-    // In-person enrollment: admin issues a voucher; the new user consumes it.
-    let admin = db.seed_admin().await;
-    db.seed_voucher(&admin, "voucher-1").await;
-    assert!(
-        db.store.consume_voucher(&sha256(b"voucher-1")).await.unwrap(),
-        "valid unused voucher consumes"
-    );
-
     let sk = SigningKey::generate();
     let user_id = db
         .store
@@ -383,26 +349,6 @@ async fn duplicate_username_returns_none() {
             .unwrap()
             .is_none(),
         "second create with the same username is a 409 (None)"
-    );
-    db.teardown().await;
-}
-
-#[tokio::test]
-async fn voucher_is_single_use_and_unknown_is_false() {
-    let db = db_or_skip!();
-    let admin = db.seed_admin().await;
-    db.seed_voucher(&admin, "one-shot").await;
-    assert!(db.store.consume_voucher(&sha256(b"one-shot")).await.unwrap());
-    assert!(
-        !db.store.consume_voucher(&sha256(b"one-shot")).await.unwrap(),
-        "second consume of the same voucher fails"
-    );
-    assert!(
-        !db.store
-            .consume_voucher(&sha256(b"never-issued"))
-            .await
-            .unwrap(),
-        "unknown voucher fails"
     );
     db.teardown().await;
 }

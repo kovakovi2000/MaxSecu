@@ -1,8 +1,9 @@
 //! Compose the secret-free server from the portable layout + dev artifacts and
 //! serve it over TLS. [`prepare`] is reusable by the smoke test (it returns the
-//! bound listener + TLS config + composed router); [`run`] prints the dev
-//! bootstrap secret ONCE + the DEV-ONLY warnings, exports the client pins, then
-//! serves until killed.
+//! bound listener + TLS config + composed router); [`run`] prints the DEV-ONLY
+//! warnings + the new-model enrollment guidance, exports the client pins, then
+//! serves until killed. There is NO bootstrap secret — enrollment is
+//! registration-key-only (via `maxsecu-setup`), and the first registrant is admin.
 
 use std::sync::Arc;
 
@@ -60,32 +61,28 @@ fn build_blobs(cfg: &LauncherConfig, layout: &Layout) -> std::io::Result<Arc<dyn
 }
 
 /// What [`prepare`] produces: a bound listener + TLS config + the composed
-/// (monomorphized) router, plus the freshly-generated bootstrap secret (`Some`
-/// only on first run, to print once) and the pinned DEV directory key.
+/// (monomorphized) router, plus the pinned DEV directory key.
 pub struct Prepared {
     pub listener: TcpListener,
     pub server_config: Arc<ServerConfig>,
     pub router: axum::Router,
-    pub bootstrap_secret: Option<String>,
     pub directory_pub: [u8; 32],
     pub local_addr: std::net::SocketAddr,
 }
 
-/// Lay out the data dir, ensure the dev cert / D5 / bootstrap secret, compose the
-/// `AppState` (DEV: `MemoryStore` + persistent `FsBlobStore` + `NullAuditSink`),
-/// and bind the listener. Reusable by the smoke test. DEV profile only.
+/// Lay out the data dir, ensure the dev cert / D5, compose the `AppState` (DEV:
+/// `MemoryStore` + persistent `FsBlobStore` + `NullAuditSink`), and bind the
+/// listener. Reusable by the smoke test. DEV profile only. There is NO bootstrap
+/// secret — enrollment is registration-key-only (the first registrant is admin).
 pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
     // Dev artifacts are identical on BOTH profiles: the persistent profile is a
-    // SECURITY-DEGRADED *persistent-DEV* (Postgres persistence + dev cert/D5/
-    // bootstrap), NOT the production ceremony profile (which additionally requires
-    // an injected non-self-signed cert + an external WORM/audit sink + the offline
-    // ceremony key). Only the Store backend differs: MemoryStore vs PgStore.
+    // SECURITY-DEGRADED *persistent-DEV* (Postgres persistence + dev cert/D5),
+    // NOT the production ceremony profile (which additionally requires an injected
+    // non-self-signed cert + an external WORM/audit sink + the offline ceremony
+    // key). Only the Store backend differs: MemoryStore vs PgStore.
     let layout = Layout::ensure(&cfg.data_dir)?;
     pki::ensure_dev_cert(&layout)?;
     let directory_pub = bootstrap::ensure_dev_d5(&layout)?;
-    let bootstrap_secret = bootstrap::ensure_bootstrap_secret(&layout)?;
-    let hash = bootstrap::bootstrap_secret_hash(&layout)?
-        .ok_or_else(|| std::io::Error::other("bootstrap hash missing after ensure"))?;
     // The server is the enrollment authority (§5, T4): it signs enrollment
     // bindings with the DEV D5 key (the private half of `directory_pub`). The
     // seed never leaves this process (DEV-only; production signs offline).
@@ -94,9 +91,7 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
     ));
 
     let server_config = pki::load_server_config(&layout)?;
-    let auth_cfg = AuthConfig::default()
-        .with_directory_pub(directory_pub)
-        .with_bootstrap_secret_hash(hash);
+    let auth_cfg = AuthConfig::default().with_directory_pub(directory_pub);
     let blobs = build_blobs(cfg, &layout)?;
 
     // Compose the router over the profile's Store. Each branch builds a distinct
@@ -144,15 +139,14 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
         router: app_router,
         listener,
         server_config,
-        bootstrap_secret,
         directory_pub,
         local_addr,
     })
 }
 
 /// Run the dev launcher: prepare, export the client pins (cert + D5 pubkey), print
-/// the bootstrap secret ONCE + the DEV-ONLY warnings + the pin locations, then
-/// serve until the process is killed.
+/// the DEV-ONLY warnings + the pin locations + the new-model enrollment guidance,
+/// then serve until the process is killed. No bootstrap secret is generated.
 pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
     let prepared = prepare(&cfg).await?;
     let layout = Layout::ensure(&cfg.data_dir)?;
@@ -164,7 +158,7 @@ pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
 
     let profile_label = match cfg.profile {
         Profile::Dev => "DEV / ephemeral MemoryStore",
-        Profile::Prod => "persistent-DEV / Postgres (SECURITY-DEGRADED dev cert+D5+secret)",
+        Profile::Prod => "persistent-DEV / Postgres (SECURITY-DEGRADED dev cert+D5)",
     };
     eprintln!(
         "maxsecu-portable-server ({profile_label}) listening on https://{}",
@@ -192,11 +186,12 @@ pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
         "  pinned D5 (DEV ONLY — replace with the offline ceremony key in production): {}",
         hex(&prepared.directory_pub)
     );
-    if let Some(secret) = &prepared.bootstrap_secret {
-        eprintln!("  BOOTSTRAP SECRET (shown ONCE — record it now): {secret}");
-    } else {
-        eprintln!("  (already bootstrapped — the bootstrap secret was shown on first run)");
-    }
+    // Enrollment model (T4/T14): NO bootstrap secret. Recovery registration is OPEN
+    // on a fresh server and CLOSES (409) once used; enrollment is registration-key
+    // only — the first account to enroll with a key becomes admin.
+    eprintln!("  enrollment: registration-key only (first registrant = admin);");
+    eprintln!("    provision the recovery account + the first registration key with `maxsecu-setup`");
+    eprintln!("    (once-only: recovery registration is open now, and closes after the first use).");
     serve(prepared.listener, prepared.server_config, prepared.router).await
 }
 

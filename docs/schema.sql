@@ -100,21 +100,12 @@ CREATE TABLE sessions (                           -- channel-bound tokens (§9.2
 );
 CREATE INDEX sessions_user_idx ON sessions(user_id);
 
-CREATE TABLE enrollment_vouchers (                -- one-time in-person anti-spam gate for POST /v1/users (api.md §5.1)
-  voucher_hash  BYTEA PRIMARY KEY CHECK (octet_length(voucher_hash) = 32),
-  issued_by     BYTEA NOT NULL REFERENCES users(user_id),  -- admin who handed it out in person
-  issued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-  expires_at    TIMESTAMPTZ NOT NULL,
-  used_at       TIMESTAMPTZ,
-  used_by_user  BYTEA REFERENCES users(user_id)
-);
-
 CREATE TABLE registration_keys (                 -- single-use registration keys for registration-key-only enrollment (T2/T4)
   key_hash      BYTEA PRIMARY KEY CHECK (octet_length(key_hash) = 32),  -- sha256(key); plaintext is NEVER stored (D4)
   -- No issued_by/used_by_user FK: operator-issued out of band, not by an in-app admin.
   issued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at    TIMESTAMPTZ NOT NULL,
-  used_at       TIMESTAMPTZ                        -- set on first successful consume; single-use (mirrors enrollment_vouchers)
+  used_at       TIMESTAMPTZ                        -- set on first successful consume; single-use (deleted-on-consume semantics)
 );
 
 CREATE TABLE first_admin_claim (                 -- one-time "first registrant = admin" slot (T4)

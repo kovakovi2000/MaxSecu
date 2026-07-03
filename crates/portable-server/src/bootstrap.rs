@@ -1,43 +1,15 @@
-//! DEV bootstrap artifacts for the portable launcher — SECURITY-DEGRADED, dev-only.
-//! - A one-time bootstrap secret: generated on first run, printed ONCE by the
-//!   caller, stored only as sha256 (+ a marker so it isn't reprinted).
-//! - A DEV directory-signing (D5) key: persisted as a 32-byte SEED so the pinned
-//!   public key is STABLE across restarts. In PRODUCTION the D5 private key is
-//!   offline (the air-gapped ceremony) and only its PUBLIC key is pinned — this
-//!   dev key is a convenience, never a production ceremony key.
+//! DEV directory-signing artifacts for the portable launcher — SECURITY-DEGRADED,
+//! dev-only. A DEV directory-signing (D5) key persisted as a 32-byte SEED so the
+//! pinned public key is STABLE across restarts. In PRODUCTION the D5 private key
+//! is offline (the air-gapped ceremony) and only its PUBLIC key is pinned — this
+//! dev key is a convenience, never a production ceremony key.
+//!
+//! There is NO bootstrap secret: enrollment is registration-key-only (the server
+//! signs bindings with the D5 key derived from this seed; the first registrant
+//! becomes admin), and the recovery account is provisioned once by `maxsecu-setup`.
 use maxsecu_admin_core::DirectorySigner;
 
 use crate::layout::Layout;
-
-/// First run (no marker) → generate a random bootstrap secret, store sha256(secret)
-/// to the marker, return Some(secret) so the caller prints it ONCE. Subsequent runs
-/// → None (already bootstrapped; the hash is unchanged).
-pub fn ensure_bootstrap_secret(layout: &Layout) -> std::io::Result<Option<String>> {
-    if layout.bootstrap_marker_path().exists() {
-        return Ok(None);
-    }
-    // URL-safe base64 of 24 random bytes — copy-pasteable, high-entropy.
-    let raw: [u8; 24] = maxsecu_crypto::random_array();
-    let secret = {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
-        URL_SAFE_NO_PAD.encode(raw)
-    };
-    let hash = maxsecu_crypto::sha256(secret.as_bytes());
-    std::fs::write(layout.bootstrap_marker_path(), hash)?; // 32 raw bytes
-    Ok(Some(secret))
-}
-
-/// Read the stored bootstrap-secret hash for `AuthConfig.with_bootstrap_secret_hash`,
-/// or None if not yet bootstrapped.
-pub fn bootstrap_secret_hash(layout: &Layout) -> std::io::Result<Option<[u8; 32]>> {
-    match std::fs::read(layout.bootstrap_marker_path()) {
-        Ok(b) if b.len() == 32 => Ok(Some(b.try_into().unwrap())),
-        Ok(_) => Err(std::io::Error::other("bootstrap marker malformed")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
 
 /// Generate (first run) / load (restart) the DEV D5 key from a persisted 32-byte
 /// seed; write its public key to `d5_pub_path`; return the public key. Stable
@@ -99,19 +71,6 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&p);
         p
-    }
-
-    #[test]
-    fn bootstrap_secret_is_one_time_and_hash_persists() {
-        let layout = Layout::ensure(&tmp()).unwrap();
-        let secret = ensure_bootstrap_secret(&layout)
-            .unwrap()
-            .expect("first run returns the secret");
-        let stored = bootstrap_secret_hash(&layout).unwrap().unwrap();
-        assert_eq!(stored, maxsecu_crypto::sha256(secret.as_bytes()));
-        // Second run: no secret returned, hash unchanged.
-        assert!(ensure_bootstrap_secret(&layout).unwrap().is_none());
-        assert_eq!(bootstrap_secret_hash(&layout).unwrap().unwrap(), stored);
     }
 
     #[test]

@@ -1,20 +1,17 @@
-//! Admin commands: list the approval queue, issue invite vouchers, and prepare
-//! ceremony work-items. The running app CANNOT confer admin or sign bindings
-//! (the D5 key is offline, D-K) — `request_approval` only shapes the data the
-//! air-gapped ceremony needs. Channel-bound sessions can't be reused across
+//! Admin commands: list the approval queue, mint single-use registration keys, and
+//! prepare ceremony work-items. The running app CANNOT confer admin or sign
+//! bindings (the D5 key is offline, D-K) — `request_approval` only shapes the data
+//! the air-gapped ceremony needs. Channel-bound sessions can't be reused across
 //! connections, so each authenticated command re-auths on a fresh channel.
 
 use tauri::State;
 
-use crate::admin;
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
 use crate::dto::{ApprovalRequest, CeremonyWorkItem, IssueVoucherResponse, PendingUserDto};
 use crate::error::UiError;
 use crate::http_client::{get_json, post_json};
 
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
 use hyper::StatusCode;
 
 /// `list_pending` — the admin approval queue (D-G). Requires an admin session
@@ -51,7 +48,12 @@ pub async fn list_pending(
     }
 }
 
-/// `issue_voucher` — generate an invite, post its hash, return the code to show.
+/// `issue_voucher` — mint a single-use **registration key** (T4). The server
+/// generates a strong key, stores only its `sha256`, and returns the plaintext
+/// ONCE via `POST /v1/registration-keys` (admin-gated). The returned code is the
+/// registration key the enrollee types into the enrollment panel; whoever enrolls
+/// first with it becomes admin (here it is always a User-only key, since an admin
+/// already exists). The key is never logged — only the DTO crosses the seam.
 #[tauri::command]
 pub async fn issue_voucher(
     dir: State<'_, AppDir>,
@@ -59,17 +61,27 @@ pub async fn issue_voucher(
     connect_lock: State<'_, ConnectLock>,
 ) -> Result<IssueVoucherResponse, UiError> {
     let server = server_of(&dir.0)?;
-    let voucher = admin::generate_voucher();
     let (mut sender, host, token) = reauth(&dir.0, &server, &session, &connect_lock).await?;
-    let body = serde_json::json!({ "voucher_hash_b64": B64.encode(voucher.hash) });
-    let (status, _json) =
-        post_json(&mut sender, "/v1/vouchers", &body, Some(&token), &host).await?;
+    let body = serde_json::json!({});
+    let (status, json) =
+        post_json(&mut sender, "/v1/registration-keys", &body, Some(&token), &host).await?;
     match status {
-        StatusCode::CREATED => Ok(IssueVoucherResponse { code: voucher.code }),
+        StatusCode::CREATED => {
+            let code = json["registration_key"]
+                .as_str()
+                .ok_or_else(|| {
+                    UiError::new("key_failed", "Server returned no registration key.")
+                })?
+                .to_owned();
+            Ok(IssueVoucherResponse { code })
+        }
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             Err(UiError::new("forbidden", "Admin access required."))
         }
-        _ => Err(UiError::new("voucher_failed", "Could not issue an invite.")),
+        _ => Err(UiError::new(
+            "key_failed",
+            "Could not mint a registration key.",
+        )),
     }
 }
 

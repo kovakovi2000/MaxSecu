@@ -1,8 +1,7 @@
 //! Single-use **registration keys** (T2): strong enrollment secrets of which the
-//! server persists ONLY `sha256(key)` (never the plaintext), plus a cheap
-//! "does any user exist yet?" probe used to decide the first-admin. The store
-//! methods themselves live on the [`Store`](crate::store::Store) trait next to
-//! the enrollment-voucher ones they mirror; this module exercises them.
+//! server persists ONLY `sha256(key)` (never the plaintext). The store methods
+//! themselves live on the [`Store`](crate::store::Store) trait; this module
+//! exercises them and the atomic first-admin [`enroll`](crate::store::Store::enroll).
 
 #[cfg(test)]
 mod tests {
@@ -37,23 +36,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn any_user_exists_flips_on_first_user() {
-        let s = MemoryStore::new();
-        assert!(
-            !s.any_user_exists().await.unwrap(),
-            "no user exists before the first is created"
-        );
-        s.create_user("alice", [1u8; 32], [2u8; 32])
-            .await
-            .unwrap()
-            .expect("username is free");
-        assert!(
-            s.any_user_exists().await.unwrap(),
-            "a user exists after create_user"
-        );
-    }
-
     // A distinct byte pattern per binding so the test can tell which one `enroll`
     // stored (the store never decodes these bytes — arbitrary is fine).
     fn bindings() -> (crate::store::StoredBinding, crate::store::StoredBinding) {
@@ -84,7 +66,10 @@ mod tests {
                 .unwrap(),
             EnrollOutcome::KeyInvalid
         );
-        assert!(!s.any_user_exists().await.unwrap(), "KeyInvalid created no user");
+        assert!(
+            s.user_by_name("alice").await.unwrap().is_none(),
+            "KeyInvalid created no user"
+        );
         assert!(s.binding_by_username("alice").await.unwrap().is_none());
 
         // Seed the key; the FIRST enrollment claims admin and stores the ADMIN

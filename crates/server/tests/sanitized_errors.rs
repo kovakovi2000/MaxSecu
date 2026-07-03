@@ -49,7 +49,7 @@ use maxsecu_encoding::structs::MLKEM768_PUB_LEN;
 use maxsecu_server::{
     router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteWrapError,
     DiscardError, EnrollOutcome, FileListEntry, FileView, FinalizeError, ListFilter,
-    MemoryBlobStore, MemoryStore, NullAuditSink, ParsedStage, PendingUser, RecipientView,
+    MemoryBlobStore, MemoryStore, NullAuditSink, ParsedStage, RecipientView,
     RecoveryAccount, SessionRecord, StageError, Store, StoreError, StoredBinding,
     StoredControlRecord, TlsExporter, UserRecord, VersionMeta, VersionSelector, WrapInput,
 };
@@ -94,7 +94,7 @@ const FORBIDDEN: &[&str] = &[
     "get_file",
     "list_files",
     "insert_nonce",
-    "consume_voucher",
+    "enroll",
 ];
 
 // ---- A backend that faults on every call (forces 500 on any path) ----
@@ -114,9 +114,6 @@ impl Store for FaultyStore {
         _s: [u8; 32],
     ) -> Result<Option<[u8; 16]>, StoreError> {
         Err(bait("create_user"))
-    }
-    async fn consume_voucher(&self, _h: &[u8; 32]) -> Result<bool, StoreError> {
-        Err(bait("consume_voucher"))
     }
     async fn user_by_name(&self, _u: &str) -> Result<Option<UserRecord>, StoreError> {
         Err(bait("user_by_name"))
@@ -154,23 +151,11 @@ impl Store for FaultyStore {
     async fn binding_by_user_id(&self, _u: &[u8; 16]) -> Result<Option<StoredBinding>, StoreError> {
         Err(bait("binding_by_user_id"))
     }
-    async fn has_any_binding(&self) -> Result<bool, StoreError> {
-        Err(bait("has_any_binding"))
-    }
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
-        Err(bait("list_pending_users"))
-    }
-    async fn issue_voucher(&self, _h: [u8; 32], _i: [u8; 16], _e: u64) -> Result<(), StoreError> {
-        Err(bait("issue_voucher"))
-    }
     async fn issue_registration_key(&self, _h: [u8; 32], _e: u64) -> Result<(), StoreError> {
         Err(bait("issue_registration_key"))
     }
     async fn consume_registration_key(&self, _h: &[u8; 32]) -> Result<bool, StoreError> {
         Err(bait("consume_registration_key"))
-    }
-    async fn any_user_exists(&self) -> Result<bool, StoreError> {
-        Err(bait("any_user_exists"))
     }
     async fn claim_first_admin(&self) -> Result<bool, StoreError> {
         Err(bait("claim_first_admin"))
@@ -294,9 +279,6 @@ impl Store for FileFaultyStore {
     ) -> Result<Option<[u8; 16]>, StoreError> {
         self.inner.create_user(u, e, s).await
     }
-    async fn consume_voucher(&self, h: &[u8; 32]) -> Result<bool, StoreError> {
-        self.inner.consume_voucher(h).await
-    }
     async fn user_by_name(&self, u: &str) -> Result<Option<UserRecord>, StoreError> {
         self.inner.user_by_name(u).await
     }
@@ -333,23 +315,11 @@ impl Store for FileFaultyStore {
     async fn binding_by_user_id(&self, u: &[u8; 16]) -> Result<Option<StoredBinding>, StoreError> {
         self.inner.binding_by_user_id(u).await
     }
-    async fn has_any_binding(&self) -> Result<bool, StoreError> {
-        self.inner.has_any_binding().await
-    }
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
-        self.inner.list_pending_users().await
-    }
-    async fn issue_voucher(&self, h: [u8; 32], i: [u8; 16], e: u64) -> Result<(), StoreError> {
-        self.inner.issue_voucher(h, i, e).await
-    }
     async fn issue_registration_key(&self, h: [u8; 32], e: u64) -> Result<(), StoreError> {
         self.inner.issue_registration_key(h, e).await
     }
     async fn consume_registration_key(&self, h: &[u8; 32]) -> Result<bool, StoreError> {
         self.inner.consume_registration_key(h).await
-    }
-    async fn any_user_exists(&self) -> Result<bool, StoreError> {
-        self.inner.any_user_exists().await
     }
     async fn claim_first_admin(&self) -> Result<bool, StoreError> {
         self.inner.claim_first_admin().await
@@ -496,8 +466,7 @@ fn state_router<S: Store + 'static>(store: S) -> Router {
 
 /// Like [`state_router`] but with a caller-supplied [`AuthConfig`] — needed to
 /// exercise the Phase-2 endpoints whose handlers gate on a pinned D5 directory
-/// key (`with_directory_pub`) or a configured bootstrap secret
-/// (`with_bootstrap_secret_hash`).
+/// key (`with_directory_pub`).
 fn router_with_config<S: Store + 'static>(store: S, cfg: AuthConfig) -> Router {
     let state = AppState {
         auth: Arc::new(AuthService::new(store, cfg)),

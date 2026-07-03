@@ -55,20 +55,12 @@ pub struct AuthConfig {
     /// fails those closed. The server holds only the *public* half — it verifies
     /// bindings, it cannot forge them.
     pub directory_pub: Option<[u8; 32]>,
-    /// `SHA-256(bootstrap_secret)` for the first-run bootstrap window (§4.2). The
-    /// plaintext is printed once by the operator/launcher and never stored.
-    pub bootstrap_secret_hash: Option<[u8; 32]>,
 }
 
 impl AuthConfig {
     /// Pin the offline D5 directory-signing public key (enables admin authz).
     pub fn with_directory_pub(mut self, dir_pub: [u8; 32]) -> Self {
         self.directory_pub = Some(dir_pub);
-        self
-    }
-    /// Configure the first-run bootstrap secret by its `SHA-256` hash.
-    pub fn with_bootstrap_secret_hash(mut self, h: [u8; 32]) -> Self {
-        self.bootstrap_secret_hash = Some(h);
         self
     }
 }
@@ -81,7 +73,6 @@ impl Default for AuthConfig {
             session_ttl_ms: 3_600_000, // 60 min (parameters §2)
             rate_limit: RateLimitConfig::default(),
             directory_pub: None,
-            bootstrap_secret_hash: None,
         }
     }
 }
@@ -136,10 +127,6 @@ impl<S: Store> AuthService<S> {
     /// The pinned D5 directory-signing public key, if configured (§7.3).
     pub fn directory_pub(&self) -> Option<[u8; 32]> {
         self.cfg.directory_pub
-    }
-    /// The configured bootstrap-secret hash, if the bootstrap window is enabled.
-    pub fn bootstrap_secret_hash(&self) -> Option<[u8; 32]> {
-        self.cfg.bootstrap_secret_hash
     }
     /// The single-use challenge nonce TTL (ms). Exposed so the recovery login
     /// (`recovery.rs`) reuses the same expiry the normal login path applies.
@@ -369,17 +356,13 @@ mod tests {
     }
 
     #[test]
-    fn config_carries_pinned_d5_and_bootstrap_secret() {
-        let cfg = AuthConfig::default()
-            .with_directory_pub([0x7D; 32])
-            .with_bootstrap_secret_hash([0xB5; 32]);
+    fn config_carries_pinned_d5() {
+        let cfg = AuthConfig::default().with_directory_pub([0x7D; 32]);
         let svc = AuthService::new(MemoryStore::new(), cfg);
         assert_eq!(svc.directory_pub(), Some([0x7D; 32]));
-        assert_eq!(svc.bootstrap_secret_hash(), Some([0xB5; 32]));
-        // Defaults are absent (admin endpoints fail closed until configured).
+        // Default is absent (admin endpoints fail closed until configured).
         let bare = AuthService::new(MemoryStore::new(), AuthConfig::default());
         assert_eq!(bare.directory_pub(), None);
-        assert_eq!(bare.bootstrap_secret_hash(), None);
     }
 
     #[tokio::test]

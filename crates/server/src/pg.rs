@@ -1,6 +1,6 @@
 //! Postgres-backed [`Store`] — the production persistence adapter over the
 //! Phase-1 tables in `docs/schema.sql` (`users`, `auth_nonces`, `sessions`,
-//! `enrollment_vouchers`). Every row is inert/ephemeral auth state; no secret,
+//! `registration_keys`). Every row is inert/ephemeral auth state; no secret,
 //! salt, KDF param, or private key ever lands here (DESIGN §4.3 / D4).
 //!
 //! **Clock model.** The auth state machine reasons in `u64` epoch-milliseconds
@@ -35,7 +35,7 @@ use crate::files::{
     VersionSelector, WrapInput,
 };
 use crate::store::{
-    ancestor_chain, ChunkSlot, EnrollOutcome, FileListEntry, FileView, PendingUser, RecipientView,
+    ancestor_chain, ChunkSlot, EnrollOutcome, FileListEntry, FileView, RecipientView,
     RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
     UserRecord, VersionMeta, WrapView,
 };
@@ -121,21 +121,6 @@ impl Store for PgStore {
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(None),
             Err(e) => Err(store_err("create_user")(e)),
         }
-    }
-
-    async fn consume_voucher(&self, voucher_hash: &[u8; 32]) -> Result<bool, StoreError> {
-        // Atomic single-use: the `used_at IS NULL` predicate means exactly one of
-        // any racing consumers updates the row. `expires_at` is the operational
-        // voucher TTL (DB clock — no app `now` is passed here).
-        let res = sqlx::query(
-            "UPDATE enrollment_vouchers SET used_at = now() \
-             WHERE voucher_hash = $1 AND used_at IS NULL AND expires_at > now()",
-        )
-        .bind(&voucher_hash[..])
-        .execute(&self.pool)
-        .await
-        .map_err(store_err("consume_voucher"))?;
-        Ok(res.rows_affected() == 1)
     }
 
     async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, StoreError> {
@@ -335,63 +320,6 @@ impl Store for PgStore {
         binding_from_row(row, "binding_by_user_id")
     }
 
-    async fn has_any_binding(&self) -> Result<bool, StoreError> {
-        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM directory_bindings) AS present")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(store_err("has_any_binding"))?;
-        row.try_get::<bool, _>("present")
-            .map_err(store_err("has_any_binding"))
-    }
-
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
-        // `users` has no `created_at`; `enrolled_at` (NOT NULL DEFAULT now()) is the
-        // registration time the pending screen surfaces (schema.sql `users`).
-        let rows = sqlx::query(
-            "SELECT u.user_id, u.username, \
-                    (EXTRACT(EPOCH FROM u.enrolled_at) * 1000)::bigint AS created_ms \
-             FROM users u \
-             WHERE NOT EXISTS (SELECT 1 FROM directory_bindings b WHERE b.user_id = u.user_id) \
-             ORDER BY u.enrolled_at DESC, u.user_id",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(store_err("list_pending_users"))?;
-        rows.iter()
-            .map(|r| {
-                Ok(PendingUser {
-                    user_id: col_fixed(r, "list_pending_users", "user_id")?,
-                    username: r
-                        .try_get("username")
-                        .map_err(store_err("list_pending_users"))?,
-                    created_at_ms: r
-                        .try_get::<i64, _>("created_ms")
-                        .map_err(store_err("list_pending_users"))?
-                        as u64,
-                })
-            })
-            .collect()
-    }
-
-    async fn issue_voucher(
-        &self,
-        voucher_hash: [u8; 32],
-        issued_by: [u8; 16],
-        expires_at_ms: u64,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO enrollment_vouchers (voucher_hash, issued_by, expires_at) VALUES ($1, $2, $3) \
-             ON CONFLICT (voucher_hash) DO NOTHING",
-        )
-        .bind(&voucher_hash[..])
-        .bind(&issued_by[..])
-        .bind(try_ms_to_ts(expires_at_ms, "issue_voucher")?)
-        .execute(&self.pool)
-        .await
-        .map_err(store_err("issue_voucher"))?;
-        Ok(())
-    }
-
     async fn issue_registration_key(
         &self,
         key_hash: [u8; 32],
@@ -410,9 +338,9 @@ impl Store for PgStore {
     }
 
     async fn consume_registration_key(&self, key_hash: &[u8; 32]) -> Result<bool, StoreError> {
-        // Atomic single-use, mirroring `consume_voucher`: the `used_at IS NULL`
-        // predicate means exactly one of any racing consumers updates the row.
-        // `expires_at` is the operational TTL (DB clock — no app `now` passed).
+        // Atomic single-use: the `used_at IS NULL` predicate means exactly one of
+        // any racing consumers updates the row. `expires_at` is the operational
+        // TTL (DB clock — no app `now` passed).
         let res = sqlx::query(
             "UPDATE registration_keys SET used_at = now() \
              WHERE key_hash = $1 AND used_at IS NULL AND expires_at > now()",
@@ -422,15 +350,6 @@ impl Store for PgStore {
         .await
         .map_err(store_err("consume_registration_key"))?;
         Ok(res.rows_affected() == 1)
-    }
-
-    async fn any_user_exists(&self) -> Result<bool, StoreError> {
-        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM users) AS present")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(store_err("any_user_exists"))?;
-        row.try_get::<bool, _>("present")
-            .map_err(store_err("any_user_exists"))
     }
 
     async fn claim_first_admin(&self) -> Result<bool, StoreError> {

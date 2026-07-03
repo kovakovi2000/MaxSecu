@@ -18,26 +18,35 @@
 |------|--------|-------------|
 | Demo depth | **Full demo + 2nd user** | Pre-seed a working admin (`root`) + a second user (`bob`), both with published directory bindings; verify upload + sandboxed-video playback through the GUI. |
 | Persistence | **Postgres (persistent)** | Accounts/sessions/directory survive server restarts. Uses the WSL `Ubuntu-22.04` PG14 (`maxsecu` DB). |
-| Server lifecycle | **Start now + script** | The assistant starts the server in this session, captures the one-time bootstrap secret, and leaves a start script. |
+| Server lifecycle | **Start now + script** | The assistant starts the server in this session and leaves a start script. (No bootstrap secret to capture — enrollment is registration-key-only; provision with `maxsecu-setup`.) |
 | First GUI launch | **Assistant smokes it, then hands to you** | The assistant confirms the window opens / UI loads, then you do the account click-through. |
 
-## 0.1 The one non-obvious design fact that shapes everything
+## 0.1 The enrollment model (updated — registration-key-only, no bootstrap secret)
 
-`POST /v1/bootstrap` (what the GUI's "create first admin" screen calls) **creates
-an account but never confers admin and never publishes a directory binding.** A
-bootstrapped account can *log in* but cannot issue vouchers, browse the feed, or
-upload until an **offline D5 directory ceremony** signs its binding and publishes
-it to `POST /v1/directory` (authority = the D5 signature, not a session). In this
-dev build the "ceremony" is a scripted tool that uses the server's on-disk dev D5
-seed (`<data_dir>/config/d5_secret.bin`).
+> **UPDATE (T4/T14/T15):** the old bootstrap-secret + voucher + pending flow is
+> **gone**. There is no `POST /v1/bootstrap`, no `/v1/vouchers`, no `/v1/pending`,
+> and the server prints **no bootstrap secret**. The `tools/demo-seed` tool is
+> **retired**; provisioning is now done by **`tools/maxsecu-setup`** + the
+> registration-key enrollment panel.
 
-Two further constraints from the code:
-- **Bootstrap closes permanently after the first published binding** (`bootstrap_closes_after_first_binding`). Once we seed `root`'s binding, the GUI bootstrap screen returns `409`.
-- The shell's **default route is `#/connect`** and there is **no link to `#/bootstrap`** in the GUI. Account provisioning is by design an out-of-band ceremony; the GUI's everyday entry point is **unlock + connect**.
+The current model:
+- **Enrollment is registration-key-only.** A new account POSTs `/v1/users` with a
+  single-use **registration key**. The **server itself signs** the account's
+  directory binding (with its DEV D5 key) and stores it atomically — no separate
+  offline ceremony step, no "pending" wait. **The first account to enroll becomes
+  admin**; everyone after is a plain user.
+- **Admins mint more keys** in-app via `POST /v1/registration-keys` (the GUI
+  Admin screen's "mint a key" button); the server returns the plaintext key once.
+- **The recovery account is provisioned once** by `maxsecu-setup`, which also
+  emits the **first registration key** and a **`recovery_pin.bin`** that must be
+  embedded into the client build (the client fails closed without it). Recovery
+  registration (`POST /v1/recovery/register`) is **open on a fresh server and
+  closes (409) after the first use**.
 
-➡️ Therefore the usable-demo path is: **pre-seed `root`+`bob` (sealed keystores +
-published bindings) over the persistent server, then you unlock + connect.** The
-GUI bootstrap/voucher screens are documented in the appendix for completeness.
+➡️ Therefore the usable-demo path is: **run the server → run `maxsecu-setup`
+(creates the recovery account + first registration key + `recovery_pin.bin`) →
+copy `recovery_pin.bin` into `crates/client-app/` and REBUILD the client → launch
+the client and enroll the first admin with the first registration key.**
 
 ---
 
@@ -45,7 +54,8 @@ GUI bootstrap/voucher screens are documented in the appendix for completeness.
 
 - Server launcher: `crates/portable-server` → `maxsecu-portable-server.exe`.
 - Client: `crates/client-app` (Tauri 2) → `maxsecu-client-app.exe` (embeds `ui/dist`, needs WebView2 — standard on Win11).
-- Seeding tool (added this session): `tools/demo-seed` → provisions `root`+`bob`.
+- Setup tool: `tools/maxsecu-setup` → provisions the recovery account + first
+  registration key + `recovery_pin.bin` (replaces the retired `tools/demo-seed`).
 - Staged output: `dist/`
   - `dist/MaxSecuServer/` — server exe + `run-server.ps1`.
   - `dist/MaxSecuClient-root/` — admin client (exe + `ui/` + `config/` pins + sealed `keystore/`).
@@ -76,24 +86,38 @@ server's persisted dev D5 seed (reusing `sign_binding`, exactly like
 `bootstrap_admin_e2e.rs`).
 - Verify: `cargo test -p maxsecu-ceremony-harness` passes.
 
-### S3 — `tools/demo-seed` provisioning tool **[DONE]**
-Mirrors `bootstrap_admin_e2e.rs` against the live server:
-1. read pins (`server_cert.der`) + dev D5 seed from the server data dir;
-2. bootstrap a glass-break account + `root` (with the live bootstrap secret);
-3. publish `root`'s `[User,Admin]` binding under the dev D5 → bootstrap closes;
-4. log in as `root`, issue a voucher; register `bob` via `/v1/users`;
-5. publish `bob`'s `[User]` binding;
-6. issue one **spare voucher** (printed, for the appendix voucher demo);
-7. seal `root`/`bob` identities into their client folders' `keystore/`.
-- Verify: tool exits 0 and prints both `user_id`s + the spare voucher.
+### S3 — `tools/maxsecu-setup` provisioning tool **[UPDATED — replaces demo-seed]**
+Run **once** against the freshly-started server (reads the pinned
+`server_cert.der` from `<data_dir>/client-pins/`). It:
+1. registers the **recovery account** (`POST /v1/recovery/register`, once-only);
+2. mints the **first registration key** (`--first-key-out register.key`);
+3. writes the canonical **`recovery_pin.bin`** (`--pin-out`) and the sealed
+   recovery private-key blob (`--out`, move to cold storage).
+
+Example:
+```
+maxsecu-setup \
+  --data-dir ./maxsecu-server-data \
+  --out ./recovery_key.blob \
+  --pin-out ./recovery_pin.bin \
+  --first-key-out ./register.key \
+  --passphrase 'recovery-demo-pass-9!'
+```
+- Verify: exits 0 and prints the three artifact paths. Re-running against the same
+  server exits **3** ("already registered", once-only).
 
 ### S4 — Build the WebView UI **[DONE]**
 `cd crates/client-app/ui && npm run build` → `ui/dist/{index.html,main.js,styles.css}`.
 - Verify: `ui/dist/main.js` present and non-empty.
 
-### S5 — Build release binaries **[DONE]**
-`cargo build --release -p maxsecu-portable-server -p maxsecu-client-app -p maxsecu-demo-seed`.
-- Verify: the three exes exist under `target/release/`.
+### S5 — Build release binaries **[UPDATED]**
+Server (root workspace): `cargo build --release -p maxsecu-portable-server`.
+Client + setup tool (client workspace): from `crates/client-app`,
+`cargo build --release` and `cargo build --release -p maxsecu-setup`.
+- Verify: `maxsecu-portable-server.exe`, `maxsecu-client-app.exe`, and
+  `maxsecu-setup.exe` exist. NOTE: the client is **rebuilt again in S9** after
+  `recovery_pin.bin` is dropped into `crates/client-app/` (the pin is embedded at
+  build time).
 
 ### S6 — Prepare Postgres **[DONE]**
 Start WSL `Ubuntu-22.04`; ensure PG14 online; `ALTER ROLE maxsecu PASSWORD
@@ -107,17 +131,22 @@ Copy exes + `ui/` + scripts into the three folders; write each client's
 write `config/recovery_recipient.txt` (`root`→`bob`, `bob`→`root`); pins are
 copied in S9 after the server prints them.
 
-### S8 — Start the persistent server **[DONE]**
+### S8 — Start the persistent server **[UPDATED]**
 `DATABASE_URL=… MAXSECU_DATA_DIR=…/maxsecu-server-data maxsecu-portable-server.exe`,
-backgrounded. Capture from its console: the **one-time bootstrap secret**, the
-**pinned dev D5**, and the **client-pins dir**.
+backgrounded. Capture from its console: the **pinned dev D5** and the
+**client-pins dir**. There is **no bootstrap secret** to capture anymore.
 - Verify: TLS `GET https://localhost:8443/...` responds (pinned).
 
-### S9 — Seed accounts + wire pins **[DONE]**
-Run `demo-seed` against the live server; then copy
-`maxsecu-server-data/client-pins/{server_cert.der,directory_pub.der}` into both
-clients' `config/`.
-- Verify: `GET /v1/directory/root` and `/v1/directory/bob` return `200`.
+### S9 — Provision recovery + first key, then REBUILD the client **[UPDATED]**
+1. Run `maxsecu-setup` (see S3) against the live server → produces
+   `recovery_pin.bin` + `register.key` + the sealed recovery blob.
+2. **Copy `recovery_pin.bin` → `crates/client-app/recovery_pin.bin` and REBUILD /
+   repackage the client** so the pin is embedded (the client fails closed without
+   it). Re-stage the rebuilt `maxsecu-client-app.exe` into `dist/`.
+3. Copy `maxsecu-server-data/client-pins/{server_cert.der,directory_pub.der}` into
+   the client's `config/`.
+- Verify: `GET /v1/recovery/pubkey` returns `200`; a second `maxsecu-setup` run
+  exits `3` (recovery already registered).
 
 ### S10 — Verify backend pipeline **[DONE]**
 Run the existing e2e gates headlessly (`bootstrap_admin_e2e`, `upload_e2e`,
@@ -133,67 +162,78 @@ This is the first time the app runs as a *window*, so this is the highest-risk s
 
 ---
 
-## 3. Create / use your first account (the click-through) **[YOU]**
+## 3. Create / use your first account (the click-through) **[YOU]** **[UPDATED]**
 
-The window opens on **"Connect to a MaxSecu server"** (default route).
+The window opens on **"Connect to a MaxSecu server"** (default route). Under the
+new model you **enroll** the first admin with the registration key — there are no
+pre-seeded `root`/`bob` accounts.
 
-### 3a. Sign in as the ready-made admin (`root`)
-1. **Server**: `localhost:8443`  *(must be `localhost`, not `127.0.0.1` — the pinned cert's SAN is `localhost`)*
-2. **Username**: `root`
-3. **Password**: `root-demo-pass-9!`
-4. Leave **Use Tor** unchecked. Click **Connect**.
-   - Under the hood: `unlock_keystore(password)` opens the sealed keystore beside
-     the exe, then `connect` does pinned-TLS + channel-bound login, then
-     `account_status` routes you. Because `root` has a published binding you land
-     on **#/feed** (an unseeded account would land on **#/pending**).
-5. You're now an **admin**: the top nav exposes **Feed · Upload · Admin · Settings**.
+### 3a. Enrol the first admin (registration-key)
+1. Open the **enrollment panel** (register a new account).
+2. **Server**: `localhost:8443`  *(must be `localhost`, not `127.0.0.1` — the pinned cert's SAN is `localhost`)*
+3. **Username** + **password** of your choice.
+4. **Registration key**: paste the contents of `register.key` (from `maxsecu-setup`).
+5. Click **Register / Enrol**.
+   - Under the hood: `POST /v1/users` with the single-use key; the **server signs**
+     the `[User, Admin]` binding (first registrant = admin) and stores it
+     atomically. You are immediately an admin — no "pending" wait, no ceremony.
+6. Connect/unlock → you land on **#/feed**; the top nav exposes
+   **Feed · Upload · Admin · Settings**.
 
 ### 3b. Verify upload + sandboxed-video playback (the GUI e2e)
 1. Click **Upload**. Pick the sample video `dist/sample/sample.mp4` (or any small MP4/AV1).
 2. The upload tray shows progress; on completion the item appears in **Feed**.
 3. Open it from the feed → the **media-viewer**/`<video-player>` decodes in the
    confined worker (codec runs out-of-process; main process holds no decoder).
-4. `root`'s upload is wrapped to `root` (self) + the recovery recipient (`bob`), so
-   `bob` can also see/share it.
+4. Your upload is wrapped to yourself (self) + the recovery recipient.
 
-### 3c. Sign in as the second user (`bob`)
-Launch `dist/MaxSecuClient-bob/maxsecu-client-app.exe` → Server `localhost:8443`,
-Username `bob`, Password `bob-demo-pass-9!` → **Connect** → **#/feed**.
+### 3c. Enrol a second user
+As the admin, open **Admin → mint a registration key** (`POST /v1/registration-keys`;
+the server returns the plaintext key once). Hand that key to the second user, who
+enrols exactly as in 3a — this time as a plain **User** (only the first registrant
+is admin). Launch a second client instance → Server `localhost:8443` → enrol with
+the new key → **#/feed**.
 
 ---
 
 ## 4. Caveats (honest list)
 
-- **SECURITY-DEGRADED dev profile.** The D5 signing key, the bootstrap secret, and
-  the TLS cert are dev artifacts generated into `maxsecu-server-data/`. The dev D5
-  **private** seed (`config/d5_secret.bin`) is cleartext on disk — anyone with the
-  data dir can forge bindings. Never share/commit the data dir. This is NOT the
-  production ceremony key.
+- **SECURITY-DEGRADED dev profile.** The D5 signing key and the TLS cert are dev
+  artifacts generated into `maxsecu-server-data/`. The dev D5 **private** seed
+  (`config/d5_secret.bin`) is cleartext on disk — and because the server signs
+  enrollment bindings with it, anyone with the data dir can forge bindings. Never
+  share/commit the data dir. This is NOT the production ceremony key. (There is no
+  bootstrap secret in this model.)
 - **Persistent-DEV ≠ Prod profile.** We get Postgres persistence while keeping the
-  dev cert/D5/bootstrap. The real Prod profile additionally needs an injected
-  (non-self-signed) cert + an external WORM/audit sink + the offline ceremony key.
+  dev cert/D5. The real Prod profile additionally needs an injected (non-self-signed)
+  cert + an external WORM/audit sink + the offline ceremony key (so the server no
+  longer holds the signing key).
 - **Unsigned exe.** No code-signing cert was provided → Windows SmartScreen may warn
   ("More info → Run anyway"). The Tauri NSIS installer is a deferred-op (Tauri CLI
   not installed); the raw cargo exe runs directly.
-- **Bootstrap is closed** on this server (we published `root`'s binding). To exercise
-  the GUI bootstrap screen from scratch, reset the DB (see §5) before seeding.
+- **Recovery is registered** on this server (once-only). To re-run `maxsecu-setup`
+  from scratch, reset the data dir + DB (see §5) first — a second run against the
+  same server exits `3`.
 - Demo passwords are placeholders — rotate for anything real.
 
 ## 5. Reset / re-run
 
-- **Re-seed only** (DB kept): drop+recreate schema, restart server, re-run `demo-seed`.
-- **Full reset**: stop the server; in WSL `psql -d maxsecu -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'` then re-apply `docs/schema.sql`; delete `maxsecu-server-data/`; restart server (new dev cert/D5/secret) and re-stage pins; re-run `demo-seed`.
+- **Full reset**: stop the server; in WSL `psql -d maxsecu -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'` then re-apply `docs/schema.sql`; delete `maxsecu-server-data/`; restart server (new dev cert/D5) and re-stage pins; re-run `maxsecu-setup` to re-provision the recovery account + a fresh first registration key, then **rebuild the client** with the new `recovery_pin.bin`.
+- Registration keys are single-use: mint a fresh one (`POST /v1/registration-keys`, admin) for each new enrollment.
 - Keystores refuse to overwrite (`keystore_exists`): delete the client folder's `keystore/` before re-sealing.
 
-## 6. Appendix — the designed bootstrap/voucher flows (reference)
+## 6. Appendix — the enrollment flows (reference)
 
-- **GUI first-run bootstrap** (`#/bootstrap`, only on a fresh DB; not linked from
-  connect): Step 1 generates a glass-break emergency account (needs the bootstrap
-  secret), Step 2 creates the first admin (username/password/secret). The new admin
-  is then **pending** until a ceremony publishes its `[User,Admin]` binding.
-- **Voucher enrolment** (`register_user`): an admin issues an invite; a new user
-  registers with it; the user is **pending** until the ceremony publishes a `[User]`
-  binding. A spare voucher code is printed by `demo-seed` for this.
+- **First-admin enrollment** (`POST /v1/users`, registration-key): a new account
+  posts its keys + the single-use registration key; the **server signs** the
+  binding and stores it atomically. The **first-ever registrant becomes admin**
+  (`[User, Admin]`); everyone after is `[User]`. No "pending" wait, no separate
+  ceremony — the server is the enrollment authority in the DEV profile.
+- **Minting more keys** (`POST /v1/registration-keys`, admin-gated): an admin mints
+  a fresh single-use key (the GUI Admin screen's "mint a key" button); the server
+  returns the plaintext once. Hand it to the enrollee.
+- **Recovery account** (`POST /v1/recovery/register`, once-only): provisioned by
+  `maxsecu-setup`, which also emits the first registration key + `recovery_pin.bin`.
 
 ## 7. Remaining manual / deferred (not done here)
 
@@ -203,9 +243,16 @@ Username `bob`, Password `bob-demo-pass-9!` → **Connect** → **#/feed**.
 
 ---
 
-## 8. Verification results (this assembly run)
+## 8. Verification results (this assembly run — HISTORICAL, pre-redesign)
 
-All checks below **PASSED** during the assembly run that produced this `dist/`.
+> **SUPERSEDED (T4/T14/T15):** the run below predates the registration-key
+> redesign. It used the now-retired `demo-seed` tool, the `enrollment_vouchers`
+> table, and a one-time bootstrap secret — **all removed**. It is kept only as a
+> historical record of the original `dist/` assembly; the current flow is §0.1 +
+> §2 + §3 above. Re-verify against the new model when you next assemble `dist/`.
+
+All checks below **PASSED** during the (pre-redesign) assembly run that produced
+the original `dist/`.
 
 **Build (release, `target/release/`):**
 - [x] `maxsecu-portable-server.exe` built (exit 0)
