@@ -277,6 +277,24 @@ pub trait Store: Send + Sync {
     /// first registrant (while this is `false`) is enrolled as admin (§ T4).
     async fn any_user_exists(&self) -> Result<bool, StoreError>;
 
+    // ---- Recovery account (the single escrow identity; T3) ----
+
+    /// Register the ONE recovery account by its PUBLIC keys — an X25519 `enc_pub`
+    /// (recovery challenges wrap to it; clients compare it to their embedded pin)
+    /// and an Ed25519 `sig_pub`. **Once-only**: `Ok(true)` iff this call stored
+    /// the account; `Ok(false)` iff one already exists (the stored keys are left
+    /// UNCHANGED — no overwrite). Race-safe: a single-row table means exactly one
+    /// of any concurrent setters wins. `Err` is a backend fault. Never stores a
+    /// private key (public material only, D4).
+    async fn set_recovery_account(
+        &self,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+    ) -> Result<bool, StoreError>;
+    /// The registered recovery account's `(enc_pub, sig_pub)`, or `Ok(None)` if
+    /// none has been registered yet (`GET`-served to clients for the pin compare).
+    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError>;
+
     // ---- Phase 2: revocation control-log (DESIGN §7.6/§11.5, api.md §7) ----
 
     /// Append a record to the single hash chain (`POST /v1/revocations|...`).
@@ -443,6 +461,9 @@ struct Inner {
     sessions: HashMap<[u8; 32], SessionRecord>,
     vouchers: HashSet<[u8; 32]>, // unused enrollment voucher hashes
     reg_keys: HashSet<[u8; 32]>, // unused single-use registration-key hashes (T2)
+    // The single recovery account's PUBLIC keys (enc_pub, sig_pub); once set,
+    // never overwritten (T3). `None` until registered.
+    recovery_account: Option<([u8; 32], [u8; 32])>,
     // Latest signed binding per user_id, with its key_version (newer replaces older).
     bindings: HashMap<[u8; 16], (u64, StoredBinding)>,
     // The single append-only control-log chain (in order) + its running head.
@@ -719,6 +740,26 @@ impl Store for MemoryStore {
 
     async fn any_user_exists(&self) -> Result<bool, StoreError> {
         Ok(!self.inner.lock().unwrap().users.is_empty())
+    }
+
+    async fn set_recovery_account(
+        &self,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Once-only under the single lock: a second setter observes `Some` and
+        // loses without overwriting (the MemoryStore analogue of the singleton
+        // PK's `ON CONFLICT DO NOTHING`).
+        if inner.recovery_account.is_some() {
+            return Ok(false);
+        }
+        inner.recovery_account = Some((enc_pub, sig_pub));
+        Ok(true)
+    }
+
+    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError> {
+        Ok(self.inner.lock().unwrap().recovery_account)
     }
 
     async fn append_control(
@@ -1232,6 +1273,16 @@ impl Store for FaultyStore {
     }
     async fn any_user_exists(&self) -> Result<bool, StoreError> {
         Err(Self::fault("any_user_exists"))
+    }
+    async fn set_recovery_account(
+        &self,
+        _enc_pub: [u8; 32],
+        _sig_pub: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        Err(Self::fault("set_recovery_account"))
+    }
+    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError> {
+        Err(Self::fault("recovery_account"))
     }
     async fn append_control(
         &self,

@@ -171,6 +171,16 @@ impl Store for FaultyStore {
     async fn any_user_exists(&self) -> Result<bool, StoreError> {
         Err(bait("any_user_exists"))
     }
+    async fn set_recovery_account(
+        &self,
+        _e: [u8; 32],
+        _s: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        Err(bait("set_recovery_account"))
+    }
+    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError> {
+        Err(bait("recovery_account"))
+    }
     async fn append_control(
         &self,
         _r: Vec<u8>,
@@ -323,6 +333,12 @@ impl Store for FileFaultyStore {
     }
     async fn any_user_exists(&self) -> Result<bool, StoreError> {
         self.inner.any_user_exists().await
+    }
+    async fn set_recovery_account(&self, e: [u8; 32], s: [u8; 32]) -> Result<bool, StoreError> {
+        self.inner.set_recovery_account(e, s).await
+    }
+    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError> {
+        self.inner.recovery_account().await
     }
     async fn control_head(&self) -> Result<[u8; 32], StoreError> {
         self.inner.control_head().await

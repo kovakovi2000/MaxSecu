@@ -285,6 +285,41 @@ async fn voucher_is_single_use_and_unknown_is_false() {
 }
 
 #[tokio::test]
+async fn recovery_account_registers_once_over_postgres() {
+    let db = db_or_skip!();
+    assert!(
+        db.store.recovery_account().await.unwrap().is_none(),
+        "no recovery account before any set"
+    );
+    let enc = [0x11u8; 32];
+    let sig = [0x22u8; 32];
+    assert!(
+        db.store.set_recovery_account(enc, sig).await.unwrap(),
+        "first registration lands the singleton row"
+    );
+    assert_eq!(
+        db.store.recovery_account().await.unwrap(),
+        Some((enc, sig)),
+        "the stored pubkeys round-trip verbatim"
+    );
+    // A second attempt with DIFFERENT keys loses (ON CONFLICT DO NOTHING) and
+    // does NOT overwrite — the singleton PK enforces once-only.
+    assert!(
+        !db.store
+            .set_recovery_account([0xAAu8; 32], [0xBBu8; 32])
+            .await
+            .unwrap(),
+        "second registration is rejected (once-only)"
+    );
+    assert_eq!(
+        db.store.recovery_account().await.unwrap(),
+        Some((enc, sig)),
+        "the ORIGINAL keys are preserved after a losing second set"
+    );
+    db.teardown().await;
+}
+
+#[tokio::test]
 async fn nonce_outstanding_respects_ttl_and_single_use() {
     let db = db_or_skip!();
     let nonce: [u8; 32] = random_array();

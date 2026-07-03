@@ -117,6 +117,13 @@ CREATE TABLE registration_keys (                 -- single-use registration keys
   used_at       TIMESTAMPTZ                        -- set on first successful consume; single-use (mirrors enrollment_vouchers)
 );
 
+CREATE TABLE recovery_account (                  -- the ONE escrow identity's PUBLIC keys; registered ONCE (T3)
+  id            BOOLEAN PRIMARY KEY DEFAULT true CHECK (id = true),      -- singleton row: at most one recovery account
+  enc_pub       BYTEA NOT NULL CHECK (octet_length(enc_pub) = 32),       -- X25519; recovery challenges wrap to it / clients pin-compare it
+  sig_pub       BYTEA NOT NULL CHECK (octet_length(sig_pub) = 32),       -- Ed25519; recovery signing key. NO private key is ever stored (D4)
+  registered_at TIMESTAMPTZ NOT NULL DEFAULT now()                       -- set once; a second INSERT hits ON CONFLICT (id) DO NOTHING
+);
+
 -- ============================================================================
 -- 11.2 / 11.7  files  +  immutable genesis
 -- ============================================================================

@@ -432,6 +432,39 @@ impl Store for PgStore {
             .map_err(store_err("any_user_exists"))
     }
 
+    async fn set_recovery_account(
+        &self,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        // Once-only via the singleton PK (`id = true`): a second INSERT hits
+        // `ON CONFLICT DO NOTHING`, so exactly one of any racing setters lands a
+        // row and the stored keys are never overwritten. Public keys only (D4).
+        let res = sqlx::query(
+            "INSERT INTO recovery_account (id, enc_pub, sig_pub) VALUES (true, $1, $2) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&enc_pub[..])
+        .bind(&sig_pub[..])
+        .execute(&self.pool)
+        .await
+        .map_err(store_err("set_recovery_account"))?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn recovery_account(&self) -> Result<Option<([u8; 32], [u8; 32])>, StoreError> {
+        let Some(row) = sqlx::query("SELECT enc_pub, sig_pub FROM recovery_account WHERE id = true")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_err("recovery_account"))?
+        else {
+            return Ok(None);
+        };
+        let enc = col_fixed::<32>(&row, "recovery_account", "enc_pub")?;
+        let sig = col_fixed::<32>(&row, "recovery_account", "sig_pub")?;
+        Ok(Some((enc, sig)))
+    }
+
     async fn append_control(
         &self,
         record_bytes: Vec<u8>,
