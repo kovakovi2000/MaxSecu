@@ -545,6 +545,35 @@ pub fn save_recovery_share(path: String, share_text: String) -> Result<(), UiErr
     Ok(())
 }
 
+// ---- read_recovery_share_file ----
+
+/// `read_recovery_share_file` — the reconstruct wizard's "pick a file" SECONDARY
+/// affordance (spec §6 step 1): read an operator-chosen file's contents back as
+/// a `String` so the frontend can feed it into `add_recovery_share` exactly as
+/// if it had been pasted. Synchronous, no network.
+///
+/// The frontend cannot read arbitrary files itself (no filesystem access from
+/// the webview), so this is the minimal read counterpart to
+/// [`save_recovery_share`] above — mirrors its shape (a bare path in, a bare
+/// string out) but reads instead of writes, and does not touch/truncate the
+/// file. An IO failure (missing file, no permission, not valid UTF-8, …) maps
+/// to a single generic, non-oracle `UiError` — no path or OS error text echoed
+/// back, mirroring `save_recovery_share`'s hygiene.
+///
+/// The returned text is the SAME class of interchange unit as
+/// `AddShareRequest.share_text` (an MSHARE1 string, allowed to cross the seam,
+/// §8 DTO rule) — this command does not itself parse/verify it; that is
+/// `add_recovery_share`'s job the moment the frontend submits it.
+#[tauri::command]
+pub fn read_recovery_share_file(path: String) -> Result<String, UiError> {
+    std::fs::read_to_string(&path).map_err(|_| {
+        UiError::new(
+            "share_read_failed",
+            "Could not read the share from that file.",
+        )
+    })
+}
+
 // ---- discard ----
 
 /// `discard_ceremony_session` — end the in-progress ceremony and wipe every
@@ -1500,5 +1529,62 @@ mod save_share_tests {
         )
         .expect_err("an unwritable path must fail closed");
         assert_eq!(err.code, "share_write_failed");
+    }
+}
+
+#[cfg(test)]
+mod read_share_tests {
+    use super::*;
+
+    /// A unique throwaway file path — same collision-avoidance approach as
+    /// `save_share_tests::temp_share_path`, but this module does not reach into
+    /// that sibling `mod`'s private helper.
+    fn temp_share_path() -> std::path::PathBuf {
+        let rand = crate::commands::feed::hex(&maxsecu_crypto::random_array::<8>());
+        std::env::temp_dir().join(format!(
+            "maxsecu-rc-read-{}-{}.txt",
+            std::process::id(),
+            rand
+        ))
+    }
+
+    #[test]
+    fn reads_back_exactly_the_written_contents() {
+        let path = temp_share_path();
+        let text = "MSHARE1:bGFiZWw:3:5:2:c2VjcmV0Ym9keQ:deadbeef";
+        std::fs::write(&path, text).expect("write test fixture");
+
+        let got = read_recovery_share_file(path.to_string_lossy().into_owned()).expect("read ok");
+        assert_eq!(got, text, "must return exactly the file's contents");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_file_maps_to_a_sanitized_error() {
+        let path = temp_share_path(); // never created
+        let err = read_recovery_share_file(path.to_string_lossy().into_owned())
+            .expect_err("a missing file must fail closed");
+        assert_eq!(err.code, "share_read_failed");
+        assert!(
+            !err.message.contains(&path.to_string_lossy().into_owned()),
+            "the sanitized error must not echo the path back"
+        );
+    }
+
+    #[test]
+    fn non_utf8_file_maps_to_a_sanitized_error() {
+        // read_to_string fails closed on non-UTF-8 bytes rather than lossily
+        // decoding them — a corrupt/binary "share file" must not silently
+        // produce garbage text that then fails later, less legibly, in
+        // add_recovery_share's parser.
+        let path = temp_share_path();
+        std::fs::write(&path, [0xFFu8, 0xFE, 0x00, 0x01]).expect("write test fixture");
+
+        let err = read_recovery_share_file(path.to_string_lossy().into_owned())
+            .expect_err("non-UTF-8 content must fail closed");
+        assert_eq!(err.code, "share_read_failed");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

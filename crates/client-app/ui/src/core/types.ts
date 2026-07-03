@@ -154,3 +154,29 @@ export interface SplitRecoveryKeyResponse {
   k: number;
   n: number;
 }
+
+// `add_recovery_share`'s response: count only (`have`/`need`) + the ceremony's
+// label — the share text itself never appears here (spec §6 step 1: a share,
+// once accepted, is never redisplayed).
+export interface AddShareResponse {
+  have: number;
+  need: number;
+  label: string;
+}
+
+// `reconstruct_recovery_key`'s response: an opaque handle into the backend's
+// CeremonySession + the non-secret label. The reconstructed key itself NEVER
+// crosses the seam — this is not yet a "success"; see ProveResponse below
+// (spec §6 step 4, the load-bearing prove gate).
+export interface ReconstructResponse {
+  ceremony_handle: string;
+  label: string;
+}
+
+// `prove_reconstructed_key`'s response. `verified: false` is a SUCCESSFUL
+// proof outcome (the reconstruction was wrong / from a different key set) —
+// it is never surfaced as an error; only `verified: true` unlocks the green
+// success state.
+export interface ProveResponse {
+  verified: boolean;
+}
