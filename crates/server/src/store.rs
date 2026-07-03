@@ -255,6 +255,28 @@ pub trait Store: Send + Sync {
         expires_at_ms: u64,
     ) -> Result<(), StoreError>;
 
+    // ---- Registration keys (single-use enrollment secrets; T2) ----
+
+    /// Persist a fresh single-use **registration key** by its `SHA-256` hash
+    /// (never the plaintext), with an absolute expiry. Unlike a voucher there is
+    /// no `issued_by` — these are handed out by the operator, not an in-app admin.
+    /// Idempotent re-issue of the same hash is allowed.
+    async fn issue_registration_key(
+        &self,
+        key_hash: [u8; 32],
+        expires_at_ms: u64,
+    ) -> Result<(), StoreError>;
+    /// Consume a registration key by its hash; `Ok(true)` iff it was present,
+    /// unused and unexpired (deleted-on-consume, exactly like [`consume_voucher`]
+    /// — atomic single-use). `Ok(false)` = unknown/used/expired; `Err` = fault.
+    ///
+    /// [`consume_voucher`]: Store::consume_voucher
+    async fn consume_registration_key(&self, key_hash: &[u8; 32])
+        -> Result<bool, StoreError>;
+    /// `true` iff at least one user account exists — the first-admin gate: the
+    /// first registrant (while this is `false`) is enrolled as admin (§ T4).
+    async fn any_user_exists(&self) -> Result<bool, StoreError>;
+
     // ---- Phase 2: revocation control-log (DESIGN §7.6/§11.5, api.md §7) ----
 
     /// Append a record to the single hash chain (`POST /v1/revocations|...`).
@@ -420,6 +442,7 @@ struct Inner {
     nonces: HashMap<[u8; 32], NonceRecord>,
     sessions: HashMap<[u8; 32], SessionRecord>,
     vouchers: HashSet<[u8; 32]>, // unused enrollment voucher hashes
+    reg_keys: HashSet<[u8; 32]>, // unused single-use registration-key hashes (T2)
     // Latest signed binding per user_id, with its key_version (newer replaces older).
     bindings: HashMap<[u8; 16], (u64, StoredBinding)>,
     // The single append-only control-log chain (in order) + its running head.
@@ -676,6 +699,26 @@ impl Store for MemoryStore {
     ) -> Result<(), StoreError> {
         self.inner.lock().unwrap().vouchers.insert(voucher_hash);
         Ok(())
+    }
+
+    async fn issue_registration_key(
+        &self,
+        key_hash: [u8; 32],
+        _expires_at_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.inner.lock().unwrap().reg_keys.insert(key_hash);
+        Ok(())
+    }
+
+    async fn consume_registration_key(
+        &self,
+        key_hash: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        Ok(self.inner.lock().unwrap().reg_keys.remove(key_hash))
+    }
+
+    async fn any_user_exists(&self) -> Result<bool, StoreError> {
+        Ok(!self.inner.lock().unwrap().users.is_empty())
     }
 
     async fn append_control(
@@ -1173,6 +1216,22 @@ impl Store for FaultyStore {
         _expires_at_ms: u64,
     ) -> Result<(), StoreError> {
         Err(Self::fault("issue_voucher"))
+    }
+    async fn issue_registration_key(
+        &self,
+        _key_hash: [u8; 32],
+        _expires_at_ms: u64,
+    ) -> Result<(), StoreError> {
+        Err(Self::fault("issue_registration_key"))
+    }
+    async fn consume_registration_key(
+        &self,
+        _key_hash: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        Err(Self::fault("consume_registration_key"))
+    }
+    async fn any_user_exists(&self) -> Result<bool, StoreError> {
+        Err(Self::fault("any_user_exists"))
     }
     async fn append_control(
         &self,

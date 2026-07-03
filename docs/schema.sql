@@ -109,6 +109,14 @@ CREATE TABLE enrollment_vouchers (                -- one-time in-person anti-spa
   used_by_user  BYTEA REFERENCES users(user_id)
 );
 
+CREATE TABLE registration_keys (                 -- single-use registration keys for registration-key-only enrollment (T2/T4)
+  key_hash      BYTEA PRIMARY KEY CHECK (octet_length(key_hash) = 32),  -- sha256(key); plaintext is NEVER stored (D4)
+  -- No issued_by/used_by_user FK: operator-issued out of band, not by an in-app admin.
+  issued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at    TIMESTAMPTZ NOT NULL,
+  used_at       TIMESTAMPTZ                        -- set on first successful consume; single-use (mirrors enrollment_vouchers)
+);
+
 -- ============================================================================
 -- 11.2 / 11.7  files  +  immutable genesis
 -- ============================================================================

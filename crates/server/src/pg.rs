@@ -391,6 +391,47 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn issue_registration_key(
+        &self,
+        key_hash: [u8; 32],
+        expires_at_ms: u64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO registration_keys (key_hash, expires_at) VALUES ($1, $2) \
+             ON CONFLICT (key_hash) DO NOTHING",
+        )
+        .bind(&key_hash[..])
+        .bind(try_ms_to_ts(expires_at_ms, "issue_registration_key")?)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err("issue_registration_key"))?;
+        Ok(())
+    }
+
+    async fn consume_registration_key(&self, key_hash: &[u8; 32]) -> Result<bool, StoreError> {
+        // Atomic single-use, mirroring `consume_voucher`: the `used_at IS NULL`
+        // predicate means exactly one of any racing consumers updates the row.
+        // `expires_at` is the operational TTL (DB clock — no app `now` passed).
+        let res = sqlx::query(
+            "UPDATE registration_keys SET used_at = now() \
+             WHERE key_hash = $1 AND used_at IS NULL AND expires_at > now()",
+        )
+        .bind(&key_hash[..])
+        .execute(&self.pool)
+        .await
+        .map_err(store_err("consume_registration_key"))?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn any_user_exists(&self) -> Result<bool, StoreError> {
+        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM users) AS present")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(store_err("any_user_exists"))?;
+        row.try_get::<bool, _>("present")
+            .map_err(store_err("any_user_exists"))
+    }
+
     async fn append_control(
         &self,
         record_bytes: Vec<u8>,

@@ -162,6 +162,15 @@ impl Store for FaultyStore {
     async fn issue_voucher(&self, _h: [u8; 32], _i: [u8; 16], _e: u64) -> Result<(), StoreError> {
         Err(bait("issue_voucher"))
     }
+    async fn issue_registration_key(&self, _h: [u8; 32], _e: u64) -> Result<(), StoreError> {
+        Err(bait("issue_registration_key"))
+    }
+    async fn consume_registration_key(&self, _h: &[u8; 32]) -> Result<bool, StoreError> {
+        Err(bait("consume_registration_key"))
+    }
+    async fn any_user_exists(&self) -> Result<bool, StoreError> {
+        Err(bait("any_user_exists"))
+    }
     async fn append_control(
         &self,
         _r: Vec<u8>,
@@ -305,6 +314,15 @@ impl Store for FileFaultyStore {
     }
     async fn issue_voucher(&self, h: [u8; 32], i: [u8; 16], e: u64) -> Result<(), StoreError> {
         self.inner.issue_voucher(h, i, e).await
+    }
+    async fn issue_registration_key(&self, h: [u8; 32], e: u64) -> Result<(), StoreError> {
+        self.inner.issue_registration_key(h, e).await
+    }
+    async fn consume_registration_key(&self, h: &[u8; 32]) -> Result<bool, StoreError> {
+        self.inner.consume_registration_key(h).await
+    }
+    async fn any_user_exists(&self) -> Result<bool, StoreError> {
+        self.inner.any_user_exists().await
     }
     async fn control_head(&self) -> Result<[u8; 32], StoreError> {
         self.inner.control_head().await

@@ -25,6 +25,7 @@ pub mod http;
 #[cfg(feature = "postgres")]
 pub mod pg;
 pub mod ratelimit;
+mod reg_keys;
 pub mod serve;
 pub mod store;
 pub mod tier;
