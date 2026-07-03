@@ -28,7 +28,11 @@ workspace = "../client-app"
 # binary needs this. Test-only edge — the real pin comes from `maxsecu-setup`; this pin
 # MUST NEVER ship.
 maxsecu-client-app = { path = "../client-app", default-features = false, features = ["unpinned-dev"] }
-maxsecu-client-core = { path = "../client-core", features = ["net"] }
+# `test-support` exposes `Identity::from_test_seeds`, which the full-flow capstone
+# (`full_flow_e2e.rs`) uses to reconstruct the recovery Identity from the fixed
+# `unpinned-dev` recovery-pin seeds (enc half == embedded pin) plus a chosen sig
+# seed, so the SAME cold key both registers the recovery account and logs in.
+maxsecu-client-core = { path = "../client-core", features = ["net", "test-support"] }
 maxsecu-crypto = { path = "../crypto" }
 maxsecu-encoding = { path = "../encoding" }
 maxsecu-media-launcher = { path = "../media-launcher" }

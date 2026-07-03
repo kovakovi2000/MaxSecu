@@ -72,6 +72,28 @@ impl Identity {
         }
     }
 
+    /// Test-support: reconstruct an [`Identity`] from raw secret seeds — the
+    /// X25519 `enc` scalar, an Ed25519 `sig` seed, and the ML-KEM-768 `mlkem`
+    /// seed. Both public keys are re-derived from their seeds. Gated behind
+    /// `test-support`, so it is compiled out of production builds entirely
+    /// (mirroring how the recovery-pin *private* seeds are `unpinned-dev`-only).
+    ///
+    /// The single use is the holistic e2e (`client-e2e/full_flow_e2e.rs`), which
+    /// must register the singleton recovery account AND drive the recovery login
+    /// with the SAME keypair whose enc half equals the embedded (unpinned-dev)
+    /// recovery pin. The pin is enc-only, so a login — which also *signs* the
+    /// channel-bound proof — needs a chosen signing seed alongside the fixed enc
+    /// seeds. **NEVER call this on a real key; it takes raw secret bytes.**
+    #[cfg(feature = "test-support")]
+    pub fn from_test_seeds(
+        x25519_secret: [u8; 32],
+        sig_seed: [u8; 32],
+        mlkem_seed: [u8; 64],
+    ) -> Identity {
+        let enc_pk = maxsecu_crypto::x25519_public_from_secret(&x25519_secret);
+        Identity::from_secret_bytes(x25519_secret, enc_pk, sig_seed, Some(mlkem_seed))
+    }
+
     // --- public material (safe to publish / send to the server) ---
 
     pub fn enc_pub_bytes(&self) -> [u8; 32] {
