@@ -80,6 +80,10 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
     Router::new()
         .route("/v1/users", post(register::<S>))
         .route("/v1/registration-keys", post(mint_registration_key::<S>))
+        .route("/v1/recovery/register", post(recovery_register::<S>))
+        .route("/v1/recovery/pubkey", get(recovery_pubkey::<S>))
+        .route("/v1/recovery/challenge", post(recovery_challenge::<S>))
+        .route("/v1/recovery/verify", post(recovery_verify::<S>))
         .route("/v1/session/challenge", post(challenge::<S>))
         .route("/v1/session/proof", post(prove::<S>))
         .route("/v1/session/logout", post(logout::<S>))
@@ -352,6 +356,156 @@ async fn mint_registration_key<S: Store + 'static>(
         Ok(()) => (StatusCode::CREATED, Json(MintRegKeyRes { registration_key: key }))
             .into_response(),
         Err(e) => internal_error(e),
+    }
+}
+
+// ---- Trusted-server recovery login (spec §6 / §0-D6) ----
+
+#[derive(Deserialize)]
+struct RecoveryRegisterReq {
+    enc_pub_b64: String,
+    sig_pub_b64: String,
+    /// Optional PQ-hybrid ML-KEM-768 encapsulation pubkey (exactly 1184 bytes
+    /// when present). Absent ⇒ a classical-only recovery account.
+    mlkem_pub_b64: Option<String>,
+}
+
+/// `POST /v1/recovery/register` — register the single escrow recovery account's
+/// PUBLIC keys (T3, once-only). Lengths are validated BEFORE any fixed-size array
+/// conversion — a malformed request (or a present-but-not-1184 ML-KEM key) is a
+/// `400`, never unvalidated network bytes into an array. `201` on the first
+/// registration; `409` if one already exists (the keys are never overwritten).
+/// Unauthenticated: the once-only guard is the protection, and `maxsecu-setup`
+/// (T14) calls this before any account exists.
+async fn recovery_register<S: Store>(
+    State(st): State<AppState<S>>,
+    Json(req): Json<RecoveryRegisterReq>,
+) -> Response {
+    let (Some(enc_pub), Some(sig_pub)) = (
+        b64_fixed::<32>(&req.enc_pub_b64),
+        b64_fixed::<32>(&req.sig_pub_b64),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    // A present ML-KEM key MUST be exactly 1184 bytes; a wrong length is a 400 (we
+    // never pass through a truncated/oversized key). Absent ⇒ classical account.
+    let mlkem_pub = match req.mlkem_pub_b64.as_deref() {
+        None => None,
+        Some(s) => match b64_fixed::<{ maxsecu_encoding::structs::MLKEM768_PUB_LEN }>(s) {
+            Some(m) => Some(m),
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+    };
+    match st
+        .auth
+        .store()
+        .set_recovery_account(enc_pub, sig_pub, mlkem_pub)
+        .await
+    {
+        Ok(true) => StatusCode::CREATED.into_response(),
+        Ok(false) => StatusCode::CONFLICT.into_response(), // already registered (once-only)
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Serialize)]
+struct RecoveryPubkeyRes {
+    enc_pub_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mlkem_pub_b64: Option<String>,
+}
+
+/// `GET /v1/recovery/pubkey` — serve the recovery account's PUBLIC enc material so
+/// the client can compare it against its embedded pin (T8). Nothing secret is
+/// exposed. `404` if no recovery account is set.
+async fn recovery_pubkey<S: Store>(State(st): State<AppState<S>>) -> Response {
+    match st.auth.store().recovery_account().await {
+        Ok(Some(a)) => Json(RecoveryPubkeyRes {
+            enc_pub_b64: b64encode(&a.enc_pub),
+            mlkem_pub_b64: a.mlkem_pub.map(|m| b64encode(&m)),
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Serialize)]
+struct RecoveryChallengeRes {
+    challenge_id: String, // lowercase hex handle
+    server_id: String,
+    wrapped_blob_b64: String,
+    /// `"v2"` = hybrid wrap, `"v1"` = classical — tells the client how to parse.
+    suite: &'static str,
+}
+
+/// `POST /v1/recovery/challenge` — mint a fresh single-use nonce wrapped to the
+/// recovery encryption pubkey (hybrid if ML-KEM is present, else classical).
+/// `404` if no recovery account exists.
+async fn recovery_challenge<S: Store>(State(st): State<AppState<S>>) -> Response {
+    match st.auth.recovery_challenge(now_ms()).await {
+        Ok(ch) => Json(RecoveryChallengeRes {
+            challenge_id: hex_encode(&ch.challenge_id),
+            server_id: st.auth.server_id().to_owned(),
+            wrapped_blob_b64: b64encode(&ch.wrapped_blob),
+            suite: if ch.hybrid { "v2" } else { "v1" },
+        })
+        .into_response(),
+        Err(crate::recovery::RecoveryError::NoAccount) => StatusCode::NOT_FOUND.into_response(),
+        Err(crate::recovery::RecoveryError::WrapFailed) => {
+            internal_error("recovery challenge wrap failed")
+        }
+        Err(crate::recovery::RecoveryError::Internal(e)) => internal_error(e),
+        // Not reachable on the challenge path, but fail closed if it ever is.
+        Err(crate::recovery::RecoveryError::Unauthorized) => {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RecoveryVerifyReq {
+    challenge_id: String,
+    proof_b64: String,
+    timestamp: u64,
+}
+
+#[derive(Serialize)]
+struct RecoveryVerifyRes {
+    session_token: String,
+    expires_in_s: u64,
+}
+
+/// `POST /v1/recovery/verify` — verify the channel-bound proof for `challenge_id`
+/// and, on success, mint an admin session (principal = `RECOVERY_ID`). The proof
+/// is bound to THIS connection's TLS exporter (relay-hardened) and the nonce is
+/// single-use (replay-proof). Every failure is a uniform `401` (no oracle).
+async fn recovery_verify<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    Extension(exporter): Extension<TlsExporter>,
+    Json(req): Json<RecoveryVerifyReq>,
+) -> Response {
+    let (Some(challenge_id), Some(proof)) = (
+        hex_fixed::<16>(&req.challenge_id),
+        b64_fixed::<64>(&req.proof_b64),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st
+        .auth
+        .recovery_verify(&challenge_id, req.timestamp, &proof, &exporter.0, now_ms())
+        .await
+    {
+        Ok(token) => Json(RecoveryVerifyRes {
+            session_token: token.to_hex(),
+            expires_in_s: 3600,
+        })
+        .into_response(),
+        // Single 401 shape for every auth-failure cause — no oracle.
+        Err(crate::recovery::RecoveryError::Unauthorized)
+        | Err(crate::recovery::RecoveryError::NoAccount) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(crate::recovery::RecoveryError::WrapFailed) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(crate::recovery::RecoveryError::Internal(e)) => internal_error(e),
     }
 }
 
@@ -1624,6 +1778,18 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AdminSession {
         state: &AppState<S>,
     ) -> Result<Self, StatusCode> {
         let session = AuthedSession::from_request_parts(parts, state).await?;
+        // A recovery-origin session (spec §6) authorizes as admin without a user
+        // binding: its principal is the reserved `RECOVERY_ID`, which the escrow
+        // recovery login mints and which no users-table user can ever hold (user
+        // ids are server-assigned random 16-byte values, so the all-zero sentinel
+        // is unreachable via the normal `POST /v1/users` + login path). This does
+        // not weaken the normal admin path below — it is a distinct principal.
+        if session.user_id == maxsecu_encoding::RECOVERY_ID.0 {
+            return Ok(AdminSession {
+                user_id: session.user_id,
+                token: session.token,
+            });
+        }
         let Some(dir_pub) = state.auth.directory_pub() else {
             return Err(StatusCode::FORBIDDEN); // admin authz disabled (no pinned D5)
         };

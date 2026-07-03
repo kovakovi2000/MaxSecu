@@ -25,6 +25,7 @@ pub mod http;
 #[cfg(feature = "postgres")]
 pub mod pg;
 pub mod ratelimit;
+pub mod recovery;
 mod recovery_account;
 mod reg_keys;
 pub mod serve;

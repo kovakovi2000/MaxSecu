@@ -28,6 +28,11 @@ impl SessionToken {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+    /// Mint a token from raw bytes — used by the recovery login (`recovery.rs`),
+    /// which reuses the same session store as the normal login path.
+    pub(crate) fn from_bytes(b: [u8; 32]) -> SessionToken {
+        SessionToken(b)
+    }
     pub fn to_hex(&self) -> String {
         let mut s = String::with_capacity(64);
         for b in self.0 {
@@ -135,6 +140,15 @@ impl<S: Store> AuthService<S> {
     /// The configured bootstrap-secret hash, if the bootstrap window is enabled.
     pub fn bootstrap_secret_hash(&self) -> Option<[u8; 32]> {
         self.cfg.bootstrap_secret_hash
+    }
+    /// The single-use challenge nonce TTL (ms). Exposed so the recovery login
+    /// (`recovery.rs`) reuses the same expiry the normal login path applies.
+    pub fn nonce_ttl_ms(&self) -> u64 {
+        self.cfg.nonce_ttl_ms
+    }
+    /// The minted-session TTL (ms) — shared with the recovery login path.
+    pub fn session_ttl_ms(&self) -> u64 {
+        self.cfg.session_ttl_ms
     }
 
     /// Issue a fresh single-use challenge. A well-formed challenge is returned
