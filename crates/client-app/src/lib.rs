@@ -2,9 +2,6 @@
 //! connection/auth orchestration over the client-core TCB. The thin binary
 //! (`main.rs`) wires these into a Tauri app; integration tests drive the same
 //! modules directly.
-pub mod admin;
-pub mod bootstrap;
-pub mod ceremony;
 pub mod commands;
 pub mod config;
 pub mod content_cache;
@@ -22,12 +19,14 @@ pub mod keystore;
 pub mod layout;
 pub mod ram;
 pub mod recipients;
-pub mod recovery_share;
+pub mod recovery_pin;
 pub mod revocations;
 pub mod session;
 pub mod sink;
 pub mod state;
+pub mod tofu;
 pub mod tor;
+pub mod transparency;
 pub mod transport;
 pub mod upload;
 pub mod upload_staging;

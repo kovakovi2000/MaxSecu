@@ -1,19 +1,15 @@
-//! **Phase-7 capstone end-to-end test (DESIGN §17 Phase 7).** Demonstrates all
-//! three committed Phase-7 exit gates over the REAL stack/TLS, in one capstone,
-//! plus the P7.8 genesis-anchor ordering add-on:
+//! **Phase-7 capstone end-to-end test (DESIGN §17 Phase 7).** Demonstrates the
+//! committed Phase-7 exit gates over the REAL stack/TLS, in one capstone, plus
+//! the P7.8 genesis-anchor ordering add-on. (The retired T6 Shamir K-of-N
+//! recovery-threshold gate is intentionally absent — recovery no longer uses
+//! threshold custody.)
 //!
 //! 1. **PQ wrap (P7.5).** A PQ-enrolled owner + a PQ recovery binding upload a
 //!    file over loopback TLS; `build_upload` emits `Suite::V2` HYBRID wraps. The
 //!    owner downloads over TLS and recovers the EXACT plaintext via its hybrid
 //!    secret (`enc_secret` + `mlkem_seed`). Every stored wrap is the 1168-byte
 //!    hybrid wire form — assert NO classical V1 wrap is present.
-//! 2. **Recovery threshold (P7.7).** The recovery key is split `(k=3,n=5)` —
-//!    BOTH the X25519 leg and the ML-KEM seed leg, so the whole hybrid recovery
-//!    secret is threshold-held. 3 shares reconstruct a working recovery key that
-//!    opens the V2 file's recovery wrap to the committed DEK; 2 shares do not.
-//!    A V1 file's recovery wrap is additionally opened via the `validate_recovery_wrap`
-//!    sweep with the threshold-reconstructed X25519 key (the classical sweep path).
-//! 3. **KT split-view (P7.10/P7.12).** A `sink-server` KT log is stood up over
+//! 2. **KT split-view (P7.10/P7.12).** A `sink-server` KT log is stood up over
 //!    TLS under a PINNED log key; bindings are enrolled → published → the client
 //!    accepts via inclusion (and an advance via a consistency proof). A SECOND
 //!    sink under the SAME KT key serves a forked checkpoint inconsistent with the
@@ -40,8 +36,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
 use maxsecu_admin_core::{
-    reconstruct_recovery_key, split_recovery_key, validate_recovery_wrap, ControlChain, CoSign,
-    DirectorySigner, KeyCompromiseParams, RecoveryWrapCtx, RevokeParams,
+    ControlChain, CoSign, DirectorySigner, KeyCompromiseParams, RevokeParams,
 };
 use maxsecu_client_core::transparency::{
     confirm_binding_logged, verify_binding_in_log, InclusionProof, KtCheckpoint, KtCheckpointStore,
@@ -52,15 +47,15 @@ use maxsecu_client_core::{
     PlaintextStreams, StreamChunks, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_crypto::{
-    deserialize_hybrid_wrap, generate_enc_keypair, generate_mlkem_keypair, sha256, shamir,
-    unwrap_dek_hybrid, HybridEncSecretKey, SigningKey, WrappedDek,
+    deserialize_hybrid_wrap, generate_enc_keypair, generate_mlkem_keypair, sha256, SigningKey,
+    WrappedDek,
 };
-use maxsecu_encoding::structs::{DirBinding, Manifest, WrapContext};
+use maxsecu_encoding::structs::{DirBinding, Manifest};
 use maxsecu_encoding::types::{
     Bytes32, FileScope, FileType, Id, MlKemPub, RecipientType, Role, RoleSet, StreamType, Suite,
     Text, Timestamp,
 };
-use maxsecu_encoding::{encode, labels, RECOVERY_ID};
+use maxsecu_encoding::{encode, labels};
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuditSink, AuthConfig, AuthService, FsBlobStore,
     HttpSinkPublisher, MemoryStore, Store, UserRecord,
@@ -261,7 +256,7 @@ async fn register(c: &mut Conn, username: &str, id: &Identity) -> [u8; 16] {
             "username": username,
             "enc_pub_b64": B64.encode(id.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(id.sig_pub_bytes()),
-            "enrollment_voucher": VOUCHER,
+            "registration_key": VOUCHER,
         }),
     )
     .await;
@@ -622,13 +617,18 @@ async fn phase7_exit_gates_over_real_tls() {
     // (so a file create anchors a genesis at a real, global sink position).
     // ============================================================
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER.as_bytes()));
+    let signer = Arc::new(SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
     let publisher =
         HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
     let blob_dir =
         std::env::temp_dir().join(format!("mxp7_{}", hex(&maxsecu_crypto::random_array::<8>())));
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(publisher),
         direct_links_enabled: false,
@@ -653,8 +653,8 @@ async fn phase7_exit_gates_over_real_tls() {
     let token = login(&mut c, "alice", &owner).await;
 
     // A PQ recovery key: an X25519 leg + an ML-KEM-768 leg (the recovery binding).
-    let (rec_x_sk, rec_x_pk) = generate_enc_keypair();
-    let (rec_mlkem_seed, rec_mlkem_pub) = generate_mlkem_keypair();
+    let (_rec_x_sk, rec_x_pk) = generate_enc_keypair();
+    let (_rec_mlkem_seed, rec_mlkem_pub) = generate_mlkem_keypair();
 
     // ============================================================
     // GATE 1 — PQ wrap: a real V2 upload over TLS, downloaded + recovered.
@@ -752,115 +752,18 @@ async fn phase7_exit_gates_over_real_tls() {
     );
 
     // ============================================================
-    // GATE 2 — Recovery threshold: split the recovery key (k=3,n=5), reconstruct
-    // from 3, open the V2 file's recovery wrap to the committed DEK; 2 don't.
+    // GATE 2 — KT split-view over real TLS.
     // ============================================================
-    // The recovery wrap is HYBRID in a V2 file, so both legs are threshold-held:
-    // the X25519 scalar (admin-core::split_recovery_key) AND the 64-byte ML-KEM
-    // seed (crypto::shamir directly). Both are reconstructed from a 3-of-5 subset.
-    let recovery_wrap = bundle
-        .wraps
-        .iter()
-        .find(|w| w.recipient_type == RecipientType::Recovery)
-        .expect("the V2 bundle carries a recovery wrap");
-    let dek_commit = bundle.manifest.dek_commit.0;
-
-    let x_shares = split_recovery_key(&rec_x_sk, 3, 5).expect("split X25519 recovery leg");
-    let seed_shares = shamir::split(&rec_mlkem_seed, 3, 5).expect("split ML-KEM recovery seed");
-    assert_eq!(x_shares.len(), 5);
-    assert_eq!(seed_shares.len(), 5);
-
-    // 3 shares (custodians 0,2,4) reconstruct BOTH legs.
-    let x_three = [x_shares[0].clone(), x_shares[2].clone(), x_shares[4].clone()];
-    let seed_three = [
-        seed_shares[0].clone(),
-        seed_shares[2].clone(),
-        seed_shares[4].clone(),
-    ];
-    let recovered_x = reconstruct_recovery_key(3, &x_three).expect("reconstruct X25519 leg");
-    let recovered_seed = shamir::combine(3, &seed_three).expect("reconstruct ML-KEM seed");
-    assert_eq!(recovered_seed.len(), 64, "ML-KEM seed reconstructs to 64 bytes");
-    let mut seed_arr = [0u8; 64];
-    seed_arr.copy_from_slice(recovered_seed.as_slice());
-
-    // The threshold-reconstructed hybrid recovery secret OPENS the V2 recovery
-    // wrap to the committed DEK (the headline "3 reconstruct a working key").
-    let hsk = HybridEncSecretKey::from_components(recovered_x.expose_bytes(), seed_arr);
-    let hybrid_wrap = deserialize_hybrid_wrap(&wrap_bytes(&recovery_wrap.wrapped_dek)).unwrap();
-    let rec_wrap_ctx = WrapContext {
-        file_id,
-        version: 1,
-        recipient_id: RECOVERY_ID,
-    };
-    let recovered_dek =
-        unwrap_dek_hybrid(&hsk, &hybrid_wrap, &rec_wrap_ctx).expect("3 shares open the V2 recovery wrap");
-    assert_eq!(
-        recovered_dek.commit(),
-        dek_commit,
-        "the reconstructed recovery key recovers the committed DEK"
-    );
-
-    // 2 shares do NOT reconstruct a working key (fail closed, no key reassembled).
-    let x_two = [x_shares[0].clone(), x_shares[1].clone()];
-    assert!(
-        reconstruct_recovery_key(3, &x_two).is_err(),
-        "2 shares cannot reconstruct the X25519 recovery leg"
-    );
-    let seed_two = [seed_shares[0].clone(), seed_shares[1].clone()];
-    assert!(
-        shamir::combine(3, &seed_two).is_err(),
-        "2 shares cannot reconstruct the ML-KEM recovery seed"
-    );
-
-    // Bonus (option b): the SAME X25519 recovery key, threshold-reconstructed,
-    // opens a V1 file's recovery wrap via the classical `validate_recovery_wrap`
-    // sweep (the §16.1/R26 path). Built client-side (recovery_mlkem_pub = None).
-    let v1_file = Id(maxsecu_crypto::random_array::<16>());
-    let v1_params = UploadParams {
-        owner: &owner,
-        owner_id: Id(user_id),
-        owner_key_version: 1,
-        file_id: v1_file,
-        file_type: FileType::Blog,
-        chunk_size: 4096,
-        recovery_pub: rec_x_pk,
-        recovery_mlkem_pub: None,
-        created_at: Timestamp(TS),
-    };
-    let v1_bundle = build_upload(&v1_params, &streams).unwrap();
-    assert!(
-        matches!(v1_bundle.manifest.alg, Suite::V1),
-        "no recovery ML-KEM ⇒ Suite::V1 fallback"
-    );
-    let v1_rec = v1_bundle
-        .wraps
-        .iter()
-        .find(|w| w.recipient_type == RecipientType::Recovery)
-        .unwrap();
-    assert_eq!(
-        validate_recovery_wrap(
-            &recovered_x,
-            &wrap_bytes(&v1_rec.wrapped_dek),
-            v1_bundle.manifest.dek_commit.0,
-            &RecoveryWrapCtx {
-                file_id: v1_file,
-                version: 1,
-            },
-        ),
-        Ok(()),
-        "the threshold-reconstructed X25519 key passes the V1 recovery sweep"
-    );
-
-    // ============================================================
-    // GATE 3 — KT split-view over real TLS.
-    // ============================================================
-    // Enroll bindings into the HONEST sink's KT log: the PQ owner at leaf 0, plus
-    // fillers so the tree grows (a meaningful consistency proof later).
+    // Enroll bindings into the HONEST sink's KT log. The app server ALREADY
+    // auto-published alice's *enrollment* binding here at leaf 0 (T6 — enrollment →
+    // transparency log), so the explicitly-published PQ owner binding below lands at
+    // the NEXT leaf; add fillers so the tree grows (a meaningful consistency proof
+    // later).
     let d5 = DirectorySigner::generate();
     let owner_binding = pq_binding("alice", 0x11, &owner);
     let owner_leaf = encode(&d5.sign_binding(&owner_binding, None).binding);
-    let idx0 = post_binding(sink_addr, sink_pki.client_config.clone(), &owner_leaf).await;
-    assert_eq!(idx0, 0, "first enrolled binding lands at leaf 0");
+    let owner_idx = post_binding(sink_addr, sink_pki.client_config.clone(), &owner_leaf).await;
+    assert_eq!(owner_idx, 1, "the enrollment binding is leaf 0; the owner binding follows");
     for u in [0x21u8, 0x22] {
         let leaf = encode(&d5.sign_binding(&filler_binding(u), None).binding);
         post_binding(sink_addr, sink_pki.client_config.clone(), &leaf).await;
@@ -869,8 +772,8 @@ async fn phase7_exit_gates_over_real_tls() {
     // The client ACCEPTS the enrolled owner binding via inclusion under a pinned,
     // KT-signed checkpoint (TOFU on first contact).
     let cp_a = fetch_checkpoint(sink_addr, sink_pki.client_config.clone()).await;
-    assert_eq!(cp_a.tree_size, 3, "honest KT log has 3 leaves");
-    let inc0 = fetch_inclusion(sink_addr, sink_pki.client_config.clone(), 0).await;
+    assert_eq!(cp_a.tree_size, 4, "enrollment binding + owner binding + 2 fillers");
+    let inc0 = fetch_inclusion(sink_addr, sink_pki.client_config.clone(), owner_idx).await;
     let mut store = MemoryKtCheckpointStore::new();
     verify_binding_in_log(&owner_leaf, &inc0, &cp_a, &[], &kt_pin, &mut store)
         .expect("enrolled binding is inclusion-provable + client-accepted over TLS");
@@ -889,10 +792,10 @@ async fn phase7_exit_gates_over_real_tls() {
     // The client also accepts a CONSISTENT advance (grow the honest log by one,
     // verify the new checkpoint against the pinned one via a consistency proof).
     let leaf3 = encode(&d5.sign_binding(&filler_binding(0x23), None).binding);
-    post_binding(sink_addr, sink_pki.client_config.clone(), &leaf3).await;
+    let leaf3_idx = post_binding(sink_addr, sink_pki.client_config.clone(), &leaf3).await;
     let cp_a2 = fetch_checkpoint(sink_addr, sink_pki.client_config.clone()).await;
-    assert_eq!(cp_a2.tree_size, 4);
-    let inc3 = fetch_inclusion(sink_addr, sink_pki.client_config.clone(), 3).await;
+    assert_eq!(cp_a2.tree_size, 5);
+    let inc3 = fetch_inclusion(sink_addr, sink_pki.client_config.clone(), leaf3_idx).await;
     let cons_a = fetch_consistency(sink_addr, sink_pki.client_config.clone(), cp_a.tree_size).await;
     verify_binding_in_log(&leaf3, &inc3, &cp_a2, &cons_a, &kt_pin, &mut store)
         .expect("a consistency-proven advance is accepted");
@@ -921,7 +824,7 @@ async fn phase7_exit_gates_over_real_tls() {
 
     // Publish DIFFERENT leaves to the fork (a divergent history, larger size).
     let mut fork_leaf0 = Vec::new();
-    for (i, u) in [0xB0u8, 0xB1, 0xB2, 0xB3, 0xB4].into_iter().enumerate() {
+    for (i, u) in [0xB0u8, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5].into_iter().enumerate() {
         let leaf = encode(&d5.sign_binding(&filler_binding(u), None).binding);
         let idx = post_binding(fork_addr, fork_pki.client_config.clone(), &leaf).await;
         if i == 0 {
@@ -930,7 +833,7 @@ async fn phase7_exit_gates_over_real_tls() {
         }
     }
     let cp_fork = fetch_checkpoint(fork_addr, fork_pki.client_config.clone()).await;
-    assert_eq!(cp_fork.tree_size, 5, "fork log has a divergent, larger history");
+    assert_eq!(cp_fork.tree_size, 6, "fork log has a divergent, larger history");
     let fork_inc0 = fetch_inclusion(fork_addr, fork_pki.client_config.clone(), 0).await;
     // The fork's own (internally valid) consistency proof from the gossiped size.
     let fork_cons =
@@ -1038,7 +941,7 @@ async fn r27_cutoff_over_real_sink() {
     let a1_id = [0xA1u8; 16];
     let a2_id = [0xA2u8; 16];
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER.as_bytes()));
     store.add_user(
         "admin1",
         UserRecord {
@@ -1048,8 +951,13 @@ async fn r27_cutoff_over_real_sink() {
         },
     );
     // Admin authority flows from a D5-signed {User, Admin} binding (D-K), verified
-    // server-side by the AdminSession gate — not an advisory roles table.
-    let d5 = DirectorySigner::generate();
+    // server-side by the AdminSession gate — not an advisory roles table. The
+    // server IS the D5 (registration-key enrollment signs bindings): derive the
+    // ceremony signer and the server's enrollment signer from ONE seed so
+    // `directory_pub` matches both.
+    let d5_seed: [u8; 32] = maxsecu_crypto::random_array();
+    let d5 = DirectorySigner::from_seed(&d5_seed);
+    let enroll_signer = Arc::new(SigningKey::from_seed(&d5_seed));
     let admin1_binding = DirBinding {
         username: Text::new("admin1").unwrap(),
         user_id: Id(a1_id),
@@ -1066,16 +974,19 @@ async fn r27_cutoff_over_real_sink() {
         .put_binding(a1_id, 1, encode(&signed_a1.binding), signed_a1.signature)
         .await
         .unwrap();
+    // admin1 is the genesis admin: claim the first-admin slot so the later
+    // registration-key enrollment of `owner` is {User}-only.
+    assert!(store.claim_first_admin().await.unwrap());
 
     let publisher =
         HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
     let blob_dir =
         std::env::temp_dir().join(format!("mxr27_{}", hex(&maxsecu_crypto::random_array::<8>())));
     let state = AppState {
-        auth: Arc::new(AuthService::new(
-            store,
-            AuthConfig::default().with_directory_pub(d5.public_key()),
-        )),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(d5.public_key()))
+                .with_dir_signer(enroll_signer),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(publisher),
         direct_links_enabled: false,

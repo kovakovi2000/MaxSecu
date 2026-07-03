@@ -51,7 +51,7 @@ use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
 use crate::commands::feed::{hex, hex16, now_ms};
 use crate::config::{load_directory_pub, RouteMode, SettingsConfig};
-use crate::directory::{resolve_and_verify_author, resolve_my_user_id, VerifiedAuthor};
+use crate::directory::{resolve_and_verify_author_logged, resolve_my_user_id, VerifiedAuthor};
 use crate::download::{build_stream_header, parse_file_view};
 use crate::error::UiError;
 use crate::fragment_cache::FragmentCache;
@@ -349,7 +349,7 @@ async fn open_video_inner(
         decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
 
     // D5-verify the author binding (fail-closed) BEFORE any decode.
-    let author = resolve_and_verify_author(
+    let (author, author_binding) = resolve_and_verify_author_logged(
         &mut sender,
         &host,
         &hex(&manifest.author_id.0),
@@ -358,6 +358,11 @@ async fn open_video_inner(
         now,
     )
     .await?;
+    // Trust-alarm C (spec §0-C/§7): block the streaming OPEN unless the served
+    // author binding is provably present in the directory key-transparency log
+    // under a pinned, non-equivocating checkpoint (opt-in; mirrors feed/viewer).
+    crate::commands::feed::enforce_author_transparency(&dir.0, session.inner(), author_binding)
+        .await?;
     let my_id =
         resolve_my_user_id(&mut sender, &host, &username, &verifier, &mut trust, now).await?;
 

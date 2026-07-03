@@ -17,9 +17,10 @@
 //! never aborts the batch or rolls back the others. The sanitized per-recipient
 //! failure codes are: "untrusted" (unresolvable / bad binding), "revoked",
 //! "pq_key_missing", "verify_failed" (DEK-commitment mismatch), "recovery_recipient",
-//! "wrap_failed", "share_failed" (a non-201 POST), "locked" (the identity was
-//! momentarily absent mid-batch — see [`run_reshare_batch`]), or a transport error
-//! code. Re-sharing is idempotent server-side (`Store::add_wrap` replaces the row),
+//! "wrap_failed", "share_failed" (a non-201 POST), "server_untrusted" (the
+//! recipient's TOFU-pinned key CHANGED — trust-alarm B, [`crate::tofu`]), "locked"
+//! (the identity was momentarily absent mid-batch — see [`run_reshare_batch`]), or a
+//! transport error code. Re-sharing is idempotent server-side (`Store::add_wrap` replaces the row),
 //! so retrying just the failed rows is always safe.
 //!
 //! **Identity-borrow discipline (spec §9).** The non-`Clone` `Identity` is borrowed
@@ -63,6 +64,7 @@ use crate::recipients::list_recipients;
 use crate::revocations::build_tombstones;
 use crate::sink::fetch_anchored_head;
 use crate::state::{SharePhase, EVT_RESHARE};
+use crate::tofu::{TofuOutcome, TofuStore};
 use crate::upload::wrap_wire;
 
 // ---------------------------------------------------------------------------
@@ -162,15 +164,19 @@ async fn reshare_inner(
     )
     .await?;
 
-    // Step 3: recover the DEK from the caller's OWN self-wrap, ONCE. Borrow the
-    // identity ONLY for this synchronous call (no await while borrowed).
-    let dek = {
+    // Step 3: recover the DEK from the caller's OWN self-wrap, ONCE, and open the
+    // identity-sealed TOFU pin store (alarm-B). Borrow the identity ONLY for these
+    // synchronous calls (no await while borrowed) — the store keeps only its derived
+    // sealing key, never the identity, so it can outlive the guard.
+    let (dek, mut tofu) = {
         let guard = session.0.lock().await;
         let identity = guard
             .identity
             .as_ref()
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-        recover_own_dek(&view, file_id, identity, my_id)?
+        let dek = recover_own_dek(&view, file_id, identity, my_id)?;
+        let tofu = TofuStore::open(&dir.0, identity)?;
+        (dek, tofu)
     }; // guard drops here — identity no longer borrowed
 
     // Step 4: fetch the sink-anchored head out of band, then build the authenticated
@@ -201,6 +207,7 @@ async fn reshare_inner(
         &dek,
         &tombstones,
         session,
+        &mut tofu,
         &req.recipient_usernames,
         &verifier,
         &mut trust,
@@ -235,6 +242,7 @@ async fn run_reshare_batch(
     dek: &Dek,
     tombstones: &TombstoneSet,
     session: &Session,
+    tofu: &mut TofuStore,
     recipients: &[String],
     verifier: &DirectoryVerifier,
     trust: &mut (dyn TrustStore + Send),
@@ -262,6 +270,30 @@ async fn run_reshare_batch(
                     continue;
                 }
             };
+
+        // (sync, no await) Trust-alarm layer B: TOFU-pin the resolved+verified key.
+        // A first sighting pins WITHOUT blocking; the SAME key Matches; a CHANGED key
+        // for a pinned username is fail-closed `server_untrusted` — no wrap, no POST
+        // for this recipient (per-recipient isolation; the pin is NOT overwritten). A
+        // store-write error is likewise fail-closed rather than silently unpinned.
+        match tofu.check_or_pin(uname, &author.enc_pub, &author.sig_pub) {
+            Ok(TofuOutcome::Pinned) | Ok(TofuOutcome::Match) => {}
+            Ok(TofuOutcome::Changed) => {
+                push_outcome(
+                    &mut outcomes,
+                    emit,
+                    file_id_hex,
+                    uname,
+                    false,
+                    Some("server_untrusted".to_owned()),
+                );
+                continue;
+            }
+            Err(e) => {
+                push_outcome(&mut outcomes, emit, file_id_hex, uname, false, Some(e.code));
+                continue;
+            }
+        }
 
         emit(SharePhase::Verifying {
             file_id: file_id_hex.to_owned(),
@@ -583,6 +615,22 @@ mod tests {
         TombstoneSet::verify(&[], GENESIS_HEAD.0).unwrap()
     }
 
+    /// A fresh, empty TOFU store in a unique temp dir (so every batch test starts
+    /// with no pins — the first sighting pins WITHOUT blocking). The dir is left in
+    /// the OS temp space; these are ephemeral test runs.
+    fn empty_tofu() -> TofuStore {
+        let dir = std::env::temp_dir().join(format!(
+            "mxtofu_share_{}_{}",
+            std::process::id(),
+            maxsecu_crypto::random_array::<8>()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        TofuStore::open(&dir, &Identity::generate()).unwrap()
+    }
+
     /// The batch-isolation contract (spec §5, testing plan step 5): a MIXED batch
     /// (one unresolvable username, one valid) returns EXACTLY one `ok:false` + one
     /// `ok:true`, in request order, never aborting the batch nor dropping a row.
@@ -631,6 +679,7 @@ mod tests {
             &dek,
             &tombstones,
             &session,
+            &mut empty_tofu(),
             &recipients,
             &verifier,
             &mut trust,
@@ -764,6 +813,7 @@ mod tests {
             &dek,
             &tombstones,
             &session,
+            &mut empty_tofu(),
             &recipients,
             &verifier,
             &mut trust,
@@ -782,6 +832,91 @@ mod tests {
             outcomes[1].ok,
             "the batch was not aborted: the next recipient still succeeds"
         );
+        assert!(outcomes[1].code.is_none());
+    }
+
+    /// Trust-alarm layer B (spec §0-B/§7): a username whose key was TOFU-pinned to a
+    /// DIFFERENT key now resolves to a changed key ⇒ fail-closed `server_untrusted`,
+    /// blocking the share for that recipient (no wrap POST), while an UNPINNED peer
+    /// in the same batch is a normal first-sighting that still succeeds — the alarm
+    /// is per-recipient and blocks a CHANGE only, never a first sighting.
+    #[tokio::test]
+    async fn changed_pinned_key_blocks_the_share_but_first_sighting_proceeds() {
+        let d5 = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+        let mut trust = MemoryTrustStore::new();
+
+        let (_alice_sk, alice_pk) = generate_enc_keypair();
+        let dek = Dek::generate();
+        let tombstones = empty_tombstones();
+        let session = session_with_identity();
+
+        let file_id_hex: String = FILE_ID.iter().map(|b| format!("{b:02x}")).collect();
+
+        // The server serves alice's REAL binding (enc = alice_pk, sig = [0x51;32]).
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/v1/directory/alice".to_owned(),
+            (
+                hyper::StatusCode::OK,
+                alice_binding(&d5, alice_pk.to_bytes()),
+            ),
+        );
+        routes.insert(
+            "/v1/directory/carol".to_owned(),
+            (
+                hyper::StatusCode::OK,
+                alice_binding(&d5, alice_pk.to_bytes()),
+            ),
+        );
+        // A 201 wraps route: if the alarm did NOT block, "alice" would succeed here —
+        // so a `server_untrusted` outcome proves the block happened BEFORE the POST.
+        routes.insert(
+            format!("/v1/files/{file_id_hex}/wraps"),
+            (hyper::StatusCode::CREATED, "{}".to_owned()),
+        );
+        let addr = spawn_router(routes).await;
+        let mut sender = connect(&addr).await;
+
+        // Pre-pin "alice" to a DIFFERENT key than the server will serve → Changed.
+        // "carol" is left UNPINNED → a normal first sighting.
+        let mut tofu = empty_tofu();
+        assert_eq!(
+            tofu.check_or_pin("alice", &[0x00; 32], &[0x51; 32]).unwrap(),
+            TofuOutcome::Pinned
+        );
+
+        let recipients = vec!["alice".to_owned(), "carol".to_owned()];
+        let outcomes = run_reshare_batch(
+            &mut sender,
+            "localhost",
+            "tok",
+            &file_id_hex,
+            FILE_ID,
+            1,
+            dek.commit(),
+            Suite::V1,
+            GRANTER_ID,
+            &dek,
+            &tombstones,
+            &session,
+            &mut tofu,
+            &recipients,
+            &verifier,
+            &mut trust,
+            NOW,
+            &|_| {},
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 2, "one outcome per entered username");
+        // alice: changed pinned key → blocked, fail-closed, no share.
+        assert_eq!(outcomes[0].username, "alice");
+        assert!(!outcomes[0].ok, "a changed pinned key blocks the share");
+        assert_eq!(outcomes[0].code.as_deref(), Some("server_untrusted"));
+        // carol: first sighting → pinned WITHOUT blocking → the share still succeeds.
+        assert_eq!(outcomes[1].username, "carol");
+        assert!(outcomes[1].ok, "a first-sighting peer is not blocked");
         assert!(outcomes[1].code.is_none());
     }
 

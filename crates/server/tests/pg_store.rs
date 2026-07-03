@@ -8,15 +8,17 @@
 
 use maxsecu_crypto::{random_array, sha256, SigningKey};
 use maxsecu_encoding::labels;
-use maxsecu_encoding::structs::{AuthProofContext, DirBinding, Genesis, Manifest, Stream};
+use maxsecu_encoding::structs::{
+    AuthProofContext, DirBinding, Genesis, Manifest, Stream, MLKEM768_PUB_LEN,
+};
 use maxsecu_encoding::types::{
     Bytes32, Compression, FileType, Id, Role, RoleSet, StreamType, Suite, Text, Timestamp,
 };
 use maxsecu_encoding::{encode, RECOVERY_ID};
 use maxsecu_server::{
-    parse_stage, AddWrapError, AuthConfig, AuthService, DeleteWrapError, FinalizeError,
-    GenesisInput, ListFilter, PgStore, SessionRecord, StageError, StageInput, Store,
-    VersionSelector, WrapInput,
+    parse_stage, AddWrapError, AuthConfig, AuthService, DeleteWrapError, EnrollOutcome,
+    FinalizeError, GenesisInput, ListFilter, PgStore, RecoveryAccount, SessionRecord, StageError,
+    StageInput, StoredBinding, Store, VersionSelector, WrapInput,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -118,35 +120,6 @@ impl TestDb {
         PgStore::new(pool)
     }
 
-    /// Seed an admin user (the in-person voucher issuer; satisfies the
-    /// `enrollment_vouchers.issued_by` FK). Returns its `user_id`.
-    async fn seed_admin(&self) -> [u8; 16] {
-        let id: [u8; 16] = random_array();
-        sqlx::query("INSERT INTO users (user_id, username, enc_pub, sig_pub) VALUES ($1,$2,$3,$4)")
-            .bind(&id[..])
-            .bind("admin")
-            .bind(&[0xAAu8; 32][..])
-            .bind(&[0xBBu8; 32][..])
-            .execute(self.store.pool())
-            .await
-            .unwrap();
-        id
-    }
-
-    /// Seed a usable, unexpired enrollment voucher by its plaintext code.
-    async fn seed_voucher(&self, issued_by: &[u8; 16], code: &str) {
-        let h = sha256(code.as_bytes());
-        sqlx::query(
-            "INSERT INTO enrollment_vouchers (voucher_hash, issued_by, expires_at) \
-             VALUES ($1, $2, now() + interval '1 day')",
-        )
-        .bind(&h[..])
-        .bind(&issued_by[..])
-        .execute(self.store.pool())
-        .await
-        .unwrap();
-    }
-
     /// Seed a user with a chosen `user_id` (for `files.owner_id` FK).
     async fn seed_user(&self, id: [u8; 16], name: &str) {
         sqlx::query("INSERT INTO users (user_id, username, enc_pub, sig_pub) VALUES ($1,$2,$3,$4)")
@@ -201,17 +174,133 @@ fn make_proof(sk: &SigningKey, server_id: &str, nonce: &[u8; 32], ts: u64) -> [u
     sk.sign_canonical(labels::AUTH, &ctx)
 }
 
+/// Build a canonical, D5-signed binding for `user_id` with the given roles — the
+/// exact wire form `enroll` decodes to populate the projection columns.
+fn signed_binding(
+    d5: &SigningKey,
+    user_id: [u8; 16],
+    username: &str,
+    enc_pub: [u8; 32],
+    sig_pub: [u8; 32],
+    admin: bool,
+) -> StoredBinding {
+    let roles = if admin {
+        RoleSet::new([Role::User, Role::Admin])
+    } else {
+        RoleSet::new([Role::User])
+    };
+    let b = DirBinding {
+        username: Text::new(username).unwrap(),
+        user_id: Id(user_id),
+        enc_pub: Bytes32(enc_pub),
+        sig_pub: Bytes32(sig_pub),
+        key_version: 1,
+        roles,
+        not_before: Timestamp(0),
+        not_after: Timestamp(4_102_444_800_000),
+        mlkem_pub: None,
+    };
+    StoredBinding {
+        signature: d5.sign_canonical(labels::DIRBINDING, &b),
+        binding_bytes: encode(&b),
+    }
+}
+
+/// `enroll` over REAL Postgres is a single all-or-nothing transaction: an invalid
+/// key writes nothing; the first enrollee is `{User, Admin}` and later ones
+/// `{User}`; and a username collision rolls the whole unit back (key unspent).
+#[tokio::test]
+async fn enroll_is_atomic_and_first_is_admin_over_pg() {
+    let db = db_or_skip!();
+    let store = &db.store;
+    let d5 = SigningKey::generate();
+    const NEVER: u64 = 4_102_444_800_000;
+
+    // (a) An UNSEEDED key: KeyInvalid, and nothing is written (transaction rolls back).
+    let kh = sha256(b"rk-1");
+    let uid1: [u8; 16] = random_array();
+    let ub = signed_binding(&d5, uid1, "alice", [0x11; 32], [0x22; 32], false);
+    let ab = signed_binding(&d5, uid1, "alice", [0x11; 32], [0x22; 32], true);
+    assert_eq!(
+        store
+            .enroll(kh, uid1, "alice", [0x11; 32], [0x22; 32], &ub, &ab)
+            .await
+            .unwrap(),
+        EnrollOutcome::KeyInvalid
+    );
+    assert!(
+        store.user_by_name("alice").await.unwrap().is_none(),
+        "KeyInvalid created no user"
+    );
+    assert!(store.binding_by_username("alice").await.unwrap().is_none());
+
+    // (b) Seed the key; the FIRST enrollment claims admin + stores the admin
+    // binding, atomically consuming the key. Verify over a FRESH pool (it's in the
+    // DB, not one process's memory).
+    store.issue_registration_key(kh, NEVER).await.unwrap();
+    assert_eq!(
+        store
+            .enroll(kh, uid1, "alice", [0x11; 32], [0x22; 32], &ub, &ab)
+            .await
+            .unwrap(),
+        EnrollOutcome::Enrolled { is_admin: true }
+    );
+    assert!(
+        !store.consume_registration_key(&kh).await.unwrap(),
+        "the key was consumed inside enroll"
+    );
+    let fresh = db.reopen().await;
+    let stored = fresh.binding_by_username("alice").await.unwrap().unwrap();
+    let decoded: DirBinding = maxsecu_encoding::decode(&stored.binding_bytes).unwrap();
+    assert!(
+        decoded.roles.roles().contains(&Role::Admin),
+        "first registrant persisted as admin"
+    );
+
+    // (c) A SECOND enrollment is User-only.
+    let kh2 = sha256(b"rk-2");
+    let uid2: [u8; 16] = random_array();
+    let ub2 = signed_binding(&d5, uid2, "bob", [0x33; 32], [0x44; 32], false);
+    let ab2 = signed_binding(&d5, uid2, "bob", [0x33; 32], [0x44; 32], true);
+    store.issue_registration_key(kh2, NEVER).await.unwrap();
+    assert_eq!(
+        store
+            .enroll(kh2, uid2, "bob", [0x33; 32], [0x44; 32], &ub2, &ab2)
+            .await
+            .unwrap(),
+        EnrollOutcome::Enrolled { is_admin: false }
+    );
+    let stored = store.binding_by_username("bob").await.unwrap().unwrap();
+    let decoded: DirBinding = maxsecu_encoding::decode(&stored.binding_bytes).unwrap();
+    assert!(
+        !decoded.roles.roles().contains(&Role::Admin),
+        "second registrant is user-only"
+    );
+
+    // (d) A username collision rolls the whole unit back — the key is NOT burned.
+    let kh3 = sha256(b"rk-3");
+    let uid3: [u8; 16] = random_array();
+    let ub3 = signed_binding(&d5, uid3, "alice", [0x55; 32], [0x66; 32], false);
+    let ab3 = signed_binding(&d5, uid3, "alice", [0x55; 32], [0x66; 32], true);
+    store.issue_registration_key(kh3, NEVER).await.unwrap();
+    assert_eq!(
+        store
+            .enroll(kh3, uid3, "alice", [0x55; 32], [0x66; 32], &ub3, &ab3)
+            .await
+            .unwrap(),
+        EnrollOutcome::UsernameTaken
+    );
+    assert!(
+        store.consume_registration_key(&kh3).await.unwrap(),
+        "the key survived the rolled-back enrollment (still consumable)"
+    );
+
+    db.teardown().await;
+}
+
 #[tokio::test]
 async fn register_then_full_login_persists_in_postgres() {
     let db = db_or_skip!();
-
-    // In-person enrollment: admin issues a voucher; the new user consumes it.
-    let admin = db.seed_admin().await;
-    db.seed_voucher(&admin, "voucher-1").await;
-    assert!(
-        db.store.consume_voucher(&sha256(b"voucher-1")).await.unwrap(),
-        "valid unused voucher consumes"
-    );
 
     let sk = SigningKey::generate();
     let user_id = db
@@ -265,21 +354,67 @@ async fn duplicate_username_returns_none() {
 }
 
 #[tokio::test]
-async fn voucher_is_single_use_and_unknown_is_false() {
+async fn recovery_account_registers_once_with_mlkem_over_postgres() {
     let db = db_or_skip!();
-    let admin = db.seed_admin().await;
-    db.seed_voucher(&admin, "one-shot").await;
-    assert!(db.store.consume_voucher(&sha256(b"one-shot")).await.unwrap());
     assert!(
-        !db.store.consume_voucher(&sha256(b"one-shot")).await.unwrap(),
-        "second consume of the same voucher fails"
+        db.store.recovery_account().await.unwrap().is_none(),
+        "no recovery account before any set"
     );
+    let enc = [0x11u8; 32];
+    let sig = [0x22u8; 32];
+    let mlkem = [0x33u8; MLKEM768_PUB_LEN];
     assert!(
-        !db.store
-            .consume_voucher(&sha256(b"never-issued"))
+        db.store
+            .set_recovery_account(enc, sig, Some(mlkem))
             .await
             .unwrap(),
-        "unknown voucher fails"
+        "first registration lands the singleton row"
+    );
+    assert_eq!(
+        db.store.recovery_account().await.unwrap(),
+        Some(RecoveryAccount {
+            enc_pub: enc,
+            sig_pub: sig,
+            mlkem_pub: Some(mlkem),
+        }),
+        "the PQ-hybrid pubkeys (incl. the 1184-byte ML-KEM key) round-trip verbatim"
+    );
+    // A second attempt with DIFFERENT keys loses (ON CONFLICT DO NOTHING) and
+    // does NOT overwrite — the singleton PK enforces once-only.
+    assert!(
+        !db.store
+            .set_recovery_account([0xAAu8; 32], [0xBBu8; 32], None)
+            .await
+            .unwrap(),
+        "second registration is rejected (once-only)"
+    );
+    assert_eq!(
+        db.store.recovery_account().await.unwrap(),
+        Some(RecoveryAccount {
+            enc_pub: enc,
+            sig_pub: sig,
+            mlkem_pub: Some(mlkem),
+        }),
+        "the ORIGINAL keys (incl. ML-KEM) are preserved after a losing second set"
+    );
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn recovery_account_classical_only_persists_null_mlkem_over_postgres() {
+    let db = db_or_skip!();
+    let enc = [0x44u8; 32];
+    let sig = [0x55u8; 32];
+    // No ML-KEM key: the nullable `mlkem_pub` column stays NULL and reads back None.
+    assert!(db.store.set_recovery_account(enc, sig, None).await.unwrap());
+    assert_eq!(
+        db.store.recovery_account().await.unwrap(),
+        Some(RecoveryAccount {
+            enc_pub: enc,
+            sig_pub: sig,
+            mlkem_pub: None,
+        }),
+        "classical-only recovery persists with a NULL mlkem_pub"
     );
     db.teardown().await;
 }

@@ -4,12 +4,13 @@
 //! ceremony D5, registers + channel-bound-logs-in an author, and publishes the
 //! author's + a recovery recipient's D5-signed bindings. Then it drives the
 //! **real** `client-app` upload modules
-//! (`upload::{prepare_image_streams, prepare_blog_streams, run_pipeline}`,
-//! `directory::resolve_recovery_recipient`) over the live connection, fetches
-//! everything back, and runs the full `verify_and_open` ladder to prove the
-//! exact plaintext round-trips. Asserts the Phase-4 gates:
+//! (`upload::{prepare_image_streams, prepare_blog_streams, run_pipeline}`) over the
+//! live connection, fetches everything back, and runs the full `verify_and_open`
+//! ladder to prove the exact plaintext round-trips. Asserts the Phase-4 gates:
 //!
-//! - GATE E: the recovery recipient resolves + D5-verifies under the pinned root;
+//! (The old GATE E — buddy recovery-recipient directory resolution — was retired in
+//! T8; the recovery wrap target is now the embedded recovery pin. This test wraps to
+//! a plain recovery identity, which is all its round-trip gates need.)
 //! - GATE A: an IMAGE upload driven by the real pipeline round-trips (content +
 //!   metadata title);
 //! - GATE B: a BLOG upload round-trips byte-exactly (+ metadata title);
@@ -35,20 +36,19 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
 use maxsecu_ceremony_harness::Ceremony;
-use maxsecu_client_app::directory::resolve_recovery_recipient;
 use maxsecu_client_core::{
-    build_upload, verify_and_open, DirectoryVerifier, DownloadBundle, Identity, MemoryTrustStore,
+    build_upload, verify_and_open, DownloadBundle, Identity,
     StreamChunks, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
-use maxsecu_crypto::{sha256, EncPublicKey, WrappedDek};
+use maxsecu_crypto::{sha256, EncPublicKey, SigningKey, WrappedDek};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::types::{FileType, Id, Role, StreamType, Timestamp};
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuthConfig, AuthService, FsBlobStore, MemoryStore,
 };
 
-const VOUCHER: &str = "in-person-code-001";
-const VOUCHER2: &str = "in-person-code-002";
+const REG_KEY: &str = "in-person-code-001";
+const REG_KEY2: &str = "in-person-code-002";
 const TS: u64 = 1_719_500_000_000;
 const BLOG_BODY: &[u8] = b"Dear diary, a Phase-4 upload that must round-trip exactly.";
 
@@ -231,7 +231,7 @@ async fn register_and_login(
     c: &mut Conn,
     owner: &Identity,
     username: &str,
-    voucher: &str,
+    reg_key: &str,
 ) -> ([u8; 16], String) {
     let (st, res) = post(
         c,
@@ -241,7 +241,7 @@ async fn register_and_login(
             "username": username,
             "enc_pub_b64": B64.encode(owner.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(owner.sig_pub_bytes()),
-            "enrollment_voucher": voucher,
+            "registration_key": reg_key,
         }),
     )
     .await;
@@ -354,8 +354,12 @@ async fn download_bundle(c: &mut Conn, token: &str, fid_hex: &str) -> DownloadBu
 
 #[tokio::test]
 async fn phase4_upload_over_real_tls() {
-    // ---- (1) Server + pinned ceremony D5 ----
-    let ceremony = Ceremony::generate();
+    // ---- (1) Server + pinned ceremony D5 (the server holds the private half so
+    // registration-key enrollment can sign the binding; the scripted ceremony is
+    // reconstructed from the same seed so its published bindings verify under the
+    // same pinned pubkey) ----
+    let d5_seed = maxsecu_crypto::random_array::<32>();
+    let ceremony = Ceremony::from_seed(&d5_seed);
     let pinned = ceremony.directory_pub();
 
     let blob_dir = std::env::temp_dir().join(format!(
@@ -363,13 +367,13 @@ async fn phase4_upload_over_real_tls() {
         hex(&maxsecu_crypto::random_array::<8>())
     ));
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
-    store.add_voucher(sha256(VOUCHER2.as_bytes()));
+    store.add_reg_key(sha256(REG_KEY.as_bytes()));
+    store.add_reg_key(sha256(REG_KEY2.as_bytes()));
     let state = AppState {
-        auth: Arc::new(AuthService::new(
-            store,
-            AuthConfig::default().with_directory_pub(pinned),
-        )),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(pinned))
+                .with_dir_signer(Arc::new(SigningKey::from_seed(&d5_seed))),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
@@ -387,36 +391,23 @@ async fn phase4_upload_over_real_tls() {
 
     // ---- (2) Register + login the author; publish author + recovery bindings ----
     let owner = Identity::generate();
-    let (user_id, token) = register_and_login(&mut c, &owner, "alice", VOUCHER).await;
+    let (user_id, token) = register_and_login(&mut c, &owner, "alice", REG_KEY).await;
     publish_binding(&mut c, &ceremony, "alice", user_id, &owner).await;
 
     // The recovery recipient is a real registered user (so the username→user_id
     // directory lookup resolves), with its own D5-signed binding.
     let recovery = Identity::generate();
     let (recovery_uid, _recovery_token) =
-        register_and_login(&mut c, &recovery, "recovery-1", VOUCHER2).await;
+        register_and_login(&mut c, &recovery, "recovery-1", REG_KEY2).await;
     publish_binding(&mut c, &ceremony, "recovery-1", recovery_uid, &recovery).await;
 
     let owner_sig_pub = owner.sig_pub_bytes();
 
-    // ---- GATE E: recovery recipient resolves + D5-verifies under the pinned root ----
-    let verifier = DirectoryVerifier::new(pinned);
-    let mut trust = MemoryTrustStore::new();
-    let rr = resolve_recovery_recipient(
-        &mut c.sender,
-        "localhost",
-        "recovery-1",
-        &verifier,
-        &mut trust,
-        TS,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        rr.enc_pub,
-        recovery.enc_pub_bytes(),
-        "GATE E: D5-verified recovery enc key"
-    );
+    // Recovery wrap target: the recovery identity's keys directly. The buddy
+    // directory-resolve (`resolve_recovery_recipient`) was retired in T8 in favour
+    // of the embedded recovery pin; this upload round-trip test just needs a
+    // recovery recipient. Classical (V1): the published binding carries no ML-KEM.
+    let recovery_enc = recovery.enc_pub_bytes();
 
     // A reusable VerifyContext builder for the author opening its own uploads.
     let make_ctx = |file_id: Id| VerifyContext {
@@ -468,8 +459,8 @@ async fn phase4_upload_over_real_tls() {
             file_id: image_file_id,
             file_type,
             chunk_size: 4096,
-            recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
-            recovery_mlkem_pub: rr.mlkem_pub,
+            recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+            recovery_mlkem_pub: None,
             created_at: Timestamp(TS),
         },
         &image_streams,
@@ -528,8 +519,8 @@ async fn phase4_upload_over_real_tls() {
             file_id: blog_file_id,
             file_type: FileType::Blog,
             chunk_size: 4096,
-            recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
-            recovery_mlkem_pub: rr.mlkem_pub,
+            recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+            recovery_mlkem_pub: None,
             created_at: Timestamp(TS),
         },
         &blog_streams,
@@ -606,8 +597,8 @@ async fn phase4_upload_over_real_tls() {
             file_id: resume_file_id,
             file_type: FileType::Blog,
             chunk_size: 4096,
-            recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
-            recovery_mlkem_pub: rr.mlkem_pub,
+            recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+            recovery_mlkem_pub: None,
             created_at: Timestamp(TS),
         },
         &resume_streams,

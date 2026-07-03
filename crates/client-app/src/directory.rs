@@ -58,55 +58,81 @@ pub fn verify_author_binding(
     })
 }
 
-/// A directory-verified recovery recipient: the wrap-target keys only.
+/// The recovery wrap-target keys: an X25519 `enc_pub` plus an OPTIONAL ML-KEM-768
+/// key (present ⇒ the recovery grant is a Suite::V2 hybrid wrap). Since the
+/// trusted-server-recovery redesign these come from the compiled-in recovery PIN
+/// (`crate::recovery_pin`), NOT a directory binding — the server-served pubkey is
+/// only ever COMPARED against the pin, never trusted on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryRecipient {
     pub enc_pub: [u8; 32],
     pub mlkem_pub: Option<[u8; 1184]>,
 }
 
-/// Verify an already-fetched recovery-recipient `(binding_bytes, signature)` under
-/// the pinned D5 and extract its wrap-target keys. Factored out so it is unit-
-/// testable without TLS (mirrors `verify_author_binding`).
-pub fn verify_recovery_binding(
-    verifier: &DirectoryVerifier,
-    trust: &mut dyn TrustStore,
-    binding_bytes: &[u8],
-    signature: &[u8; 64],
-    now_ms: u64,
+/// Trust-alarm A (spec §3/§7). Fetch the server-served recovery pubkey
+/// (`GET /v1/recovery/pubkey`), constant-time-compare it against the compiled-in
+/// recovery pin, and — ONLY on an exact match — return the **embedded pin's**
+/// wrap-target keys (never the served ones; the served bytes are compared, not
+/// trusted). This is called BEFORE any DEK wrap; on a mismatch the upload MUST be
+/// blocked entirely (no wrap / no stage / no bytes stored).
+///
+/// * server has no recovery account (`404`) ⇒ fail-closed `no_recovery_account`;
+/// * served pubkey ≠ embedded pin ⇒ fail-closed `server_untrusted` (the alarm);
+/// * match ⇒ decode the embedded pin into its `{enc_pub, mlkem_pub}` halves.
+///
+/// No D5/directory verification is involved: the pin — not the directory — is the
+/// trust anchor for the recovery wrap target.
+pub async fn resolve_recovery_pin(
+    sender: &mut SendRequest<Full<Bytes>>,
+    host: &str,
 ) -> Result<RecoveryRecipient, UiError> {
-    let binding: DirBinding = decode(binding_bytes)
-        .map_err(|_| UiError::new("untrusted", "Malformed directory record."))?;
-    let v = verifier
-        .verify_binding(&binding, signature, now_ms, trust)
-        .map_err(|_| UiError::new("untrusted", "The recovery recipient could not be verified."))?;
+    let (status, json) = get_json(sender, "/v1/recovery/pubkey", None, host).await?;
+    if status != hyper::StatusCode::OK {
+        return Err(UiError::new(
+            "no_recovery_account",
+            "This server has no recovery account configured.",
+        ));
+    }
+    // Canonicalize the served halves and compare the WHOLE blob against the pin.
+    let served = parse_served_recovery_pin(&json)?;
+    crate::recovery_pin::compare_served(&served).map_err(|_| {
+        UiError::new(
+            "server_untrusted",
+            "This server's recovery key does not match this app's pinned key.",
+        )
+    })?;
+    // Match: wrap to the EMBEDDED pin (trusted, compiled-in) — not the served key.
+    let parsed = crate::recovery_pin::parse_pin(crate::recovery_pin::embedded_pin())
+        .ok_or_else(|| UiError::new("server_untrusted", "The embedded recovery pin is malformed."))?;
     Ok(RecoveryRecipient {
-        enc_pub: v.enc_pub,
-        mlkem_pub: v.mlkem_pub,
+        enc_pub: parsed.enc_pub,
+        mlkem_pub: parsed.mlkem_pub,
     })
 }
 
-/// Resolve + D5-verify the configured recovery recipient by username
-/// (`GET /v1/directory/{username}`). Fail-closed `untrusted` if unpublished/forged.
-pub async fn resolve_recovery_recipient(
-    sender: &mut SendRequest<Full<Bytes>>,
-    host: &str,
-    username: &str,
-    verifier: &DirectoryVerifier,
-    // `+ Send` for the same reason as `resolve_and_verify_author` (the trust
-    // object is held across the `get_json` await ⇒ the future must be `Send`).
-    trust: &mut (dyn TrustStore + Send),
-    now_ms: u64,
-) -> Result<RecoveryRecipient, UiError> {
-    let (status, json) = get_json(sender, &format!("/v1/directory/{username}"), None, host).await?;
-    if status != hyper::StatusCode::OK {
-        return Err(UiError::new(
-            "untrusted",
-            "The recovery recipient is not published.",
-        ));
-    }
-    let (bytes, sig) = parse_binding(&json)?;
-    verify_recovery_binding(verifier, trust, &bytes, &sig, now_ms)
+/// Decode a `GET /v1/recovery/pubkey` body (`{enc_pub_b64, mlkem_pub_b64?}`) into
+/// the canonical pin byte form so it can be compared against the embedded pin. A
+/// missing `mlkem_pub_b64` ⇒ a classical (33-byte) canonical pin; present ⇒ a
+/// 1217-byte hybrid pin. Any malformed field fails closed as `server_untrusted`.
+fn parse_served_recovery_pin(json: &serde_json::Value) -> Result<Vec<u8>, UiError> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    let bad = || UiError::new("server_untrusted", "The server sent a malformed recovery key.");
+    let enc_vec = B64
+        .decode(json["enc_pub_b64"].as_str().ok_or_else(bad)?)
+        .map_err(|_| bad())?;
+    let enc: [u8; 32] = enc_vec.try_into().map_err(|_| bad())?;
+    let mlkem: Option<[u8; 1184]> = match json.get("mlkem_pub_b64").and_then(|v| v.as_str()) {
+        None => None,
+        Some(s) => {
+            let m = B64.decode(s).map_err(|_| bad())?;
+            Some(m.try_into().map_err(|_| bad())?)
+        }
+    };
+    Ok(crate::recovery_pin::canonical_pin(
+        &enc,
+        mlkem.as_ref().map(|m| m.as_slice()),
+    ))
 }
 
 /// Decode a §6.1 `BindingRes` JSON body into `(binding_bytes, signature)`.
@@ -142,6 +168,28 @@ pub async fn resolve_and_verify_author(
     trust: &mut (dyn TrustStore + Send),
     now_ms: u64,
 ) -> Result<VerifiedAuthor, UiError> {
+    Ok(resolve_and_verify_author_logged(sender, host, user_id_hex, verifier, trust, now_ms)
+        .await?
+        .0)
+}
+
+/// Like [`resolve_and_verify_author`] but ALSO returns the canonical served
+/// `DirBinding` leaf bytes — the EXACT bytes the directory KT log records for this
+/// author (`crates/server/src/http.rs` publishes them on enrollment). The
+/// browse/open resolve boundary feeds these to the trust-alarm-C gate
+/// ([`crate::transparency::verify_binding_transparency`]) so the client can prove
+/// the served binding is provably included in the KT log under a pinned,
+/// non-equivocating checkpoint — catching a server that serves a key it never
+/// logged. The bytes are the SAME ones D5-verified here (never re-fetched), so the
+/// KT-proven leaf and the D5-trusted keys cannot diverge.
+pub async fn resolve_and_verify_author_logged(
+    sender: &mut SendRequest<Full<Bytes>>,
+    host: &str,
+    user_id_hex: &str,
+    verifier: &DirectoryVerifier,
+    trust: &mut (dyn TrustStore + Send),
+    now_ms: u64,
+) -> Result<(VerifiedAuthor, Vec<u8>), UiError> {
     let (status, json) = get_json(
         sender,
         &format!("/v1/directory/by-id/{user_id_hex}"),
@@ -156,7 +204,8 @@ pub async fn resolve_and_verify_author(
         ));
     }
     let (bytes, sig) = parse_binding(&json)?;
-    verify_author_binding(verifier, trust, &bytes, &sig, now_ms)
+    let author = verify_author_binding(verifier, trust, &bytes, &sig, now_ms)?;
+    Ok((author, bytes))
 }
 
 /// Resolve MY own `user_id` from my published binding (`GET /v1/directory/{username}`),
@@ -200,7 +249,7 @@ pub async fn resolve_my_binding(
 
 /// Resolve + D5-verify an arbitrary THIRD-PARTY recipient by username
 /// (`GET /v1/directory/{username}`), for a post-upload share (multi-recipient
-/// sharing design §3). Mirrors `resolve_recovery_recipient`'s fetch+parse+verify+
+/// sharing design §3). Mirrors `resolve_my_binding`'s fetch+parse+verify+
 /// fail-closed shape, but is generic (not the recovery sentinel) and returns the
 /// full `VerifiedAuthor` (incl. `mlkem_pub`, forwarded from Task 1) so the caller
 /// has everything `ReshareParams` needs. **No partial trust**: a `404`, a bad
@@ -281,34 +330,6 @@ mod tests {
         };
         let sig = d5.sign_canonical(labels::DIRBINDING, &b);
         (encode(&b), sig)
-    }
-
-    #[test]
-    fn recovery_recipient_extracts_enc_pub() {
-        let d5 = SigningKey::generate();
-        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
-        let mut trust = MemoryTrustStore::new();
-        let (bytes, sig) = signed_binding(&d5); // enc_pub [0xE1;32], sig_pub [0x51;32]
-        let rr = verify_recovery_binding(&verifier, &mut trust, &bytes, &sig, NOW).unwrap();
-        assert_eq!(rr.enc_pub, [0xE1; 32]);
-        assert_eq!(rr.mlkem_pub, None);
-    }
-
-    #[test]
-    fn recovery_recipient_rejects_wrong_key() {
-        let d5 = SigningKey::generate();
-        let attacker = SigningKey::generate();
-        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
-        let mut trust = MemoryTrustStore::new();
-        let (bytes, _) = signed_binding(&d5);
-        let forged =
-            attacker.sign_canonical(labels::DIRBINDING, &decode::<DirBinding>(&bytes).unwrap());
-        assert_eq!(
-            verify_recovery_binding(&verifier, &mut trust, &bytes, &forged, NOW)
-                .unwrap_err()
-                .code,
-            "untrusted"
-        );
     }
 
     #[test]

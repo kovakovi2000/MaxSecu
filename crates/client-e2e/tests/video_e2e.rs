@@ -37,7 +37,7 @@ use base64::Engine;
 
 use maxsecu_ceremony_harness::Ceremony;
 use maxsecu_client_app::directory::{
-    resolve_and_verify_author, resolve_my_user_id, resolve_recovery_recipient,
+    resolve_and_verify_author, resolve_my_user_id,
 };
 use maxsecu_client_app::download::{build_stream_header, parse_file_view};
 use maxsecu_client_app::fragment_cache::FragmentCache;
@@ -48,7 +48,7 @@ use maxsecu_client_core::{
     MemoryTrustStore, PlaintextStreams, StreamHeader, UploadParams, VerifyContext, NO_ADMINS,
     NO_GRANTERS,
 };
-use maxsecu_crypto::{sha256, EncPublicKey};
+use maxsecu_crypto::{sha256, EncPublicKey, SigningKey};
 use maxsecu_encoding::structs::Manifest;
 use maxsecu_encoding::types::{FileType, Id, RecipientType, Role, StreamType, Timestamp};
 use maxsecu_encoding::{decode, labels};
@@ -179,7 +179,7 @@ async fn register_and_login(
     c: &mut Conn,
     owner: &Identity,
     username: &str,
-    voucher: &str,
+    reg_key: &str,
 ) -> ([u8; 16], String) {
     let (st, res) = post(
         c,
@@ -189,7 +189,7 @@ async fn register_and_login(
             "username": username,
             "enc_pub_b64": B64.encode(owner.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(owner.sig_pub_bytes()),
-            "enrollment_voucher": voucher,
+            "registration_key": reg_key,
         }),
     )
     .await;
@@ -310,20 +310,21 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
     };
 
     // ---- Server boot (verbatim from phase7_video_author_to_view_over_real_tls) ----
-    let ceremony = Ceremony::generate();
+    let d5_seed = maxsecu_crypto::random_array::<32>();
+    let ceremony = Ceremony::from_seed(&d5_seed);
     let pinned = ceremony.directory_pub();
     let blob_dir = std::env::temp_dir().join(format!(
         "mxrangeblob_{}",
         hex(&maxsecu_crypto::random_array::<8>())
     ));
     let store = MemoryStore::new();
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
-    store.add_voucher(sha256(VOUCHER2.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER2.as_bytes()));
     let state = AppState {
-        auth: Arc::new(AuthService::new(
-            store,
-            AuthConfig::default().with_directory_pub(pinned),
-        )),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(pinned))
+                .with_dir_signer(Arc::new(SigningKey::from_seed(&d5_seed))),
+        ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(maxsecu_server::NullAuditSink),
         direct_links_enabled: false,
@@ -349,16 +350,9 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
 
     let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
-    let rr = resolve_recovery_recipient(
-        &mut c.sender,
-        "localhost",
-        "recovery-1",
-        &verifier,
-        &mut trust,
-        TS,
-    )
-    .await
-    .unwrap();
+    // Recovery wrap target: the recovery identity's keys directly (buddy resolve
+    // retired in T8). Classical (V1) — the published binding carries no ML-KEM.
+    let recovery_enc = recovery.enc_pub_bytes();
 
     // ---- Upload the synthetic video ----
     let file_id = Id(maxsecu_crypto::random_array::<16>());
@@ -371,8 +365,8 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
             file_id,
             file_type: FileType::Video,
             chunk_size: 4096,
-            recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
-            recovery_mlkem_pub: rr.mlkem_pub,
+            recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+            recovery_mlkem_pub: None,
             created_at: Timestamp(TS),
         },
         &streams,

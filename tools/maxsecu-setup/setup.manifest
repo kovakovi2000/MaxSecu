@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Embedded so `maxsecu-setup.exe` (and its test binaries) are NOT caught by
+     Windows UAC "installer detection", which auto-elevates any executable whose
+     name contains "setup"/"install"/"update". This tool is an ordinary user-level
+     operator command — it must run as the invoking user, never demand elevation.
+     An explicit requestedExecutionLevel disables the installer-detection heuristic. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

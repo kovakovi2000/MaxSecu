@@ -29,6 +29,11 @@ serde_json = { version = "1", optional = true }
 base64 = { version = "0.22", optional = true }
 
 [features]
+# Test-only: expose `Identity::from_test_seeds` (reconstruct an Identity from raw
+# secret seeds). Compiled out of production builds; enabled only by the client↔server
+# e2e suite (`client-e2e`) so its full-flow capstone can build the recovery Identity
+# whose enc half equals the embedded `unpinned-dev` recovery pin. MUST NEVER ship.
+test-support = []
 # The pinned-TLS sink HTTP client. Default build pulls none of this (stays pure).
 net = [
     "dep:tokio",

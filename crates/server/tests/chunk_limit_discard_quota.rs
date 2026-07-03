@@ -63,12 +63,17 @@ fn hex16(s: &str) -> [u8; 16] {
 
 fn mk_router_with_quota(quota: Option<u64>) -> axum::Router {
     let store = MemoryStore::new();
-    // Pre-seed multiple one-time vouchers (one per user that a test may register).
-    store.add_voucher(sha256(VOUCHER.as_bytes()));
-    store.add_voucher(sha256(VOUCHER2.as_bytes()));
-    store.add_voucher(sha256(VOUCHER3.as_bytes()));
+    // Pre-seed multiple one-time registration keys (one per user a test registers).
+    store.add_reg_key(sha256(VOUCHER.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER2.as_bytes()));
+    store.add_reg_key(sha256(VOUCHER3.as_bytes()));
+    let signer = Arc::new(SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer),
+        ),
         blobs: Arc::new(MemoryBlobStore::new()),
         audit: Arc::new(NullAuditSink),
         direct_links_enabled: false,
@@ -181,7 +186,7 @@ async fn register_and_login(
                 "username": username,
                 "enc_pub_b64":  B64.encode(enc_pub.to_bytes()),
                 "sig_pub_b64":  B64.encode(sk.verifying_key().to_bytes()),
-                "enrollment_voucher": voucher,
+                "registration_key": voucher,
             }),
             None,
         ),

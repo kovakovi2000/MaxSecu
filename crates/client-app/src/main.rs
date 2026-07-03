@@ -38,11 +38,11 @@ fn main() {
         .manage(AppDir(app_dir))
         .manage(Session::new())
         .manage(ConnectLock::new())
+        .manage(maxsecu_client_app::commands::recovery_login::RecoveryLogin::new())
         .manage(maxsecu_client_app::jobs::UploadJobs::new())
         .manage(maxsecu_client_app::jobs::VideoJobs::new())
         .manage(maxsecu_client_app::jobs::VideoPrepareCancel::default())
         .manage(ContentCache::new(cap_bytes))
-        .manage(maxsecu_client_app::ceremony::CeremonySession::new())
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
             maxsecu_client_app::commands::auth::unlock_keystore,
@@ -52,21 +52,11 @@ fn main() {
             maxsecu_client_app::commands::viewer::open_content,
             maxsecu_client_app::commands::search::search_local,
             maxsecu_client_app::commands::dialog::pick_file,
-            maxsecu_client_app::commands::bootstrap::register_glassbreak,
-            maxsecu_client_app::commands::bootstrap::create_first_admin,
-            maxsecu_client_app::commands::bootstrap::register_user,
-            maxsecu_client_app::commands::bootstrap::account_status,
-            maxsecu_client_app::commands::admin::list_pending,
-            maxsecu_client_app::commands::admin::issue_voucher,
-            maxsecu_client_app::commands::admin::request_approval,
-            maxsecu_client_app::commands::recovery_custody::split_recovery_key,
-            maxsecu_client_app::commands::recovery_custody::add_recovery_share,
-            maxsecu_client_app::commands::recovery_custody::reconstruct_recovery_key,
-            maxsecu_client_app::commands::recovery_custody::prove_reconstructed_key,
-            maxsecu_client_app::commands::recovery_custody::discard_ceremony_session,
-            maxsecu_client_app::commands::recovery_custody::record_split_ceremony,
-            maxsecu_client_app::commands::recovery_custody::save_recovery_share,
-            maxsecu_client_app::commands::recovery_custody::read_recovery_share_file,
+            maxsecu_client_app::commands::register::register_with_key,
+            maxsecu_client_app::commands::startup::startup_mode,
+            maxsecu_client_app::commands::admin::mint_registration_key,
+            maxsecu_client_app::commands::recovery_login::request_recovery_challenge,
+            maxsecu_client_app::commands::recovery_login::answer_recovery_challenge,
             maxsecu_client_app::commands::upload::stage_upload,
             maxsecu_client_app::commands::upload::confirm_upload,
             maxsecu_client_app::commands::upload::cancel_upload,

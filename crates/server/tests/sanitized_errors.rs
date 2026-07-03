@@ -35,7 +35,7 @@ use serde_json::json;
 use tower::ServiceExt; // oneshot
 
 use maxsecu_admin_core::DirectorySigner;
-use maxsecu_crypto::{sha256, SigningKey};
+use maxsecu_crypto::SigningKey;
 use maxsecu_encoding::encode;
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::{
@@ -45,12 +45,13 @@ use maxsecu_encoding::types::{
     Bytes32, Compression, FileScope, FileType, Id, Role, RoleSet, StreamType, Suite, Text,
     Timestamp,
 };
+use maxsecu_encoding::structs::MLKEM768_PUB_LEN;
 use maxsecu_server::{
     router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteWrapError,
-    DiscardError, FileListEntry, FileView, FinalizeError, ListFilter, MemoryBlobStore, MemoryStore,
-    NullAuditSink, ParsedStage, PendingUser, RecipientView, SessionRecord, StageError, Store,
-    StoreError, StoredBinding, StoredControlRecord, TlsExporter, UserRecord, VersionMeta,
-    VersionSelector, WrapInput,
+    DiscardError, EnrollOutcome, FileListEntry, FileView, FinalizeError, ListFilter,
+    MemoryBlobStore, MemoryStore, NullAuditSink, ParsedStage, RecipientView,
+    RecoveryAccount, SessionRecord, StageError, Store, StoreError, StoredBinding,
+    StoredControlRecord, TlsExporter, UserRecord, VersionMeta, VersionSelector, WrapInput,
 };
 
 const EXPORTER: [u8; 32] = [0xE7; 32];
@@ -93,7 +94,7 @@ const FORBIDDEN: &[&str] = &[
     "get_file",
     "list_files",
     "insert_nonce",
-    "consume_voucher",
+    "enroll",
 ];
 
 // ---- A backend that faults on every call (forces 500 on any path) ----
@@ -113,9 +114,6 @@ impl Store for FaultyStore {
         _s: [u8; 32],
     ) -> Result<Option<[u8; 16]>, StoreError> {
         Err(bait("create_user"))
-    }
-    async fn consume_voucher(&self, _h: &[u8; 32]) -> Result<bool, StoreError> {
-        Err(bait("consume_voucher"))
     }
     async fn user_by_name(&self, _u: &str) -> Result<Option<UserRecord>, StoreError> {
         Err(bait("user_by_name"))
@@ -153,14 +151,37 @@ impl Store for FaultyStore {
     async fn binding_by_user_id(&self, _u: &[u8; 16]) -> Result<Option<StoredBinding>, StoreError> {
         Err(bait("binding_by_user_id"))
     }
-    async fn has_any_binding(&self) -> Result<bool, StoreError> {
-        Err(bait("has_any_binding"))
+    async fn issue_registration_key(&self, _h: [u8; 32], _e: u64) -> Result<(), StoreError> {
+        Err(bait("issue_registration_key"))
     }
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
-        Err(bait("list_pending_users"))
+    async fn consume_registration_key(&self, _h: &[u8; 32]) -> Result<bool, StoreError> {
+        Err(bait("consume_registration_key"))
     }
-    async fn issue_voucher(&self, _h: [u8; 32], _i: [u8; 16], _e: u64) -> Result<(), StoreError> {
-        Err(bait("issue_voucher"))
+    async fn claim_first_admin(&self) -> Result<bool, StoreError> {
+        Err(bait("claim_first_admin"))
+    }
+    async fn enroll(
+        &self,
+        _reg_key_hash: [u8; 32],
+        _user_id: [u8; 16],
+        _username: &str,
+        _enc_pub: [u8; 32],
+        _sig_pub: [u8; 32],
+        _user_binding: &StoredBinding,
+        _admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError> {
+        Err(bait("enroll"))
+    }
+    async fn set_recovery_account(
+        &self,
+        _e: [u8; 32],
+        _s: [u8; 32],
+        _m: Option<[u8; MLKEM768_PUB_LEN]>,
+    ) -> Result<bool, StoreError> {
+        Err(bait("set_recovery_account"))
+    }
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError> {
+        Err(bait("recovery_account"))
     }
     async fn append_control(
         &self,
@@ -258,9 +279,6 @@ impl Store for FileFaultyStore {
     ) -> Result<Option<[u8; 16]>, StoreError> {
         self.inner.create_user(u, e, s).await
     }
-    async fn consume_voucher(&self, h: &[u8; 32]) -> Result<bool, StoreError> {
-        self.inner.consume_voucher(h).await
-    }
     async fn user_by_name(&self, u: &str) -> Result<Option<UserRecord>, StoreError> {
         self.inner.user_by_name(u).await
     }
@@ -297,14 +315,47 @@ impl Store for FileFaultyStore {
     async fn binding_by_user_id(&self, u: &[u8; 16]) -> Result<Option<StoredBinding>, StoreError> {
         self.inner.binding_by_user_id(u).await
     }
-    async fn has_any_binding(&self) -> Result<bool, StoreError> {
-        self.inner.has_any_binding().await
+    async fn issue_registration_key(&self, h: [u8; 32], e: u64) -> Result<(), StoreError> {
+        self.inner.issue_registration_key(h, e).await
     }
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
-        self.inner.list_pending_users().await
+    async fn consume_registration_key(&self, h: &[u8; 32]) -> Result<bool, StoreError> {
+        self.inner.consume_registration_key(h).await
     }
-    async fn issue_voucher(&self, h: [u8; 32], i: [u8; 16], e: u64) -> Result<(), StoreError> {
-        self.inner.issue_voucher(h, i, e).await
+    async fn claim_first_admin(&self) -> Result<bool, StoreError> {
+        self.inner.claim_first_admin().await
+    }
+    async fn enroll(
+        &self,
+        reg_key_hash: [u8; 32],
+        user_id: [u8; 16],
+        username: &str,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+        user_binding: &StoredBinding,
+        admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError> {
+        self.inner
+            .enroll(
+                reg_key_hash,
+                user_id,
+                username,
+                enc_pub,
+                sig_pub,
+                user_binding,
+                admin_binding,
+            )
+            .await
+    }
+    async fn set_recovery_account(
+        &self,
+        e: [u8; 32],
+        s: [u8; 32],
+        m: Option<[u8; MLKEM768_PUB_LEN]>,
+    ) -> Result<bool, StoreError> {
+        self.inner.set_recovery_account(e, s, m).await
+    }
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError> {
+        self.inner.recovery_account().await
     }
     async fn control_head(&self) -> Result<[u8; 32], StoreError> {
         self.inner.control_head().await
@@ -395,8 +446,16 @@ fn b64_fixed32(s: &str) -> [u8; 32] {
 }
 
 fn state_router<S: Store + 'static>(store: S) -> Router {
+    // Configure the directory signer so enrollment (`POST /v1/users`) reaches the
+    // store rather than short-circuiting on "enrollment disabled" — the 500-on-
+    // fault tests need the request to reach the faulting store.
+    let signer = Arc::new(SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
     let state = AppState {
-        auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer),
+        ),
         blobs: Arc::new(MemoryBlobStore::new()),
         audit: Arc::new(NullAuditSink),
         direct_links_enabled: false,
@@ -407,8 +466,7 @@ fn state_router<S: Store + 'static>(store: S) -> Router {
 
 /// Like [`state_router`] but with a caller-supplied [`AuthConfig`] — needed to
 /// exercise the Phase-2 endpoints whose handlers gate on a pinned D5 directory
-/// key (`with_directory_pub`) or a configured bootstrap secret
-/// (`with_bootstrap_secret_hash`).
+/// key (`with_directory_pub`).
 fn router_with_config<S: Store + 'static>(store: S, cfg: AuthConfig) -> Router {
     let state = AppState {
         auth: Arc::new(AuthService::new(store, cfg)),
@@ -705,7 +763,7 @@ async fn error_responses_never_leak_internals() {
     .await;
     assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
     assert_generic("500 challenge", &body);
-    // register → consume_voucher faults
+    // register → consume_registration_key faults
     let sk = SigningKey::generate();
     let (st, _, body) = send(
         &faulty,
@@ -716,7 +774,7 @@ async fn error_responses_never_leak_internals() {
                 "username": "x",
                 "enc_pub_b64": B64.encode([0x11; 32]),
                 "sig_pub_b64": B64.encode(sk.verifying_key().to_bytes()),
-                "enrollment_voucher": "code",
+                "registration_key": "code",
             }),
             None,
         ),
@@ -964,58 +1022,29 @@ async fn no_existence_oracle() {
     assert_generic("chunk get no-oracle", &ub);
 }
 
-// ===== Phase-2 endpoints (bootstrap / publish / pending) =====
+// ===== Phase-2 / T4 endpoints (registration-key mint / publish) =====
 
-/// `POST /v1/bootstrap` over a faulting store: the handler's gating order is
-/// secret-configured? → `has_any_binding()` → secret check, so the injected
-/// `has_any_binding` fault hits the `internal_error` path BEFORE the secret is
-/// ever checked. A backend fault must surface as a bare `500` with an empty body
-/// — never a misleading `401`/`201`/`409`.
+/// `POST /v1/registration-keys` is admin-gated with no cause oracle: a request
+/// with NO session is a uniform `401` (empty body); an AUTHENTIC session that
+/// lacks a D5-verified admin binding is `403` (empty body). Neither carries a
+/// reason.
 #[tokio::test]
-async fn bootstrap_backend_fault_is_bare_500() {
-    let app = router_with_config(
-        FaultyStore,
-        AuthConfig::default().with_bootstrap_secret_hash(sha256(b"X")),
-    );
-    // Well-formed body with the CORRECT secret — proves the 500 comes from the
-    // store fault, not from a body/secret rejection.
-    let (st, _, body) = send(
-        &app,
-        req_json(
-            "POST",
-            "/v1/bootstrap",
-            &json!({
-                "username": "root",
-                "enc_pub_b64": B64.encode([0x11; 32]),
-                "sig_pub_b64": B64.encode([0x22; 32]),
-                "bootstrap_secret": "X",
-            }),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_generic("500 bootstrap has_any_binding fault", &body);
-}
-
-/// `GET /v1/pending` is admin-gated with no cause oracle: a request with NO
-/// session is a uniform `401` (empty body); an AUTHENTIC session that lacks a
-/// D5-verified admin binding is `403` (empty body). Neither carries a reason.
-#[tokio::test]
-async fn pending_requires_admin_no_oracle() {
+async fn mint_requires_admin_no_oracle() {
     let (router, _admin, bob) = app().await;
 
     // No Authorization header → uniform 401, empty body (no "missing token" hint).
-    let (st, _, body) = send(&router, req_get("/v1/pending", None)).await;
+    let (st, _, body) =
+        send(&router, req_json("POST", "/v1/registration-keys", &json!({}), None)).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
-    assert_generic("401 pending no-token", &body);
+    assert_generic("401 mint no-token", &body);
 
     // bob is an authentic session but has no published binding ⇒ not an admin →
     // 403, empty body (no "not an admin" hint).
     let bob_tok = login(&router, "bob", &bob).await;
-    let (st, _, body) = send(&router, req_get("/v1/pending", Some(&bob_tok))).await;
+    let (st, _, body) =
+        send(&router, req_json("POST", "/v1/registration-keys", &json!({}), Some(&bob_tok))).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
-    assert_generic("403 pending non-admin", &body);
+    assert_generic("403 mint non-admin", &body);
 }
 
 /// `POST /v1/directory` with a canonical binding but a forged (all-zero)

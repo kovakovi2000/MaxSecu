@@ -25,6 +25,9 @@ pub mod http;
 #[cfg(feature = "postgres")]
 pub mod pg;
 pub mod ratelimit;
+pub mod recovery;
+mod recovery_account;
+mod reg_keys;
 pub mod serve;
 pub mod store;
 pub mod tier;
@@ -54,7 +57,7 @@ pub use files::{
     ListFilter, ParsedStage, StageError, StageInput, VersionSelector, WrapInput,
 };
 pub use store::{
-    ChunkSlot, FileListEntry, FileView, MemoryStore, NonceRecord, PendingUser, RecipientView,
-    SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView, UserRecord, VersionMeta,
-    WrapView,
+    ChunkSlot, EnrollOutcome, FileListEntry, FileView, MemoryStore, NonceRecord, RecipientView,
+    RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
+    UserRecord, VersionMeta, WrapView,
 };

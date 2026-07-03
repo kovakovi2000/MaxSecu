@@ -47,16 +47,6 @@ pub enum RecoveryError {
     DekCommitMismatch,
     /// The HPKE wrap to the recipient failed (malformed recipient key).
     WrapFailed,
-    /// Shamir splitting of the recovery scalar failed (bad `k`/`n` threshold,
-    /// §16.3) — the custody shares were never produced.
-    ThresholdSplitFailed(maxsecu_crypto::shamir::ShamirError),
-    /// Shamir reconstruction from the presented custodian shares failed —
-    /// fewer than `k` shares, a duplicate/inconsistent share, etc. Fail-closed:
-    /// no recovery key is reassembled.
-    ThresholdCombineFailed(maxsecu_crypto::shamir::ShamirError),
-    /// The reconstructed secret was not the 32-byte X25519 scalar a recovery key
-    /// requires — the shares did not encode a recovery key.
-    ReconstructLength,
 }
 
 /// Issue a recovery-operator read grant for `dek` (already unwrapped with
@@ -178,62 +168,6 @@ pub fn validate_recovery_wrap(
     Ok(())
 }
 
-// ---- K-of-N threshold recovery-key custody (DESIGN §16.3 / §19 / D6) ----
-//
-// "Recovery requires a threshold of custodians" — no single cold copy is total.
-// The recovery keypair's PRIVATE half (an X25519 scalar, §6.3/D6) is split K-of-N
-// with Shamir (`crypto::shamir`) at the air-gapped ceremony; any `k` custodian
-// shares reconstruct it, any `k-1` reveal nothing. The wrap/upload path is
-// UNCHANGED — this is a custody layer over the SAME recovery key.
-//
-// Residual (DESIGN §16.3): the scalar is briefly **reassembled in air-gapped RAM**
-// at reconstruction (and exposed once at split time on the offline device). This
-// is the accepted custody posture — a reconstruct-to-use scheme, not a never-
-// reassemble threshold cryptosystem. All transient copies are zeroized.
-
-use maxsecu_crypto::shamir::{self, Share};
-use zeroize::{Zeroize, Zeroizing};
-
-/// Split the recovery PRIVATE key `k`-of-`n` for offline custodian custody.
-///
-/// Exposes the 32-byte X25519 scalar **once** on the air-gapped device into a
-/// `Zeroizing` buffer, Shamir-splits it, and zeroizes the transient copy. Each
-/// returned [`Share`] goes to a distinct custodian; any `k` reconstruct the key
-/// (`reconstruct_recovery_key`). A bad threshold (`k == 0`, `n == 0`, `k > n`)
-/// maps to [`RecoveryError::ThresholdSplitFailed`].
-pub fn split_recovery_key(
-    recovery_secret: &EncSecretKey,
-    k: u8,
-    n: u8,
-) -> Result<Vec<Share>, RecoveryError> {
-    // Exposed once on the offline device (§16.3); zeroized on drop of the buffer.
-    let scalar = Zeroizing::new(recovery_secret.expose_bytes());
-    shamir::split(scalar.as_ref(), k, n).map_err(RecoveryError::ThresholdSplitFailed)
-}
-
-/// Reconstruct the recovery PRIVATE key from `k` custodian [`Share`]s at the
-/// air-gapped recovery ceremony.
-///
-/// Lagrange-interpolates the scalar (held in a `Zeroizing` transient), requires
-/// it to be exactly 32 bytes, and returns it as an [`EncSecretKey`] (which carries
-/// its own zero-on-drop hygiene). Fewer than `k` shares, inconsistent shares, or a
-/// non-32-byte reconstruction fail closed — no key is reassembled.
-///
-/// Residual: the full scalar exists in air-gapped RAM for the lifetime of the
-/// returned key (DESIGN §16.3) — the accepted reconstruct-to-use posture.
-pub fn reconstruct_recovery_key(k: u8, shares: &[Share]) -> Result<EncSecretKey, RecoveryError> {
-    let secret = shamir::combine(k, shares).map_err(RecoveryError::ThresholdCombineFailed)?;
-    if secret.len() != 32 {
-        return Err(RecoveryError::ReconstructLength);
-    }
-    let mut buf = [0u8; 32];
-    buf.copy_from_slice(&secret);
-    let key = EncSecretKey::from_bytes(buf);
-    // `secret` (Zeroizing) wipes on drop; wipe the stack copy we fed to the key.
-    buf.zeroize();
-    Ok(key)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,87 +274,5 @@ mod tests {
             build_recovery_grant(&params(&admin, rpk, other.commit()), &dek),
             Err(RecoveryError::DekCommitMismatch)
         ));
-    }
-
-    // ---- P7.7: K-of-N threshold recovery-key custody ----
-
-    #[test]
-    fn recovery_key_split_reconstruct_unwraps() {
-        // The recovery keypair (DESIGN §6.3/D6): the PRIVATE half is split 3-of-5.
-        let (rsk, rpk) = generate_enc_keypair();
-        let shares = split_recovery_key(&rsk, 3, 5).expect("split");
-        assert_eq!(shares.len(), 5);
-
-        // A real recovery wrap to the recovery PUBLIC key (upload-path form).
-        let dek = Dek::generate();
-        let wire = recovery_wire_wrap(&rpk, &dek, FILE, 7);
-
-        // Reconstruct from a 3-subset of custodian shares.
-        let subset = [shares[0].clone(), shares[2].clone(), shares[4].clone()];
-        let recovered = reconstruct_recovery_key(3, &subset).expect("reconstruct");
-
-        // The reconstructed scalar IS the recovery key: it opens the real wrap.
-        assert_eq!(
-            validate_recovery_wrap(
-                &recovered,
-                &wire,
-                dek.commit(),
-                &RecoveryWrapCtx { file_id: FILE, version: 7 },
-            ),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn recovery_key_below_threshold_fails() {
-        let (rsk, _rpk) = generate_enc_keypair();
-        let shares = split_recovery_key(&rsk, 3, 5).expect("split");
-        // Only k-1 = 2 shares supplied → fails closed (InsufficientShares mapped).
-        // `EncSecretKey` is intentionally not Debug/PartialEq (hygiene), so assert
-        // on the error arm only.
-        let two = [shares[0].clone(), shares[1].clone()];
-        assert!(matches!(
-            reconstruct_recovery_key(3, &two),
-            Err(RecoveryError::ThresholdCombineFailed(
-                maxsecu_crypto::shamir::ShamirError::InsufficientShares
-            ))
-        ));
-    }
-
-    #[test]
-    fn reconstructed_key_opens_only_for_correct_shares() {
-        // A reconstruction from the WRONG number/threshold cannot open the wrap.
-        // Force a bad combine (k mismatch on a subset that interpolates a wrong
-        // polynomial constant) and prove the resulting key does not open the wrap.
-        let (rsk, rpk) = generate_enc_keypair();
-        let shares = split_recovery_key(&rsk, 3, 5).expect("split");
-        let dek = Dek::generate();
-        let wire = recovery_wire_wrap(&rpk, &dek, FILE, 7);
-
-        // Combining with k=2 over a 3-of-5 split interpolates the wrong secret →
-        // a non-recovery key that fails the wrap open (fail-closed downstream).
-        let wrongk = [shares[0].clone(), shares[1].clone()];
-        let bad = reconstruct_recovery_key(2, &wrongk).expect("combine k=2 (no err)");
-        assert!(validate_recovery_wrap(
-            &bad,
-            &wire,
-            dek.commit(),
-            &RecoveryWrapCtx { file_id: FILE, version: 7 },
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn split_rejects_bad_threshold() {
-        let (rsk, _rpk) = generate_enc_keypair();
-        use maxsecu_crypto::shamir::ShamirError::BadThreshold;
-        assert_eq!(
-            split_recovery_key(&rsk, 0, 5),
-            Err(RecoveryError::ThresholdSplitFailed(BadThreshold))
-        );
-        assert_eq!(
-            split_recovery_key(&rsk, 6, 5),
-            Err(RecoveryError::ThresholdSplitFailed(BadThreshold))
-        );
     }
 }

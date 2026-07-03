@@ -25,27 +25,6 @@ pub fn load_directory_pub(dir: &Path) -> Result<[u8; 32], UiError> {
         .map_err(|_| UiError::new("untrusted", "The pinned directory key is malformed."))
 }
 
-/// The configured standing **recovery recipient** username (`<dir>/config/
-/// recovery_recipient.txt`, one line, trimmed). The upload resolves its
-/// directory-verified `enc_pub` as the mandatory recovery wrap target (DESIGN §6.3).
-pub fn recovery_recipient_username(dir: &Path) -> Result<String, UiError> {
-    let path = dir.join("config").join("recovery_recipient.txt");
-    let raw = std::fs::read_to_string(&path).map_err(|_| {
-        UiError::new(
-            "no_recovery_recipient",
-            "No recovery recipient is configured.",
-        )
-    })?;
-    let name = raw.trim();
-    if name.is_empty() {
-        return Err(UiError::new(
-            "no_recovery_recipient",
-            "No recovery recipient is configured.",
-        ));
-    }
-    Ok(name.to_owned())
-}
-
 /// The offline-pinned trust anchors for the out-of-band **sink** (T4 / spec §0
 /// D-OQ1). Held to the SAME trust model as the D5 directory pin above:
 /// build-/deploy-time pinned, NEVER server-served — the whole point is that a
@@ -180,6 +159,30 @@ pub fn load_sink_pins(dir: &Path) -> Result<SinkPins, UiError> {
         tls,
         custodian_pubs,
         transparency_log_pubs,
+    })
+}
+
+/// Load the offline-pinned **directory key-transparency (KT) log** public keys
+/// from `<dir>/config/kt_log.der` (a raw concatenation of 32-byte Ed25519 keys) —
+/// held to the SAME build-/deploy-time pinned trust model as the D5 directory pin
+/// and the sink pins, NEVER server-served (the whole point of KT is that a
+/// compromised operator cannot influence which key signs the checkpoint the client
+/// trusts). These are the keys a KT checkpoint signature must verify under
+/// ([`crate::transparency::verify_binding_transparency`]); a checkpoint not signed
+/// by a pinned key is equivocation and fails closed.
+///
+/// Absent ⇒ an EMPTY allowlist: the KT gate is OPT-IN (mirroring the optional
+/// `sink_transparency.der` list), so a deployment that has not pinned a KT key runs
+/// today's D5-only browse/open verification rather than failing every open closed.
+/// A malformed (non-multiple-of-32) file still fails closed.
+pub fn load_kt_log_pubs(dir: &Path) -> Result<Vec<[u8; 32]>, UiError> {
+    // Absent ⇒ Ok(empty) (opt-in, not required). A malformed file fails closed with
+    // a KT-specific code (not the sink's `sink_unpinned` misnomer).
+    read_pinned_keys(&dir.join("config").join("kt_log.der"), false).map_err(|_| {
+        UiError::new(
+            "kt_log_unpinned",
+            "The pinned key-transparency log key is malformed.",
+        )
     })
 }
 
@@ -380,23 +383,6 @@ mod tests {
         // Wrong length → fail closed.
         std::fs::write(tmp.join("config").join("directory_pub.der"), [0u8; 31]).unwrap();
         assert_eq!(load_directory_pub(&tmp).unwrap_err().code, "untrusted");
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn recovery_recipient_username_reads_config() {
-        let tmp = std::env::temp_dir().join(format!("mxcfg-rr-{}", n()));
-        std::fs::create_dir_all(tmp.join("config")).unwrap();
-        assert_eq!(
-            recovery_recipient_username(&tmp).unwrap_err().code,
-            "no_recovery_recipient"
-        );
-        std::fs::write(
-            tmp.join("config").join("recovery_recipient.txt"),
-            "  recovery-1\n",
-        )
-        .unwrap();
-        assert_eq!(recovery_recipient_username(&tmp).unwrap(), "recovery-1");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

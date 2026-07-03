@@ -1,9 +1,17 @@
 export interface ConnState { state: string }
 export interface AuthStateMsg { state: string }
-export interface GlassbreakResponse { username: string; password: string; user_id: string }
-export interface PendingUserDto { user_id: string; username: string; created_at: number }
-export interface IssueVoucherResponse { code: string }
-export interface AccountStateMsg { state: "unknown" | "pending" | "active" }
+export interface MintedKeyResponse { registration_key: string }
+
+// --- Trusted-server recovery login (spec §6) DTO mirrors ---
+// No key material ever crosses the seam: only an opaque status + the public
+// server_id. The cold recovery private key + the challenge nonce stay in Rust.
+export interface RecoveryChallengeDto { status: string; server_id: string }
+export interface RecoveryLoginDto { status: string; server_id: string }
+
+// --- Registration-key enrollment (spec §5) DTO mirror ---
+// The single-use key is read from the local register.key file in Rust, never on
+// the seam. Only the enrolled username + the opaque server-assigned user_id return.
+export interface RegisteredDto { username: string; user_id: string }
 
 // --- Phase 3 (browse + view) DTO mirrors of the Rust serde shapes ---
 // kebab-case enum values, snake_case fields — match server/core serde exactly.
@@ -141,42 +149,3 @@ export interface RamLimits { default_mb: number; min_mb: number; max_mb: number 
 // Live process + budget memory figures from the `memory_stats` command.
 // `used_bytes` is null when the OS process-RSS query is unavailable (fail-soft).
 export interface MemoryStats { used_bytes: number | null; budget_bytes: number }
-
-// --- T6 (Shamir K-of-N recovery-key custody ceremony) DTO mirrors ---
-// `split_recovery_key`'s response: `n` wire-encoded MSHARE1 share strings (the
-// interchange unit, spec §5/§8 — deliberately allowed to cross the seam) plus
-// the non-secret label/k/n. The frontend holds `shares` only transiently for
-// the one-at-a-time reveal wizard and drops the reference once every share has
-// been shown (spec §4.4/§11).
-export interface SplitRecoveryKeyResponse {
-  shares: string[];
-  label: string;
-  k: number;
-  n: number;
-}
-
-// `add_recovery_share`'s response: count only (`have`/`need`) + the ceremony's
-// label — the share text itself never appears here (spec §6 step 1: a share,
-// once accepted, is never redisplayed).
-export interface AddShareResponse {
-  have: number;
-  need: number;
-  label: string;
-}
-
-// `reconstruct_recovery_key`'s response: an opaque handle into the backend's
-// CeremonySession + the non-secret label. The reconstructed key itself NEVER
-// crosses the seam — this is not yet a "success"; see ProveResponse below
-// (spec §6 step 4, the load-bearing prove gate).
-export interface ReconstructResponse {
-  ceremony_handle: string;
-  label: string;
-}
-
-// `prove_reconstructed_key`'s response. `verified: false` is a SUCCESSFUL
-// proof outcome (the reconstruction was wrong / from a different key set) —
-// it is never surfaced as an error; only `verified: true` unlocks the green
-// success state.
-export interface ProveResponse {
-  verified: boolean;
-}

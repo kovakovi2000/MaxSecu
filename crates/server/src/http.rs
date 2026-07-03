@@ -19,9 +19,9 @@ use crate::blob::BlobStore;
 use crate::store::{FileView, Store};
 use maxsecu_encoding::labels::DIRBINDING;
 use maxsecu_encoding::structs::{DirBinding, Manifest};
-use maxsecu_encoding::types::Role;
-use maxsecu_encoding::decode;
-use maxsecu_crypto::VerifyingKey;
+use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
+use maxsecu_encoding::{decode, encode};
+use maxsecu_crypto::{random_array, VerifyingKey};
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Json, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{request::Parts, StatusCode};
@@ -79,7 +79,11 @@ impl<S: Store> Clone for AppState<S> {
 pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
     Router::new()
         .route("/v1/users", post(register::<S>))
-        .route("/v1/bootstrap", post(bootstrap_register::<S>))
+        .route("/v1/registration-keys", post(mint_registration_key::<S>))
+        .route("/v1/recovery/register", post(recovery_register::<S>))
+        .route("/v1/recovery/pubkey", get(recovery_pubkey::<S>))
+        .route("/v1/recovery/challenge", post(recovery_challenge::<S>))
+        .route("/v1/recovery/verify", post(recovery_verify::<S>))
         .route("/v1/session/challenge", post(challenge::<S>))
         .route("/v1/session/proof", post(prove::<S>))
         .route("/v1/session/logout", post(logout::<S>))
@@ -92,8 +96,6 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         )
         .route("/v1/reinstatements", post(post_control::<S>))
         .route("/v1/key-compromise", post(post_control::<S>))
-        .route("/v1/pending", get(list_pending::<S>))
-        .route("/v1/vouchers", post(issue_voucher::<S>))
         .route("/v1/files", get(list_files::<S>).post(create_file::<S>))
         .route("/v1/files/{file_id}", get(get_file::<S>).delete(discard_file::<S>))
         .route(
@@ -186,7 +188,13 @@ fn hex_encode(b: &[u8]) -> String {
 }
 
 fn hex_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
-    if s.len() != 2 * N {
+    // ASCII-gate FIRST: `s.len()` is a *byte* length, but the loop slices by byte
+    // offset — a multibyte UTF-8 char straddling an even offset would panic on a
+    // non-char-boundary slice (attacker-reachable via `recovery_verify`'s
+    // challenge_id and every other caller; same class as T6 M-1). Rejecting
+    // non-ASCII up front makes byte offsets == char boundaries, so the slice is
+    // always safe and bad input returns None (→ the handler's 400 path).
+    if !s.is_ascii() || s.len() != 2 * N {
         return None;
     }
     let mut out = [0u8; N];
@@ -196,14 +204,22 @@ fn hex_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-// ---- POST /v1/users — voucher-gated enrollment (api.md §5.1) ----
+// ---- POST /v1/users — registration-key enrollment (DESIGN §5 / §0-D5) ----
+
+/// A server-signed enrollment binding's validity window: always-valid from the
+/// epoch to 2100-01-01. Key rotation (not a short expiry) is how a compromised
+/// enrollment key is retired; the transparency log (T6) is what bounds trust.
+const BINDING_NOT_BEFORE_MS: u64 = 0;
+const BINDING_NOT_AFTER_MS: u64 = 4_102_444_800_000; // 2100-01-01
 
 #[derive(Deserialize)]
 struct RegisterReq {
     username: String,
     enc_pub_b64: String,
     sig_pub_b64: String,
-    enrollment_voucher: String,
+    /// The single-use registration key (plaintext); the server persists only its
+    /// `sha256` and consumes it atomically. Operator- or admin-minted.
+    registration_key: String,
 }
 
 #[derive(Serialize)]
@@ -211,87 +227,308 @@ struct RegisterRes {
     user_id: String, // lowercase hex (api.md §1.4)
 }
 
+/// `POST /v1/users` — registration-key-only enrollment. The server is the
+/// enrollment authority AND the binding signer:
+///
+/// 1. validate the request (decode keys, well-formed username, signer available)
+///    — all side-effect-free, so a malformed request never burns a key;
+/// 2. build BOTH candidate bindings for a fresh `user_id` and SIGN them
+///    server-side — pure, no store I/O (the private seed stays in the signer;
+///    only signature bytes cross into the store);
+/// 3. hand the whole unit of work to the ATOMIC [`enroll`]: it consumes the
+///    single-use key, creates the user, resolves the one-time first-admin slot,
+///    and stores the matching binding in ONE transaction. A fault leaves NO
+///    partial state — no burned key, no orphan user, no dangling admin claim —
+///    so a retry with the same key works. The first-ever registrant is
+///    `{User, Admin}`; everyone else `{User}`.
+///
+/// 4. (T6) append the just-stored, server-signed binding to the directory
+///    key-transparency log via the audit-sink seam — AFTER the atomic store, so the
+///    log never carries a binding the directory does not serve. Best-effort: an
+///    append failure does not undo a successful enrollment.
+///
+/// [`enroll`]: crate::store::Store::enroll
 async fn register<S: Store>(
     State(st): State<AppState<S>>,
     Json(req): Json<RegisterReq>,
-) -> Result<(StatusCode, Json<RegisterRes>), StatusCode> {
-    let enc_pub = b64_fixed::<32>(&req.enc_pub_b64).ok_or(StatusCode::BAD_REQUEST)?;
-    let sig_pub = b64_fixed::<32>(&req.sig_pub_b64).ok_or(StatusCode::BAD_REQUEST)?;
-    // Voucher is the anti-spam gate (the trust gate is the in-person ceremony).
-    // Consumed first so one voucher buys exactly one creation attempt.
-    let voucher_hash = maxsecu_crypto::sha256(req.enrollment_voucher.as_bytes());
-    match st.auth.store().consume_voucher(&voucher_hash).await {
-        Ok(true) => {}                                                  // gate passed
-        Ok(false) => return Err(StatusCode::FORBIDDEN),                 // invalid/used voucher
-        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),       // backend fault, not "bad voucher"
-    }
-    match st
-        .auth
-        .store()
-        .create_user(&req.username, enc_pub, sig_pub)
-        .await
-    {
-        Ok(Some(user_id)) => Ok((
-            StatusCode::CREATED,
-            Json(RegisterRes {
-                user_id: hex_encode(&user_id),
-            }),
-        )),
-        Ok(None) => Err(StatusCode::CONFLICT), // username taken
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
-}
-
-// ---- POST /v1/bootstrap — first-run glass-break register (§4.2) ----
-
-#[derive(Deserialize)]
-struct BootstrapReq {
-    username: String,
-    enc_pub_b64: String,
-    sig_pub_b64: String,
-    bootstrap_secret: String,
-}
-
-/// `POST /v1/bootstrap` — first-run glass-break / first-admin registration (§4.2).
-/// Valid ONLY while the bootstrap window is open (no published binding) and the
-/// bootstrap secret matches. Creates the user; **never** confers admin — admin
-/// arrives only when the offline ceremony D5-signs the binding (D-K).
-async fn bootstrap_register<S: Store>(
-    State(st): State<AppState<S>>,
-    Json(req): Json<BootstrapReq>,
 ) -> Response {
-    let Some(want) = st.auth.bootstrap_secret_hash() else {
-        return StatusCode::FORBIDDEN.into_response(); // bootstrap disabled
-    };
-    match st.auth.store().has_any_binding().await {
-        Ok(true) => return StatusCode::CONFLICT.into_response(), // bootstrap_closed
-        Ok(false) => {}
-        Err(e) => return internal_error(e),
-    }
-    if maxsecu_crypto::sha256(req.bootstrap_secret.as_bytes()) != want {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+    // (1) Pure validation — no store I/O yet, so a bad request cannot burn a key.
     let (Some(enc_pub), Some(sig_pub)) = (
         b64_fixed::<32>(&req.enc_pub_b64),
         b64_fixed::<32>(&req.sig_pub_b64),
     ) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let Ok(username) = Text::new(&req.username) else {
+        return StatusCode::BAD_REQUEST.into_response(); // over-long / non-canonical
+    };
+    // Enrollment requires the server to hold its directory-signing key; if it is
+    // not configured, enrollment is disabled (checked BEFORE any store I/O).
+    let Some(signer) = st.auth.dir_signer() else {
+        return StatusCode::FORBIDDEN.into_response(); // enrollment signing disabled
+    };
+
+    // (2) The server assigns the id, then signs BOTH role variants for it (pure).
+    // The atomic `enroll` stores exactly the one that matches its first-admin
+    // decision — so the role decision and the signed binding can never diverge,
+    // and signing never needs to happen inside the store (no key in the store).
+    let user_id: [u8; 16] = random_array();
+    let sign_for = |roles: RoleSet| -> crate::store::StoredBinding {
+        let binding = DirBinding {
+            username: username.clone(),
+            user_id: Id(user_id),
+            enc_pub: Bytes32(enc_pub),
+            sig_pub: Bytes32(sig_pub),
+            key_version: 1,
+            roles,
+            not_before: Timestamp(BINDING_NOT_BEFORE_MS),
+            not_after: Timestamp(BINDING_NOT_AFTER_MS),
+            mlkem_pub: None,
+        };
+        let signature = signer.sign_canonical(DIRBINDING, &binding);
+        crate::store::StoredBinding {
+            binding_bytes: encode(&binding),
+            signature,
+        }
+    };
+    let user_binding = sign_for(RoleSet::new([Role::User]));
+    let admin_binding = sign_for(RoleSet::new([Role::User, Role::Admin]));
+
+    // (3) Atomic unit of work: consume-key → create-user → claim-admin →
+    // store-binding, all-or-nothing (see `Store::enroll`).
+    let key_hash = maxsecu_crypto::sha256(req.registration_key.as_bytes());
     match st
         .auth
         .store()
-        .create_user(&req.username, enc_pub, sig_pub)
+        .enroll(
+            key_hash,
+            user_id,
+            &req.username,
+            enc_pub,
+            sig_pub,
+            &user_binding,
+            &admin_binding,
+        )
         .await
     {
-        Ok(Some(user_id)) => (
-            StatusCode::CREATED,
-            Json(RegisterRes {
-                user_id: hex_encode(&user_id),
-            }),
-        )
-            .into_response(),
-        Ok(None) => StatusCode::CONFLICT.into_response(), // username taken
+        Ok(crate::store::EnrollOutcome::Enrolled { is_admin }) => {
+            // T6: append the JUST-STORED, server-signed binding to the directory
+            // key-transparency log — the SAME leaf a Phase-7 published binding takes.
+            // Done AFTER the atomic `enroll` durably stored it, so the log never
+            // carries a binding the directory does not serve. `is_admin` selects the
+            // exact variant `enroll` persisted, so the logged leaf byte-matches the
+            // served one. Best-effort: a publish failure does not undo enrollment
+            // (the fail-closed authority is the client-side inclusion check, T10).
+            let logged = if is_admin { &admin_binding } else { &user_binding };
+            st.audit
+                .publish_dir_binding(logged.binding_bytes.clone())
+                .await;
+            (
+                StatusCode::CREATED,
+                Json(RegisterRes {
+                    user_id: hex_encode(&user_id),
+                }),
+            )
+                .into_response()
+        }
+        Ok(crate::store::EnrollOutcome::KeyInvalid) => StatusCode::FORBIDDEN.into_response(),
+        Ok(crate::store::EnrollOutcome::UsernameTaken) => StatusCode::CONFLICT.into_response(),
         Err(e) => internal_error(e),
+    }
+}
+
+// ---- POST /v1/registration-keys — admin-minted single-use keys (§5) ----
+
+/// Admin-minted registration-key TTL (operational admission window).
+const REG_KEY_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+#[derive(Serialize)]
+struct MintRegKeyRes {
+    /// The plaintext registration key, returned ONCE (the server stores only its
+    /// `sha256`). Hand it to the enrollee out of band.
+    registration_key: String,
+}
+
+/// `POST /v1/registration-keys` — an admin mints a fresh strong single-use
+/// registration key (§5). Admin-gated by the D5-verified [`AdminSession`].
+/// Admin-minted keys are **User-role only** — only the first-ever registrant is
+/// admin — which holds automatically: by the time any admin exists to mint a
+/// key, a user already exists, so `claim_first_admin` returns `false` for every
+/// key-minted enrollment. The server persists ONLY `sha256(key)` and returns the
+/// plaintext once; the raw bytes are zeroized server-side after use.
+async fn mint_registration_key<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    _admin: AdminSession,
+) -> Response {
+    // A 256-bit random key, rendered as lowercase hex for a copy-pasteable token.
+    let mut raw: [u8; 32] = random_array();
+    let key = hex_encode(&raw);
+    {
+        use zeroize::Zeroize;
+        raw.zeroize(); // the hex string is the only copy handed out
+    }
+    let key_hash = maxsecu_crypto::sha256(key.as_bytes());
+    match st
+        .auth
+        .store()
+        .issue_registration_key(key_hash, now_ms() + REG_KEY_TTL_MS)
+        .await
+    {
+        Ok(()) => (StatusCode::CREATED, Json(MintRegKeyRes { registration_key: key }))
+            .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+// ---- Trusted-server recovery login (spec §6 / §0-D6) ----
+
+#[derive(Deserialize)]
+struct RecoveryRegisterReq {
+    enc_pub_b64: String,
+    sig_pub_b64: String,
+    /// Optional PQ-hybrid ML-KEM-768 encapsulation pubkey (exactly 1184 bytes
+    /// when present). Absent ⇒ a classical-only recovery account.
+    mlkem_pub_b64: Option<String>,
+}
+
+/// `POST /v1/recovery/register` — register the single escrow recovery account's
+/// PUBLIC keys (T3, once-only). Lengths are validated BEFORE any fixed-size array
+/// conversion — a malformed request (or a present-but-not-1184 ML-KEM key) is a
+/// `400`, never unvalidated network bytes into an array. `201` on the first
+/// registration; `409` if one already exists (the keys are never overwritten).
+/// Unauthenticated: the once-only guard is the protection, and `maxsecu-setup`
+/// (T14) calls this before any account exists.
+async fn recovery_register<S: Store>(
+    State(st): State<AppState<S>>,
+    Json(req): Json<RecoveryRegisterReq>,
+) -> Response {
+    let (Some(enc_pub), Some(sig_pub)) = (
+        b64_fixed::<32>(&req.enc_pub_b64),
+        b64_fixed::<32>(&req.sig_pub_b64),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    // A present ML-KEM key MUST be exactly 1184 bytes; a wrong length is a 400 (we
+    // never pass through a truncated/oversized key). Absent ⇒ classical account.
+    let mlkem_pub = match req.mlkem_pub_b64.as_deref() {
+        None => None,
+        Some(s) => match b64_fixed::<{ maxsecu_encoding::structs::MLKEM768_PUB_LEN }>(s) {
+            Some(m) => Some(m),
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+    };
+    match st
+        .auth
+        .store()
+        .set_recovery_account(enc_pub, sig_pub, mlkem_pub)
+        .await
+    {
+        Ok(true) => StatusCode::CREATED.into_response(),
+        Ok(false) => StatusCode::CONFLICT.into_response(), // already registered (once-only)
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Serialize)]
+struct RecoveryPubkeyRes {
+    enc_pub_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mlkem_pub_b64: Option<String>,
+}
+
+/// `GET /v1/recovery/pubkey` — serve the recovery account's PUBLIC enc material so
+/// the client can compare it against its embedded pin (T8). Nothing secret is
+/// exposed. `404` if no recovery account is set.
+async fn recovery_pubkey<S: Store>(State(st): State<AppState<S>>) -> Response {
+    match st.auth.store().recovery_account().await {
+        Ok(Some(a)) => Json(RecoveryPubkeyRes {
+            enc_pub_b64: b64encode(&a.enc_pub),
+            mlkem_pub_b64: a.mlkem_pub.map(|m| b64encode(&m)),
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Serialize)]
+struct RecoveryChallengeRes {
+    challenge_id: String, // lowercase hex handle
+    server_id: String,
+    wrapped_blob_b64: String,
+    /// `"v2"` = hybrid wrap, `"v1"` = classical — tells the client how to parse.
+    suite: &'static str,
+}
+
+/// `POST /v1/recovery/challenge` — mint a fresh single-use nonce wrapped to the
+/// recovery encryption pubkey (hybrid if ML-KEM is present, else classical).
+/// `404` if no recovery account exists.
+async fn recovery_challenge<S: Store>(State(st): State<AppState<S>>) -> Response {
+    match st.auth.recovery_challenge(now_ms()).await {
+        Ok(ch) => Json(RecoveryChallengeRes {
+            challenge_id: hex_encode(&ch.challenge_id),
+            server_id: st.auth.server_id().to_owned(),
+            wrapped_blob_b64: b64encode(&ch.wrapped_blob),
+            suite: if ch.hybrid { "v2" } else { "v1" },
+        })
+        .into_response(),
+        Err(crate::recovery::RecoveryError::NoAccount) => StatusCode::NOT_FOUND.into_response(),
+        Err(crate::recovery::RecoveryError::WrapFailed) => {
+            internal_error("recovery challenge wrap failed")
+        }
+        Err(crate::recovery::RecoveryError::Internal(e)) => internal_error(e),
+        // Not reachable on the challenge path, but fail closed if it ever is.
+        Err(crate::recovery::RecoveryError::Unauthorized) => {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RecoveryVerifyReq {
+    challenge_id: String,
+    proof_b64: String,
+    timestamp: u64,
+}
+
+#[derive(Serialize)]
+struct RecoveryVerifyRes {
+    session_token: String,
+    expires_in_s: u64,
+}
+
+/// `POST /v1/recovery/verify` — verify the channel-bound proof for `challenge_id`
+/// and, on success, mint an admin session (principal = `RECOVERY_ID`). The proof
+/// is bound to THIS connection's TLS exporter (relay-hardened) and the nonce is
+/// single-use (replay-proof). Every failure is a uniform `401` (no oracle).
+async fn recovery_verify<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    Extension(exporter): Extension<TlsExporter>,
+    Json(req): Json<RecoveryVerifyReq>,
+) -> Response {
+    let (Some(challenge_id), Some(proof)) = (
+        hex_fixed::<16>(&req.challenge_id),
+        b64_fixed::<64>(&req.proof_b64),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st
+        .auth
+        .recovery_verify(&challenge_id, req.timestamp, &proof, &exporter.0, now_ms())
+        .await
+    {
+        Ok(token) => Json(RecoveryVerifyRes {
+            session_token: token.to_hex(),
+            // Report the actual configured TTL (mirror the login path) so the
+            // client's expiry can't be a lie if the TTL is reconfigured.
+            expires_in_s: st.auth.session_ttl_ms() / 1000,
+        })
+        .into_response(),
+        // Single 401 shape for every auth-failure cause — no oracle.
+        Err(crate::recovery::RecoveryError::Unauthorized)
+        | Err(crate::recovery::RecoveryError::NoAccount) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(crate::recovery::RecoveryError::WrapFailed) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(crate::recovery::RecoveryError::Internal(e)) => internal_error(e),
     }
 }
 
@@ -583,72 +820,6 @@ async fn post_control<S: Store + 'static>(
         Err(ControlAppendError::Conflict) => StatusCode::CONFLICT.into_response(),
         Err(ControlAppendError::Malformed) => StatusCode::BAD_REQUEST.into_response(),
         Err(ControlAppendError::Store(e)) => internal_error(e),
-    }
-}
-
-// ---- Admin approval queue + voucher issuance (api.md §4.2/§5, D-G/D-K) ----
-
-#[derive(Serialize)]
-struct PendingOut {
-    user_id: String,
-    username: String,
-    created_at: u64,
-}
-
-#[derive(Serialize)]
-struct PendingRes {
-    pending: Vec<PendingOut>,
-}
-
-/// `GET /v1/pending` — the admin approval queue (D-G). Admin-gated; lists users
-/// with no published binding. Status only — no key material.
-async fn list_pending<S: Store + 'static>(
-    State(st): State<AppState<S>>,
-    _admin: AdminSession,
-) -> Response {
-    match st.auth.store().list_pending_users().await {
-        Ok(list) => Json(PendingRes {
-            pending: list
-                .iter()
-                .map(|p| PendingOut {
-                    user_id: hex_encode(&p.user_id),
-                    username: p.username.clone(),
-                    created_at: p.created_at_ms,
-                })
-                .collect(),
-        })
-        .into_response(),
-        Err(e) => internal_error(e),
-    }
-}
-
-/// Admin-issued voucher TTL (operational anti-spam window).
-const VOUCHER_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-
-#[derive(Deserialize)]
-struct IssueVoucherReq {
-    voucher_hash_b64: String,
-}
-
-/// `POST /v1/vouchers` — admin issues a one-time enrollment voucher (§4.2). The
-/// admin client generates the code and posts only its `SHA-256` (the server never
-/// sees the code). Admin-gated.
-async fn issue_voucher<S: Store + 'static>(
-    State(st): State<AppState<S>>,
-    admin: AdminSession,
-    Json(req): Json<IssueVoucherReq>,
-) -> Response {
-    let Some(hash) = b64_fixed::<32>(&req.voucher_hash_b64) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    match st
-        .auth
-        .store()
-        .issue_voucher(hash, admin.user_id, now_ms() + VOUCHER_TTL_MS)
-        .await
-    {
-        Ok(()) => StatusCode::CREATED.into_response(),
-        Err(e) => internal_error(e),
     }
 }
 
@@ -1567,9 +1738,51 @@ async fn list_files<S: Store + 'static>(
     }
 }
 
-/// An authenticated, channel-bound session, resolved from the
-/// `Authorization: MaxSecu-Session <hex>` header and validated against the live
-/// connection's exporter (api.md §1.5/§2.3). Rejects with `401` on any failure.
+/// The shared, principal-agnostic session resolution (api.md §1.5/§2.3): parse
+/// the `Authorization: MaxSecu-Session <hex>` token, bind it to the live
+/// connection's TLS exporter, and validate it. Returns the session's principal
+/// `user_id` and the raw token, or the uniform `401`/`500`. Both `AuthedSession`
+/// and `AdminSession` build on THIS (not on each other), so each applies its own
+/// principal policy independently — the recovery principal is admitted by the
+/// admin gate but NOT by the file/content gate.
+async fn resolve_session<S: Store + 'static>(
+    parts: &mut Parts,
+    state: &AppState<S>,
+) -> Result<([u8; 16], [u8; 32]), StatusCode> {
+    let exporter = parts
+        .extensions
+        .get::<TlsExporter>()
+        .copied()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let token = parts
+        .headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("MaxSecu-Session "))
+        .and_then(hex_fixed::<32>)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let user_id = state
+        .auth
+        .validate_session(&token, &exporter.0, now_ms())
+        .await
+        .map_err(|e| match e {
+            AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AuthError::Internal(e) => {
+                log_internal(e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    Ok((user_id, token))
+}
+
+/// An authenticated, channel-bound session for **file/content** endpoints,
+/// resolved from the `Authorization: MaxSecu-Session <hex>` header and validated
+/// against the live connection's exporter (api.md §1.5/§2.3). Rejects with `401`
+/// on any auth failure, and **`403` for the recovery principal**: a recovery
+/// session (spec §9) authorizes admin SERVER actions only and is NOT a
+/// file-read/write principal — barring it here (rather than relying on it
+/// happening to own no files) keeps every current and future file endpoint out
+/// of the recovery session's blast radius.
 pub struct AuthedSession {
     pub user_id: [u8; 16],
     pub token: [u8; 32],
@@ -1582,40 +1795,34 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AuthedSession {
         parts: &mut Parts,
         state: &AppState<S>,
     ) -> Result<Self, StatusCode> {
-        let exporter = parts
-            .extensions
-            .get::<TlsExporter>()
-            .copied()
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-        let token = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.strip_prefix("MaxSecu-Session "))
-            .and_then(hex_fixed::<32>)
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-        let user_id = state
-            .auth
-            .validate_session(&token, &exporter.0, now_ms())
-            .await
-            .map_err(|e| match e {
-                AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
-                AuthError::Internal(e) => {
-                    log_internal(e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-            })?;
+        let (user_id, token) = resolve_session(parts, state).await?;
+        // The recovery principal is admin-only (spec §9) — never a file principal.
+        if user_id == maxsecu_encoding::RECOVERY_ID.0 {
+            return Err(StatusCode::FORBIDDEN);
+        }
         Ok(AuthedSession { user_id, token })
     }
 }
 
-/// A channel-bound session whose caller is a **D5-verified admin** (DESIGN
-/// §4.2/§10.1, D-K): the session resolves to a `user_id` whose stored binding
-/// verifies under the pinned D5 key, is within its validity window, and carries
-/// `Role::Admin`. The server can never confer admin — authority flows only from
-/// the offline directory ceremony. This is the coarse server gate; the client
-/// re-verifies every control-log record's authenticity independently. Rejects
-/// `401` (not a session) or `403` (authenticated but not a verified admin).
+/// A channel-bound session authorized for **admin server actions**. Two disjoint
+/// principals satisfy it:
+///
+///  * a **D5-verified user admin** (DESIGN §4.2/§10.1, D-K): the session's
+///    `user_id` has a stored binding that verifies under the pinned D5 key, is
+///    within its validity window, and carries `Role::Admin`. The server can never
+///    confer admin — authority flows only from the offline directory ceremony;
+///  * the **recovery principal** (spec §6/§9): the reserved `RECOVERY_ID` minted
+///    by the escrow recovery login, which has no users-table binding. No normal
+///    user can ever hold this id (user ids are server-assigned random 16-byte
+///    values, so the all-zero sentinel is unreachable via `POST /v1/users` +
+///    login), so admitting it here does not touch the user admin path below.
+///
+/// This is the coarse server gate; the client re-verifies every control-log
+/// record's authenticity independently. It grants admin SERVER actions ONLY (e.g.
+/// minting user-role registration keys) — file/content endpoints use
+/// `AuthedSession`, which bars the recovery principal — and never yields any
+/// private key. Rejects `401` (not a session) or `403` (authenticated but not
+/// authorized as admin).
 pub struct AdminSession {
     pub user_id: [u8; 16],
     #[allow(dead_code)] // mirrors AuthedSession; kept for symmetry / future use
@@ -1629,14 +1836,21 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AdminSession {
         parts: &mut Parts,
         state: &AppState<S>,
     ) -> Result<Self, StatusCode> {
-        let session = AuthedSession::from_request_parts(parts, state).await?;
+        // Built on the shared resolver — NOT on `AuthedSession` (which now bars the
+        // recovery principal). Each gate applies its own principal policy.
+        let (user_id, token) = resolve_session(parts, state).await?;
+        // Recovery-origin admin (spec §6): bindingless, admin server actions only.
+        if user_id == maxsecu_encoding::RECOVERY_ID.0 {
+            return Ok(AdminSession { user_id, token });
+        }
+        // Normal user admin path — unchanged.
         let Some(dir_pub) = state.auth.directory_pub() else {
             return Err(StatusCode::FORBIDDEN); // admin authz disabled (no pinned D5)
         };
         let stored = state
             .auth
             .store()
-            .binding_by_user_id(&session.user_id)
+            .binding_by_user_id(&user_id)
             .await
             .map_err(|e| {
                 log_internal(e);
@@ -1658,10 +1872,7 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AdminSession {
         if !binding.roles.roles().contains(&Role::Admin) {
             return Err(StatusCode::FORBIDDEN); // a valid binding, but not an admin
         }
-        Ok(AdminSession {
-            user_id: session.user_id,
-            token: session.token,
-        })
+        Ok(AdminSession { user_id, token })
     }
 }
 
@@ -1680,6 +1891,19 @@ mod tests {
     use tower::ServiceExt; // oneshot
 
     const EXPORTER: [u8; 32] = [0xE7; 32];
+
+    #[test]
+    fn hex_fixed_rejects_non_ascii_without_panicking() {
+        // A 32-byte string whose length passes the `2*N` guard but which contains a
+        // multibyte char straddling an even byte offset must return None — NOT panic
+        // on a non-char-boundary slice. This input is attacker-reachable through
+        // `recovery_verify`'s `challenge_id` (and every other hex_fixed caller).
+        let s = "a\u{20AC}".repeat(8); // 'a'(1) + '€'(3) × 8 = 32 bytes, offsets straddle
+        assert_eq!(s.len(), 32, "the length guard would pass");
+        assert!(hex_fixed::<16>(&s).is_none(), "non-ASCII hex input is rejected, not a panic");
+        // A well-formed ASCII hex string of the right length still decodes.
+        assert!(hex_fixed::<16>("00112233445566778899aabbccddeeff").is_some());
+    }
 
     fn app(exporter: [u8; 32]) -> (Router, SigningKey) {
         let store = MemoryStore::new();
@@ -1939,37 +2163,54 @@ mod tests {
         assert!(body["binding_b64"].as_str().is_some());
     }
 
-    fn app_with_vouchers(vouchers: &[&str]) -> Router {
+    /// An enrollment app: seeds the given single-use registration keys and gives
+    /// the server its directory-signing key (so `POST /v1/users` can sign the
+    /// enrollment binding). Returns the router; the pinned dir pub equals the
+    /// signer's public key.
+    fn app_with_reg_keys(keys: &[&str]) -> Router {
+        let (router, _dir_pub) = app_with_reg_keys_pub(keys);
+        router
+    }
+
+    fn app_with_reg_keys_pub(keys: &[&str]) -> (Router, [u8; 32]) {
         let store = MemoryStore::new();
-        for v in vouchers {
-            store.add_voucher(sha256(v.as_bytes()));
+        for k in keys {
+            store.add_reg_key(sha256(k.as_bytes()));
         }
+        let signer = Arc::new(SigningKey::generate());
+        let dir_pub = signer.verifying_key().to_bytes();
         let state = AppState {
-            auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+            auth: Arc::new(
+                AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                    .with_dir_signer(signer),
+            ),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
             max_file_bytes: None,
         };
-        router(state).layer(Extension(TlsExporter(EXPORTER)))
+        (
+            router(state).layer(Extension(TlsExporter(EXPORTER))),
+            dir_pub,
+        )
     }
 
-    fn register_body(sk: &SigningKey, username: &str, voucher: &str) -> serde_json::Value {
+    fn register_body(sk: &SigningKey, username: &str, key: &str) -> serde_json::Value {
         let (_esk, epk) = generate_enc_keypair();
         serde_json::json!({
             "username": username,
             "enc_pub_b64": b64encode(&epk.to_bytes()),
             "sig_pub_b64": b64encode(&sk.verifying_key().to_bytes()),
-            "enrollment_voucher": voucher,
+            "registration_key": key,
         })
     }
 
     #[tokio::test]
-    async fn register_with_voucher_then_login() {
-        let voucher = "in-person-code-001";
-        let router = app_with_vouchers(&[voucher]);
+    async fn register_with_key_then_login() {
+        let key = "reg-key-001";
+        let router = app_with_reg_keys(&[key]);
         let sk = SigningKey::generate();
-        let (st, res) = post_json(&router, "/v1/users", register_body(&sk, "bob", voucher)).await;
+        let (st, res) = post_json(&router, "/v1/users", register_body(&sk, "bob", key)).await;
         assert_eq!(st, StatusCode::CREATED);
         assert_eq!(res["user_id"].as_str().unwrap().len(), 32); // 16 bytes hex
 
@@ -1994,94 +2235,44 @@ mod tests {
         assert!(res["session_token"].as_str().is_some());
     }
 
-    fn app_with_bootstrap_secret(secret: &[u8]) -> Router {
-        let store = MemoryStore::new();
-        let state = AppState {
-            auth: Arc::new(AuthService::new(
-                store,
-                AuthConfig::default().with_bootstrap_secret_hash(sha256(secret)),
-            )),
-            blobs: Arc::new(MemoryBlobStore::new()),
-            audit: Arc::new(crate::audit::NullAuditSink),
-            direct_links_enabled: false,
-            max_file_bytes: None,
-        };
-        router(state).layer(Extension(TlsExporter(EXPORTER)))
-    }
-
-    fn bootstrap_body(sk: &SigningKey, username: &str, secret: &str) -> serde_json::Value {
-        let (_esk, epk) = generate_enc_keypair();
-        serde_json::json!({
-            "username": username,
-            "enc_pub_b64": b64encode(&epk.to_bytes()),
-            "sig_pub_b64": b64encode(&sk.verifying_key().to_bytes()),
-            "bootstrap_secret": secret,
-        })
-    }
-
     #[tokio::test]
-    async fn bootstrap_wrong_secret_401_right_secret_201() {
-        let router = app_with_bootstrap_secret(b"S3CRET");
-        let sk = SigningKey::generate();
+    async fn first_registrant_is_admin_second_is_user_only() {
+        use maxsecu_encoding::structs::DirBinding;
+        let (router, dir_pub) = app_with_reg_keys_pub(&["k1", "k2"]);
 
-        // Wrong secret → 401 (no user created).
-        let (st, _) = post_json(
-            &router,
-            "/v1/bootstrap",
-            bootstrap_body(&sk, "root", "wrong"),
-        )
-        .await;
-        assert_eq!(st, StatusCode::UNAUTHORIZED);
-
-        // Right secret → 201 with a hex-16 user_id.
-        let (st, res) = post_json(
-            &router,
-            "/v1/bootstrap",
-            bootstrap_body(&sk, "root", "S3CRET"),
-        )
-        .await;
+        // First registrant → the served binding carries {User, Admin} and
+        // verifies under the server's directory pubkey.
+        let sk1 = SigningKey::generate();
+        let (st, _) = post_json(&router, "/v1/users", register_body(&sk1, "alice", "k1")).await;
         assert_eq!(st, StatusCode::CREATED);
-        assert_eq!(res["user_id"].as_str().unwrap().len(), 32); // 16 bytes hex
+        let (st, body) = get_json(&router, "/v1/directory/alice").await;
+        assert_eq!(st, StatusCode::OK);
+        let bytes = B64.decode(body["binding_b64"].as_str().unwrap()).unwrap();
+        let sig = b64_fixed::<64>(body["directory_signature_b64"].as_str().unwrap()).unwrap();
+        let binding = decode::<DirBinding>(&bytes).unwrap();
+        let vk = VerifyingKey::from_bytes(&dir_pub).unwrap();
+        assert!(vk.verify_canonical(DIRBINDING, &binding, &sig).is_ok());
+        assert!(binding.roles.roles().contains(&Role::Admin), "first = admin");
+
+        // Second registrant → {User} only.
+        let sk2 = SigningKey::generate();
+        let (st, _) = post_json(&router, "/v1/users", register_body(&sk2, "bob", "k2")).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (_st, body) = get_json(&router, "/v1/directory/bob").await;
+        let bytes = B64.decode(body["binding_b64"].as_str().unwrap()).unwrap();
+        let binding = decode::<DirBinding>(&bytes).unwrap();
+        assert!(binding.roles.roles().contains(&Role::User));
+        assert!(!binding.roles.roles().contains(&Role::Admin), "second = user only");
     }
 
     #[tokio::test]
-    async fn bootstrap_closes_after_first_binding() {
-        // Seed one published binding BEFORE building the app so the window is
-        // already closed (has_any_binding only checks the map is non-empty —
-        // the bytes need not decode).
+    async fn enrollment_disabled_without_signer_is_403() {
+        // No directory signer configured → enrollment cannot sign ⇒ disabled,
+        // and the registration key is NOT consumed (checked before consume).
         let store = MemoryStore::new();
-        store
-            .put_binding([0x0A; 16], 1, vec![1u8, 2, 3], [0u8; 64])
-            .await
-            .unwrap();
+        store.add_reg_key(sha256(b"k"));
         let state = AppState {
-            auth: Arc::new(AuthService::new(
-                store,
-                AuthConfig::default().with_bootstrap_secret_hash(sha256(b"S3CRET")),
-            )),
-            blobs: Arc::new(MemoryBlobStore::new()),
-            audit: Arc::new(crate::audit::NullAuditSink),
-            direct_links_enabled: false,
-            max_file_bytes: None,
-        };
-        let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
-
-        // Even the CORRECT secret no longer works once the ceremony published.
-        let sk = SigningKey::generate();
-        let (st, _) = post_json(
-            &router,
-            "/v1/bootstrap",
-            bootstrap_body(&sk, "root", "S3CRET"),
-        )
-        .await;
-        assert_eq!(st, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn bootstrap_disabled_returns_403() {
-        // No bootstrap secret configured → the endpoint is disabled entirely.
-        let state = AppState {
-            auth: Arc::new(AuthService::new(MemoryStore::new(), AuthConfig::default())),
+            auth: Arc::new(AuthService::new(store, AuthConfig::default())),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
@@ -2089,34 +2280,29 @@ mod tests {
         };
         let router = router(state).layer(Extension(TlsExporter(EXPORTER)));
         let sk = SigningKey::generate();
-        let (st, _) = post_json(
-            &router,
-            "/v1/bootstrap",
-            bootstrap_body(&sk, "root", "anything"),
-        )
-        .await;
+        let (st, _) = post_json(&router, "/v1/users", register_body(&sk, "bob", "k")).await;
         assert_eq!(st, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
-    async fn reused_voucher_is_forbidden() {
-        let voucher = "one-time-code";
-        let router = app_with_vouchers(&[voucher]);
+    async fn reused_key_is_forbidden() {
+        let key = "one-time-key";
+        let router = app_with_reg_keys(&[key]);
         let sk = SigningKey::generate();
-        let (st1, _) = post_json(&router, "/v1/users", register_body(&sk, "bob", voucher)).await;
+        let (st1, _) = post_json(&router, "/v1/users", register_body(&sk, "bob", key)).await;
         assert_eq!(st1, StatusCode::CREATED);
-        let (st2, _) = post_json(&router, "/v1/users", register_body(&sk, "carol", voucher)).await;
+        let (st2, _) = post_json(&router, "/v1/users", register_body(&sk, "carol", key)).await;
         assert_eq!(st2, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
-    async fn bad_voucher_is_forbidden() {
-        let router = app_with_vouchers(&["real-code"]);
+    async fn bad_key_is_forbidden() {
+        let router = app_with_reg_keys(&["real-key"]);
         let sk = SigningKey::generate();
         let (st, _) = post_json(
             &router,
             "/v1/users",
-            register_body(&sk, "bob", "wrong-code"),
+            register_body(&sk, "bob", "wrong-key"),
         )
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN);
@@ -2124,7 +2310,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_username_conflicts() {
-        let router = app_with_vouchers(&["v1", "v2"]);
+        let router = app_with_reg_keys(&["v1", "v2"]);
         let sk = SigningKey::generate();
         let (st1, _) = post_json(&router, "/v1/users", register_body(&sk, "bob", "v1")).await;
         assert_eq!(st1, StatusCode::CREATED);
@@ -2371,17 +2557,17 @@ mod tests {
         (router, admin_sk, bob_sk, audit)
     }
 
-    /// An admin-configured app whose pinned D5 has published a `{User, Admin}`
-    /// binding for the admin caller, plus a minted channel-bound admin session
-    /// token. Also seeds a pending `newbie` (registered, no binding) for the
-    /// approval-queue tests. Returns `(router, d5, admin_session_token_hex)`.
-    async fn admin_app_d5() -> (Router, maxsecu_admin_core::DirectorySigner, String) {
-        use maxsecu_admin_core::DirectorySigner;
+    /// An admin-configured enrollment app: the server's directory-signing key
+    /// both (a) signs a `{User, Admin}` binding for the `admin` caller (so the
+    /// D5-verified [`AdminSession`] gate accepts it) and (b) backs server-side
+    /// enrollment signing. Returns `(router, admin_session_token_hex)`.
+    async fn admin_signer_app() -> (Router, String) {
         use maxsecu_encoding::encode;
         use maxsecu_encoding::structs::DirBinding;
         use maxsecu_encoding::types::{Id, RoleSet};
 
-        let d5 = DirectorySigner::generate();
+        let signer = Arc::new(SigningKey::generate());
+        let dir_pub = signer.verifying_key().to_bytes();
         let store = MemoryStore::new();
         let admin_sk = SigningKey::generate();
         store.add_user(
@@ -2403,78 +2589,67 @@ mod tests {
             not_after: Timestamp(4_102_444_800_000),
             mlkem_pub: None,
         };
-        let signed = d5.sign_binding(&admin_binding, None);
+        let admin_sig = signer.sign_canonical(DIRBINDING, &admin_binding);
         store
-            .put_binding([0xAD; 16], 1, encode(&signed.binding), signed.signature)
+            .put_binding([0xAD; 16], 1, encode(&admin_binding), admin_sig)
             .await
             .unwrap();
-        // A pending newbie: registered, no published binding (the approval queue).
-        store.add_user(
-            "newbie",
-            UserRecord {
-                user_id: [0x0B; 16],
-                enc_pub: [0xE2; 32],
-                sig_pub: [0x52; 32],
-            },
-        );
-        let app = app_with_directory_pub(store, d5.public_key());
+        // Mark the admin slot already claimed: `admin` is the genesis admin, so a
+        // later key-minted enrollment must NOT also become admin.
+        assert!(store.claim_first_admin().await.unwrap());
+        let state = AppState {
+            auth: Arc::new(
+                AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                    .with_dir_signer(signer),
+            ),
+            blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
+            max_file_bytes: None,
+        };
+        let app = router(state).layer(Extension(TlsExporter(EXPORTER)));
         let token = login(&app, "admin", &admin_sk).await;
-        (app, d5, token)
+        (app, token)
     }
 
     #[tokio::test]
-    async fn pending_list_is_admin_gated_and_lists_unsigned_users() {
-        let (app, _d5, admin_token) = admin_app_d5().await;
+    async fn mint_registration_key_is_admin_gated_and_enrolls_user_only() {
+        use maxsecu_encoding::structs::DirBinding;
+        let (app, admin_token) = admin_signer_app().await;
+
         // No token → 401 (not a session).
-        let (st, _) = get_json(&app, "/v1/pending").await;
+        let (st, _) = post_json(&app, "/v1/registration-keys", serde_json::json!({})).await;
         assert_eq!(st, StatusCode::UNAUTHORIZED);
-        // Admin token → 200, lists the pending newbie.
-        let (st, body) = get_json_auth(&app, "/v1/pending", &admin_token).await;
-        assert_eq!(st, StatusCode::OK);
-        assert!(body["pending"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|u| u["username"] == "newbie"));
+
+        // Admin → 201 with a plaintext key handed back once.
+        let (st, res) =
+            post_json_auth(&app, "/v1/registration-keys", serde_json::json!({}), &admin_token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let key = res["registration_key"].as_str().unwrap().to_owned();
+        assert!(!key.is_empty());
+
+        // The minted key enrolls exactly one user, who is User-role ONLY (only the
+        // first-ever registrant — here the genesis `admin` — is admin).
+        let sk = SigningKey::generate();
+        let (st, _) = post_json(&app, "/v1/users", register_body(&sk, "viakey", &key)).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (_st, body) = get_json(&app, "/v1/directory/viakey").await;
+        let bytes = B64.decode(body["binding_b64"].as_str().unwrap()).unwrap();
+        let binding = decode::<DirBinding>(&bytes).unwrap();
+        assert!(binding.roles.roles().contains(&Role::User));
+        assert!(
+            !binding.roles.roles().contains(&Role::Admin),
+            "admin-minted keys are never admin"
+        );
+
+        // The minted key is single-use.
+        let sk2 = SigningKey::generate();
+        let (st, _) = post_json(&app, "/v1/users", register_body(&sk2, "again", &key)).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
-    async fn issue_voucher_is_admin_gated_and_enables_registration() {
-        let (app, _d5, admin_token) = admin_app_d5().await;
-        let h = sha256(b"in-person-code");
-        // Non-admin (no token) → 401.
-        let (st, _) = post_json(
-            &app,
-            "/v1/vouchers",
-            serde_json::json!({ "voucher_hash_b64": B64.encode(h) }),
-        )
-        .await;
-        assert_eq!(st, StatusCode::UNAUTHORIZED);
-        // Admin → 201; the voucher then works on POST /v1/users.
-        let (st, _) = post_json_auth(
-            &app,
-            "/v1/vouchers",
-            serde_json::json!({ "voucher_hash_b64": B64.encode(h) }),
-            &admin_token,
-        )
-        .await;
-        assert_eq!(st, StatusCode::CREATED);
-        let (st, _) = post_json(
-            &app,
-            "/v1/users",
-            serde_json::json!({
-                "username": "viaadmin",
-                "enc_pub_b64": B64.encode([3u8; 32]),
-                "sig_pub_b64": B64.encode([4u8; 32]),
-                "enrollment_voucher": "in-person-code",
-            }),
-        )
-        .await;
-        assert_eq!(st, StatusCode::CREATED);
-    }
-
-    #[tokio::test]
-    async fn non_admin_session_cannot_post_control_or_list_pending() {
+    async fn non_admin_session_cannot_mint_or_post_control() {
         use maxsecu_admin_core::DirectorySigner;
         // A valid session with NO admin binding must be rejected (403, not 401) on
         // every admin-gated endpoint — the session is authentic, the authority is
@@ -2494,7 +2669,9 @@ mod tests {
         let app = app_with_directory_pub(store, d5.public_key());
         let token = login(&app, "plain", &user_sk).await;
 
-        let (st, _) = get_json_auth(&app, "/v1/pending", &token).await;
+        // Minting is admin-gated: an authentic non-admin session is refused.
+        let (st, _) =
+            post_json_auth(&app, "/v1/registration-keys", serde_json::json!({}), &token).await;
         assert_eq!(st, StatusCode::FORBIDDEN);
 
         let (rec, sig) = revocation_b64([0u8; 32], 1, 0x96);
@@ -2690,8 +2867,15 @@ mod tests {
     async fn store_fault_yields_500_not_401_or_403() {
         // Over a backend that faults on every call, the HTTP layer must answer
         // 500 (server health) — NOT a swallowed 200/401/403 that hides the fault.
+        // A dir signer is configured so enrollment reaches the (faulting) store
+        // rather than short-circuiting on "enrollment disabled".
+        let signer = Arc::new(SigningKey::generate());
+        let dir_pub = signer.verifying_key().to_bytes();
         let state = AppState {
-            auth: Arc::new(AuthService::new(FaultyStore, AuthConfig::default())),
+            auth: Arc::new(
+                AuthService::new(FaultyStore, AuthConfig::default().with_directory_pub(dir_pub))
+                    .with_dir_signer(signer),
+            ),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
@@ -2708,7 +2892,7 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "challenge over a faulty store");
 
-        // register: a voucher-table fault → 500, not a misleading 403 "bad voucher".
+        // register: a reg-key-table fault → 500, not a misleading 403 "bad key".
         let sk = SigningKey::generate();
         let (_esk, epk) = generate_enc_keypair();
         let (st, _) = post_json(
@@ -2718,7 +2902,7 @@ mod tests {
                 "username": "bob",
                 "enc_pub_b64": b64encode(&epk.to_bytes()),
                 "sig_pub_b64": b64encode(&sk.verifying_key().to_bytes()),
-                "enrollment_voucher": "code",
+                "registration_key": "code",
             }),
         )
         .await;

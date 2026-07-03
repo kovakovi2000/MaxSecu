@@ -49,7 +49,7 @@ use base64::Engine;
 
 use maxsecu_admin_core::{CoSign, ControlChain, DirectorySigner, RevokeParams};
 use maxsecu_client_app::config::{client_config_for_pinned_root, load_sink_pins};
-use maxsecu_client_app::directory::{resolve_recipient, resolve_recovery_recipient};
+use maxsecu_client_app::directory::resolve_recipient;
 use maxsecu_client_app::download::parse_file_view;
 use maxsecu_client_app::sink::fetch_anchored_head;
 use maxsecu_client_app::upload::{prepare_image_streams, run_pipeline};
@@ -257,7 +257,7 @@ async fn register_and_login(
     c: &mut Conn,
     owner: &Identity,
     username: &str,
-    voucher: &str,
+    reg_key: &str,
 ) -> ([u8; 16], String) {
     let (st, res) = post(
         c,
@@ -267,7 +267,7 @@ async fn register_and_login(
             "username": username,
             "enc_pub_b64": B64.encode(owner.enc_pub_bytes()),
             "sig_pub_b64": B64.encode(owner.sig_pub_bytes()),
-            "enrollment_voucher": voucher,
+            "registration_key": reg_key,
         }),
     )
     .await;
@@ -586,21 +586,25 @@ impl Fixture {
         let blob_dir = app_dir.join("blobs");
         std::fs::create_dir_all(app_dir.join("config")).unwrap();
 
-        // ---- D5 directory root (the pinned trust anchor for all bindings) ----
-        let dir_signer = DirectorySigner::generate();
+        // ---- D5 directory root (the pinned trust anchor for all bindings). The
+        // server holds the private half (from the same seed) so registration-key
+        // enrollment can sign bindings; the scripted ceremony signer publishes the
+        // PQ/role bindings this test needs, which verify under the same pinned key. ----
+        let d5_seed = maxsecu_crypto::random_array::<32>();
+        let dir_signer = DirectorySigner::from_seed(&d5_seed);
         let pinned = dir_signer.public_key();
 
         // ---- App server (MemoryStore + FsBlobStore + a MemoryAuditSink) ----
         let store = MemoryStore::new();
         for i in 0..64usize {
-            store.add_voucher(sha256(format!("voucher-{i}").as_bytes()));
+            store.add_reg_key(sha256(format!("voucher-{i}").as_bytes()));
         }
         let audit = Arc::new(MemoryAuditSink::new());
         let state = AppState {
-            auth: Arc::new(AuthService::new(
-                store,
-                AuthConfig::default().with_directory_pub(pinned),
-            )),
+            auth: Arc::new(
+                AuthService::new(store, AuthConfig::default().with_directory_pub(pinned))
+                    .with_dir_signer(Arc::new(SigningKey::from_seed(&d5_seed))),
+            ),
             blobs: Arc::new(FsBlobStore::new(&blob_dir)),
             audit: audit.clone(),
             direct_links_enabled: false,
@@ -679,7 +683,11 @@ impl Fixture {
     /// otherwise a classical `Suite::V1` file. Returns `(file_id, canonical content)`.
     async fn upload_image(&mut self, pq: bool) -> ([u8; 16], Vec<u8>) {
         let rname = format!("recovery-{}", self.ctr);
-        let _ = enroll(
+        // Enroll the standing recovery recipient and take its keys directly (the
+        // buddy directory-resolve was retired in T8). `pq` still drives the suite:
+        // include the recovery ML-KEM key only when a PQ recovery is requested, so
+        // `build_upload` selects Suite::V2 exactly as before (self+recovery both PQ).
+        let (recovery_id, _uid, _tok) = enroll(
             &mut self.conn,
             &self.dir_signer,
             &mut self.ctr,
@@ -688,18 +696,8 @@ impl Fixture {
             pq,
         )
         .await;
-        let verifier = DirectoryVerifier::new(self.pinned);
-        let mut trust = MemoryTrustStore::new();
-        let rr = resolve_recovery_recipient(
-            &mut self.conn.sender,
-            "localhost",
-            &rname,
-            &verifier,
-            &mut trust,
-            TS,
-        )
-        .await
-        .unwrap();
+        let recovery_enc = recovery_id.enc_pub_bytes();
+        let recovery_mlkem = if pq { recovery_id.mlkem_pub_bytes() } else { None };
 
         let src_png = gen_png();
         let (file_type, streams) =
@@ -715,8 +713,8 @@ impl Fixture {
                 file_id,
                 file_type,
                 chunk_size: 4096,
-                recovery_pub: EncPublicKey::from_bytes(rr.enc_pub),
-                recovery_mlkem_pub: rr.mlkem_pub,
+                recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+                recovery_mlkem_pub: recovery_mlkem,
                 created_at: Timestamp(TS),
             },
             &streams,

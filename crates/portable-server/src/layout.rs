@@ -1,6 +1,6 @@
 //! Portable folder layout (Phase-6 Task 2). All server-side artifacts (TLS cert,
-//! blobs, D5 key material, bootstrap marker, logs) live under a single portable
-//! `data_dir` root. [`Layout::ensure`] creates the sub-directories idempotently.
+//! blobs, D5 key material, logs) live under a single portable `data_dir` root.
+//! [`Layout::ensure`] creates the sub-directories idempotently.
 use std::path::{Path, PathBuf};
 
 /// Portable folder layout rooted at a `data_dir`.
@@ -67,11 +67,6 @@ impl Layout {
     pub fn d5_secret_path(&self) -> PathBuf {
         self.config_dir().join("d5_secret.bin")
     }
-
-    /// Bootstrap secret marker (`config/bootstrap_secret.sha256`).
-    pub fn bootstrap_marker_path(&self) -> PathBuf {
-        self.config_dir().join("bootstrap_secret.sha256")
-    }
 }
 
 #[cfg(test)]
@@ -87,7 +82,6 @@ mod tests {
         }
         assert!(l.cert_der_path().starts_with(&tmp));
         assert!(l.d5_pub_path().starts_with(&tmp));
-        assert!(l.bootstrap_marker_path().starts_with(&tmp));
         // idempotent
         assert!(Layout::ensure(&tmp).is_ok());
         let _ = std::fs::remove_dir_all(&tmp);

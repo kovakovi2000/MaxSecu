@@ -29,8 +29,8 @@ use maxsecu_encoding::types::{Id, RecipientType, Suite, Timestamp};
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{open_conn, reauth, server_of};
-use crate::config::{load_directory_pub, recovery_recipient_username};
-use crate::directory::{resolve_my_binding, resolve_recovery_recipient};
+use crate::config::load_directory_pub;
+use crate::directory::{resolve_my_binding, resolve_recovery_pin};
 use crate::dto::{
     CancelUploadRequest, ConfirmUploadRequest, PendingUploadView, StageUploadRequest, UploadJobView,
     UploadKind, UploadPreview,
@@ -319,16 +319,13 @@ pub async fn stage_upload(
     let (mut sender, host, _exporter) = open_conn(&dir.0, &server).await?;
     let me =
         resolve_my_binding(&mut sender, &host, &username, &verifier, &mut trust, now).await?;
-    let recovery_username = recovery_recipient_username(&dir.0)?;
-    let recovery = resolve_recovery_recipient(
-        &mut sender,
-        &host,
-        &recovery_username,
-        &verifier,
-        &mut trust,
-        now,
-    )
-    .await?;
+    // Trust-alarm A (spec §3/§7): fetch the server-served recovery pubkey and
+    // constant-time-compare it against this client's compiled-in recovery pin
+    // BEFORE any DEK wrap. A mismatch returns a `server_untrusted` error and aborts
+    // here — nothing is wrapped, staged, or uploaded. On a match we wrap the file
+    // DEK to the EMBEDDED pin's keys (the trusted, compiled-in value), NOT the
+    // server-served key (which is only ever compared, never trusted).
+    let recovery = resolve_recovery_pin(&mut sender, &host).await?;
 
     // 3) Build the upload content. Video: streaming (disk-backed); Image/Blog: InRam.
     let file_id = Id(maxsecu_crypto::random_array::<16>());

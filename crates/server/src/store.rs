@@ -16,6 +16,7 @@ use crate::files::{
 };
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
+use maxsecu_encoding::structs::MLKEM768_PUB_LEN;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -25,6 +26,22 @@ pub struct UserRecord {
     pub user_id: [u8; 16],
     pub enc_pub: [u8; 32],
     pub sig_pub: [u8; 32],
+}
+
+/// The single escrow **recovery account**'s PUBLIC keys (schema.sql
+/// `recovery_account`; T3). The recovery identity uses the same key types as a
+/// normal Identity (spec §3), which today is PQ-hybrid: an X25519 `enc_pub`
+/// **and** an optional ML-KEM-768 `mlkem_pub`. Wraps to recovery encapsulate to
+/// both so an upload stays `Suite::V2` (dropping `mlkem_pub` would silently
+/// downgrade every recovery-wrapped upload to classical V1). `mlkem_pub` is
+/// `None` only for a classical-only recovery account. Mirrors
+/// [`DirBinding.mlkem_pub`](maxsecu_encoding::structs::DirBinding). No private
+/// key is ever stored (D4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryAccount {
+    pub enc_pub: [u8; 32],
+    pub sig_pub: [u8; 32],
+    pub mlkem_pub: Option<[u8; MLKEM768_PUB_LEN]>,
 }
 
 /// A single-use login challenge (schema.sql `auth_nonces`).
@@ -51,17 +68,6 @@ pub struct SessionRecord {
 pub struct StoredBinding {
     pub binding_bytes: Vec<u8>,
     pub signature: [u8; 64],
-}
-
-/// One un-approved account for the admin queue (`GET /v1/pending`, D-G): a user
-/// record with **no** published binding yet. `created_at_ms` is the account's
-/// `enrolled_at` registration time in epoch ms (0 only if a backend somehow
-/// lacks one), which the pending screen surfaces and sorts newest-first.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingUser {
-    pub user_id: [u8; 16],
-    pub username: String,
-    pub created_at_ms: u64,
 }
 
 /// One control-log record as served by `GET /v1/revocations` (api.md §7.1): the
@@ -177,6 +183,25 @@ pub struct VersionMeta {
 /// transient DB error is surfaced (→ 500, logged) rather than swallowed into a
 /// fail-closed "not found" that silently denies (see [`StoreError`]). Callers
 /// still fail *closed* — they map `Err` to denial — but now *observably*.
+/// The outcome of the atomic registration-key [`enroll`](Store::enroll) unit of
+/// work (T4). A backend fault is the separate `Err` arm — these are the clean
+/// business outcomes, each leaving the store in a fully-consistent state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollOutcome {
+    /// The registration key was unknown / already used / expired. NOTHING was
+    /// written — the key is not consumed, no user created (→ 403). A retry with a
+    /// valid key still works.
+    KeyInvalid,
+    /// The username is taken. The whole unit rolled back — the key is NOT consumed
+    /// and no partial row remains (→ 409). A retry with a free username + the same
+    /// key works.
+    UsernameTaken,
+    /// The user was created, the first-admin slot resolved, and the matching
+    /// server-signed binding stored — ALL atomically (→ 201). `is_admin` reports
+    /// whether this registrant claimed the one-time admin slot.
+    Enrolled { is_admin: bool },
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     /// Create an unsigned user, assigning a fresh 16-byte `user_id` (api.md
@@ -188,10 +213,6 @@ pub trait Store: Send + Sync {
         enc_pub: [u8; 32],
         sig_pub: [u8; 32],
     ) -> Result<Option<[u8; 16]>, StoreError>;
-    /// Consume a one-time enrollment voucher; `Ok(true)` iff it was valid and
-    /// unused (the anti-spam gate for the unauthenticated `POST /v1/users`,
-    /// api.md §5.1). `Ok(false)` = invalid/used; `Err` = backend fault.
-    async fn consume_voucher(&self, voucher_hash: &[u8; 32]) -> Result<bool, StoreError>;
     async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, StoreError>;
     async fn insert_nonce(
         &self,
@@ -237,23 +258,80 @@ pub trait Store: Send + Sync {
         &self,
         user_id: &[u8; 16],
     ) -> Result<Option<StoredBinding>, StoreError>;
-    /// `true` iff at least one signed binding has been published — the first-run
-    /// bootstrap window is **open** only while this is `false` (§4.2).
-    async fn has_any_binding(&self) -> Result<bool, StoreError>;
 
-    /// Users with a record but no published binding — the admin approval queue
-    /// (§4.2 / D-G). Newest-first by `created_at_ms`.
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError>;
+    // ---- Registration keys (single-use enrollment secrets; T2) ----
 
-    /// Persist a fresh single-use enrollment voucher by its `SHA-256` hash, with
-    /// an absolute expiry (`POST /v1/vouchers`, admin-issued). Idempotent re-issue
-    /// of the same hash is allowed.
-    async fn issue_voucher(
+    /// Persist a fresh single-use **registration key** by its `SHA-256` hash
+    /// (never the plaintext), with an absolute expiry. Unlike a voucher there is
+    /// no `issued_by` — these are handed out by the operator, not an in-app admin.
+    /// Idempotent re-issue of the same hash is allowed.
+    async fn issue_registration_key(
         &self,
-        voucher_hash: [u8; 32],
-        issued_by: [u8; 16],
+        key_hash: [u8; 32],
         expires_at_ms: u64,
     ) -> Result<(), StoreError>;
+    /// Consume a registration key by its hash; `Ok(true)` iff it was present,
+    /// unused and unexpired (deleted-on-consume — atomic single-use). `Ok(false)`
+    /// = unknown/used/expired; `Err` = fault.
+    async fn consume_registration_key(&self, key_hash: &[u8; 32])
+        -> Result<bool, StoreError>;
+    /// Atomically claim the ONE-TIME "first admin" slot: `Ok(true)` for exactly
+    /// the first caller ever, `Ok(false)` thereafter. The race-safe primitive
+    /// backing [`enroll`](Store::enroll)'s admin decision — a singleton row claimed
+    /// via `ON CONFLICT DO NOTHING` (the same pattern as [`set_recovery_account`]),
+    /// so two concurrent first-registrants can never both become admin. Exposed on
+    /// the trait so tests can pre-claim the slot (mark a genesis admin) before
+    /// exercising later enrollments; the enrollment path itself performs the claim
+    /// *inside* [`enroll`](Store::enroll)'s transaction, not via this method.
+    ///
+    /// [`set_recovery_account`]: Store::set_recovery_account
+    async fn claim_first_admin(&self) -> Result<bool, StoreError>;
+    /// **Atomic registration-key enrollment (T4).** Performs the entire unit of
+    /// work — consume the single-use key, create the user, resolve the one-time
+    /// first-admin slot, and store the matching **already-signed** binding — in ONE
+    /// transaction (PgStore) / under the single lock (MemoryStore), so a fault
+    /// mid-way leaves NO partial state: the key is not consumed, no orphan user, no
+    /// dangling admin claim, and a retry with the same key works. Signing is pure
+    /// and done by the caller *before* this call; the two candidate bindings
+    /// (`user_binding` = `{User}`, `admin_binding` = `{User, Admin}`) are signed
+    /// for the SAME `user_id`, and this method stores exactly the one matching the
+    /// atomic first-admin decision. `key_version` is always 1 (enrollment).
+    ///
+    /// Returns [`EnrollOutcome`]; `Err` is a backend fault (→ 500). Closes the
+    /// first-enrollment "zero-admins" hole that a non-transactional
+    /// consume→create→claim→put sequence left on a mid-sequence fault.
+    #[allow(clippy::too_many_arguments)]
+    async fn enroll(
+        &self,
+        reg_key_hash: [u8; 32],
+        user_id: [u8; 16],
+        username: &str,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+        user_binding: &StoredBinding,
+        admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError>;
+
+    // ---- Recovery account (the single escrow identity; T3) ----
+
+    /// Register the ONE recovery account by its PUBLIC keys — an X25519 `enc_pub`
+    /// (recovery challenges wrap to it; clients compare it to their embedded pin),
+    /// an Ed25519 `sig_pub`, and an OPTIONAL ML-KEM-768 `mlkem_pub` (the PQ-hybrid
+    /// encapsulation half; `None` = classical-only recovery). **Once-only**:
+    /// `Ok(true)` iff this call stored the account; `Ok(false)` iff one already
+    /// exists (the stored keys are left UNCHANGED — no overwrite). Race-safe: a
+    /// single-row table means exactly one of any concurrent setters wins. `Err`
+    /// is a backend fault. Never stores a private key (public material only, D4).
+    async fn set_recovery_account(
+        &self,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+        mlkem_pub: Option<[u8; MLKEM768_PUB_LEN]>,
+    ) -> Result<bool, StoreError>;
+    /// The registered recovery account's public keys, or `Ok(None)` if none has
+    /// been registered yet (`GET`-served to clients for the pin compare + used as
+    /// the PQ-hybrid recovery wrap target).
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError>;
 
     // ---- Phase 2: revocation control-log (DESIGN §7.6/§11.5, api.md §7) ----
 
@@ -404,22 +482,18 @@ pub(crate) fn ancestor_chain(
     out
 }
 
-/// Wall-clock epoch-ms (best-effort; the dev `MemoryStore` only).
-fn now_ms_wall() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[derive(Default)]
 struct Inner {
     users: HashMap<String, UserRecord>,
-    // Wall-clock creation time per username (best-effort; dev store only).
-    created_ms: HashMap<String, u64>,
     nonces: HashMap<[u8; 32], NonceRecord>,
     sessions: HashMap<[u8; 32], SessionRecord>,
-    vouchers: HashSet<[u8; 32]>, // unused enrollment voucher hashes
+    reg_keys: HashSet<[u8; 32]>, // unused single-use registration-key hashes (T2)
+    // The one-time first-admin claim (T4): `true` once the first registrant has
+    // claimed admin; every later `claim_first_admin` observes `true` and loses.
+    first_admin_claimed: bool,
+    // The single recovery account's PUBLIC keys (X25519 + optional ML-KEM-768);
+    // once set, never overwritten (T3). `None` until registered.
+    recovery_account: Option<RecoveryAccount>,
     // Latest signed binding per user_id, with its key_version (newer replaces older).
     bindings: HashMap<[u8; 16], (u64, StoredBinding)>,
     // The single append-only control-log chain (in order) + its running head.
@@ -467,27 +541,12 @@ impl MemoryStore {
     /// Seed an already-enrolled user (test/dev convenience).
     pub fn add_user(&self, username: &str, rec: UserRecord) {
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .created_ms
-            .entry(username.to_owned())
-            .or_insert_with(now_ms_wall);
         inner.users.insert(username.to_owned(), rec);
     }
 
-    /// Seed a usable enrollment voucher by its `SHA-256` hash (issued in person).
-    pub fn add_voucher(&self, voucher_hash: [u8; 32]) {
-        self.inner.lock().unwrap().vouchers.insert(voucher_hash);
-    }
-
-    /// Override a user's recorded creation time (tests only — `add_user`/
-    /// `create_user` stamp wall-clock, which a test cannot control).
-    #[cfg(test)]
-    pub(crate) fn set_created_ms(&self, username: &str, ms: u64) {
-        self.inner
-            .lock()
-            .unwrap()
-            .created_ms
-            .insert(username.to_owned(), ms);
+    /// Seed a usable single-use registration key by its `SHA-256` hash (T4 tests).
+    pub fn add_reg_key(&self, key_hash: [u8; 32]) {
+        self.inner.lock().unwrap().reg_keys.insert(key_hash);
     }
 }
 
@@ -519,12 +578,7 @@ impl Store for MemoryStore {
                 sig_pub,
             },
         );
-        inner.created_ms.insert(username.to_owned(), now_ms_wall());
         Ok(Some(user_id))
-    }
-
-    async fn consume_voucher(&self, voucher_hash: &[u8; 32]) -> Result<bool, StoreError> {
-        Ok(self.inner.lock().unwrap().vouchers.remove(voucher_hash))
     }
 
     async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, StoreError> {
@@ -644,38 +698,107 @@ impl Store for MemoryStore {
             .map(|(_, b)| b.clone()))
     }
 
-    async fn has_any_binding(&self) -> Result<bool, StoreError> {
-        Ok(!self.inner.lock().unwrap().bindings.is_empty())
-    }
-
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
-        let inner = self.inner.lock().unwrap();
-        let mut out: Vec<PendingUser> = inner
-            .users
-            .iter()
-            .filter(|(_, u)| !inner.bindings.contains_key(&u.user_id))
-            .map(|(name, u)| PendingUser {
-                user_id: u.user_id,
-                username: name.clone(),
-                created_at_ms: inner.created_ms.get(name).copied().unwrap_or(0),
-            })
-            .collect();
-        out.sort_by(|a, b| {
-            b.created_at_ms
-                .cmp(&a.created_at_ms)
-                .then(a.user_id.cmp(&b.user_id))
-        });
-        Ok(out)
-    }
-
-    async fn issue_voucher(
+    async fn issue_registration_key(
         &self,
-        voucher_hash: [u8; 32],
-        _issued_by: [u8; 16],
+        key_hash: [u8; 32],
         _expires_at_ms: u64,
     ) -> Result<(), StoreError> {
-        self.inner.lock().unwrap().vouchers.insert(voucher_hash);
+        self.inner.lock().unwrap().reg_keys.insert(key_hash);
         Ok(())
+    }
+
+    async fn consume_registration_key(
+        &self,
+        key_hash: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        Ok(self.inner.lock().unwrap().reg_keys.remove(key_hash))
+    }
+
+    async fn claim_first_admin(&self) -> Result<bool, StoreError> {
+        // Once-only under the single lock: the first caller flips the flag and
+        // wins (→ admin); every later caller observes `true` and loses. The
+        // MemoryStore analogue of the singleton PK's `ON CONFLICT DO NOTHING`.
+        let mut inner = self.inner.lock().unwrap();
+        if inner.first_admin_claimed {
+            return Ok(false);
+        }
+        inner.first_admin_claimed = true;
+        Ok(true)
+    }
+
+    async fn enroll(
+        &self,
+        reg_key_hash: [u8; 32],
+        user_id: [u8; 16],
+        username: &str,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+        user_binding: &StoredBinding,
+        admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError> {
+        // Everything happens under the single `Inner` lock. Preconditions are
+        // checked FIRST and the maps are only mutated once all pass, so an early
+        // return leaves the store byte-for-byte unchanged (the MemoryStore analogue
+        // of a Pg transaction rolled back before any write).
+        let mut inner = self.inner.lock().unwrap();
+        // 1. Single-use key (the dev store tracks membership only, no expiry).
+        if !inner.reg_keys.contains(&reg_key_hash) {
+            return Ok(EnrollOutcome::KeyInvalid); // nothing consumed
+        }
+        // 2. Username uniqueness — bail BEFORE consuming the key.
+        if inner.users.contains_key(username) {
+            return Ok(EnrollOutcome::UsernameTaken); // key NOT consumed
+        }
+        // 3. First-admin slot (same flag as `claim_first_admin`).
+        let is_admin = !inner.first_admin_claimed;
+        let binding = if is_admin { admin_binding } else { user_binding };
+        // All preconditions passed — commit every mutation together.
+        inner.reg_keys.remove(&reg_key_hash);
+        inner.first_admin_claimed = true;
+        inner.users.insert(
+            username.to_owned(),
+            UserRecord {
+                user_id,
+                enc_pub,
+                sig_pub,
+            },
+        );
+        inner.bindings.insert(
+            user_id,
+            (
+                1,
+                StoredBinding {
+                    binding_bytes: binding.binding_bytes.clone(),
+                    signature: binding.signature,
+                },
+            ),
+        );
+        Ok(EnrollOutcome::Enrolled { is_admin })
+    }
+
+    async fn set_recovery_account(
+        &self,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+        mlkem_pub: Option<[u8; MLKEM768_PUB_LEN]>,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Once-only under the single lock: a second setter observes `Some` and
+        // loses without overwriting (the MemoryStore analogue of the singleton
+        // PK's `ON CONFLICT DO NOTHING`).
+        if inner.recovery_account.is_some() {
+            return Ok(false);
+        }
+        inner.recovery_account = Some(RecoveryAccount {
+            enc_pub,
+            sig_pub,
+            mlkem_pub,
+        });
+        Ok(true)
+    }
+
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError> {
+        Ok(self.inner.lock().unwrap().recovery_account.clone())
     }
 
     async fn append_control(
@@ -1099,9 +1222,6 @@ impl Store for FaultyStore {
     ) -> Result<Option<[u8; 16]>, StoreError> {
         Err(Self::fault("create_user"))
     }
-    async fn consume_voucher(&self, _voucher_hash: &[u8; 32]) -> Result<bool, StoreError> {
-        Err(Self::fault("consume_voucher"))
-    }
     async fn user_by_name(&self, _username: &str) -> Result<Option<UserRecord>, StoreError> {
         Err(Self::fault("user_by_name"))
     }
@@ -1160,19 +1280,44 @@ impl Store for FaultyStore {
     ) -> Result<Option<StoredBinding>, StoreError> {
         Err(Self::fault("binding_by_user_id"))
     }
-    async fn has_any_binding(&self) -> Result<bool, StoreError> {
-        Err(Self::fault("has_any_binding"))
-    }
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
-        Err(Self::fault("list_pending_users"))
-    }
-    async fn issue_voucher(
+    async fn issue_registration_key(
         &self,
-        _voucher_hash: [u8; 32],
-        _issued_by: [u8; 16],
+        _key_hash: [u8; 32],
         _expires_at_ms: u64,
     ) -> Result<(), StoreError> {
-        Err(Self::fault("issue_voucher"))
+        Err(Self::fault("issue_registration_key"))
+    }
+    async fn consume_registration_key(
+        &self,
+        _key_hash: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        Err(Self::fault("consume_registration_key"))
+    }
+    async fn claim_first_admin(&self) -> Result<bool, StoreError> {
+        Err(Self::fault("claim_first_admin"))
+    }
+    async fn enroll(
+        &self,
+        _reg_key_hash: [u8; 32],
+        _user_id: [u8; 16],
+        _username: &str,
+        _enc_pub: [u8; 32],
+        _sig_pub: [u8; 32],
+        _user_binding: &StoredBinding,
+        _admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError> {
+        Err(Self::fault("enroll"))
+    }
+    async fn set_recovery_account(
+        &self,
+        _enc_pub: [u8; 32],
+        _sig_pub: [u8; 32],
+        _mlkem_pub: Option<[u8; MLKEM768_PUB_LEN]>,
+    ) -> Result<bool, StoreError> {
+        Err(Self::fault("set_recovery_account"))
+    }
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError> {
+        Err(Self::fault("recovery_account"))
     }
     async fn append_control(
         &self,
@@ -1252,128 +1397,5 @@ impl Store for FaultyStore {
         _caller_id: [u8; 16],
     ) -> Result<Vec<String>, DiscardError> {
         Err(DiscardError::Store(Self::fault("discard_unfinalized")))
-    }
-}
-
-#[cfg(test)]
-mod phase2_store_tests {
-    use super::*;
-    use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
-    use maxsecu_encoding::{encode, structs::DirBinding};
-
-    fn binding_bytes(uid: u8) -> Vec<u8> {
-        encode(&DirBinding {
-            username: Text::new("u").unwrap(),
-            user_id: Id([uid; 16]),
-            enc_pub: Bytes32([uid; 32]),
-            sig_pub: Bytes32([uid; 32]),
-            key_version: 1,
-            roles: RoleSet::new([Role::User]),
-            not_before: Timestamp(0),
-            not_after: Timestamp(4_102_444_800_000),
-            mlkem_pub: None,
-        })
-    }
-
-    #[tokio::test]
-    async fn has_any_binding_flips_after_first_publish() {
-        let s = MemoryStore::new();
-        assert!(
-            !s.has_any_binding().await.unwrap(),
-            "window open with no bindings"
-        );
-        s.put_binding([0x0A; 16], 1, binding_bytes(0x0A), [0u8; 64])
-            .await
-            .unwrap();
-        assert!(
-            s.has_any_binding().await.unwrap(),
-            "window closes after first publish"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_pending_excludes_users_with_a_binding() {
-        let s = MemoryStore::new();
-        s.add_user(
-            "alice",
-            UserRecord {
-                user_id: [0x0A; 16],
-                enc_pub: [1; 32],
-                sig_pub: [1; 32],
-            },
-        );
-        s.add_user(
-            "bob",
-            UserRecord {
-                user_id: [0x0B; 16],
-                enc_pub: [2; 32],
-                sig_pub: [2; 32],
-            },
-        );
-        // alice gets a binding (approved); bob stays pending.
-        s.put_binding([0x0A; 16], 1, binding_bytes(0x0A), [0u8; 64])
-            .await
-            .unwrap();
-
-        let pending = s.list_pending_users().await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].user_id, [0x0B; 16]);
-        assert_eq!(pending[0].username, "bob");
-    }
-
-    #[tokio::test]
-    async fn list_pending_orders_newest_first_then_user_id() {
-        let s = MemoryStore::new();
-        s.add_user(
-            "a",
-            UserRecord {
-                user_id: [0x01; 16],
-                enc_pub: [1; 32],
-                sig_pub: [1; 32],
-            },
-        );
-        s.add_user(
-            "b",
-            UserRecord {
-                user_id: [0x02; 16],
-                enc_pub: [2; 32],
-                sig_pub: [2; 32],
-            },
-        );
-        s.add_user(
-            "c",
-            UserRecord {
-                user_id: [0x03; 16],
-                enc_pub: [3; 32],
-                sig_pub: [3; 32],
-            },
-        );
-        // Deterministic creation times (wall-clock stamps cannot be controlled).
-        s.set_created_ms("a", 300);
-        s.set_created_ms("b", 100);
-        s.set_created_ms("c", 300);
-
-        let pending = s.list_pending_users().await.unwrap();
-        // Newest-first by created_at_ms; ties broken by ascending user_id, so the
-        // two ms=300 rows (a, c) come before b=100, and a precedes c.
-        let order: Vec<[u8; 16]> = pending.iter().map(|p| p.user_id).collect();
-        assert_eq!(order, vec![[0x01; 16], [0x03; 16], [0x02; 16]]);
-    }
-
-    #[tokio::test]
-    async fn issued_voucher_is_consumable_once() {
-        let s = MemoryStore::new();
-        let h = maxsecu_crypto::sha256(b"invite-code-xyz");
-        s.issue_voucher(h, [0xAD; 16], 4_102_444_800_000)
-            .await
-            .unwrap();
-        assert!(
-            s.consume_voucher(&h).await.unwrap(),
-            "fresh issued voucher consumes"
-        );
-        assert!(
-            !s.consume_voucher(&h).await.unwrap(),
-            "second consume fails (single-use)"
-        );
     }
 }

@@ -6,7 +6,8 @@
 use crate::error::{AuthError, ChallengeError, ProveError, StoreError};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::store::{SessionRecord, Store};
-use maxsecu_crypto::{random_array, sha256, VerifyingKey};
+use maxsecu_crypto::{random_array, sha256, SigningKey, VerifyingKey};
+use std::sync::Arc;
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::AuthProofContext;
 use maxsecu_encoding::types::{Bytes32, Text, Timestamp};
@@ -26,6 +27,11 @@ pub struct SessionToken([u8; 32]);
 impl SessionToken {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+    /// Mint a token from raw bytes — used by the recovery login (`recovery.rs`),
+    /// which reuses the same session store as the normal login path.
+    pub(crate) fn from_bytes(b: [u8; 32]) -> SessionToken {
+        SessionToken(b)
     }
     pub fn to_hex(&self) -> String {
         let mut s = String::with_capacity(64);
@@ -49,20 +55,12 @@ pub struct AuthConfig {
     /// fails those closed. The server holds only the *public* half — it verifies
     /// bindings, it cannot forge them.
     pub directory_pub: Option<[u8; 32]>,
-    /// `SHA-256(bootstrap_secret)` for the first-run bootstrap window (§4.2). The
-    /// plaintext is printed once by the operator/launcher and never stored.
-    pub bootstrap_secret_hash: Option<[u8; 32]>,
 }
 
 impl AuthConfig {
     /// Pin the offline D5 directory-signing public key (enables admin authz).
     pub fn with_directory_pub(mut self, dir_pub: [u8; 32]) -> Self {
         self.directory_pub = Some(dir_pub);
-        self
-    }
-    /// Configure the first-run bootstrap secret by its `SHA-256` hash.
-    pub fn with_bootstrap_secret_hash(mut self, h: [u8; 32]) -> Self {
-        self.bootstrap_secret_hash = Some(h);
         self
     }
 }
@@ -75,7 +73,6 @@ impl Default for AuthConfig {
             session_ttl_ms: 3_600_000, // 60 min (parameters §2)
             rate_limit: RateLimitConfig::default(),
             directory_pub: None,
-            bootstrap_secret_hash: None,
         }
     }
 }
@@ -84,6 +81,12 @@ pub struct AuthService<S: Store> {
     store: S,
     cfg: AuthConfig,
     limiter: RateLimiter,
+    /// The directory-signing PRIVATE key the server signs enrollment bindings
+    /// with (registration-key enrollment, DESIGN §5). `None` = enrollment
+    /// disabled (`POST /v1/users` → 403). Its public half is `cfg.directory_pub`
+    /// (the value clients pin); the private seed lives ONLY here and is never put
+    /// into any DTO, response, or log. `Arc` so cloning `AppState` is a bump.
+    dir_signer: Option<Arc<SigningKey>>,
 }
 
 impl<S: Store> AuthService<S> {
@@ -93,7 +96,24 @@ impl<S: Store> AuthService<S> {
             store,
             cfg,
             limiter,
+            dir_signer: None,
         }
+    }
+
+    /// Give the service the directory-signing key so it can sign enrollment
+    /// bindings server-side (§5). The caller must pass the key whose public half
+    /// equals `cfg.directory_pub` — the server verifies bindings against that pub
+    /// and signs new ones with this private key. Builder form so existing
+    /// `AuthService::new(..)` call sites are unaffected.
+    pub fn with_dir_signer(mut self, signer: Arc<SigningKey>) -> Self {
+        self.dir_signer = Some(signer);
+        self
+    }
+
+    /// The directory-signing key, if enrollment signing is enabled (§5). Returns
+    /// a clone of the `Arc` (a refcount bump); the private seed never escapes.
+    pub fn dir_signer(&self) -> Option<Arc<SigningKey>> {
+        self.dir_signer.clone()
     }
 
     pub fn store(&self) -> &S {
@@ -108,9 +128,14 @@ impl<S: Store> AuthService<S> {
     pub fn directory_pub(&self) -> Option<[u8; 32]> {
         self.cfg.directory_pub
     }
-    /// The configured bootstrap-secret hash, if the bootstrap window is enabled.
-    pub fn bootstrap_secret_hash(&self) -> Option<[u8; 32]> {
-        self.cfg.bootstrap_secret_hash
+    /// The single-use challenge nonce TTL (ms). Exposed so the recovery login
+    /// (`recovery.rs`) reuses the same expiry the normal login path applies.
+    pub fn nonce_ttl_ms(&self) -> u64 {
+        self.cfg.nonce_ttl_ms
+    }
+    /// The minted-session TTL (ms) — shared with the recovery login path.
+    pub fn session_ttl_ms(&self) -> u64 {
+        self.cfg.session_ttl_ms
     }
 
     /// Issue a fresh single-use challenge. A well-formed challenge is returned
@@ -331,17 +356,13 @@ mod tests {
     }
 
     #[test]
-    fn config_carries_pinned_d5_and_bootstrap_secret() {
-        let cfg = AuthConfig::default()
-            .with_directory_pub([0x7D; 32])
-            .with_bootstrap_secret_hash([0xB5; 32]);
+    fn config_carries_pinned_d5() {
+        let cfg = AuthConfig::default().with_directory_pub([0x7D; 32]);
         let svc = AuthService::new(MemoryStore::new(), cfg);
         assert_eq!(svc.directory_pub(), Some([0x7D; 32]));
-        assert_eq!(svc.bootstrap_secret_hash(), Some([0xB5; 32]));
-        // Defaults are absent (admin endpoints fail closed until configured).
+        // Default is absent (admin endpoints fail closed until configured).
         let bare = AuthService::new(MemoryStore::new(), AuthConfig::default());
         assert_eq!(bare.directory_pub(), None);
-        assert_eq!(bare.bootstrap_secret_hash(), None);
     }
 
     #[tokio::test]

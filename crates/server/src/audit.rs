@@ -61,6 +61,14 @@ pub trait AuditSink: Send + Sync {
     async fn publish_control_record(&self, _record_bytes: Vec<u8>) {}
     /// Anchor a file's `genesis` at its current sink position (R27/D28).
     async fn anchor_genesis(&self, _file_id: [u8; 16]) {}
+    /// Append a server-signed enrollment `DirBinding` (its canonical leaf bytes) to
+    /// the directory key-transparency log (T6, DESIGN §2/§7.4). Called on the atomic
+    /// enrollment success point, AFTER the binding is durably stored — the KT log
+    /// never carries a binding the directory does not serve. Best-effort and
+    /// infallible from the caller (an append failure never denies enrollment; the
+    /// binding is stored + served, and the fail-closed authority is the client-side
+    /// inclusion check, T10). Defaults to a no-op so existing sinks need not change.
+    async fn publish_dir_binding(&self, _binding_bytes: Vec<u8>) {}
 }
 
 /// In-memory sink for tests/e2e — records edges, control-head publishes, and
@@ -82,6 +90,8 @@ struct SinkState {
     control_pos: Vec<u64>,
     /// Global sink position of each anchored file genesis.
     genesis_pos: HashMap<[u8; 16], u64>,
+    /// The canonical `DirBinding` leaf bytes appended to the KT log, in append order.
+    dir_bindings: Vec<Vec<u8>>,
 }
 
 impl MemoryAuditSink {
@@ -111,6 +121,11 @@ impl MemoryAuditSink {
     pub fn genesis_pos(&self, file_id: &[u8; 16]) -> Option<u64> {
         self.inner.lock().unwrap().genesis_pos.get(file_id).copied()
     }
+
+    /// The `DirBinding` leaf bytes appended to the KT log, in append order.
+    pub fn dir_bindings(&self) -> Vec<Vec<u8>> {
+        self.inner.lock().unwrap().dir_bindings.clone()
+    }
 }
 
 #[async_trait]
@@ -137,6 +152,10 @@ impl AuditSink for MemoryAuditSink {
         let pos = st.next_pos;
         st.next_pos += 1;
         st.genesis_pos.insert(file_id, pos);
+    }
+
+    async fn publish_dir_binding(&self, binding_bytes: Vec<u8>) {
+        self.inner.lock().unwrap().dir_bindings.push(binding_bytes);
     }
 }
 
@@ -261,6 +280,17 @@ impl HttpSinkPublisher {
         let body = serde_json::json!({ "file_id_b64": file_id_b64 }).to_string();
         self.post_json("/v1/genesis-anchor", body).await
     }
+
+    /// `POST /v1/dir-log/bindings {binding_b64}` (admin bearer) — append one
+    /// server-signed enrollment `DirBinding` leaf to the directory KT log
+    /// (`sink-interface.md` §8). Best-effort, infallible from the caller (see
+    /// [`Self::post_json`]).
+    async fn post_dir_binding(&self, binding_bytes: &[u8]) -> Result<(), ()> {
+        use base64::Engine;
+        let binding_b64 = base64::engine::general_purpose::STANDARD.encode(binding_bytes);
+        let body = serde_json::json!({ "binding_b64": binding_b64 }).to_string();
+        self.post_json("/v1/dir-log/bindings", body).await
+    }
 }
 
 #[async_trait]
@@ -283,6 +313,16 @@ impl AuditSink for HttpSinkPublisher {
     /// anchor degrades safely. (P7.8 — was a no-op through Phase 6.)
     async fn anchor_genesis(&self, file_id: [u8; 16]) {
         let _ = self.post_genesis(&file_id).await;
+    }
+
+    /// Append a server-signed enrollment `DirBinding` leaf to the directory KT log
+    /// over the REAL sink (`POST /v1/dir-log/bindings`, `sink-interface.md` §8) — the
+    /// T6 enrollment→transparency wiring. Best-effort and infallible from the caller:
+    /// a failed append never denies enrollment (the binding is already durably stored
+    /// and served); the fail-closed authority is the client-side inclusion check
+    /// (T10), which catches a binding served-but-not-logged.
+    async fn publish_dir_binding(&self, binding_bytes: Vec<u8>) {
+        let _ = self.post_dir_binding(&binding_bytes).await;
     }
 }
 
@@ -309,5 +349,18 @@ mod tests {
         let c = s.control_pos(1).expect("control #1 position");
         assert!(g > c, "genesis anchored after the control append");
         assert!(s.genesis_pos(&[0x00; 16]).is_none(), "an un-anchored file has no position");
+    }
+
+    #[tokio::test]
+    async fn memory_sink_records_dir_bindings_in_append_order() {
+        let s = MemoryAuditSink::new();
+        assert!(s.dir_bindings().is_empty(), "no bindings before any enrollment");
+        s.publish_dir_binding(vec![0x11; 8]).await;
+        s.publish_dir_binding(vec![0x22; 8]).await;
+        assert_eq!(
+            s.dir_bindings(),
+            vec![vec![0x11; 8], vec![0x22; 8]],
+            "enrollment bindings are recorded verbatim, in append order"
+        );
     }
 }

@@ -100,13 +100,25 @@ CREATE TABLE sessions (                           -- channel-bound tokens (§9.2
 );
 CREATE INDEX sessions_user_idx ON sessions(user_id);
 
-CREATE TABLE enrollment_vouchers (                -- one-time in-person anti-spam gate for POST /v1/users (api.md §5.1)
-  voucher_hash  BYTEA PRIMARY KEY CHECK (octet_length(voucher_hash) = 32),
-  issued_by     BYTEA NOT NULL REFERENCES users(user_id),  -- admin who handed it out in person
+CREATE TABLE registration_keys (                 -- single-use registration keys for registration-key-only enrollment (T2/T4)
+  key_hash      BYTEA PRIMARY KEY CHECK (octet_length(key_hash) = 32),  -- sha256(key); plaintext is NEVER stored (D4)
+  -- No issued_by/used_by_user FK: operator-issued out of band, not by an in-app admin.
   issued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at    TIMESTAMPTZ NOT NULL,
-  used_at       TIMESTAMPTZ,
-  used_by_user  BYTEA REFERENCES users(user_id)
+  used_at       TIMESTAMPTZ                        -- single-use: PgStore MARKS this on first consume (row retained for audit); the in-memory dev store instead DELETES the row
+);
+
+CREATE TABLE first_admin_claim (                 -- one-time "first registrant = admin" slot (T4)
+  id            BOOLEAN PRIMARY KEY DEFAULT true CHECK (id = true),      -- singleton row: the admin slot is claimed at most once, ever
+  claimed_at    TIMESTAMPTZ NOT NULL DEFAULT now()                       -- set once; a second INSERT hits ON CONFLICT (id) DO NOTHING (closes the first-admin TOCTOU)
+);
+
+CREATE TABLE recovery_account (                  -- the ONE escrow identity's PUBLIC keys; registered ONCE (T3)
+  id            BOOLEAN PRIMARY KEY DEFAULT true CHECK (id = true),      -- singleton row: at most one recovery account
+  enc_pub       BYTEA NOT NULL CHECK (octet_length(enc_pub) = 32),       -- X25519; recovery challenges wrap to it / clients pin-compare it
+  sig_pub       BYTEA NOT NULL CHECK (octet_length(sig_pub) = 32),       -- Ed25519; recovery signing key. NO private key is ever stored (D4)
+  mlkem_pub     BYTEA CHECK (mlkem_pub IS NULL OR octet_length(mlkem_pub) = 1184),  -- optional ML-KEM-768 (MLKEM768_PUB_LEN=1184); NULL=classical-only. PQ-hybrid wrap target so recovery uploads stay Suite::V2 (mirrors directory_bindings.mlkem_pub)
+  registered_at TIMESTAMPTZ NOT NULL DEFAULT now()                       -- set once; a second INSERT hits ON CONFLICT (id) DO NOTHING
 );
 
 -- ============================================================================

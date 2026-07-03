@@ -18,7 +18,6 @@ mod kdf;
 pub mod merkle;
 mod pwkdf;
 mod rng;
-pub mod shamir;
 mod sign;
 mod wrap;
 
@@ -31,12 +30,11 @@ pub use hash::sha256;
 pub use hybrid::{
     deserialize_hybrid_wrap, generate_hybrid_keypair, generate_mlkem_keypair,
     mlkem_public_from_seed, serialize_hybrid_wrap, unwrap_dek_hybrid, wrap_dek_hybrid,
-    HybridEncPublicKey, HybridEncSecretKey, HybridWrappedDek,
+    x25519_public_from_secret, HybridEncPublicKey, HybridEncSecretKey, HybridWrappedDek,
 };
 pub use kdf::hkdf_sha256_32;
 pub use pwkdf::{derive_key, Argon2Params, ARGON2_DESKTOP_TARGET, ARGON2_FLOOR};
 pub use rng::{fill_random, random_array};
-pub use shamir::{combine, split, ShamirError, Share};
 pub use sign::{SigningKey, VerifyingKey};
 pub use wrap::{
     generate_enc_keypair, unwrap_dek, wrap_dek, EncPublicKey, EncSecretKey, WrappedDek,

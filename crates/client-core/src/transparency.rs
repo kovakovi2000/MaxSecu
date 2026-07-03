@@ -120,6 +120,24 @@ fn checkpoint_signing_bytes(tree_size: u64, root: &[u8; 32]) -> Vec<u8> {
 /// The consistency proof is an explicit input (`consistency`): the caller obtains
 /// it from the log (`prev.tree_size → checkpoint.tree_size`); it is empty when
 /// there is no prev or when `tree_size` is unchanged.
+/// Verify ONLY a checkpoint's signature under the pinned KT log keys — step (1) of
+/// [`verify_binding_in_log`], factored out as a standalone fast guard.
+///
+/// Returns `true` iff some key in `log_pubs` signs the checkpoint's domain-framed
+/// `tree_size ‖ root` ([`checkpoint_signing_bytes`]). An empty `log_pubs` (nothing
+/// pinned) ⇒ `false` (fail closed). A caller runs this BEFORE trusting any
+/// sink-controlled field of a served checkpoint (notably `tree_size`) to bound
+/// further work: a forged checkpoint is rejected without first doing inclusion /
+/// consistency fetches whose count an attacker's `tree_size` would otherwise
+/// dictate. The authoritative [`verify_binding_in_log`] still runs afterward.
+pub fn verify_checkpoint_sig(checkpoint: &KtCheckpoint, log_pubs: &[[u8; 32]]) -> bool {
+    any_key_verifies(
+        log_pubs,
+        &checkpoint_signing_bytes(checkpoint.tree_size, &checkpoint.root),
+        &checkpoint.sig,
+    )
+}
+
 pub fn verify_binding_in_log(
     binding_bytes: &[u8],
     inclusion: &InclusionProof,
@@ -129,11 +147,7 @@ pub fn verify_binding_in_log(
     store: &mut dyn KtCheckpointStore,
 ) -> Result<(), KtError> {
     // (1) A pinned log key must sign this checkpoint. Empty pin set ⇒ fail closed.
-    if !any_key_verifies(
-        log_pubs,
-        &checkpoint_signing_bytes(checkpoint.tree_size, &checkpoint.root),
-        &checkpoint.sig,
-    ) {
+    if !verify_checkpoint_sig(checkpoint, log_pubs) {
         return Err(KtError::BadCheckpoint);
     }
 
@@ -431,6 +445,34 @@ mod tests {
             ),
             Err(KtError::BadCheckpoint)
         );
+    }
+
+    #[test]
+    fn checkpoint_sig_guard_rejects_forged_head_even_with_huge_tree_size() {
+        // The standalone guard a caller runs BEFORE bounding any work by the
+        // sink-controlled `tree_size`. A checkpoint NOT signed by a pinned key is
+        // rejected regardless of how large `tree_size` claims to be — so a forged
+        // `tree_size = u64::MAX` cannot drive an unbounded index-discovery scan.
+        let log = SigningKey::generate();
+        let attacker = SigningKey::generate();
+        let pin = [log.verifying_key().to_bytes()];
+
+        let root = [0x11u8; 32];
+        let forged = KtCheckpoint {
+            tree_size: u64::MAX,
+            root,
+            sig: attacker.sign_raw(&checkpoint_signing_bytes(u64::MAX, &root)),
+        };
+        assert!(!verify_checkpoint_sig(&forged, &pin), "forged sig rejected");
+        assert!(!verify_checkpoint_sig(&forged, &[]), "empty pin set fails closed");
+
+        // A genuinely pinned-key checkpoint verifies (even at a huge tree_size).
+        let genuine = KtCheckpoint {
+            tree_size: u64::MAX,
+            root,
+            sig: log.sign_raw(&checkpoint_signing_bytes(u64::MAX, &root)),
+        };
+        assert!(verify_checkpoint_sig(&genuine, &pin));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Postgres-backed [`Store`] — the production persistence adapter over the
 //! Phase-1 tables in `docs/schema.sql` (`users`, `auth_nonces`, `sessions`,
-//! `enrollment_vouchers`). Every row is inert/ephemeral auth state; no secret,
+//! `registration_keys`). Every row is inert/ephemeral auth state; no secret,
 //! salt, KDF param, or private key ever lands here (DESIGN §4.3 / D4).
 //!
 //! **Clock model.** The auth state machine reasons in `u64` epoch-milliseconds
@@ -22,7 +22,7 @@
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
 use maxsecu_encoding::decode;
-use maxsecu_encoding::structs::DirBinding;
+use maxsecu_encoding::structs::{DirBinding, MLKEM768_PUB_LEN};
 use maxsecu_encoding::GENESIS_HEAD;
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::Row;
@@ -35,8 +35,9 @@ use crate::files::{
     VersionSelector, WrapInput,
 };
 use crate::store::{
-    ancestor_chain, ChunkSlot, FileListEntry, FileView, PendingUser, RecipientView, SessionRecord,
-    StoredBinding, StoredControlRecord, Store, StreamView, UserRecord, VersionMeta, WrapView,
+    ancestor_chain, ChunkSlot, EnrollOutcome, FileListEntry, FileView, RecipientView,
+    RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
+    UserRecord, VersionMeta, WrapView,
 };
 
 /// Postgres [`Store`]. Cheap to clone (the pool is an `Arc` internally).
@@ -120,21 +121,6 @@ impl Store for PgStore {
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(None),
             Err(e) => Err(store_err("create_user")(e)),
         }
-    }
-
-    async fn consume_voucher(&self, voucher_hash: &[u8; 32]) -> Result<bool, StoreError> {
-        // Atomic single-use: the `used_at IS NULL` predicate means exactly one of
-        // any racing consumers updates the row. `expires_at` is the operational
-        // voucher TTL (DB clock — no app `now` is passed here).
-        let res = sqlx::query(
-            "UPDATE enrollment_vouchers SET used_at = now() \
-             WHERE voucher_hash = $1 AND used_at IS NULL AND expires_at > now()",
-        )
-        .bind(&voucher_hash[..])
-        .execute(&self.pool)
-        .await
-        .map_err(store_err("consume_voucher"))?;
-        Ok(res.rows_affected() == 1)
     }
 
     async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, StoreError> {
@@ -334,61 +320,204 @@ impl Store for PgStore {
         binding_from_row(row, "binding_by_user_id")
     }
 
-    async fn has_any_binding(&self) -> Result<bool, StoreError> {
-        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM directory_bindings) AS present")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(store_err("has_any_binding"))?;
-        row.try_get::<bool, _>("present")
-            .map_err(store_err("has_any_binding"))
-    }
-
-    async fn list_pending_users(&self) -> Result<Vec<PendingUser>, StoreError> {
-        // `users` has no `created_at`; `enrolled_at` (NOT NULL DEFAULT now()) is the
-        // registration time the pending screen surfaces (schema.sql `users`).
-        let rows = sqlx::query(
-            "SELECT u.user_id, u.username, \
-                    (EXTRACT(EPOCH FROM u.enrolled_at) * 1000)::bigint AS created_ms \
-             FROM users u \
-             WHERE NOT EXISTS (SELECT 1 FROM directory_bindings b WHERE b.user_id = u.user_id) \
-             ORDER BY u.enrolled_at DESC, u.user_id",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(store_err("list_pending_users"))?;
-        rows.iter()
-            .map(|r| {
-                Ok(PendingUser {
-                    user_id: col_fixed(r, "list_pending_users", "user_id")?,
-                    username: r
-                        .try_get("username")
-                        .map_err(store_err("list_pending_users"))?,
-                    created_at_ms: r
-                        .try_get::<i64, _>("created_ms")
-                        .map_err(store_err("list_pending_users"))?
-                        as u64,
-                })
-            })
-            .collect()
-    }
-
-    async fn issue_voucher(
+    async fn issue_registration_key(
         &self,
-        voucher_hash: [u8; 32],
-        issued_by: [u8; 16],
+        key_hash: [u8; 32],
         expires_at_ms: u64,
     ) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO enrollment_vouchers (voucher_hash, issued_by, expires_at) VALUES ($1, $2, $3) \
-             ON CONFLICT (voucher_hash) DO NOTHING",
+            "INSERT INTO registration_keys (key_hash, expires_at) VALUES ($1, $2) \
+             ON CONFLICT (key_hash) DO NOTHING",
         )
-        .bind(&voucher_hash[..])
-        .bind(&issued_by[..])
-        .bind(try_ms_to_ts(expires_at_ms, "issue_voucher")?)
+        .bind(&key_hash[..])
+        .bind(try_ms_to_ts(expires_at_ms, "issue_registration_key")?)
         .execute(&self.pool)
         .await
-        .map_err(store_err("issue_voucher"))?;
+        .map_err(store_err("issue_registration_key"))?;
         Ok(())
+    }
+
+    async fn consume_registration_key(&self, key_hash: &[u8; 32]) -> Result<bool, StoreError> {
+        // Atomic single-use: the `used_at IS NULL` predicate means exactly one of
+        // any racing consumers updates the row. `expires_at` is the operational
+        // TTL (DB clock — no app `now` passed).
+        let res = sqlx::query(
+            "UPDATE registration_keys SET used_at = now() \
+             WHERE key_hash = $1 AND used_at IS NULL AND expires_at > now()",
+        )
+        .bind(&key_hash[..])
+        .execute(&self.pool)
+        .await
+        .map_err(store_err("consume_registration_key"))?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn claim_first_admin(&self) -> Result<bool, StoreError> {
+        // Atomic once-only claim, mirroring `set_recovery_account`: the singleton
+        // PK + `ON CONFLICT DO NOTHING` serializes concurrent claimers so exactly
+        // one INSERT affects a row (→ admin) — the first-admin decision cannot be
+        // split across a racing read + create.
+        let res = sqlx::query(
+            "INSERT INTO first_admin_claim (id) VALUES (true) ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(store_err("claim_first_admin"))?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn enroll(
+        &self,
+        reg_key_hash: [u8; 32],
+        user_id: [u8; 16],
+        username: &str,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+        user_binding: &StoredBinding,
+        admin_binding: &StoredBinding,
+    ) -> Result<EnrollOutcome, StoreError> {
+        // ONE transaction: every step runs on `&mut *tx`, so a fault (or an early
+        // KeyInvalid/UsernameTaken) rolls the whole unit back — no burned key, no
+        // orphan user, no dangling admin claim.
+        let mut tx = self.pool.begin().await.map_err(store_err("enroll"))?;
+
+        // 1. Consume the single-use key atomically (same predicate as
+        // `consume_registration_key`). Not consumed ⇒ nothing was written ⇒ roll
+        // back and report KeyInvalid.
+        let consumed = sqlx::query(
+            "UPDATE registration_keys SET used_at = now() \
+             WHERE key_hash = $1 AND used_at IS NULL AND expires_at > now()",
+        )
+        .bind(&reg_key_hash[..])
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err("enroll"))?;
+        if consumed.rows_affected() != 1 {
+            tx.rollback().await.map_err(store_err("enroll"))?;
+            return Ok(EnrollOutcome::KeyInvalid);
+        }
+
+        // 2. Create the user with the caller-provided (already-bound) user_id. A
+        // unique violation (username OR id taken) rolls back — the key is unspent.
+        let ins = sqlx::query(
+            "INSERT INTO users (user_id, username, enc_pub, sig_pub) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&user_id[..])
+        .bind(username)
+        .bind(&enc_pub[..])
+        .bind(&sig_pub[..])
+        .execute(&mut *tx)
+        .await;
+        match ins {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                tx.rollback().await.map_err(store_err("enroll"))?;
+                return Ok(EnrollOutcome::UsernameTaken);
+            }
+            Err(e) => return Err(store_err("enroll")(e)),
+        }
+
+        // 3. Resolve the one-time first-admin slot inside the txn.
+        let claim = sqlx::query(
+            "INSERT INTO first_admin_claim (id) VALUES (true) ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err("enroll"))?;
+        let is_admin = claim.rows_affected() == 1;
+
+        // 4. Store the matching already-signed binding (+ the advisory projection
+        // columns / users mirror, exactly as `put_binding` does), all on the txn.
+        let binding = if is_admin { admin_binding } else { user_binding };
+        let b: DirBinding = decode(&binding.binding_bytes)
+            .map_err(|_| StoreError::new("enroll", "binding bytes are not canonical"))?;
+        let roles: Vec<String> = b.roles.roles().iter().map(role_text).collect();
+        sqlx::query(
+            "INSERT INTO directory_bindings \
+             (user_id, key_version, enc_pub, sig_pub, roles, not_before, not_after, \
+              binding_bytes, directory_signature) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        )
+        .bind(&user_id[..])
+        .bind(1i64)
+        .bind(&b.enc_pub.0[..])
+        .bind(&b.sig_pub.0[..])
+        .bind(&roles)
+        .bind(try_ms_to_ts(b.not_before.0, "enroll")?)
+        .bind(try_ms_to_ts(b.not_after.0, "enroll")?)
+        .bind(&binding.binding_bytes)
+        .bind(&binding.signature[..])
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err("enroll"))?;
+        sqlx::query(
+            "UPDATE users SET signed_at = now(), enc_pub = $2, sig_pub = $3, \
+             key_version = $4, roles = $5 WHERE user_id = $1",
+        )
+        .bind(&user_id[..])
+        .bind(&b.enc_pub.0[..])
+        .bind(&b.sig_pub.0[..])
+        .bind(1i64)
+        .bind(&roles)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err("enroll"))?;
+
+        // 5. Commit — the enrollment becomes visible all at once.
+        tx.commit().await.map_err(store_err("enroll"))?;
+        Ok(EnrollOutcome::Enrolled { is_admin })
+    }
+
+    async fn set_recovery_account(
+        &self,
+        enc_pub: [u8; 32],
+        sig_pub: [u8; 32],
+        mlkem_pub: Option<[u8; MLKEM768_PUB_LEN]>,
+    ) -> Result<bool, StoreError> {
+        // Once-only via the singleton PK (`id = true`): a second INSERT hits
+        // `ON CONFLICT DO NOTHING`, so exactly one of any racing setters lands a
+        // row and the stored keys are never overwritten. Public keys only (D4);
+        // `mlkem_pub` NULL = classical-only recovery.
+        let res = sqlx::query(
+            "INSERT INTO recovery_account (id, enc_pub, sig_pub, mlkem_pub) VALUES (true, $1, $2, $3) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&enc_pub[..])
+        .bind(&sig_pub[..])
+        .bind(mlkem_pub.as_ref().map(|k| &k[..]))
+        .execute(&self.pool)
+        .await
+        .map_err(store_err("set_recovery_account"))?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn recovery_account(&self) -> Result<Option<RecoveryAccount>, StoreError> {
+        let Some(row) =
+            sqlx::query("SELECT enc_pub, sig_pub, mlkem_pub FROM recovery_account WHERE id = true")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(store_err("recovery_account"))?
+        else {
+            return Ok(None);
+        };
+        let enc_pub = col_fixed::<32>(&row, "recovery_account", "enc_pub")?;
+        let sig_pub = col_fixed::<32>(&row, "recovery_account", "sig_pub")?;
+        // `mlkem_pub` is nullable (classical-only recovery); when present the DB
+        // CHECK guarantees the width, but we re-validate on read-back (D4).
+        let mlkem_raw: Option<Vec<u8>> = row
+            .try_get("mlkem_pub")
+            .map_err(store_err("recovery_account"))?;
+        let mlkem_pub = match mlkem_raw {
+            None => None,
+            Some(v) => Some(v.try_into().map_err(|_| {
+                StoreError::new("recovery_account", "mlkem_pub has unexpected width")
+            })?),
+        };
+        Ok(Some(RecoveryAccount {
+            enc_pub,
+            sig_pub,
+            mlkem_pub,
+        }))
     }
 
     async fn append_control(

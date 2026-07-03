@@ -570,7 +570,6 @@ settings-screen main > form,
 settings-screen main > fieldset,
 upload-screen form,
 connect-screen form,
-bootstrap-screen form,
 admin-screen section[aria-labelledby] {
   max-width: 760px;
 }
@@ -1757,3 +1756,49 @@ share-dialog .sd-retry, share-dialog .sd-remove {
   padding: 0.32rem 0.6rem;
 }
 share-dialog .share-actions { display: flex; justify-content: end; margin-top: 0.6rem; }
+
+/* T13 shared fail-closed trust alarm (A/B/C). A blocking modal with no "continue"
+   affordance — the strongest, most alarming surface in the app (highest z-index so
+   it sits above every other overlay/toast). */
+trust-alarm[hidden] { display: none !important; }
+trust-alarm .trust-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(10, 2, 2, 0.72);
+  backdrop-filter: blur(5px);
+}
+trust-alarm .trust-panel {
+  width: min(520px, 100%);
+  max-height: min(640px, calc(100vh - 2rem));
+  overflow-y: auto;
+  padding: clamp(1.2rem, 3vw, 1.7rem);
+  border: 1px solid var(--mx-danger, #ff5a5a);
+  border-radius: var(--mx-radius-lg);
+  background: color-mix(in srgb, var(--mx-surface-1) 96%, transparent);
+  box-shadow: var(--mx-elev-2), 0 0 0 1px color-mix(in srgb, var(--mx-danger, #ff5a5a) 40%, transparent);
+}
+trust-alarm .trust-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+trust-alarm .trust-mark { font-size: 1.6rem; color: var(--mx-danger, #ff5a5a); }
+trust-alarm .trust-head h2 { margin: 0; font-size: var(--mx-fs-3); letter-spacing: -0.02em; }
+trust-alarm #ta-guidance { margin: 0.2rem 0 0.6rem; line-height: 1.5; }
+trust-alarm .trust-detail { min-height: 1.2em; margin: 0 0 0.6rem; color: var(--mx-muted); font-size: var(--mx-fs-1); }
+trust-alarm .trust-detail:empty { display: none; }
+trust-alarm .trust-actions { display: flex; justify-content: end; }
+trust-alarm .danger {
+  min-height: 2.4rem;
+  padding: 0.5rem 1rem;
+  font-weight: 800;
+  color: #fff;
+  background: var(--mx-danger, #d33);
+  border: 1px solid var(--mx-danger, #ff5a5a);
+  border-radius: var(--mx-radius-sm);
+}

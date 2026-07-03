@@ -21,8 +21,18 @@ workspace = "../client-app"
 # applies when client-app is the crate under test — for the client-e2e binaries
 # the flag must live on this dependency edge (a transitive default is not
 # disabled by a CLI `--no-default-features` on the e2e package).
-maxsecu-client-app = { path = "../client-app", default-features = false }
-maxsecu-client-core = { path = "../client-core", features = ["net"] }
+# `unpinned-dev` embeds the NON-SECURE, clearly-labelled compile-time TEST recovery
+# pin (a real, fixed-seed HYBRID keypair — see client-app `build.rs`/`recovery_pin.rs`)
+# so client-app builds WITHOUT a real `recovery_pin.bin`. Since T7 the client-app build
+# fails closed without a pin; the whole client-e2e suite links client-app, so every e2e
+# binary needs this. Test-only edge — the real pin comes from `maxsecu-setup`; this pin
+# MUST NEVER ship.
+maxsecu-client-app = { path = "../client-app", default-features = false, features = ["unpinned-dev"] }
+# `test-support` exposes `Identity::from_test_seeds`, which the full-flow capstone
+# (`full_flow_e2e.rs`) uses to reconstruct the recovery Identity from the fixed
+# `unpinned-dev` recovery-pin seeds (enc half == embedded pin) plus a chosen sig
+# seed, so the SAME cold key both registers the recovery account and logs in.
+maxsecu-client-core = { path = "../client-core", features = ["net", "test-support"] }
 maxsecu-crypto = { path = "../crypto" }
 maxsecu-encoding = { path = "../encoding" }
 maxsecu-media-launcher = { path = "../media-launcher" }
