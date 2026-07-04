@@ -68,6 +68,13 @@ pub struct StageInput {
     /// The version the client proposes (1 for create; N for rotation). Must equal
     /// the manifest's `version`; finalize enforces strict `+1` (§12).
     pub proposed_version: u64,
+    /// File-level feed visibility, set once at v1 creation (Task 1.3). `false`
+    /// marks a bundle member the server hides from the feed listing (Task 1.4).
+    /// Ignored on rotations (vN) — the file's value is fixed at genesis.
+    pub listed: bool,
+    /// The owning bundle's `file_id` for a bundle member, else `None`. Set once at
+    /// v1 creation; ignored on rotations.
+    pub bundle_id: Option<[u8; 16]>,
 }
 
 /// One `file_streams` row projected from the manifest (authoritative) plus the
@@ -110,6 +117,12 @@ pub struct ParsedStage {
     pub streams: Vec<StreamRow>,
     pub wraps: Vec<WrapInput>,
     pub recovery_present: bool,
+    /// File-level feed visibility, recorded once at v1 creation (Task 1.3).
+    /// `false` = a bundle member hidden from the feed listing (Task 1.4). The
+    /// store only applies this on the genesis (v1) path; rotations ignore it.
+    pub listed: bool,
+    /// The owning bundle's `file_id` for a bundle member, else `None` (Task 1.3).
+    pub bundle_id: Option<[u8; 16]>,
 }
 
 /// Why a stage/finalize was rejected. The pure [`parse_stage`] yields the
@@ -353,6 +366,8 @@ pub fn parse_stage(input: StageInput) -> Result<ParsedStage, StageError> {
         streams,
         wraps: input.wraps,
         recovery_present: manifest.recovery_present,
+        listed: input.listed,
+        bundle_id: input.bundle_id,
     })
 }
 
@@ -451,6 +466,8 @@ mod tests {
             wraps: vec![self_wrap(), recovery_wrap()],
             stream_totals: vec![(1, 4096), (2, 100)],
             proposed_version: 1,
+            listed: true,
+            bundle_id: None,
         }
     }
 

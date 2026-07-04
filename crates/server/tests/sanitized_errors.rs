@@ -48,7 +48,7 @@ use maxsecu_encoding::types::{
 use maxsecu_encoding::structs::MLKEM768_PUB_LEN;
 use maxsecu_server::{
     router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteWrapError,
-    DiscardError, EnrollOutcome, FileListEntry, FileView, FinalizeError, ListFilter,
+    DiscardError, EnrollOutcome, FileListEntry, FileMeta, FileView, FinalizeError, ListFilter,
     MemoryBlobStore, MemoryStore, NullAuditSink, ParsedStage, RecipientView,
     RecoveryAccount, SessionRecord, StageError, Store, StoreError, StoredBinding,
     StoredControlRecord, TlsExporter, UserRecord, VersionMeta, VersionSelector, WrapInput,
@@ -227,6 +227,9 @@ impl Store for FaultyStore {
     ) -> Result<Option<VersionMeta>, StoreError> {
         Err(bait("version_meta"))
     }
+    async fn get_file_meta(&self, _f: [u8; 16]) -> Result<Option<FileMeta>, StoreError> {
+        Err(bait("get_file_meta"))
+    }
     async fn add_wrap(
         &self,
         _f: [u8; 16],
@@ -401,6 +404,9 @@ impl Store for FileFaultyStore {
         _v: u64,
     ) -> Result<Option<VersionMeta>, StoreError> {
         Err(bait("version_meta"))
+    }
+    async fn get_file_meta(&self, _f: [u8; 16]) -> Result<Option<FileMeta>, StoreError> {
+        Err(bait("get_file_meta"))
     }
     async fn add_wrap(
         &self,

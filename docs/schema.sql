@@ -128,8 +128,10 @@ CREATE TABLE recovery_account (                  -- the ONE escrow identity's PU
 CREATE TABLE files (
   file_id        BYTEA PRIMARY KEY CHECK (octet_length(file_id) = 16),  -- CLIENT-generated random; PK enforces uniqueness (api.md §1.4)
   owner_id       BYTEA NOT NULL REFERENCES users(user_id),              -- advisory; authority is the signed genesis (§11.7)
-  file_type      SMALLINT NOT NULL CHECK (file_type IN (1,2,3)),        -- 1=video 2=image 3=blog (encoding-spec FileType); advisory mirror of signed manifest (D35)
+  file_type      SMALLINT NOT NULL CHECK (file_type IN (1,2,3,4,5)),    -- 1=video 2=image 3=blog 4=generic 5=bundle (encoding-spec FileType); advisory mirror of signed manifest (D35)
   current_version BIGINT NOT NULL DEFAULT 0 CHECK (current_version >= 0), -- 0 while only-staged; set to N on finalize
+  listed         BOOLEAN NOT NULL DEFAULT true,                         -- set once at v1 creation; false = a bundle member (hidden from the feed listing, Task 1.4)
+  bundle_id      BYTEA NULL CHECK (bundle_id IS NULL OR octet_length(bundle_id) = 16),  -- the owning bundle's file_id for a member, else NULL (Task 1.3)
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );

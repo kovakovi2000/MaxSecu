@@ -830,6 +830,8 @@ fn file_type_code(s: &str) -> Option<i16> {
         "video" => Some(1),
         "image" => Some(2),
         "blog" => Some(3),
+        "generic" => Some(4),
+        "bundle" => Some(5),
         _ => None,
     }
 }
@@ -838,6 +840,8 @@ fn file_type_name(c: i16) -> &'static str {
         1 => "video",
         2 => "image",
         3 => "blog",
+        4 => "generic",
+        5 => "bundle",
         _ => "unknown",
     }
 }
@@ -906,6 +910,13 @@ struct CreateFileReq {
     manifest_sig_b64: String,
     streams: Vec<StreamReq>,
     wraps: Vec<WrapReq>,
+    /// Feed visibility, set once at creation (Task 1.3); defaults `true`. `false`
+    /// marks a bundle member the server hides from the feed listing (Task 1.4).
+    #[serde(default)]
+    listed: Option<bool>,
+    /// The owning bundle's `file_id` (hex-16) for a bundle member, else absent.
+    #[serde(default)]
+    bundle_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -993,6 +1004,16 @@ async fn create_file<S: Store + 'static>(
     else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    // File-level visibility (Task 1.3): `listed` defaults true; a malformed hex
+    // `bundle_id` is a client error (→ 400). Both are set once here, at genesis.
+    let listed = req.listed.unwrap_or(true);
+    let bundle_id = match req.bundle_id.as_deref() {
+        None => None,
+        Some(h) => match hex_fixed::<16>(h) {
+            Some(id) => Some(id),
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+    };
     let input = StageInput {
         file_id,
         caller_id: session.user_id,
@@ -1006,6 +1027,8 @@ async fn create_file<S: Store + 'static>(
         wraps,
         stream_totals,
         proposed_version: 1, // POST /v1/files is the version-1 endpoint
+        listed,
+        bundle_id,
     };
     stage_and_respond(&st, input).await
 }
@@ -1049,6 +1072,10 @@ async fn stage_version<S: Store + 'static>(
         wraps,
         stream_totals,
         proposed_version,
+        // Rotations never change file-level visibility (set once at v1); the store
+        // ignores these on the vN path, but supply the genesis defaults anyway.
+        listed: true,
+        bundle_id: None,
     };
     stage_and_respond(&st, input).await
 }
@@ -2557,6 +2584,57 @@ mod tests {
         (router, admin_sk, bob_sk, audit)
     }
 
+    /// Like [`admin_app`] but also hands back the `Arc<AuthService<MemoryStore>>`
+    /// so a test can query the store directly (e.g. `get_file_meta`) after driving
+    /// the HTTP surface. Same D5-verified admin authority as [`admin_app_audited`].
+    async fn admin_app_with_auth() -> (Router, SigningKey, Arc<AuthService<MemoryStore>>) {
+        use maxsecu_admin_core::DirectorySigner;
+        use maxsecu_encoding::encode;
+        use maxsecu_encoding::structs::DirBinding;
+        use maxsecu_encoding::types::{Id, RoleSet};
+
+        let d5 = DirectorySigner::generate();
+        let store = MemoryStore::new();
+        let admin_sk = SigningKey::generate();
+        store.add_user(
+            "admin",
+            UserRecord {
+                user_id: [0xAD; 16],
+                enc_pub: [0xE1; 32],
+                sig_pub: admin_sk.verifying_key().to_bytes(),
+            },
+        );
+        let admin_binding = DirBinding {
+            username: Text::new("admin").unwrap(),
+            user_id: Id([0xAD; 16]),
+            enc_pub: Bytes32([0xE1; 32]),
+            sig_pub: Bytes32(admin_sk.verifying_key().to_bytes()),
+            key_version: 1,
+            roles: RoleSet::new([Role::User, Role::Admin]),
+            not_before: Timestamp(0),
+            not_after: Timestamp(4_102_444_800_000),
+            mlkem_pub: None,
+        };
+        let signed = d5.sign_binding(&admin_binding, None);
+        store
+            .put_binding([0xAD; 16], 1, encode(&signed.binding), signed.signature)
+            .await
+            .unwrap();
+        let auth = Arc::new(AuthService::new(
+            store,
+            AuthConfig::default().with_directory_pub(d5.public_key()),
+        ));
+        let router = router(AppState {
+            auth: auth.clone(),
+            blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::MemoryAuditSink::new()),
+            direct_links_enabled: false,
+            max_file_bytes: None,
+        })
+        .layer(Extension(TlsExporter(EXPORTER)));
+        (router, admin_sk, auth)
+    }
+
     /// An admin-configured enrollment app: the server's directory-signing key
     /// both (a) signs a `{User, Admin}` binding for the `admin` caller (so the
     /// D5-verified [`AdminSession`] gate accepts it) and (b) backs server-side
@@ -3068,6 +3146,42 @@ mod tests {
                          {"stream_type":"metadata","chunk_count":1,"chunk_size":1048576,"total_bytes":256} ],
             "wraps": file_wraps_json(owner),
         })
+    }
+
+    #[tokio::test]
+    async fn create_file_records_listed_and_bundle_id_over_http() {
+        let (router, admin_sk, auth) = admin_app_with_auth().await;
+        let owner = [0xADu8; 16]; // admin's user_id
+        let token = login(&router, "admin", &admin_sk).await;
+
+        // POST a v1 file with listed=false + a bundle_id → the fields round-trip.
+        let file = [0xF7u8; 16];
+        let bundle = [0x9Au8; 16];
+        let mut body = create_file_body(file, owner);
+        body["listed"] = serde_json::json!(false);
+        body["bundle_id"] = serde_json::json!(hex_encode(&bundle));
+        let (st, res) = post_json_auth(&router, "/v1/files", body, &token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(res["version"].as_u64().unwrap(), 1);
+        let meta = auth.store().get_file_meta(file).await.unwrap().unwrap();
+        assert!(!meta.listed);
+        assert_eq!(meta.bundle_id, Some(bundle));
+
+        // Omitting both defaults to listed=true, bundle_id=None.
+        let file2 = [0xF8u8; 16];
+        let (st, _) =
+            post_json_auth(&router, "/v1/files", create_file_body(file2, owner), &token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let meta2 = auth.store().get_file_meta(file2).await.unwrap().unwrap();
+        assert!(meta2.listed);
+        assert_eq!(meta2.bundle_id, None);
+
+        // A malformed hex bundle_id is a client error (→ 400).
+        let file3 = [0xF9u8; 16];
+        let mut bad = create_file_body(file3, owner);
+        bad["bundle_id"] = serde_json::json!("nothex");
+        let (st, _) = post_json_auth(&router, "/v1/files", bad, &token).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

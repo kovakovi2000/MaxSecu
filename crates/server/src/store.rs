@@ -175,6 +175,17 @@ pub struct VersionMeta {
     pub streams: Vec<ChunkSlot>,
 }
 
+/// File-level metadata independent of any version (schema `files`): the coarse
+/// `owner_id`, the advisory `file_type`, and the set-once-at-genesis feed
+/// visibility (`listed`) + owning-bundle pointer (`bundle_id`) — Task 1.3.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileMeta {
+    pub owner_id: [u8; 16],
+    pub file_type: i16,
+    pub listed: bool,
+    pub bundle_id: Option<[u8; 16]>,
+}
+
 /// Async because the production backing is sqlx/Postgres. `Send + Sync` so the
 /// service can be shared across axum request tasks.
 ///
@@ -405,6 +416,14 @@ pub trait Store: Send + Sync {
         version: u64,
     ) -> Result<Option<VersionMeta>, StoreError>;
 
+    /// File-level metadata (owner, type, and the set-once feed-visibility fields
+    /// `listed`/`bundle_id`) regardless of any version's finalize state — Task 1.3.
+    /// `Ok(None)` if no such file exists.
+    async fn get_file_meta(
+        &self,
+        file_id: [u8; 16],
+    ) -> Result<Option<FileMeta>, StoreError>;
+
     /// Add a read re-share wrap to the file's current finalized version
     /// (`POST /v1/files/{id}/wraps`, api.md §10.1). Coarse-gated: the posted
     /// `granted_by` must be `caller_id`, the recipient must be a user (not
@@ -509,6 +528,10 @@ struct Inner {
 struct FileEntry {
     owner_id: [u8; 16],
     file_type: i16,
+    // Set once at v1 creation (Task 1.3); unchanged across rotations. `listed`
+    // false = a bundle member hidden from the feed listing (Task 1.4).
+    listed: bool,
+    bundle_id: Option<[u8; 16]>,
     current_version: u64, // 0 while only-staged (schema files.current_version)
     updated_at_ms: u64,
     // Immutable genesis (set on the v1 stage); retained across rotations (§11.7).
@@ -853,6 +876,8 @@ impl Store for MemoryStore {
                 let entry = inner.files.entry(parsed.file_id).or_insert_with(|| FileEntry {
                     owner_id: g.owner_id,
                     file_type: parsed.file_type,
+                    listed: parsed.listed,
+                    bundle_id: parsed.bundle_id,
                     current_version: 0,
                     updated_at_ms: now_ms,
                     genesis_bytes: g.genesis_bytes,
@@ -1046,6 +1071,22 @@ impl Store for MemoryStore {
             owner_id: entry.owner_id,
             finalized: ver.finalized,
             streams,
+        }))
+    }
+
+    async fn get_file_meta(
+        &self,
+        file_id: [u8; 16],
+    ) -> Result<Option<FileMeta>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.files.get(&file_id) else {
+            return Ok(None);
+        };
+        Ok(Some(FileMeta {
+            owner_id: entry.owner_id,
+            file_type: entry.file_type,
+            listed: entry.listed,
+            bundle_id: entry.bundle_id,
         }))
     }
 
@@ -1363,6 +1404,12 @@ impl Store for FaultyStore {
     ) -> Result<Option<VersionMeta>, StoreError> {
         Err(Self::fault("version_meta"))
     }
+    async fn get_file_meta(
+        &self,
+        _file_id: [u8; 16],
+    ) -> Result<Option<FileMeta>, StoreError> {
+        Err(Self::fault("get_file_meta"))
+    }
 
     async fn add_wrap(
         &self,
@@ -1397,5 +1444,69 @@ impl Store for FaultyStore {
         _caller_id: [u8; 16],
     ) -> Result<Vec<String>, DiscardError> {
         Err(DiscardError::Store(Self::fault("discard_unfinalized")))
+    }
+}
+
+#[cfg(test)]
+mod memory_store_tests {
+    use super::*;
+    use crate::files::{GenesisRow, ParsedStage};
+
+    /// Build a version-1 [`ParsedStage`] the way `parse_stage` would, carrying the
+    /// file-level `listed`/`bundle_id` set once at genesis (Task 1.3).
+    fn v1_parsed(
+        file: [u8; 16],
+        owner: [u8; 16],
+        listed: bool,
+        bundle_id: Option<[u8; 16]>,
+    ) -> ParsedStage {
+        ParsedStage {
+            file_id: file,
+            file_type: 3, // blog
+            version: 1,
+            author_id: owner,
+            alg: 1,
+            manifest_bytes: vec![0x01, 0x02, 0x03],
+            manifest_sig: [0u8; 64],
+            genesis: Some(GenesisRow {
+                owner_id: owner,
+                owner_key_version: 1,
+                genesis_bytes: vec![0x0A, 0x0B],
+                genesis_sig: [0u8; 64],
+            }),
+            streams: vec![],
+            wraps: vec![],
+            recovery_present: true,
+            listed,
+            bundle_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_records_listed_and_bundle_id() {
+        let store = MemoryStore::new();
+
+        // A bundle member: listed=false, bundle_id=Some(..) → round-trips.
+        store
+            .stage_version(v1_parsed([1u8; 16], [7u8; 16], false, Some([9u8; 16])), 1_000)
+            .await
+            .unwrap();
+        let rec = store.get_file_meta([1u8; 16]).await.unwrap().unwrap();
+        assert!(!rec.listed);
+        assert_eq!(rec.bundle_id, Some([9u8; 16]));
+        assert_eq!(rec.file_type, 3);
+        assert_eq!(rec.owner_id, [7u8; 16]);
+
+        // Fields defaulted → listed=true, bundle_id=None.
+        store
+            .stage_version(v1_parsed([2u8; 16], [7u8; 16], true, None), 1_000)
+            .await
+            .unwrap();
+        let rec2 = store.get_file_meta([2u8; 16]).await.unwrap().unwrap();
+        assert!(rec2.listed);
+        assert_eq!(rec2.bundle_id, None);
+
+        // Unknown file → Ok(None).
+        assert!(store.get_file_meta([0xEEu8; 16]).await.unwrap().is_none());
     }
 }

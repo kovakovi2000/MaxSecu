@@ -81,6 +81,8 @@ async fn finalized_v1(store: &MemoryStore, wraps: Vec<WrapInput>) {
         wraps,
         stream_totals: vec![(1, 1_000)],
         proposed_version: 1,
+        listed: true,
+        bundle_id: None,
     };
     let parsed = parse_stage(input).unwrap();
     store.stage_version(parsed, 1000).await.unwrap();

@@ -35,7 +35,7 @@ use crate::files::{
     VersionSelector, WrapInput,
 };
 use crate::store::{
-    ancestor_chain, ChunkSlot, EnrollOutcome, FileListEntry, FileView, RecipientView,
+    ancestor_chain, ChunkSlot, EnrollOutcome, FileListEntry, FileMeta, FileView, RecipientView,
     RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
     UserRecord, VersionMeta, WrapView,
 };
@@ -637,12 +637,14 @@ impl Store for PgStore {
                     }
                 }
                 sqlx::query(
-                    "INSERT INTO files (file_id, owner_id, file_type, current_version) \
-                     VALUES ($1,$2,$3,0) ON CONFLICT (file_id) DO NOTHING",
+                    "INSERT INTO files (file_id, owner_id, file_type, current_version, listed, bundle_id) \
+                     VALUES ($1,$2,$3,0,$4,$5) ON CONFLICT (file_id) DO NOTHING",
                 )
                 .bind(&parsed.file_id[..])
                 .bind(&g.owner_id[..])
                 .bind(parsed.file_type)
+                .bind(parsed.listed)
+                .bind(parsed.bundle_id.as_ref().map(|b| &b[..]))
                 .execute(&mut *tx)
                 .await
                 .map_err(serr)?;
@@ -1020,6 +1022,33 @@ impl Store for PgStore {
             owner_id: col_fixed(&frow, op, "owner_id")?,
             finalized: frow.get("finalized"),
             streams,
+        }))
+    }
+
+    async fn get_file_meta(
+        &self,
+        file_id: [u8; 16],
+    ) -> Result<Option<FileMeta>, StoreError> {
+        let op = "get_file_meta";
+        let row = sqlx::query("SELECT owner_id, file_type, listed, bundle_id FROM files WHERE file_id = $1")
+            .bind(&file_id[..])
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_err(op))?;
+        let Some(row) = row else { return Ok(None) };
+        // `bundle_id` is a nullable 16-byte BYTEA; widen-check like `col_fixed`.
+        let raw: Option<Vec<u8>> = row.try_get("bundle_id").map_err(store_err(op))?;
+        let bundle_id = match raw {
+            Some(v) => Some(v.try_into().map_err(|_| {
+                StoreError::new(op, "column `bundle_id` has unexpected width".to_string())
+            })?),
+            None => None,
+        };
+        Ok(Some(FileMeta {
+            owner_id: col_fixed(&row, op, "owner_id")?,
+            file_type: row.get("file_type"),
+            listed: row.get("listed"),
+            bundle_id,
         }))
     }
 

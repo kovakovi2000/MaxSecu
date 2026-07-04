@@ -730,6 +730,8 @@ fn pg_stage(
         ],
         stream_totals: vec![(1, 2_000_000), (2, 256)],
         proposed_version: version,
+        listed: true,
+        bundle_id: None,
     }
 }
 
