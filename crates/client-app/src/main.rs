@@ -57,6 +57,7 @@ fn main() {
             maxsecu_client_app::commands::search::search_local,
             maxsecu_client_app::commands::dialog::pick_file,
             maxsecu_client_app::commands::dialog::save_file,
+            maxsecu_client_app::commands::dialog::pick_folder,
             maxsecu_client_app::commands::download_cmd::download_content,
             maxsecu_client_app::commands::register::register_with_key,
             maxsecu_client_app::commands::startup::startup_mode,

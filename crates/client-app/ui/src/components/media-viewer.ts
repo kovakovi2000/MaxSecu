@@ -9,6 +9,7 @@ import type { VideoPlayer } from "./video-player.ts";
 import "./share-dialog.ts";
 import type { ShareDialog } from "./share-dialog.ts";
 import { toast } from "../core/toast.ts";
+import { downloadPost } from "../core/download.ts";
 
 // Viewer (spec §5): renders one decrypted post. Image → data: URL <img>; blog →
 // textContent (NEVER innerHTML). Subscribes to EVT_FETCH for live status. The
@@ -18,6 +19,8 @@ import { toast } from "../core/toast.ts";
 export class MediaViewer extends HTMLElement {
   private cleanup: (() => void) | null = null;
   private reqId = "";
+  // The opened content (for the Download button), set on a successful open.
+  private opened: OpenedContent | null = null;
 
   connectedCallback() {
     // Two mount modes, sharing ALL content rendering (image/blog/video/meta):
@@ -141,6 +144,23 @@ export class MediaViewer extends HTMLElement {
   private render(c: OpenedContent) {
     (this.querySelector("#vw-h") as HTMLElement).textContent = c.title || "(untitled)";
     (this.querySelector("#vw-share-btn") as HTMLButtonElement).hidden = !c.can_share;
+    this.opened = c;
+
+    // A Download button on ANY successful open (routed and embedded — the head
+    // markup is shared). Verify+decrypt+write happens in the TCB (download_content);
+    // built via createElement so no dynamic data is templated into innerHTML.
+    if (!this.querySelector("#vw-dl-btn")) {
+      const dlBtn = document.createElement("button");
+      dlBtn.id = "vw-dl-btn";
+      dlBtn.type = "button";
+      dlBtn.className = "secondary";
+      dlBtn.textContent = "Download";
+      dlBtn.addEventListener("click", () => {
+        if (this.opened) void downloadPost(this.reqId, this.opened.file_type, this.opened.title);
+      });
+      (this.querySelector("#vw-share-btn") as HTMLElement).insertAdjacentElement("afterend", dlBtn);
+    }
+
     const body = this.querySelector("#vw-body") as HTMLElement;
     body.replaceChildren();
 

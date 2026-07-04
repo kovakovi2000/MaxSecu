@@ -1,6 +1,7 @@
 import { call } from "../core/rpc.ts";
-import { serialPriority } from "../core/serial.ts";
+import { serial, serialPriority } from "../core/serial.ts";
 import { toast } from "../core/toast.ts";
+import { downloadName, dedupeName } from "../core/download-name.ts";
 import {
   readBundleViewMode,
   writeBundleViewMode,
@@ -45,6 +46,7 @@ export class BundleScreen extends HTMLElement {
             <button id="bd-gallery" type="button" class="bundle-mode">Gallery</button>
             <button id="bd-stacked" type="button" class="bundle-mode">Stacked</button>
           </div>
+          <button id="bd-download-all" type="button" class="secondary" disabled>Download all</button>
         </div>
         <div id="bd-members"></div>
       </main>`;
@@ -56,6 +58,9 @@ export class BundleScreen extends HTMLElement {
     );
     (this.querySelector("#bd-stacked") as HTMLButtonElement).addEventListener("click", () =>
       this.setMode("stacked"),
+    );
+    (this.querySelector("#bd-download-all") as HTMLButtonElement).addEventListener("click", () =>
+      void this.downloadAll(),
     );
 
     // Skeleton while the bundle resolves.
@@ -79,6 +84,8 @@ export class BundleScreen extends HTMLElement {
       const n = view.members.length;
       (this.querySelector("#bd-status") as HTMLElement).textContent =
         n === 0 ? "This bundle is empty." : `${n} item${n === 1 ? "" : "s"}.`;
+      // Download-all only makes sense once there is at least one member.
+      (this.querySelector("#bd-download-all") as HTMLButtonElement).disabled = n === 0;
       this.render();
     } catch (x) {
       this.fail(bundleErr(x));
@@ -109,6 +116,48 @@ export class BundleScreen extends HTMLElement {
     stacked.setAttribute("aria-pressed", String(this.mode === "stacked"));
     gallery.classList.toggle("active", this.mode === "gallery");
     stacked.classList.toggle("active", this.mode === "stacked");
+  }
+
+  // Download-all (design §7): pick ONE destination folder, then verify+decrypt+write
+  // every member into it, sequentially — each download_content re-auths and cannot run
+  // concurrently, so each is routed through the serial queue. Member titles are empty
+  // from open_bundle, so a name is derived per member (`member-<n>.<ext>` by kind) and
+  // de-duped so two same-kind members never collide. A member failure is tolerated:
+  // the loop continues and the final toast reports how many of M succeeded.
+  private async downloadAll() {
+    if (!this.view || this.view.members.length === 0) return;
+    const members = this.view.members;
+
+    let folder: string | null;
+    try {
+      folder = await call<string | null>("pick_folder");
+    } catch (x) {
+      toast("error", bundleErr(x));
+      return;
+    }
+    if (folder === null) return; // user cancelled the folder dialog
+
+    const btn = this.querySelector("#bd-download-all") as HTMLButtonElement;
+    btn.disabled = true;
+    const sep = folder.includes("\\") ? "\\" : "/";
+    const used = new Set<string>();
+    const total = members.length;
+    let ok = 0;
+    for (let i = 0; i < total; i++) {
+      const m = members[i];
+      const name = dedupeName(downloadName(m.file_type, `member-${i + 1}`), used);
+      const savePath = `${folder}${sep}${name}`;
+      try {
+        await serial(() =>
+          call<string>("download_content", { req: { file_id: m.file_id, save_path: savePath } }),
+        );
+        ok++;
+      } catch {
+        // Tolerate a single member failure; keep going and report the final tally.
+      }
+    }
+    btn.disabled = false;
+    toast(ok === total ? "success" : "info", `Downloaded ${ok} of ${total}.`);
   }
 
   private render() {

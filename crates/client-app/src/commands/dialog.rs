@@ -31,6 +31,23 @@ pub async fn pick_file(extensions: Vec<String>) -> Result<Option<String>, UiErro
     Ok(picked.map(|p| p.to_string_lossy().into_owned()))
 }
 
+/// `pick_folder` — open the native "select folder" dialog and return the chosen
+/// directory path, or `None` if the user cancelled. The bundle screen's
+/// "Download all" (Task 5.2) calls this to pick ONE destination directory into
+/// which each member is then written (via `download_content`).
+///
+/// Like [`pick_file`]/[`save_file`], this is UNAUTHENTICATED, touches no server
+/// channel / keystore / identity, and returns only a filesystem PATH string. The
+/// blocking native dialog runs on a `spawn_blocking` thread.
+#[tauri::command]
+pub async fn pick_folder() -> Result<Option<String>, UiError> {
+    let picked = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().pick_folder())
+        .await
+        .map_err(|_| UiError::new("dialog_failed", "Could not open the folder dialog."))?;
+
+    Ok(picked.map(|p| p.to_string_lossy().into_owned()))
+}
+
 /// `save_file` — open the native "save file" dialog pre-filled with
 /// `default_name` and return the chosen destination path, or `None` if the user
 /// cancelled. The download screen (Task 5.2) calls this with

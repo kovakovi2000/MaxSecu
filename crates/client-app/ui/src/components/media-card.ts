@@ -2,6 +2,7 @@ import { call } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import { decideCardOutcome } from "../core/card-retry.ts";
 import { cardHref, countsLabel } from "../core/card-view.ts";
+import { downloadPost } from "../core/download.ts";
 import type { Card } from "../core/types.ts";
 import "./state-badge.ts";
 
@@ -121,14 +122,19 @@ export class MediaCard extends HTMLElement {
         footer.appendChild(tags);
       }
       if (isGeneric) {
-        // A downloadable file surfaces a Download affordance. WS5 wires the
-        // actual download_content handler; for now this is a disabled placeholder
-        // so the generic card visibly differs from a viewable media card.
+        // A downloadable file surfaces a Download affordance: verify+decrypt+write
+        // the plaintext via the shared per-post flow (save dialog → download_content).
+        // The button sits ABOVE the whole-card overlay link (z-index in styles.css)
+        // and stops the click from also navigating the card link.
         const dl = document.createElement("button");
         dl.type = "button";
         dl.className = "card-download";
-        dl.disabled = true;
         dl.textContent = "Download";
+        dl.addEventListener("click", (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          void downloadPost(id, card.file_type, card.title);
+        });
         footer.appendChild(dl);
       } else {
         const cue = document.createElement("span");

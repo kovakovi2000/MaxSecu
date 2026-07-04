@@ -1045,7 +1045,9 @@ media-card article.media-card-shell:focus-within {
 }
 .card-download {
   position: relative;
-  z-index: 2;
+  /* Above the whole-card overlay link (.media-card-link is z-index:4) so the
+     button — not the overlay — receives the click. */
+  z-index: 5;
   margin-left: auto;
 }
 .card-download:disabled { opacity: 0.55; cursor: not-allowed; }
