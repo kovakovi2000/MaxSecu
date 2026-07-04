@@ -1750,7 +1750,7 @@ share-dialog .sd-row {
 share-dialog .sd-username { font-weight: 800; }
 share-dialog .sd-fingerprint { font-size: 0.78rem; color: var(--mx-muted); }
 share-dialog .sd-note { font-size: var(--mx-fs-1); color: var(--mx-info); }
-share-dialog .sd-retry, share-dialog .sd-remove {
+share-dialog .sd-retry {
   margin-left: auto;
   min-height: 2rem;
   padding: 0.32rem 0.6rem;
@@ -1779,6 +1779,11 @@ share-dialog .share-actions { display: flex; justify-content: end; margin-top: 0
   align-items: center;
   gap: 0.5rem;
   padding: 0.4rem 0.6rem;
+  /* Reset the base .sd-row card look (all-sides border/radius/background) so
+     roster rows read as block rows separated by a single divider, not cards. */
+  border: none;
+  border-radius: 0;
+  background: none;
   border-bottom: 1px solid var(--mx-border);
 }
 .sd-roster .sd-row:last-child {
