@@ -1548,6 +1548,47 @@ pub async fn cancel_upload(
     Ok(())
 }
 
+/// `cancel_bundle` — drop a staged (pre-confirm) [`BundleJob`] and wipe each
+/// member's on-disk staging dir.
+///
+/// **No server state to delete.** Unlike a single upload, `stage_bundle` performs
+/// NO network write — members are POSTed only during `confirm_bundle`. So cancelling
+/// a STAGED (never-confirmed) bundle is pure local cleanup: remove the `BundleJob`
+/// from the registry and `remove_dir_all` each member's `Some(job_dir)`. There is
+/// nothing on the server to DELETE (contrast `cancel_upload`, which best-effort
+/// DELETEs a streaming job's orphaned unfinalized version).
+///
+/// **Partial-confirm caveat.** If `confirm_bundle` failed part-way, the members it
+/// already uploaded are `listed=false` (invisible in the feed) and the whole
+/// `BundleJob` is RETAINED for retry; cancelling it here wipes local staging but does
+/// NOT delete those already-uploaded members from the server. `BundleJob` does not
+/// track which members finalized, so per-member server cleanup on cancel is out of
+/// scope (deferred per the plan) — such members are reclaimable later via owner delete
+/// and stay invisible until then.
+///
+/// Idempotent: cancelling an id that is already gone returns `Ok(())`. Dir removal is
+/// best-effort — a missing/locked dir never errors the command.
+#[tauri::command]
+pub async fn cancel_bundle(
+    req: CancelUploadRequest,
+    jobs: State<'_, BundleJobs>,
+) -> Result<(), UiError> {
+    cancel_bundle_inner(&jobs, &req.job_id).await
+}
+
+/// Testable core of [`cancel_bundle`]: remove the `BundleJob` (if any) and
+/// best-effort wipe each member's staging dir. Always `Ok` (idempotent).
+async fn cancel_bundle_inner(jobs: &BundleJobs, job_id: &str) -> Result<(), UiError> {
+    if let Some(job) = jobs.0.lock().await.remove(job_id) {
+        for m in &job.members {
+            if let Some(d) = &m.job_dir {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `cancel_video_prepare` — request cancellation of the in-flight video
 /// `stage_upload` transcode. Best-effort: sets the stored cancel token's flag.
 #[tauri::command]
@@ -2058,5 +2099,100 @@ mod tests {
             ct2, chunks_pass1[0],
             "pass-2 seal_chunk must produce byte-identical ciphertext to pass-1"
         );
+    }
+
+    // ── cancel_bundle_inner unit tests (Task 2.5) ────────────────────────────
+
+    /// Build a minimal in-RAM `StagedUpload` (image/blog-shaped) whose `job_dir`
+    /// points at `dir`, so the cancel path has a staging dir to wipe.
+    fn staged_member_with_dir(dir: std::path::PathBuf) -> StagedUpload {
+        use maxsecu_client_core::{build_upload, Identity, PlaintextStreams, UploadParams};
+        use maxsecu_crypto::generate_enc_keypair;
+        use maxsecu_encoding::types::{FileType, Id, Timestamp};
+        let owner = Identity::generate();
+        let (_rsk, rpk) = generate_enc_keypair();
+        let params = UploadParams {
+            owner: &owner,
+            owner_id: Id([0x11; 16]),
+            owner_key_version: 1,
+            file_id: Id([0xF1; 16]),
+            file_type: FileType::Blog,
+            chunk_size: 4096,
+            recovery_pub: rpk,
+            recovery_mlkem_pub: None,
+            created_at: Timestamp(1_719_500_000_000),
+        };
+        let streams = PlaintextStreams {
+            content: b"hi".to_vec(),
+            metadata: None,
+            thumbnail: None,
+            preview: None,
+        };
+        let bundle = build_upload(&params, &streams).unwrap();
+        StagedUpload {
+            content: StagedContent::InRam(bundle),
+            file_type: "blog".into(),
+            title: "T".into(),
+            total_chunks: 1,
+            byte_size: 2,
+            preview: None,
+            job_dir: Some(dir),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_bundle_drops_job_and_wipes_member_dirs() {
+        // Two members, each with a real on-disk staging dir holding a file.
+        let base = std::env::temp_dir().join(format!(
+            "maxsecu_cancel_bundle_{}",
+            rand_job_id()
+        ));
+        let dir_a = base.join("a");
+        let dir_b = base.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_a.join("record.json"), b"x").unwrap();
+        std::fs::write(dir_b.join("out.mp4"), b"y").unwrap();
+
+        let jobs = BundleJobs::new();
+        let job = BundleJob {
+            bundle_id: [0xB1; 16],
+            title: "Trip".into(),
+            tags: vec!["a".into()],
+            members: vec![
+                staged_member_with_dir(dir_a.clone()),
+                staged_member_with_dir(dir_b.clone()),
+            ],
+            member_meta: vec![
+                MemberMeta {
+                    file_id: [0x01; 16],
+                    file_type: maxsecu_encoding::types::FileType::Blog,
+                },
+                MemberMeta {
+                    file_id: [0x02; 16],
+                    file_type: maxsecu_encoding::types::FileType::Blog,
+                },
+            ],
+        };
+        jobs.0.lock().await.insert("b-1".into(), job);
+
+        // (a) cancel drops the job.
+        cancel_bundle_inner(&jobs, "b-1").await.unwrap();
+        assert!(jobs.0.lock().await.get("b-1").is_none(), "job removed");
+
+        // (b) each member's staging dir was wiped.
+        assert!(!dir_a.exists(), "member A staging dir removed");
+        assert!(!dir_b.exists(), "member B staging dir removed");
+
+        // (c) a second cancel of the same id is a no-op Ok (idempotent).
+        cancel_bundle_inner(&jobs, "b-1").await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn cancel_bundle_unknown_id_is_ok_noop() {
+        let jobs = BundleJobs::new();
+        cancel_bundle_inner(&jobs, "never-staged").await.unwrap();
     }
 }
