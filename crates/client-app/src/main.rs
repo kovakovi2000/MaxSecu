@@ -1,4 +1,6 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Hide the Windows console window for ALL profiles (a debug build would otherwise
+// pop a cmd window behind the GUI). Was gated on `not(debug_assertions)`.
+#![windows_subsystem = "windows"]
 
 use maxsecu_client_app::commands::auth::{AppDir, ConnectLock, Session};
 use maxsecu_client_app::config::SettingsConfig;
@@ -19,7 +21,7 @@ fn main() {
     let _ = maxsecu_client_app::layout::ensure_portable_layout(&app_dir);
 
     // Initial cache cap from persisted settings, clamped to the live RAM bounds.
-    // `load` normalizes a present file, but the missing-file default (256 MiB)
+    // `load` normalizes a present file, but the missing-file default (1 GiB)
     // is not; `normalized()` here also bounds that first-run default to the
     // (total − 6 GB) ceiling so a small-RAM machine can't start over-cap. MiB → bytes.
     let cap_bytes = SettingsConfig::load(&app_dir)

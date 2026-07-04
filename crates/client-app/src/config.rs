@@ -248,7 +248,7 @@ pub struct PerformanceSettings {
 impl Default for PerformanceSettings {
     fn default() -> Self {
         Self {
-            ram_cache_cap_mb: 256,
+            ram_cache_cap_mb: 1024,
         }
     }
 }
@@ -416,7 +416,7 @@ mod tests {
         let d = SettingsConfig::load(&dir);
         assert!(!d.a11y.reduced_motion && !d.a11y.high_contrast);
         assert_eq!(d.a11y.text_size, "normal");
-        assert_eq!(d.performance.ram_cache_cap_mb, 256);
+        assert_eq!(d.performance.ram_cache_cap_mb, 1024);
         // Round-trip.
         let mut s = SettingsConfig::default();
         s.a11y.reduced_motion = true;

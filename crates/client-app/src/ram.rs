@@ -1,6 +1,7 @@
 //! Physical-RAM sizing for the in-memory decrypted-content cache (spec §6.1).
-//! The cap defaults to 10% of system RAM, floored at 64 MiB, and is never allowed
-//! above (total − 6 GB) so the OS + app keep working room on small machines.
+//! The cap defaults to max(10% of system RAM, 1 GiB), floored at 64 MiB, and is
+//! never allowed above (total − 6 GB) so the OS + app keep working room on small
+//! machines (where the (total − 6 GB) ceiling can pull the default back below 1 GiB).
 
 use serde::Serialize;
 
@@ -19,13 +20,14 @@ pub struct RamLimits {
 }
 
 /// Pure RAM-cap math (unit-tested without touching the OS): max = max(min,
-/// total − 6 GB); default = clamp(total / 10, min, max).
+/// total − 6 GB); default = clamp(max(total / 10, 1 GiB), min, max).
 pub fn compute_ram_limits(total_mb: u64) -> RamLimits {
     let min_mb = MIN_MB;
     let ceiling = total_mb.saturating_sub(HEADROOM_MB) as u32;
     let max_mb = ceiling.max(min_mb);
+    // Default to at least 1 GiB (or 10% of RAM if larger), bounded by the ceiling.
     let ten_pct = (total_mb / 10) as u32;
-    let default_mb = ten_pct.clamp(min_mb, max_mb);
+    let default_mb = ten_pct.max(1024).clamp(min_mb, max_mb);
     RamLimits {
         default_mb,
         min_mb,
@@ -106,9 +108,9 @@ mod tests {
 
     #[test]
     fn mid_machine_ceiling_and_default() {
-        // 8 GiB total → max = 2048; default = 819 (10%).
+        // 8 GiB total → max = 2048; default = max(819, 1024) = 1024 (1 GiB floor).
         let l = compute_ram_limits(8192);
         assert_eq!(l.max_mb, 2048);
-        assert_eq!(l.default_mb, 819);
+        assert_eq!(l.default_mb, 1024);
     }
 }
