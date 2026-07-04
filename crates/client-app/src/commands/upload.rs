@@ -44,8 +44,9 @@ use crate::jobs::{
 };
 use crate::state::{PreparePhase, UploadPhase, EVT_UPLOAD, EVT_VIDEO_PREPARE};
 use crate::upload::{
-    file_type_str, prepare_blog_streams, prepare_generic_metadata, prepare_image_streams,
-    prepare_video_streams, put_chunk_retried, run_pipeline, total_chunks, wrap_wire, PreparedVideo,
+    build_metadata, file_type_str, prepare_blog_streams, prepare_generic_metadata,
+    prepare_image_streams, prepare_video_streams, put_chunk_retried, run_pipeline, total_chunks,
+    wrap_wire, PreparedVideo, StageFlags,
 };
 use crate::upload_staging::{StagedSmallStream, StagedWrap, StagingRecord, StagingStore};
 
@@ -107,7 +108,7 @@ fn stream_type_from_u8(v: u8) -> Option<maxsecu_encoding::types::StreamType> {
 /// directly (no re-encoding). `total_bytes` for the content stream is the exact
 /// ciphertext byte count from pass 1 (advisory: server uses it for listing/quota,
 /// not enforcement).
-fn stage_body_from_record(rec: &StagingRecord) -> serde_json::Value {
+fn stage_body_from_record(rec: &StagingRecord, flags: StageFlags) -> serde_json::Value {
     let file_id_hex: String = rec.file_id.iter().map(|b| format!("{b:02x}")).collect();
 
     // Content stream first (ascending stream_type order)
@@ -144,7 +145,7 @@ fn stage_body_from_record(rec: &StagingRecord) -> serde_json::Value {
         })
     }).collect();
 
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "file_id":         file_id_hex,
         "file_type":       &rec.file_type,
         "genesis_b64":     B64.encode(&rec.genesis),
@@ -153,7 +154,17 @@ fn stage_body_from_record(rec: &StagingRecord) -> serde_json::Value {
         "manifest_sig_b64":B64.encode(&rec.manifest_sig),
         "streams": streams,
         "wraps":   wraps,
-    })
+    });
+    // Optional bundle-member visibility flags (Task 2.4): `listed:false` only when
+    // set; `bundle_id` only when `Some`. A normal single-upload passes the default.
+    if flags.listed_false {
+        body["listed"] = serde_json::json!(false);
+    }
+    if let Some(bid) = flags.bundle_id {
+        let bid_hex: String = bid.iter().map(|b| format!("{b:02x}")).collect();
+        body["bundle_id"] = serde_json::json!(bid_hex);
+    }
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +586,22 @@ fn hex16(b: &[u8; 16]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Encode a bundle's ordered member list into the canonical `BundleBody` bytes that
+/// become the bundle file's authenticated `content` stream (Task 1.2/2.4). Order is
+/// preserved verbatim — `members[i]` maps to `BundleMember { file_id, file_type }` in
+/// the SAME position (the codec neither sorts nor de-duplicates), so the viewer reads
+/// the members back in the authoritative bundle order.
+fn build_bundle_content(members: &[(Id, maxsecu_encoding::types::FileType)]) -> Vec<u8> {
+    use maxsecu_encoding::structs::{BundleBody, BundleMember};
+    let body = BundleBody {
+        members: members
+            .iter()
+            .map(|(id, ft)| BundleMember { file_id: *id, file_type: *ft })
+            .collect(),
+    };
+    maxsecu_encoding::encode(&body)
+}
+
 // ---------------------------------------------------------------------------
 // stage_bundle
 // ---------------------------------------------------------------------------
@@ -957,6 +984,7 @@ async fn confirm_inner(
                         emit(UploadPhase::Finalizing { job_id: job_id.clone() });
                     }
                 },
+                StageFlags::default(),
             )
             .await;
             (r, StagedContent::InRam(bundle))
@@ -973,6 +1001,7 @@ async fn confirm_inner(
                 &host,
                 &token,
                 total_chunks,
+                StageFlags::default(),
                 emit,
             )
             .await;
@@ -1034,6 +1063,7 @@ async fn streaming_confirm(
     host: &str,
     token: &str,
     total_for_progress: u64,
+    flags: StageFlags,
     emit: &impl Fn(UploadPhase),
 ) -> Result<(), UiError> {
     use maxsecu_encoding::structs::Manifest;
@@ -1053,7 +1083,7 @@ async fn streaming_confirm(
 
     if rec.progress == 0 {
         // ── Step 1: POST /v1/files ────────────────────────────────────────────
-        let body = stage_body_from_record(rec);
+        let body = stage_body_from_record(rec, flags);
         let (st, _) = post_json(sender, "/v1/files", &body, Some(token), host).await?;
         if st != hyper::StatusCode::CREATED {
             return Err(UiError::new("stage_failed", "Could not start the upload."));
@@ -1219,6 +1249,262 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usiz
 }
 
 // ---------------------------------------------------------------------------
+// confirm_bundle
+// ---------------------------------------------------------------------------
+
+/// `confirm_bundle` — run a staged bundle's network pipeline: upload every member
+/// as a HIDDEN (`listed=false`) file tagged with the parent `bundle_id`, THEN upload
+/// the signed, individually-listed bundle file whose `content` is the ordered member
+/// list. Uploading the bundle file LAST means a partial/failed bundle leaves no
+/// visible orphan (the members stay `listed=false` — invisible in the feed — until
+/// the bundle file that lists them lands). On success the job is removed and each
+/// member's staging dir is cleaned up; on failure the whole [`BundleJob`] is RETAINED
+/// so the tray can retry. Neither member nor bundle DEK ever leaves the TCB.
+#[tauri::command]
+pub async fn confirm_bundle(
+    req: ConfirmUploadRequest,
+    app: tauri::AppHandle,
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
+    jobs: State<'_, BundleJobs>,
+) -> Result<String, UiError> {
+    let emit = |p: UploadPhase| {
+        let _ = app.emit(EVT_UPLOAD, p);
+    };
+    let job_id = req.job_id.clone();
+    let out = confirm_bundle_inner(&req, &dir, &session, &connect_lock, &jobs, &emit).await;
+    match &out {
+        Ok(bundle_id_hex) => {
+            emit(UploadPhase::Done {
+                job_id: job_id.clone(),
+                file_id: bundle_id_hex.clone(),
+            });
+        }
+        Err(e) => {
+            emit(UploadPhase::Failed {
+                job_id: job_id.clone(),
+                code: e.code.clone(),
+            });
+        }
+    }
+    out
+}
+
+async fn confirm_bundle_inner(
+    req: &ConfirmUploadRequest,
+    dir: &State<'_, AppDir>,
+    session: &State<'_, Session>,
+    connect_lock: &State<'_, ConnectLock>,
+    jobs: &State<'_, BundleJobs>,
+    emit: &impl Fn(UploadPhase),
+) -> Result<String, UiError> {
+    let job_id = req.job_id.clone();
+    let server = server_of(&dir.0)?;
+    emit(UploadPhase::Staging { job_id: job_id.clone() });
+    let (mut sender, host, token) = reauth(&dir.0, &server, session, connect_lock).await?;
+
+    // Take the bundle job out of the registry for the duration of the upload;
+    // re-inserted verbatim on failure so the tray can retry.
+    let mut job = { jobs.0.lock().await.remove(&job_id) }
+        .ok_or_else(|| UiError::new("no_such_job", "That bundle is no longer staged."))?;
+
+    let result = run_bundle_pipeline(
+        &mut job, &job_id, &server, &dir.0, session, &mut sender, &host, &token, emit,
+    )
+    .await;
+
+    match result {
+        Ok(bundle_id_hex) => {
+            // Members are already uploaded + finalized; the bundle file has landed.
+            // Clean up each member's staging dir (streaming members; InRam are None).
+            for m in &job.members {
+                if let Some(d) = &m.job_dir {
+                    let _ = std::fs::remove_dir_all(d);
+                }
+            }
+            Ok(bundle_id_hex)
+        }
+        Err(e) => {
+            // Retain the whole job (with any streaming members' advanced progress
+            // persisted on disk) for retry. Members already uploaded are listed=false,
+            // so a failed bundle leaves NO visible orphan in the feed.
+            jobs.0.lock().await.insert(job_id, job);
+            Err(e)
+        }
+    }
+}
+
+/// Upload every member (hidden, under `bundle_id`) then the signed bundle file
+/// (listed). Returns `hex16(bundle_id)` on success. Does NOT touch the job registry —
+/// the caller owns take/re-insert. On the FIRST member/bundle-file error this returns
+/// early; the caller retains the job for retry (see the retry-semantics note below).
+///
+/// **Retry semantics (best-effort).** A retry re-runs from the FIRST member. Members
+/// that already fully finalized on a prior attempt will be re-POSTed; the server
+/// answers a re-POST of a finalized version with `409 CONFLICT`, which surfaces here
+/// as `stage_failed`. So a retry only converges cleanly when the failure happened
+/// BEFORE any member fully finalized (e.g. a mid-member transport drop, which the
+/// per-chunk PUT retry + streaming checkpoint already recover). The full-network
+/// round-trip + robust idempotent retry is the WS9 e2e's gate; here the guarantee is
+/// happy-path + retain-on-failure + no visible orphan.
+#[allow(clippy::too_many_arguments)]
+async fn run_bundle_pipeline(
+    job: &mut BundleJob,
+    job_id: &str,
+    server: &str,
+    app_dir: &std::path::Path,
+    session: &State<'_, Session>,
+    sender: &mut hyper::client::conn::http1::SendRequest<
+        http_body_util::Full<hyper::body::Bytes>,
+    >,
+    host: &str,
+    token: &str,
+    emit: &impl Fn(UploadPhase),
+) -> Result<String, UiError> {
+    use maxsecu_encoding::types::FileType;
+
+    let bundle_id = job.bundle_id;
+
+    // ── Build the signed bundle file up front (crypto only, NO network) ──────────
+    // Its file_id IS the bundle_id, its content is the ordered member list, its
+    // metadata is the bundle title/tags. Building it first gives us its chunk count
+    // for the aggregate progress denominator; it is UPLOADED last (below).
+    //
+    // Resolve recipients under the pinned D5 over a fresh unauthenticated channel —
+    // mirrors `stage_item` (directory GETs + embedded-pin recovery trust-alarm A).
+    let pinned = load_directory_pub(app_dir)?;
+    let verifier = DirectoryVerifier::new(pinned);
+    let mut trust = MemoryTrustStore::new();
+    let now = now_ms();
+    let username = { session.0.lock().await.username.clone() }
+        .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
+    let (mut dir_sender, dir_host, _exporter) = open_conn(app_dir, server).await?;
+    let me =
+        resolve_my_binding(&mut dir_sender, &dir_host, &username, &verifier, &mut trust, now)
+            .await?;
+    let recovery = resolve_recovery_pin(&mut dir_sender, &dir_host).await?;
+
+    let member_pairs: Vec<(Id, FileType)> =
+        job.member_meta.iter().map(|m| (Id(m.file_id), m.file_type)).collect();
+    let bundle_content = build_bundle_content(&member_pairs);
+
+    // Identity is borrowed ONLY across the synchronous `build_upload` (no `.await`
+    // holds it) — exactly as the single-upload build path does.
+    let bundle_file = {
+        let guard = session.0.lock().await;
+        let identity: &Identity = guard
+            .identity
+            .as_ref()
+            .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+        let params = UploadParams {
+            owner: identity,
+            owner_id: Id(me.user_id),
+            owner_key_version: me.key_version,
+            file_id: Id(bundle_id),
+            file_type: FileType::Bundle,
+            chunk_size: CHUNK_SIZE,
+            recovery_pub: EncPublicKey::from_bytes(recovery.enc_pub),
+            recovery_mlkem_pub: recovery.mlkem_pub,
+            created_at: Timestamp(now),
+        };
+        // Thumbnail is best-effort None: member thumbnails are already sealed into
+        // each member and not retained in plaintext here, so the bundle file carries
+        // no derived thumbnail (the feed card falls back to the member previews).
+        let streams = maxsecu_client_core::PlaintextStreams {
+            content: bundle_content,
+            metadata: Some(build_metadata(&job.title, &job.tags)),
+            thumbnail: None,
+            preview: None,
+        };
+        build_upload(&params, &streams)
+            .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the bundle."))?
+    }; // guard drops here — identity no longer borrowed
+
+    let bundle_total = total_chunks(&bundle_file);
+    let members_total: u64 = job.members.iter().map(|m| m.total_chunks).sum();
+    let grand_total = members_total + bundle_total;
+
+    // ── Upload each member in order, HIDDEN under the bundle_id ───────────────────
+    let mut base: u64 = 0;
+    for (member, meta) in job.members.iter_mut().zip(job.member_meta.iter()) {
+        let member_total = member.total_chunks;
+        let member_fid_hex = hex16(&meta.file_id);
+        let flags = StageFlags { listed_false: true, bundle_id: Some(bundle_id) };
+        match &mut member.content {
+            StagedContent::InRam(bundle) => {
+                run_pipeline(
+                    sender,
+                    host,
+                    token,
+                    bundle,
+                    |done, _total| {
+                        emit(UploadPhase::Uploading {
+                            job_id: job_id.to_owned(),
+                            done: base + done,
+                            total: grand_total,
+                            bytes_per_s: 0,
+                        });
+                    },
+                    flags,
+                )
+                .await?;
+            }
+            StagedContent::Streaming(rec) => {
+                // Rewrite the member's own (done,total) into the aggregate frame;
+                // suppress the member's per-file Finalizing/Staging phases.
+                let member_emit = |p: UploadPhase| {
+                    if let UploadPhase::Uploading { done, .. } = p {
+                        emit(UploadPhase::Uploading {
+                            job_id: job_id.to_owned(),
+                            done: base + done,
+                            total: grand_total,
+                            bytes_per_s: 0,
+                        });
+                    }
+                };
+                streaming_confirm(
+                    rec,
+                    job_id,
+                    &member_fid_hex,
+                    app_dir,
+                    session,
+                    sender,
+                    host,
+                    token,
+                    member_total,
+                    flags,
+                    &member_emit,
+                )
+                .await?;
+            }
+        }
+        base += member_total;
+    }
+
+    // ── Upload the bundle file LAST (listed=true, a normal file) ──────────────────
+    emit(UploadPhase::Finalizing { job_id: job_id.to_owned() });
+    run_pipeline(
+        sender,
+        host,
+        token,
+        &bundle_file,
+        |done, _total| {
+            emit(UploadPhase::Uploading {
+                job_id: job_id.to_owned(),
+                done: members_total + done,
+                total: grand_total,
+                bytes_per_s: 0,
+            });
+        },
+        StageFlags::default(),
+    )
+    .await?;
+
+    Ok(hex16(&bundle_id))
+}
+
+// ---------------------------------------------------------------------------
 // cancel_upload / cancel_video_prepare / upload_jobs
 // ---------------------------------------------------------------------------
 
@@ -1376,6 +1662,7 @@ pub async fn resume_upload(
         &host,
         &token,
         total,
+        StageFlags::default(),
         &emit,
     )
     .await;
@@ -1523,6 +1810,25 @@ mod tests {
         assert!(parse_file_id_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
     }
 
+    // ── build_bundle_content roundtrip (Task 2.4) ────────────────────────────
+
+    #[test]
+    fn build_bundle_content_roundtrips_in_order() {
+        use maxsecu_encoding::types::{FileType, Id};
+        let members = vec![
+            (Id([0x01; 16]), FileType::Video),
+            (Id([0x02; 16]), FileType::Image),
+            (Id([0x03; 16]), FileType::Generic),
+        ];
+        let bytes = build_bundle_content(&members);
+        let body: maxsecu_encoding::structs::BundleBody =
+            maxsecu_encoding::decode(&bytes).unwrap();
+        assert_eq!(body.members.len(), 3);
+        assert_eq!(body.members[0].file_type, FileType::Video);
+        assert_eq!(body.members[2].file_id, Id([0x03; 16]));
+        assert_eq!(body.members[1].file_id, Id([0x02; 16])); // order authoritative
+    }
+
     // ── prepare_generic_metadata unit test ───────────────────────────────────
 
     #[test]
@@ -1601,7 +1907,7 @@ mod tests {
     #[test]
     fn stage_body_from_record_shapes_the_post() {
         let rec = make_test_record();
-        let body = stage_body_from_record(&rec);
+        let body = stage_body_from_record(&rec, StageFlags::default());
 
         // file_id is the hex of [0xF1; 16]
         assert_eq!(
@@ -1636,6 +1942,19 @@ mod tests {
         assert!(user_wrap["wrapped_dek_b64"].is_string());
         assert!(user_wrap["grant_b64"].is_string());
         assert_eq!(user_wrap["wrap_alg"], 1);
+
+        // Default flags → a normal listed file: neither field is emitted.
+        assert!(body.get("listed").is_none());
+        assert!(body.get("bundle_id").is_none());
+    }
+
+    #[test]
+    fn stage_body_from_record_member_flags_emit_listed_false_and_bundle_id() {
+        let rec = make_test_record();
+        let flags = StageFlags { listed_false: true, bundle_id: Some([0xAB; 16]) };
+        let body = stage_body_from_record(&rec, flags);
+        assert_eq!(body["listed"], false);
+        assert_eq!(body["bundle_id"], "abababababababababababababababab");
     }
 
     /// Prove that `resume_content_sealer` recovers the same DEK as the original

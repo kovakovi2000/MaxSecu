@@ -63,6 +63,7 @@ fn main() {
             maxsecu_client_app::commands::upload::stage_upload,
             maxsecu_client_app::commands::upload::stage_bundle,
             maxsecu_client_app::commands::upload::confirm_upload,
+            maxsecu_client_app::commands::upload::confirm_bundle,
             maxsecu_client_app::commands::upload::cancel_upload,
             maxsecu_client_app::commands::upload::cancel_video_prepare,
             maxsecu_client_app::commands::upload::upload_jobs,

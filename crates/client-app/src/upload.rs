@@ -369,8 +369,36 @@ pub(crate) fn file_type_str(t: FileType) -> &'static str {
     }
 }
 
-/// Shape the §8.1 `POST /v1/files` JSON body from a built bundle.
-pub fn stage_body(b: &UploadBundle) -> serde_json::Value {
+/// Optional §8.1 `POST /v1/files` visibility flags (bundles, Task 1.3/2.4).
+/// `Default` is a normal, individually-listed file with no bundle parent — exactly
+/// what every single-post upload emits. A bundle MEMBER is posted with
+/// `listed_false=true` + `bundle_id=Some(<parent>)` so it stays invisible in the feed
+/// until the signed bundle file that lists it lands; the bundle file itself uses the
+/// default. `listed` is emitted ONLY when false (the server defaults it to true), and
+/// `bundle_id` only when `Some` — so the default flags add nothing to the body.
+#[derive(Clone, Copy, Default)]
+pub struct StageFlags {
+    pub listed_false: bool,
+    pub bundle_id: Option<[u8; 16]>,
+}
+
+/// Insert the optional `listed`/`bundle_id` fields into an already-built
+/// `POST /v1/files` body object. A no-op for `StageFlags::default()`.
+fn apply_stage_flags(body: &mut serde_json::Value, flags: StageFlags) {
+    if let Some(obj) = body.as_object_mut() {
+        if flags.listed_false {
+            obj.insert("listed".to_owned(), serde_json::json!(false));
+        }
+        if let Some(bid) = flags.bundle_id {
+            obj.insert("bundle_id".to_owned(), serde_json::json!(hex(&bid)));
+        }
+    }
+}
+
+/// Shape the §8.1 `POST /v1/files` JSON body from a built bundle. `flags` add the
+/// optional `listed`/`bundle_id` fields (a bundle member is `listed:false` under its
+/// parent's `bundle_id`); pass [`StageFlags::default`] for a normal listed file.
+pub fn stage_body(b: &UploadBundle, flags: StageFlags) -> serde_json::Value {
     let streams: Vec<_> = b
         .streams
         .iter()
@@ -399,12 +427,14 @@ pub fn stage_body(b: &UploadBundle) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "file_id": hex(&b.file_id.0), "file_type": file_type_str(b.file_type),
         "genesis_b64": B64.encode(encode(&b.genesis)), "genesis_sig_b64": B64.encode(b.genesis_sig),
         "manifest_b64": B64.encode(encode(&b.manifest)), "manifest_sig_b64": B64.encode(b.manifest_sig),
         "streams": streams, "wraps": wraps,
-    })
+    });
+    apply_stage_flags(&mut body, flags);
+    body
 }
 
 /// Total ciphertext chunks across all streams (progress denominator).
@@ -454,9 +484,11 @@ pub async fn run_pipeline<F: FnMut(u64, u64)>(
     token: &str,
     bundle: &UploadBundle,
     mut on_progress: F,
+    flags: StageFlags,
 ) -> Result<(), UiError> {
     let fid = hex(&bundle.file_id.0);
-    let (st, _res) = post_json(sender, "/v1/files", &stage_body(bundle), Some(token), host).await?;
+    let (st, _res) =
+        post_json(sender, "/v1/files", &stage_body(bundle, flags), Some(token), host).await?;
     if st != hyper::StatusCode::CREATED {
         return Err(UiError::new("stage_failed", "Could not start the upload."));
     }
@@ -660,7 +692,7 @@ mod tests {
         };
         let streams = prepare_blog_streams(b"hello".to_vec(), "Hi", &["t".to_owned()]);
         let bundle = build_upload(&params, &streams).unwrap();
-        let body = stage_body(&bundle);
+        let body = stage_body(&bundle, StageFlags::default());
         assert_eq!(body["file_id"], "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1");
         assert_eq!(body["file_type"], "blog");
         assert!(body["streams"]
@@ -677,5 +709,35 @@ mod tests {
         assert!(wraps.iter().any(|w| w["recipient_type"] == "recovery"));
         // total_chunks counts every stream's chunks.
         assert!(total_chunks(&bundle) >= 1);
+        // Default flags → a normal listed file: NEITHER field is emitted.
+        assert!(body.get("listed").is_none());
+        assert!(body.get("bundle_id").is_none());
+    }
+
+    #[test]
+    fn stage_body_member_flags_emit_listed_false_and_bundle_id() {
+        use maxsecu_client_core::{build_upload, Identity, UploadParams};
+        use maxsecu_crypto::generate_enc_keypair;
+        use maxsecu_encoding::types::{FileType, Id, Timestamp};
+        let owner = Identity::generate();
+        let (_rsk, rpk) = generate_enc_keypair();
+        let params = UploadParams {
+            owner: &owner,
+            owner_id: Id([0x11; 16]),
+            owner_key_version: 1,
+            file_id: Id([0xF2; 16]),
+            file_type: FileType::Blog,
+            chunk_size: 4096,
+            recovery_pub: rpk,
+            recovery_mlkem_pub: None,
+            created_at: Timestamp(1_719_500_000_000),
+        };
+        let streams = prepare_blog_streams(b"hello".to_vec(), "Hi", &["t".to_owned()]);
+        let bundle = build_upload(&params, &streams).unwrap();
+        // A bundle member: listed:false under the parent bundle_id.
+        let flags = StageFlags { listed_false: true, bundle_id: Some([0xAB; 16]) };
+        let body = stage_body(&bundle, flags);
+        assert_eq!(body["listed"], false);
+        assert_eq!(body["bundle_id"], "abababababababababababababababab");
     }
 }
