@@ -244,11 +244,32 @@ pub struct BehaviorSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PerformanceSettings {
     pub ram_cache_cap_mb: u32,
+    /// How many feed cards to fetch/decode in parallel (clamped 1..=8). `#[serde(default)]`
+    /// lets an older `settings.json` without this key load with the default.
+    #[serde(default = "default_feed_concurrency")]
+    pub feed_concurrency: u8,
+    /// Worker-thread budget for the confined author-side transcode (clamped 1..=cores).
+    #[serde(default = "default_cpu_threads")]
+    pub transcode_threads: u16,
+    /// Worker-thread budget for the confined decode path (clamped 1..=cores).
+    #[serde(default = "default_cpu_threads")]
+    pub decode_threads: u16,
+}
+fn default_feed_concurrency() -> u8 {
+    4
+}
+fn default_cpu_threads() -> u16 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u16)
+        .unwrap_or(1)
 }
 impl Default for PerformanceSettings {
     fn default() -> Self {
         Self {
             ram_cache_cap_mb: 1024,
+            feed_concurrency: default_feed_concurrency(),
+            transcode_threads: default_cpu_threads(),
+            decode_threads: default_cpu_threads(),
         }
     }
 }
@@ -346,6 +367,10 @@ impl SettingsConfig {
             .performance
             .ram_cache_cap_mb
             .clamp(limits.min_mb, limits.max_mb);
+        let cores = default_cpu_threads();
+        s.performance.feed_concurrency = s.performance.feed_concurrency.clamp(1, 8);
+        s.performance.transcode_threads = s.performance.transcode_threads.clamp(1, cores);
+        s.performance.decode_threads = s.performance.decode_threads.clamp(1, cores);
         if !matches!(s.a11y.text_size.as_str(), "normal" | "large" | "larger") {
             s.a11y.text_size = "normal".into();
         }
@@ -524,6 +549,27 @@ mod tests {
         assert_eq!(load_sink_pins(&dir).unwrap_err().code, "sink_unpinned");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn performance_thread_settings_default_and_clamp() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get() as u16)
+            .unwrap_or(1);
+        let d = PerformanceSettings::default();
+        assert_eq!(d.feed_concurrency, 4);
+        assert_eq!(d.transcode_threads, cores);
+        assert_eq!(d.decode_threads, cores);
+        // Clamp: feed_concurrency 1..=8; threads 1..=cores.
+        let mut bad = SettingsConfig::default();
+        bad.performance.feed_concurrency = 99;
+        bad.performance.transcode_threads = 9999;
+        bad.performance.decode_threads = 0;
+        let limits = crate::ram::compute_ram_limits(crate::ram::system_total_mb_public());
+        let nrm = bad.normalized_with_ram(&limits).performance;
+        assert_eq!(nrm.feed_concurrency, 8);
+        assert_eq!(nrm.transcode_threads, cores);
+        assert_eq!(nrm.decode_threads, 1);
     }
 
     fn n() -> u128 {
