@@ -464,3 +464,77 @@ impl Canonical for FingerprintInput {
         })
     }
 }
+
+/// `BundleMember` — one entry of a [`BundleBody`]: a referenced file's id and
+/// its type. Not a top-level [`Canonical`] struct — it has no `type_id` of its
+/// own and is only ever emitted inline as a fixed 17-byte field (16-byte
+/// `file_id` ‖ 1-byte `file_type`) within the bundle body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleMember {
+    pub file_id: Id,
+    pub file_type: FileType,
+}
+
+/// `bundle_body` — `0x000E`. The encrypted, author-signed **content** stream of
+/// a bundle file: an ordered list of member files. Order is authoritative and
+/// preserved verbatim (unlike a manifest's `set`-style streams) — the codec
+/// neither sorts nor de-duplicates. The count is a `u16` length prefix so a
+/// bundle may carry more than 255 members. Minimum-member and other policy
+/// checks belong to higher layers, not this codec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleBody {
+    pub members: Vec<BundleMember>,
+}
+
+impl Canonical for BundleBody {
+    const TYPE_ID: u16 = 0x000E;
+    fn encode_body(&self, w: &mut Writer) {
+        w.u16(self.members.len() as u16);
+        for m in &self.members {
+            m.file_id.put(w);
+            m.file_type.put(w);
+        }
+    }
+    fn decode_body(r: &mut Reader) -> Result<Self, DecodeError> {
+        let count = r.u16()? as usize;
+        let mut members = Vec::with_capacity(count);
+        for _ in 0..count {
+            let file_id = Id::get(r)?;
+            let file_type = FileType::get(r)?;
+            members.push(BundleMember { file_id, file_type });
+        }
+        Ok(BundleBody { members })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{decode, encode};
+
+    #[test]
+    fn bundle_body_roundtrips_and_preserves_order() {
+        let body = BundleBody {
+            members: vec![
+                BundleMember {
+                    file_id: Id([0x01; 16]),
+                    file_type: FileType::Video,
+                },
+                BundleMember {
+                    file_id: Id([0x02; 16]),
+                    file_type: FileType::Image,
+                },
+                BundleMember {
+                    file_id: Id([0x03; 16]),
+                    file_type: FileType::Generic,
+                },
+            ],
+        };
+        let bytes = encode(&body);
+        let back: BundleBody = decode(&bytes).unwrap();
+        assert_eq!(back.members.len(), 3);
+        assert_eq!(back.members[0].file_type, FileType::Video);
+        assert_eq!(back.members[2].file_id, Id([0x03; 16]));
+        assert_eq!(back.members[1].file_id, Id([0x02; 16])); // order is authoritative
+    }
+}

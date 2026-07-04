@@ -45,7 +45,7 @@ pub const SUITE_V2: u16 = 0x0002;
 /// A top-level signed/hashed structure: a `u16 type_id` (§5) followed by its
 /// fields in declared order. There is exactly one canonical byte form per value.
 ///
-/// Only this crate implements `Canonical` (the 12 structures of §4); callers
+/// Only this crate implements `Canonical` (the 13 structures of §4); callers
 /// use [`encode`] / [`decode`].
 pub trait Canonical: Sized {
     /// The `u16` registry codepoint (encoding-spec §5).
@@ -74,6 +74,7 @@ const fn is_registered(id: u16) -> bool {
             | 0x000B
             | 0x000C
             | 0x000D
+            | 0x000E
     )
 }
 
