@@ -60,6 +60,8 @@ fn file_type() -> impl Strategy<Value = FileType> {
         Just(FileType::Video),
         Just(FileType::Image),
         Just(FileType::Blog),
+        Just(FileType::Generic),
+        Just(FileType::Bundle),
     ]
 }
 fn recipient_type() -> impl Strategy<Value = RecipientType> {

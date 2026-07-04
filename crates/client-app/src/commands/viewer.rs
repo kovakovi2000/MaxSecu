@@ -34,7 +34,7 @@ pub(crate) fn shape_content(
         )),
         FileType::Generic => Ok((None, None)), // download-only: no inline render
         FileType::Bundle => Err(UiError::new(
-            "verify_failed",
+            "bad_request",
             "A bundle has no direct content.",
         )),
     }
