@@ -257,8 +257,8 @@ pub struct ResolvedRecipientDto {
 }
 
 /// A known contact (roster row) for the share checklist — display-only, no key
-/// material. `already_shared` is filled in by the dialog (cross-checked against
-/// `list_file_recipients`), NOT by the store; the command always returns `false`.
+/// material. This roster carries no `already_shared` flag; the dialog computes
+/// access itself by cross-checking `user_id` against `list_file_recipients`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ContactDto {
     pub username: String,
