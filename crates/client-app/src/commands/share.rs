@@ -169,7 +169,7 @@ async fn reshare_inner(
     // identity-sealed TOFU pin store (alarm-B). Borrow the identity ONLY for these
     // synchronous calls (no await while borrowed) — the store keeps only its derived
     // sealing key, never the identity, so it can outlive the guard.
-    let (dek, mut tofu) = {
+    let (dek, mut tofu, mut contacts) = {
         let guard = session.0.lock().await;
         let identity = guard
             .identity
@@ -177,7 +177,8 @@ async fn reshare_inner(
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
         let dek = recover_own_dek(&view, file_id, identity, my_id)?;
         let tofu = TofuStore::open(&dir.0, identity)?;
-        (dek, tofu)
+        let contacts = crate::contacts::ContactStore::open(&dir.0, identity)?;
+        (dek, tofu, contacts)
     }; // guard drops here — identity no longer borrowed
 
     // Step 4: fetch the sink-anchored head out of band, then build the authenticated
@@ -209,6 +210,7 @@ async fn reshare_inner(
         &tombstones,
         session,
         &mut tofu,
+        &mut contacts,
         &req.recipient_usernames,
         &verifier,
         &mut trust,
@@ -244,6 +246,7 @@ async fn run_reshare_batch(
     tombstones: &TombstoneSet,
     session: &Session,
     tofu: &mut TofuStore,
+    contacts: &mut crate::contacts::ContactStore,
     recipients: &[String],
     verifier: &DirectoryVerifier,
     trust: &mut (dyn TrustStore + Send),
@@ -350,6 +353,12 @@ async fn run_reshare_batch(
         let uri = format!("/v1/files/{file_id_hex}/wraps");
         match post_json(sender, &uri, &body, Some(token), host).await {
             Ok((st, _)) if st == hyper::StatusCode::CREATED => {
+                // Best-effort: remember this recipient as a contact (roster for the
+                // share checklist). A store-write failure must NEVER turn a
+                // successful share into a failure — swallow it (mirrors the
+                // best-effort index write in `feed.rs`).
+                let fp = crate::tofu::key_fingerprint(&author.enc_pub, &author.sig_pub);
+                let _ = contacts.upsert(uname, author.user_id, fp);
                 push_outcome(&mut outcomes, emit, file_id_hex, uname, true, None);
             }
             Ok(_) => {
@@ -669,6 +678,21 @@ mod tests {
         TofuStore::open(&dir, &Identity::generate()).unwrap()
     }
 
+    /// A fresh, empty ContactStore in a unique temp dir (so a batch test starts
+    /// with no contacts). Left in OS temp space; these are ephemeral test runs.
+    fn empty_contacts() -> crate::contacts::ContactStore {
+        let dir = std::env::temp_dir().join(format!(
+            "mxcontacts_share_{}_{}",
+            std::process::id(),
+            maxsecu_crypto::random_array::<8>()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::contacts::ContactStore::open(&dir, &Identity::generate()).unwrap()
+    }
+
     /// The batch-isolation contract (spec §5, testing plan step 5): a MIXED batch
     /// (one unresolvable username, one valid) returns EXACTLY one `ok:false` + one
     /// `ok:true`, in request order, never aborting the batch nor dropping a row.
@@ -718,6 +742,7 @@ mod tests {
             &tombstones,
             &session,
             &mut empty_tofu(),
+            &mut empty_contacts(),
             &recipients,
             &verifier,
             &mut trust,
@@ -852,6 +877,7 @@ mod tests {
             &tombstones,
             &session,
             &mut empty_tofu(),
+            &mut empty_contacts(),
             &recipients,
             &verifier,
             &mut trust,
@@ -939,6 +965,7 @@ mod tests {
             &tombstones,
             &session,
             &mut tofu,
+            &mut empty_contacts(),
             &recipients,
             &verifier,
             &mut trust,
@@ -995,5 +1022,70 @@ mod tests {
             "recovery_recipient"
         );
         assert_eq!(reshare_error_code(&ReshareError::WrapFailed), "wrap_failed");
+    }
+
+    /// A successful share RECORDS the recipient as a contact; an unresolvable /
+    /// failed recipient records NOTHING. Uses the same `spawn_router` stub as the
+    /// isolation test (alice → 201 wrap; ghost → default 404 resolve).
+    #[tokio::test]
+    async fn successful_share_records_a_contact_failed_does_not() {
+        let d5 = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+        let mut trust = MemoryTrustStore::new();
+
+        let (_alice_sk, alice_pk) = generate_enc_keypair();
+        let dek = Dek::generate();
+        let tombstones = empty_tombstones();
+        let session = session_with_identity();
+
+        let file_id_hex: String = FILE_ID.iter().map(|b| format!("{b:02x}")).collect();
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/v1/directory/alice".to_owned(),
+            (hyper::StatusCode::OK, alice_binding(&d5, alice_pk.to_bytes())),
+        );
+        routes.insert(
+            format!("/v1/files/{file_id_hex}/wraps"),
+            (hyper::StatusCode::CREATED, "{}".to_owned()),
+        );
+        let addr = spawn_router(routes).await;
+        let mut sender = connect(&addr).await;
+
+        let mut contacts = empty_contacts();
+        let recipients = vec!["ghost".to_owned(), "alice".to_owned()];
+        let outcomes = run_reshare_batch(
+            &mut sender,
+            "localhost",
+            "tok",
+            &file_id_hex,
+            FILE_ID,
+            1,
+            dek.commit(),
+            Suite::V1,
+            GRANTER_ID,
+            &dek,
+            &tombstones,
+            &session,
+            &mut empty_tofu(),
+            &mut contacts,
+            &recipients,
+            &verifier,
+            &mut trust,
+            NOW,
+            &|_| {},
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(!outcomes[0].ok, "ghost fails");
+        assert!(outcomes[1].ok, "alice succeeds");
+
+        // Only the successful recipient (alice) was recorded — ghost never resolved.
+        let list = contacts.list();
+        assert_eq!(list.len(), 1, "only the successful share is a contact");
+        assert_eq!(list[0].username, "alice");
+        // alice's binding uses user_id [0x0A; 16] (see `alice_binding`).
+        assert_eq!(list[0].user_id, [0x0A; 16]);
     }
 }
