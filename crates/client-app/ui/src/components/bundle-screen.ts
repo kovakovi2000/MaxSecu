@@ -128,36 +128,41 @@ export class BundleScreen extends HTMLElement {
     if (!this.view || this.view.members.length === 0) return;
     const members = this.view.members;
 
-    let folder: string | null;
-    try {
-      folder = await call<string | null>("pick_folder");
-    } catch (x) {
-      toast("error", bundleErr(x));
-      return;
-    }
-    if (folder === null) return; // user cancelled the folder dialog
-
+    // Disable up front (before the pick_folder await) so a rapid double-click can't
+    // open two folder dialogs / two concurrent batches; re-enabled in `finally`.
     const btn = this.querySelector("#bd-download-all") as HTMLButtonElement;
     btn.disabled = true;
-    const sep = folder.includes("\\") ? "\\" : "/";
-    const used = new Set<string>();
-    const total = members.length;
-    let ok = 0;
-    for (let i = 0; i < total; i++) {
-      const m = members[i];
-      const name = dedupeName(downloadName(m.file_type, `member-${i + 1}`), used);
-      const savePath = `${folder}${sep}${name}`;
+    try {
+      let folder: string | null;
       try {
-        await serial(() =>
-          call<string>("download_content", { req: { file_id: m.file_id, save_path: savePath } }),
-        );
-        ok++;
-      } catch {
-        // Tolerate a single member failure; keep going and report the final tally.
+        folder = await call<string | null>("pick_folder");
+      } catch (x) {
+        toast("error", bundleErr(x));
+        return;
       }
+      if (folder === null) return; // user cancelled the folder dialog
+
+      const sep = folder.includes("\\") ? "\\" : "/";
+      const used = new Set<string>();
+      const total = members.length;
+      let ok = 0;
+      for (let i = 0; i < total; i++) {
+        const m = members[i];
+        const name = dedupeName(downloadName(m.file_type, `member-${i + 1}`), used);
+        const savePath = `${folder}${sep}${name}`;
+        try {
+          await serial(() =>
+            call<string>("download_content", { req: { file_id: m.file_id, save_path: savePath } }),
+          );
+          ok++;
+        } catch {
+          // Tolerate a single member failure; keep going and report the final tally.
+        }
+      }
+      toast(ok === total ? "success" : "info", `Downloaded ${ok} of ${total}.`);
+    } finally {
+      btn.disabled = false;
     }
-    btn.disabled = false;
-    toast(ok === total ? "success" : "info", `Downloaded ${ok} of ${total}.`);
   }
 
   private render() {

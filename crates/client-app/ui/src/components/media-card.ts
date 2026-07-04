@@ -121,22 +121,7 @@ export class MediaCard extends HTMLElement {
         tags.textContent = card.tags.map((t) => `#${t}`).join(" ");
         footer.appendChild(tags);
       }
-      if (isGeneric) {
-        // A downloadable file surfaces a Download affordance: verify+decrypt+write
-        // the plaintext via the shared per-post flow (save dialog → download_content).
-        // The button sits ABOVE the whole-card overlay link (z-index in styles.css)
-        // and stops the click from also navigating the card link.
-        const dl = document.createElement("button");
-        dl.type = "button";
-        dl.className = "card-download";
-        dl.textContent = "Download";
-        dl.addEventListener("click", (e) => {
-          e.stopPropagation();
-          e.preventDefault();
-          void downloadPost(id, card.file_type, card.title);
-        });
-        footer.appendChild(dl);
-      } else {
+      if (!isGeneric) {
         const cue = document.createElement("span");
         cue.className = "open-cue";
         cue.setAttribute("aria-hidden", "true");
@@ -146,6 +131,29 @@ export class MediaCard extends HTMLElement {
       article.appendChild(footer);
 
       article.appendChild(link);
+
+      if (isGeneric) {
+        // A downloadable file surfaces a Download affordance: verify+decrypt+write
+        // the plaintext via the shared per-post flow (save dialog → download_content).
+        // Appended as a DIRECT CHILD of article.media-card-shell (a sibling of the
+        // .media-card-link overlay) — NOT inside .card-footer, whose own z-index:1
+        // stacking context would trap the button beneath the z-index:4 overlay. As a
+        // direct child of the isolation:isolate article, its z-index:5 (styles.css)
+        // competes directly with the overlay's z-index:4 and wins, so the button
+        // receives the click; stopPropagation/preventDefault keep that click from
+        // also navigating the card link.
+        const dl = document.createElement("button");
+        dl.type = "button";
+        dl.className = "card-download";
+        dl.textContent = "Download";
+        dl.addEventListener("click", (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          void downloadPost(id, card.file_type, card.title);
+        });
+        article.appendChild(dl);
+      }
+
       this.replaceChildren(article);
     } catch (x) {
       // A "cancelled" rejection is the GLOBAL serial-queue flush (cancelPending),

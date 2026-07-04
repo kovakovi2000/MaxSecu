@@ -1044,11 +1044,16 @@ media-card article.media-card-shell:focus-within {
   line-height: 1;
 }
 .card-download {
-  position: relative;
-  /* Above the whole-card overlay link (.media-card-link is z-index:4) so the
-     button — not the overlay — receives the click. */
+  /* The button is a DIRECT child of article.media-card-shell (a sibling of the
+     .media-card-link overlay), NOT inside .card-footer — the footer has its own
+     position:relative; z-index:1 stacking context that would trap the button below
+     the z-index:4 overlay. As a direct child of the isolation:isolate article, this
+     z-index:5 competes DIRECTLY with the overlay's z-index:4 and wins, so the button
+     (not the overlay) receives the click. Positioned in the bottom-right corner. */
+  position: absolute;
+  right: 0.85rem;
+  bottom: 0.85rem;
   z-index: 5;
-  margin-left: auto;
 }
 .card-download:disabled { opacity: 0.55; cursor: not-allowed; }
 .thumb-frame {

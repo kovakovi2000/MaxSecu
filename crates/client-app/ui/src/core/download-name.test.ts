@@ -77,6 +77,11 @@ test("media-card enables the generic Download button (not disabled) + stops prop
   assert.match(src, /downloadPost/);
   // The placeholder's `disabled = true` must be gone.
   assert.doesNotMatch(src, /dl\.disabled\s*=\s*true/);
+  // The button must be a DIRECT child of the card shell (a sibling of the overlay
+  // link), NOT trapped inside .card-footer's own z-index:1 stacking context — else
+  // the z-index:5 can never beat the z-index:4 overlay and the click is swallowed.
+  assert.match(src, /article\.appendChild\(dl\)/);
+  assert.doesNotMatch(src, /footer\.appendChild\(dl\)/);
 });
 
 test("bundle-screen has a Download-all button driving pick_folder + per-member download", () => {
