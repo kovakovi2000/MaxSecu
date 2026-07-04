@@ -270,6 +270,8 @@ mod tests {
         let list = reopened.list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].username, "carol");
+        assert_eq!(list[0].user_id, ID_A);
+        assert_eq!(list[0].fingerprint, FP_A);
 
         // A DIFFERENT identity cannot read the sealed store (fails closed).
         let other = Identity::generate();
