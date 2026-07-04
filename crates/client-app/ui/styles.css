@@ -1757,6 +1757,44 @@ share-dialog .sd-retry, share-dialog .sd-remove {
 }
 share-dialog .share-actions { display: flex; justify-content: end; margin-top: 0.6rem; }
 
+/* Share checklist: a bounded, scrollable list of tickable contacts. */
+.sd-roster {
+  max-height: 15rem;
+  overflow-y: auto;
+  margin: 0.5rem 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--mx-border);
+  border-radius: 6px;
+}
+.sd-roster:empty {
+  display: none; /* no chrome when the roster is empty (manual-only) */
+}
+.sd-roster .sd-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--mx-border);
+}
+.sd-roster .sd-row:last-child {
+  border-bottom: none;
+}
+/* The checkbox+username label is the row's primary hit target. */
+.sd-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+.sd-check input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+}
+/* An already-has-access row is visibly de-emphasised (greyed). */
+.sd-row:has(input[type="checkbox"]:disabled) {
+  opacity: 0.6;
+}
+
 /* T13 shared fail-closed trust alarm (A/B/C). A blocking modal with no "continue"
    affordance — the strongest, most alarming surface in the app (highest z-index so
    it sits above every other overlay/toast). */
