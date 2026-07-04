@@ -1770,8 +1770,9 @@ share-dialog .share-actions { display: flex; justify-content: end; margin-top: 0
   border: 1px solid var(--mx-border);
   border-radius: 6px;
 }
-.sd-roster:empty {
-  display: none; /* no chrome when the roster is empty (manual-only) */
+#sd-rows.sd-roster:empty {
+  display: none; /* no chrome when the roster is empty (manual-only) — must
+                    out-specify the #sd-rows.sd-roster display:block above */
 }
 .sd-roster .sd-row {
   display: flex;
