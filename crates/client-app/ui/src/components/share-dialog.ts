@@ -180,6 +180,7 @@ export class ShareDialog extends HTMLElement {
     for (const c of contacts) {
       if (me && c.username.toLowerCase() === me.toLowerCase()) continue;
       if (this.rows.some((r) => r.username.toLowerCase() === c.username.toLowerCase())) continue;
+      if (this.rows.some((r) => r.key === c.user_id)) continue;
       const already = this.alreadySharedIds.has(c.user_id);
       this.rows.push({
         key: c.user_id,
@@ -216,7 +217,9 @@ export class ShareDialog extends HTMLElement {
     );
     if (existingRow) {
       if (!existingRow.alreadyShared) existingRow.selected = true;
-      status.textContent = `${username} is already in the list.`;
+      status.textContent = existingRow.alreadyShared
+        ? `${username} already has access.`
+        : `${username} is already in the list.`;
       this.renderRows();
       this.updateShareEnabled();
       return;
@@ -373,6 +376,7 @@ export class ShareDialog extends HTMLElement {
         cb.type = "checkbox";
         cb.checked = row.selected && !row.alreadyShared;
         cb.disabled = !!row.alreadyShared;
+        if (row.alreadyShared) cb.setAttribute("aria-label", `${row.username} — already has access`);
         cb.addEventListener("change", () => this.toggleRow(row.key, cb.checked));
         const name = document.createElement("span");
         name.className = "sd-username";
