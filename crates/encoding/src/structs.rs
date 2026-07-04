@@ -489,6 +489,7 @@ pub struct BundleBody {
 impl Canonical for BundleBody {
     const TYPE_ID: u16 = 0x000E;
     fn encode_body(&self, w: &mut Writer) {
+        debug_assert!(self.members.len() <= u16::MAX as usize);
         w.u16(self.members.len() as u16);
         for m in &self.members {
             m.file_id.put(w);
@@ -536,5 +537,48 @@ mod tests {
         assert_eq!(back.members[0].file_type, FileType::Video);
         assert_eq!(back.members[2].file_id, Id([0x03; 16]));
         assert_eq!(back.members[1].file_id, Id([0x02; 16])); // order is authoritative
+    }
+
+    #[test]
+    fn bundle_body_over_255_members_pins_u16_width_and_keeps_dups() {
+        // 300 members forces the count past a u8 ceiling: a regression to a u8
+        // length prefix would truncate/corrupt here. Two identical members lock
+        // in the deliberate no-dedup behavior.
+        let mut members: Vec<BundleMember> = (0..300)
+            .map(|i| BundleMember {
+                file_id: Id([i as u8; 16]),
+                file_type: FileType::Video,
+            })
+            .collect();
+        // Overwrite two entries to be byte-identical (same id + type).
+        members[10] = BundleMember {
+            file_id: Id([0xAB; 16]),
+            file_type: FileType::Image,
+        };
+        members[11] = BundleMember {
+            file_id: Id([0xAB; 16]),
+            file_type: FileType::Image,
+        };
+        let body = BundleBody { members };
+        let bytes = encode(&body);
+        let back: BundleBody = decode(&bytes).unwrap();
+        assert_eq!(back.members.len(), 300);
+        // First/last survive in order.
+        assert_eq!(back.members[0].file_id, Id([0x00; 16]));
+        assert_eq!(back.members[299].file_id, Id([(299u16 as u8); 16]));
+        // Both identical members survive (no dedup).
+        assert_eq!(back.members[10], back.members[11]);
+        assert_eq!(back.members[10].file_id, Id([0xAB; 16]));
+        assert_eq!(back.members[10].file_type, FileType::Image);
+    }
+
+    #[test]
+    fn bundle_body_empty_roundtrips() {
+        let body = BundleBody { members: vec![] };
+        let bytes = encode(&body);
+        // type_id (2) + u16 count (2), no member bytes.
+        assert_eq!(bytes.len(), 4);
+        let back: BundleBody = decode(&bytes).unwrap();
+        assert!(back.members.is_empty());
     }
 }
