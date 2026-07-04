@@ -56,7 +56,8 @@ use crate::config::{load_directory_pub, load_sink_pins};
 use crate::directory::VerifiedAuthor;
 use crate::download::{parse_file_view, recover_own_dek};
 use crate::dto::{
-    ReshareOutcomeDto, ReshareRequest, ResolveRecipientRequest, ResolvedRecipientDto,
+    ContactDto, ReshareOutcomeDto, ReshareRequest, ResolveRecipientRequest,
+    ResolvedRecipientDto,
 };
 use crate::error::UiError;
 use crate::http_client::{get_json, post_json};
@@ -493,6 +494,43 @@ pub async fn list_file_recipients(
     let (mut sender, host, token) = reauth(&dir.0, &server, &session, &connect_lock).await?;
     let rows = list_recipients(&mut sender, &file_id, &token, &host).await;
     Ok(rows.iter().map(|r| hex(&r.user_id)).collect())
+}
+
+// ---------------------------------------------------------------------------
+// list_contacts — the roster source for the share checklist
+// ---------------------------------------------------------------------------
+
+/// `list_contacts` — the local address book (people you've successfully shared
+/// with), the roster for the share checklist. Reads the identity-sealed
+/// [`crate::contacts::ContactStore`].
+///
+/// FAILS OPEN to an empty roster: a not-yet-signed-in identity, an absent store,
+/// or any store-open error all degrade to `Ok(vec![])` so the dialog is NEVER
+/// blocked (manual username input remains fully available). `fingerprint` is the
+/// first 8 bytes hex (matching `resolved_recipient_dto`). `already_shared` is not
+/// part of this DTO — the dialog computes access itself via `list_file_recipients`.
+#[tauri::command]
+pub async fn list_contacts(
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+) -> Result<Vec<ContactDto>, UiError> {
+    let guard = session.0.lock().await;
+    let Some(identity) = guard.identity.as_ref() else {
+        return Ok(Vec::new()); // not signed in → empty roster, fail-open
+    };
+    let store = match crate::contacts::ContactStore::open(&dir.0, identity) {
+        Ok(s) => s,
+        Err(_) => return Ok(Vec::new()), // corrupt/unreadable → empty, never block
+    };
+    Ok(store
+        .list()
+        .into_iter()
+        .map(|c| ContactDto {
+            username: c.username,
+            user_id: hex(&c.user_id),
+            fingerprint: hex(&c.fingerprint[..8]),
+        })
+        .collect())
 }
 
 #[cfg(test)]
