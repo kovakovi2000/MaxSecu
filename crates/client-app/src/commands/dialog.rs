@@ -30,3 +30,25 @@ pub async fn pick_file(extensions: Vec<String>) -> Result<Option<String>, UiErro
 
     Ok(picked.map(|p| p.to_string_lossy().into_owned()))
 }
+
+/// `save_file` — open the native "save file" dialog pre-filled with
+/// `default_name` and return the chosen destination path, or `None` if the user
+/// cancelled. The download screen (Task 5.2) calls this with
+/// `suggested_filename(...)` to obtain a `save_path` for `download_content`.
+///
+/// Like [`pick_file`], this is UNAUTHENTICATED, touches no server channel /
+/// keystore / identity, and returns only a filesystem PATH string (never any file
+/// bytes — the decrypt-and-write happens inside the TCB in `download_content`).
+/// The blocking native dialog runs on a `spawn_blocking` thread.
+#[tauri::command]
+pub async fn save_file(default_name: String) -> Result<Option<String>, UiError> {
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .save_file()
+    })
+    .await
+    .map_err(|_| UiError::new("dialog_failed", "Could not open the file dialog."))?;
+
+    Ok(picked.map(|p| p.to_string_lossy().into_owned()))
+}

@@ -124,6 +124,15 @@ pub struct CardRequest {
     pub version: Option<u64>,
 }
 
+/// A request to download+decrypt a post's original to disk. `save_path` is the
+/// OS path the user chose (via the `save_file` native dialog); the command writes
+/// the verified plaintext there. Plain data only — no key material.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DownloadRequest {
+    pub file_id: String,
+    pub save_path: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpenContentRequest {
     pub file_id: String,
