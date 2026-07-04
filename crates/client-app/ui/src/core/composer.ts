@@ -59,6 +59,18 @@ export function removeMember<T>(list: T[], index: number): T[] {
 }
 
 /**
+ * Single-flight gate for the composer's stage/confirm state machine. Returns true
+ * only when NO stage_bundle is currently in flight, so `preview()`/`post()` can
+ * begin. While a stage is running, `staging` is true and this returns false —
+ * blocking a second concurrent `stage_bundle` (a double-click, or Gallery→Stacked
+ * in quick succession) whose `cancelStale()` would run before the first stage set
+ * `lastJobId`, orphaning the first staged bundle's on-disk staging dir.
+ */
+export function canBeginStage(staging: boolean): boolean {
+  return !staging;
+}
+
+/**
  * The trailing path segment (basename) of a full path, splitting on both "/" and
  * "\". Used to seed a member's default title from the picked filename. Returns the
  * input unchanged when there is no separator.

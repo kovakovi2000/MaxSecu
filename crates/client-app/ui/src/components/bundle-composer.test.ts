@@ -6,6 +6,7 @@ import {
   removeMember,
   detectKind,
   basename,
+  canBeginStage,
 } from "../core/composer.ts";
 
 // --- Pure member-list helpers (DOM-free) -----------------------------------
@@ -76,6 +77,11 @@ test("detectKind accepts full paths (splits on / and \\\\)", () => {
   assert.equal(detectKind("/home/me/photo.png"), "image");
 });
 
+test("canBeginStage is the single-flight gate (blocks a concurrent stage)", () => {
+  assert.equal(canBeginStage(false), true, "idle ⇒ a stage may begin");
+  assert.equal(canBeginStage(true), false, "a stage in flight ⇒ re-entry blocked");
+});
+
 test("basename returns the trailing path segment", () => {
   assert.equal(basename("C:\\Users\\me\\clip.mp4"), "clip.mp4");
   assert.equal(basename("/home/me/photo.png"), "photo.png");
@@ -120,6 +126,15 @@ test("composer posts via the REAL confirm_bundle and cancels stale via cancel_bu
   assert.match(src, /"confirm_bundle"/);
   assert.match(src, /"cancel_bundle"/);
   assert.match(src, /Post bundle/i);
+});
+
+test("composer single-flight-guards preview/post against a concurrent stage", () => {
+  // A `staging` flag gated by canBeginStage, flipped via setStagingBusy which
+  // disables the Preview/Post buttons, guards both entry points.
+  assert.match(src, /canBeginStage\(this\.staging\)/, "both entry points gate on canBeginStage");
+  assert.match(src, /this\.staging\s*=\s*on/, "setStagingBusy toggles the staging flag");
+  assert.match(src, /setStagingBusy\(true\)/, "a stage marks the guard busy before awaiting");
+  assert.match(src, /b\.disabled\s*=\s*on/, "the Preview/Post buttons are disabled while staging");
 });
 
 test("composer reuses the transcode-opts builder for per-video members", () => {

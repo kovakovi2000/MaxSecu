@@ -2,7 +2,7 @@ import { call } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import { setBusy, clearBusy } from "../core/busy.ts";
 import { toast } from "../core/toast.ts";
-import { reorderMember, removeMember, detectKind, basename } from "../core/composer.ts";
+import { reorderMember, removeMember, detectKind, basename, canBeginStage } from "../core/composer.ts";
 import {
   normalizeOptions,
   resolutionForPreset,
@@ -44,6 +44,12 @@ export class BundleComposer extends HTMLElement {
   // so Preview/Post know to re-stage (and cancel the stale job first).
   private dirty = true;
   private previewMode: "gallery" | "stacked" = "gallery";
+  // Single-flight guard: true while a stage_bundle is in flight. Blocks a second
+  // concurrent stage (double-clicked Preview, or Gallery→Stacked in quick
+  // succession) whose cancelStale() would run before the first stage set
+  // lastJobId — which would orphan the first staged bundle's on-disk staging dir.
+  // Covers BOTH preview() and post() since they share the stage/cancel/job_id state.
+  private staging = false;
 
   // Nominal 16:9 dims per height preset — only a starting bitrate-suggestion source
   // (mirrors <upload-screen>). The Rust side re-clamps authoritatively.
@@ -339,6 +345,8 @@ export class BundleComposer extends HTMLElement {
   // Stage (if needed) and render the member previews in the chosen mode. A fresh
   // (non-dirty) preview just re-renders in the new mode with NO network call.
   private async preview(mode: "gallery" | "stacked") {
+    // Single-flight: refuse a re-entrant stage while one is already running.
+    if (!canBeginStage(this.staging)) return;
     this.previewMode = mode;
     this.syncPreviewToggle();
     if (this.members.length === 0) {
@@ -349,8 +357,11 @@ export class BundleComposer extends HTMLElement {
       this.renderPreview(this.lastPreview);
       return;
     }
+    this.setStagingBusy(true);
     this.status("Preparing preview…");
     // Cancel any stale staged bundle BEFORE re-staging (no orphaned staging dir).
+    // The single-flight guard guarantees no other stage is mid-flight here, so
+    // lastJobId (if any) is the one to cancel.
     this.cancelStale();
     setBusy("Preparing bundle");
     try {
@@ -364,6 +375,17 @@ export class BundleComposer extends HTMLElement {
       this.status(errMsg(x, "Could not prepare the bundle preview."));
     } finally {
       clearBusy();
+      this.setStagingBusy(false);
+    }
+  }
+
+  // Toggle the single-flight state + disable/enable the Preview + Post buttons so
+  // the user cannot fire a second stage while one is in flight.
+  private setStagingBusy(on: boolean) {
+    this.staging = on;
+    for (const id of ["#bc-prev-gallery", "#bc-prev-stacked", "#bc-post"]) {
+      const b = this.querySelector(id) as HTMLButtonElement | null;
+      if (b) b.disabled = on;
     }
   }
 
@@ -419,12 +441,15 @@ export class BundleComposer extends HTMLElement {
     return cell;
   }
 
-  private async post(btn: HTMLButtonElement) {
+  private async post(_btn: HTMLButtonElement) {
+    // Single-flight: post shares the stage/cancel/job_id state with preview, so
+    // the same guard blocks a Post firing a stage concurrently with a Preview.
+    if (!canBeginStage(this.staging)) return;
     if (this.members.length === 0) {
       this.status("Add at least one item first.");
       return;
     }
-    btn.disabled = true;
+    this.setStagingBusy(true);
     setBusy("Posting bundle");
     try {
       // Ensure a fresh staged job: (re)stage if never previewed or edited since.
@@ -444,10 +469,10 @@ export class BundleComposer extends HTMLElement {
       toast("success", "Bundle posted.");
       this.status("Bundle posted.");
     } catch (x) {
-      btn.disabled = false;
       this.status(errMsg(x, "Could not post the bundle."));
     } finally {
       clearBusy();
+      this.setStagingBusy(false);
     }
   }
 
