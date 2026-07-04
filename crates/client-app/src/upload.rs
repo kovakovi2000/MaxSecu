@@ -376,17 +376,28 @@ pub(crate) fn file_type_str(t: FileType) -> &'static str {
 /// until the signed bundle file that lists it lands; the bundle file itself uses the
 /// default. `listed` is emitted ONLY when false (the server defaults it to true), and
 /// `bundle_id` only when `Some` — so the default flags add nothing to the body.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct StageFlags {
-    pub listed_false: bool,
+    pub listed: bool,
     pub bundle_id: Option<[u8; 16]>,
 }
 
+impl Default for StageFlags {
+    /// A normal, individually-listed file with no bundle parent.
+    fn default() -> Self {
+        Self { listed: true, bundle_id: None }
+    }
+}
+
 /// Insert the optional `listed`/`bundle_id` fields into an already-built
-/// `POST /v1/files` body object. A no-op for `StageFlags::default()`.
-fn apply_stage_flags(body: &mut serde_json::Value, flags: StageFlags) {
+/// `POST /v1/files` body object. A no-op for `StageFlags::default()` (`listed` is
+/// emitted only when false — the server defaults it to true — and `bundle_id` only
+/// when `Some`). Shared by [`stage_body`] and
+/// [`crate::commands::upload::stage_body_from_record`] so the two POST-body shapers
+/// can never drift.
+pub(crate) fn apply_stage_flags(body: &mut serde_json::Value, flags: StageFlags) {
     if let Some(obj) = body.as_object_mut() {
-        if flags.listed_false {
+        if !flags.listed {
             obj.insert("listed".to_owned(), serde_json::json!(false));
         }
         if let Some(bid) = flags.bundle_id {
@@ -735,7 +746,7 @@ mod tests {
         let streams = prepare_blog_streams(b"hello".to_vec(), "Hi", &["t".to_owned()]);
         let bundle = build_upload(&params, &streams).unwrap();
         // A bundle member: listed:false under the parent bundle_id.
-        let flags = StageFlags { listed_false: true, bundle_id: Some([0xAB; 16]) };
+        let flags = StageFlags { listed: false, bundle_id: Some([0xAB; 16]) };
         let body = stage_body(&bundle, flags);
         assert_eq!(body["listed"], false);
         assert_eq!(body["bundle_id"], "abababababababababababababababab");

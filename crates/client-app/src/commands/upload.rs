@@ -44,9 +44,9 @@ use crate::jobs::{
 };
 use crate::state::{PreparePhase, UploadPhase, EVT_UPLOAD, EVT_VIDEO_PREPARE};
 use crate::upload::{
-    build_metadata, file_type_str, prepare_blog_streams, prepare_generic_metadata,
-    prepare_image_streams, prepare_video_streams, put_chunk_retried, run_pipeline, total_chunks,
-    wrap_wire, PreparedVideo, StageFlags,
+    apply_stage_flags, build_metadata, file_type_str, prepare_blog_streams,
+    prepare_generic_metadata, prepare_image_streams, prepare_video_streams, put_chunk_retried,
+    run_pipeline, total_chunks, wrap_wire, PreparedVideo, StageFlags,
 };
 use crate::upload_staging::{StagedSmallStream, StagedWrap, StagingRecord, StagingStore};
 
@@ -155,15 +155,10 @@ fn stage_body_from_record(rec: &StagingRecord, flags: StageFlags) -> serde_json:
         "streams": streams,
         "wraps":   wraps,
     });
-    // Optional bundle-member visibility flags (Task 2.4): `listed:false` only when
-    // set; `bundle_id` only when `Some`. A normal single-upload passes the default.
-    if flags.listed_false {
-        body["listed"] = serde_json::json!(false);
-    }
-    if let Some(bid) = flags.bundle_id {
-        let bid_hex: String = bid.iter().map(|b| format!("{b:02x}")).collect();
-        body["bundle_id"] = serde_json::json!(bid_hex);
-    }
+    // Optional bundle-member visibility flags (Task 2.4): shared shaper so this and
+    // `upload::stage_body` can never drift (`listed:false` only when set; `bundle_id`
+    // only when `Some`). A normal single-upload passes the default (a no-op here).
+    apply_stage_flags(&mut body, flags);
     body
 }
 
@@ -215,6 +210,43 @@ pub async fn stage_upload(
         total_chunks,
         thumbnail_b64,
     })
+}
+
+/// Resolve the upload recipients under the pinned directory key (D5): the caller's
+/// own verified binding (`me`) and the recovery recipient. Shared by [`stage_item`]
+/// (single post / bundle member) and [`run_bundle_pipeline`] (the bundle file) so the
+/// **security-critical** recovery-pin trust-alarm A lives in exactly ONE place.
+///
+/// Trust-alarm A (spec §3/§7): [`resolve_recovery_pin`] fetches the server-served
+/// recovery pubkey and constant-time-compares it against this client's compiled-in
+/// recovery pin BEFORE any DEK wrap. A mismatch returns a `server_untrusted` error and
+/// aborts here — nothing is wrapped, staged, or uploaded. On a match the caller wraps
+/// the file DEK to the EMBEDDED pin's keys (the trusted, compiled-in value), NOT the
+/// server-served key (which is only ever compared, never trusted).
+///
+/// Returns `(me, recovery, now)` where `now` is the SINGLE timestamp used both for the
+/// binding freshness check AND as the upload `created_at`, so the caller and the
+/// trust-alarm agree on one instant. This helper does NOT resolve or borrow the
+/// signing identity — that stays with the caller, borrowed later only under the
+/// session lock across the SYNCHRONOUS `build_upload` (the lock-discipline split is
+/// preserved exactly). All GETs are unauthenticated directory reads over a fresh
+/// connection; nothing here crosses the Tauri seam.
+async fn resolve_recipients(
+    app_dir: &std::path::Path,
+    session: &Session,
+) -> Result<(crate::directory::VerifiedAuthor, crate::directory::RecoveryRecipient, u64), UiError> {
+    let pinned = load_directory_pub(app_dir)?;
+    let verifier = DirectoryVerifier::new(pinned);
+    let mut trust = MemoryTrustStore::new();
+    let now = now_ms();
+    let username = { session.0.lock().await.username.clone() }
+        .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
+    let server = server_of(app_dir)?;
+    let (mut sender, host, _exporter) = open_conn(app_dir, &server).await?;
+    let me =
+        resolve_my_binding(&mut sender, &host, &username, &verifier, &mut trust, now).await?;
+    let recovery = resolve_recovery_pin(&mut sender, &host).await?;
+    Ok((me, recovery, now))
 }
 
 /// Prepare + encrypt/stage ONE item (a single post or one bundle member) WITHOUT
@@ -420,24 +452,12 @@ async fn stage_item(
         opt_streams.as_ref().map(|s| s.content.len() as u64).unwrap_or(0)
     };
 
-    // 2) Resolve recipients under the pinned D5 (unauth directory GETs).
-    let pinned = load_directory_pub(&dir.0)?;
-    let verifier = DirectoryVerifier::new(pinned);
-    let mut trust = MemoryTrustStore::new();
-    let now = now_ms();
-    let username = { session.0.lock().await.username.clone() }
-        .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
-    let server = server_of(&dir.0)?;
-    let (mut sender, host, _exporter) = open_conn(&dir.0, &server).await?;
-    let me =
-        resolve_my_binding(&mut sender, &host, &username, &verifier, &mut trust, now).await?;
-    // Trust-alarm A (spec §3/§7): fetch the server-served recovery pubkey and
-    // constant-time-compare it against this client's compiled-in recovery pin
-    // BEFORE any DEK wrap. A mismatch returns a `server_untrusted` error and aborts
-    // here — nothing is wrapped, staged, or uploaded. On a match we wrap the file
-    // DEK to the EMBEDDED pin's keys (the trusted, compiled-in value), NOT the
-    // server-served key (which is only ever compared, never trusted).
-    let recovery = resolve_recovery_pin(&mut sender, &host).await?;
+    // 2) Resolve recipients under the pinned D5 (unauth directory GETs). The
+    //    security-critical recovery-pin trust-alarm A (spec §3/§7) lives in the shared
+    //    `resolve_recipients` helper (also used by the bundle file in
+    //    `run_bundle_pipeline`); `now` is the single timestamp for both the binding
+    //    freshness check and the `created_at` below.
+    let (me, recovery, now) = resolve_recipients(&dir.0, session).await?;
 
     // 3) Build the upload content. Video: streaming (disk-backed); Image/Blog: InRam.
     let file_id = Id(maxsecu_crypto::random_array::<16>());
@@ -1310,7 +1330,7 @@ async fn confirm_bundle_inner(
         .ok_or_else(|| UiError::new("no_such_job", "That bundle is no longer staged."))?;
 
     let result = run_bundle_pipeline(
-        &mut job, &job_id, &server, &dir.0, session, &mut sender, &host, &token, emit,
+        &mut job, &job_id, &dir.0, session, &mut sender, &host, &token, emit,
     )
     .await;
 
@@ -1345,14 +1365,16 @@ async fn confirm_bundle_inner(
 /// answers a re-POST of a finalized version with `409 CONFLICT`, which surfaces here
 /// as `stage_failed`. So a retry only converges cleanly when the failure happened
 /// BEFORE any member fully finalized (e.g. a mid-member transport drop, which the
-/// per-chunk PUT retry + streaming checkpoint already recover). The full-network
-/// round-trip + robust idempotent retry is the WS9 e2e's gate; here the guarantee is
-/// happy-path + retain-on-failure + no visible orphan.
+/// per-chunk PUT retry + streaming checkpoint already recover). A bundle that fails
+/// AFTER a member has fully finalized therefore leaves that finalized member on the
+/// server under a `bundle_id` that a retry can no longer complete (it 409s) — this is
+/// NOT corruption and NOT visible (the member stays `listed=false`), and the orphan is
+/// reclaimable via owner delete; full idempotent resume is the WS9 e2e's gate. Here
+/// the guarantee is happy-path + retain-on-failure + no visible orphan.
 #[allow(clippy::too_many_arguments)]
 async fn run_bundle_pipeline(
     job: &mut BundleJob,
     job_id: &str,
-    server: &str,
     app_dir: &std::path::Path,
     session: &State<'_, Session>,
     sender: &mut hyper::client::conn::http1::SendRequest<
@@ -1371,19 +1393,9 @@ async fn run_bundle_pipeline(
     // metadata is the bundle title/tags. Building it first gives us its chunk count
     // for the aggregate progress denominator; it is UPLOADED last (below).
     //
-    // Resolve recipients under the pinned D5 over a fresh unauthenticated channel —
-    // mirrors `stage_item` (directory GETs + embedded-pin recovery trust-alarm A).
-    let pinned = load_directory_pub(app_dir)?;
-    let verifier = DirectoryVerifier::new(pinned);
-    let mut trust = MemoryTrustStore::new();
-    let now = now_ms();
-    let username = { session.0.lock().await.username.clone() }
-        .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
-    let (mut dir_sender, dir_host, _exporter) = open_conn(app_dir, server).await?;
-    let me =
-        resolve_my_binding(&mut dir_sender, &dir_host, &username, &verifier, &mut trust, now)
-            .await?;
-    let recovery = resolve_recovery_pin(&mut dir_sender, &dir_host).await?;
+    // Resolve recipients under the pinned D5 (directory GETs + embedded-pin recovery
+    // trust-alarm A) — the SAME shared helper `stage_item` uses.
+    let (me, recovery, now) = resolve_recipients(app_dir, session).await?;
 
     let member_pairs: Vec<(Id, FileType)> =
         job.member_meta.iter().map(|m| (Id(m.file_id), m.file_type)).collect();
@@ -1430,7 +1442,7 @@ async fn run_bundle_pipeline(
     for (member, meta) in job.members.iter_mut().zip(job.member_meta.iter()) {
         let member_total = member.total_chunks;
         let member_fid_hex = hex16(&meta.file_id);
-        let flags = StageFlags { listed_false: true, bundle_id: Some(bundle_id) };
+        let flags = StageFlags { listed: false, bundle_id: Some(bundle_id) };
         match &mut member.content {
             StagedContent::InRam(bundle) => {
                 run_pipeline(
@@ -1951,7 +1963,7 @@ mod tests {
     #[test]
     fn stage_body_from_record_member_flags_emit_listed_false_and_bundle_id() {
         let rec = make_test_record();
-        let flags = StageFlags { listed_false: true, bundle_id: Some([0xAB; 16]) };
+        let flags = StageFlags { listed: false, bundle_id: Some([0xAB; 16]) };
         let body = stage_body_from_record(&rec, flags);
         assert_eq!(body["listed"], false);
         assert_eq!(body["bundle_id"], "abababababababababababababababab");
