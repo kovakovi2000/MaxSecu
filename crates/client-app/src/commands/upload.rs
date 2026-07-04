@@ -41,8 +41,8 @@ use crate::http_client::{delete_req, post_json};
 use crate::jobs::{StagedContent, StagedUpload, StagedVideoPreview, UploadJobs, VideoPrepareCancel};
 use crate::state::{PreparePhase, UploadPhase, EVT_UPLOAD, EVT_VIDEO_PREPARE};
 use crate::upload::{
-    prepare_blog_streams, prepare_image_streams, prepare_video_streams, put_chunk_retried,
-    run_pipeline, total_chunks, wrap_wire, PreparedVideo,
+    prepare_blog_streams, prepare_generic_metadata, prepare_image_streams, prepare_video_streams,
+    put_chunk_retried, run_pipeline, total_chunks, wrap_wire, PreparedVideo,
 };
 use crate::upload_staging::{StagedSmallStream, StagedWrap, StagingRecord, StagingStore};
 
@@ -189,8 +189,16 @@ pub async fn stage_upload(
         job_dir: std::path::PathBuf,
     }
 
+    // Carries the generic (download-only) inputs out of the match arm. The source
+    // is the user's OWN file — it is COPIED into staging, never moved or deleted.
+    struct GenericPrep {
+        src_path: std::path::PathBuf,
+        byte_size: u64,
+        metadata: Vec<u8>,
+    }
+
     // 1) Type-specific preparation — no network, no crypto yet.
-    let (file_type, opt_streams, opt_video) = match req.kind {
+    let (file_type, opt_streams, opt_video, opt_generic) = match req.kind {
         UploadKind::Blog => {
             let text = req.content.clone().unwrap_or_default();
             if text.len() as u64 > MAX_UPLOAD_BYTES {
@@ -200,6 +208,7 @@ pub async fn stage_upload(
                 maxsecu_encoding::types::FileType::Blog,
                 Some(prepare_blog_streams(text.into_bytes(), &req.title, &req.tags)),
                 None::<VideoPrep>,
+                None::<GenericPrep>,
             )
         }
         UploadKind::Image => {
@@ -215,15 +224,37 @@ pub async fn stage_upload(
             let bytes = std::fs::read(&path)
                 .map_err(|_| UiError::new("bad_request", "That file could not be read."))?;
             let (ft, s) = prepare_image_streams(&bytes, &req.title, &req.tags)?;
-            (ft, Some(s), None)
+            (ft, Some(s), None, None)
         }
         UploadKind::Generic => {
-            // Generic download-only uploads are wired in Task 2.2; staging one
-            // through this single-post path is not yet supported.
-            return Err(UiError::new(
-                "unsupported",
-                "Generic uploads are not supported yet.",
-            ));
+            // Generic download-only upload: no transcode. Stream the RAW file via the
+            // disk-backed path (no in-RAM MAX_UPLOAD_BYTES cap — it is chunked from
+            // disk), carrying the original filename in the metadata.
+            let path = req
+                .path
+                .clone()
+                .ok_or_else(|| UiError::new("bad_request", "No file was chosen."))?;
+            let src_path = std::path::PathBuf::from(&path);
+            let meta = std::fs::metadata(&src_path)
+                .map_err(|_| UiError::new("bad_request", "That file could not be read."))?;
+            if !meta.is_file() {
+                return Err(UiError::new("bad_request", "That is not a file."));
+            }
+            let byte_size = meta.len();
+            // The original filename (basename) baked into the metadata for the
+            // viewer's "download as <name>" action.
+            let filename = src_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("download.bin")
+                .to_owned();
+            let metadata = prepare_generic_metadata(&filename, &req.title, &req.tags);
+            (
+                maxsecu_encoding::types::FileType::Generic,
+                None,
+                None,
+                Some(GenericPrep { src_path, byte_size, metadata }),
+            )
         }
         UploadKind::Video => {
             let path = req
@@ -294,6 +325,7 @@ pub async fn stage_upload(
                 maxsecu_encoding::types::FileType::Video,
                 None,
                 Some(VideoPrep { prepared, frag_index, job_dir }),
+                None,
             )
         }
     };
@@ -312,6 +344,8 @@ pub async fn stage_upload(
     };
     let byte_size: u64 = if let Some(ref v) = opt_video {
         v.prepared.output_size
+    } else if let Some(ref g) = opt_generic {
+        g.byte_size
     } else {
         opt_streams.as_ref().map(|s| s.content.len() as u64).unwrap_or(0)
     };
@@ -340,130 +374,71 @@ pub async fn stage_upload(
 
     let (content, final_preview, final_job_dir) = if let Some(vp) = opt_video {
         // ── VIDEO STREAMING PATH ──────────────────────────────────────────────
-        // Pass 1 (digest) + finish (sign/wrap/seal small streams) happen under the
-        // session lock. The lock is held for the full streaming + move + persist
-        // sequence, which mirrors the old `build_upload` placement.
-        let (rec, staging_dir) = {
-            let guard = session.0.lock().await;
-            let identity: &Identity = guard
-                .identity
-                .as_ref()
-                .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-            let params = UploadParams {
-                owner: identity,
-                owner_id: Id(me.user_id),
-                owner_key_version: me.key_version,
-                file_id,
-                file_type,
-                chunk_size: CHUNK_SIZE,
-                recovery_pub: EncPublicKey::from_bytes(recovery.enc_pub),
-                recovery_mlkem_pub: recovery.mlkem_pub,
-                created_at: Timestamp(now),
-            };
-
-            let builder = StreamingUploadBuilder::new();
-            let sealer = builder.content_sealer(&params);
-
-            // Pass 1: stream out.mp4 → (chunk_count, digest). The emit closure
-            // also sums the ciphertext bytes for the advisory `total_bytes`.
-            let mut mp4_file = std::fs::File::open(&vp.prepared.out_mp4_path).map_err(|_| {
-                UiError::new("encrypt_failed", "Could not prepare the upload.")
-            })?;
-            let mut ct_total: u64 = 0;
-            let (count, digest) = sealer
-                .seal_from_reader(&mut mp4_file, |_, ct| {
-                    ct_total += ct.len() as u64;
-                    Ok(())
-                })
-                .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
-            drop(mp4_file); // close before rename
-
-            // Build small (non-content) streams — these are sealed in-RAM (small).
-            let small = SmallStreams {
-                metadata: Some(vp.prepared.metadata),
-                thumbnail: Some(vp.prepared.thumbnail),
-                preview: Some(vp.prepared.preview),
-            };
-            let records = builder
-                .finish(&params, &small, digest, count)
-                .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
-
-            // Move out.mp4 into the staging dir. rename() can fail across volumes
-            // → fall back to copy+remove.
-            let store = StagingStore::new(dir.0.join("staging"));
-            let sdir = store.dir_for(&file_id.0);
-            std::fs::create_dir_all(&sdir).map_err(|_| {
-                UiError::new("encrypt_failed", "Could not prepare the upload.")
-            })?;
-            let dest = sdir.join("out.mp4");
-            if std::fs::rename(&vp.prepared.out_mp4_path, &dest).is_err() {
-                std::fs::copy(&vp.prepared.out_mp4_path, &dest).map_err(|_| {
-                    UiError::new("encrypt_failed", "Could not prepare the upload.")
-                })?;
-                let _ = std::fs::remove_file(&vp.prepared.out_mp4_path);
-            }
-            // Delete the now-empty transcode temp dir (Low-IL container artifacts).
-            let _ = std::fs::remove_dir_all(&vp.job_dir);
-            // Switch the cleanup guard to the staging dir: if persist fails, we wipe
-            // the staging dir on drop.
-            dir_cleanup.0 = Some(sdir.clone());
-
-            let rec = StagingRecord {
-                file_id: file_id.0,
-                file_type: "video".into(),
-                title: req.title.clone(),
-                manifest: maxsecu_encoding::encode(&records.manifest),
-                manifest_sig: records.manifest_sig.to_vec(),
-                genesis: maxsecu_encoding::encode(&records.genesis),
-                genesis_sig: records.genesis_sig.to_vec(),
-                wraps: records
-                    .wraps
-                    .iter()
-                    .map(|w| StagedWrap {
-                        recipient_id: w.recipient_id.0,
-                        recipient_type: if w.recipient_type == RecipientType::Recovery {
-                            "recovery".into()
-                        } else {
-                            "user".into()
-                        },
-                        wrapped_dek: wrap_wire(w),
-                        granted_by: w.granted_by.0,
-                        grant: maxsecu_encoding::encode(&w.grant),
-                        grant_sig: w.grant_sig.to_vec(),
-                    })
-                    .collect(),
-                out_mp4_path: dest,
-                chunk_size: CHUNK_SIZE,
-                content_chunk_count: count,
-                content_total_bytes: ct_total,
-                small_streams: records
-                    .small_streams
-                    .iter()
-                    .map(|s| StagedSmallStream {
-                        stream_type: s.stream_type as u8,
-                        chunk_size: s.chunk_size,
-                        chunk_count: s.chunk_count,
-                        total_bytes: s.total_bytes,
-                        digest: s.digest.to_vec(),
-                        chunks: s.chunks.clone(),
-                    })
-                    .collect(),
-                progress: 0,
-                created_ms: now,
-                last_progress_ms: now,
-                finalized: false,
-            };
-            store.persist(&rec).map_err(|_| {
-                UiError::new("encrypt_failed", "Could not prepare the upload.")
-            })?;
-            (rec, sdir)
-        }; // session lock drops here
+        // Stream via the shared helper: MOVE the generated `out.mp4` into staging
+        // and remove the transcode temp dir afterwards.
+        let small = SmallStreams {
+            metadata: Some(vp.prepared.metadata),
+            thumbnail: Some(vp.prepared.thumbnail),
+            preview: Some(vp.prepared.preview),
+        };
+        let (rec, staging_dir) = stage_streaming_content(
+            &session,
+            &vp.prepared.out_mp4_path,
+            true, // MOVE the generated temp file
+            "out.mp4",
+            Some(&vp.job_dir),
+            file_type,
+            "video",
+            small,
+            me.user_id,
+            me.key_version,
+            file_id,
+            recovery.enc_pub,
+            recovery.mlkem_pub,
+            now,
+            &req.title,
+            dir.0.join("staging"),
+            &mut dir_cleanup.0,
+        )
+        .await?;
 
         let preview = StagedVideoPreview {
             out_mp4_path: rec.out_mp4_path.clone(),
             index: vp.frag_index,
         };
         (StagedContent::Streaming(rec), Some(preview), Some(staging_dir))
+    } else if let Some(g) = opt_generic {
+        // ── GENERIC STREAMING PATH ────────────────────────────────────────────
+        // Stream the raw source via the shared helper: COPY the user's OWN file
+        // into staging (never move/delete it), metadata-only small streams, no
+        // thumbnail/preview.
+        let small = SmallStreams {
+            metadata: Some(g.metadata),
+            thumbnail: None,
+            preview: None,
+        };
+        let (rec, staging_dir) = stage_streaming_content(
+            &session,
+            &g.src_path,
+            false, // COPY the user's source (never move/delete)
+            "content.bin",
+            None,
+            file_type,
+            "generic",
+            small,
+            me.user_id,
+            me.key_version,
+            file_id,
+            recovery.enc_pub,
+            recovery.mlkem_pub,
+            now,
+            &req.title,
+            dir.0.join("staging"),
+            &mut dir_cleanup.0,
+        )
+        .await?;
+
+        (StagedContent::Streaming(rec), None, Some(staging_dir))
     } else {
         // ── IMAGE / BLOG PATH (unchanged) ────────────────────────────────────
         let mut streams = opt_streams.unwrap();
@@ -497,7 +472,7 @@ pub async fn stage_upload(
         StagedContent::InRam(b) => (total_chunks(b), bundle_file_type_str(b)),
         StagedContent::Streaming(r) => {
             let sc: u64 = r.small_streams.iter().map(|s| s.chunk_count).sum();
-            (r.content_chunk_count + sc, "video".to_owned())
+            (r.content_chunk_count + sc, r.file_type.clone())
         }
     };
 
@@ -538,6 +513,164 @@ fn bundle_file_type_str(b: &maxsecu_client_core::UploadBundle) -> String {
         FileType::Bundle => "bundle",
     }
     .to_owned()
+}
+
+/// Shared streaming-seal + stage for disk-backed uploads (video and generic).
+///
+/// Under the session lock (identity borrowed only across the SYNCHRONOUS pass-1
+/// seal + `finish` — never across an `.await`), this:
+/// 1. Pass-1 streams `input_path` → `(chunk_count, digest)`, DISCARDING the
+///    ciphertext (the staged file on disk stays PLAINTEXT; pass-2 re-seals it
+///    byte-identically at PUT time). The closure sums ciphertext bytes for the
+///    advisory `total_bytes`.
+/// 2. `finish` signs/wraps and seals the small (metadata/thumbnail/preview) streams.
+/// 3. Places the plaintext content in a fresh staging dir — MOVEs the input when
+///    `move_input` (video's generated `out.mp4`; `rename` w/ copy+remove fallback
+///    across volumes), else COPIes it (generic: the user's OWN source file is never
+///    moved or deleted).
+/// 4. Removes `temp_dir` after the move, if any (the video transcode temp dir —
+///    Low-IL container artifacts).
+/// 5. Builds + persists the `StagingRecord` under `file_type_str`.
+///
+/// `dir_cleanup_slot` is the caller's error-cleanup guard field: it is switched to
+/// the staging dir once the content is in place, so a later persist failure (or an
+/// error after this returns) wipes the staging dir. Returns the persisted record and
+/// its staging dir.
+#[allow(clippy::too_many_arguments)]
+async fn stage_streaming_content(
+    session: &State<'_, Session>,
+    input_path: &std::path::Path,
+    move_input: bool,
+    content_filename: &str,
+    temp_dir: Option<&std::path::Path>,
+    file_type: maxsecu_encoding::types::FileType,
+    file_type_str: &str,
+    small: SmallStreams,
+    owner_id: [u8; 16],
+    owner_key_version: u64,
+    file_id: Id,
+    recovery_enc_pub: [u8; 32],
+    recovery_mlkem_pub: Option<[u8; 1184]>,
+    now: u64,
+    title: &str,
+    staging_root: std::path::PathBuf,
+    dir_cleanup_slot: &mut Option<std::path::PathBuf>,
+) -> Result<(StagingRecord, std::path::PathBuf), UiError> {
+    // Pass 1 (digest) + finish (sign/wrap/seal small streams) + move/copy + persist
+    // all happen under the session lock. There is NO `.await` while the identity is
+    // borrowed — the seal/finish sequence is fully synchronous.
+    let guard = session.0.lock().await;
+    let identity: &Identity = guard
+        .identity
+        .as_ref()
+        .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
+    let params = UploadParams {
+        owner: identity,
+        owner_id: Id(owner_id),
+        owner_key_version,
+        file_id,
+        file_type,
+        chunk_size: CHUNK_SIZE,
+        recovery_pub: EncPublicKey::from_bytes(recovery_enc_pub),
+        recovery_mlkem_pub,
+        created_at: Timestamp(now),
+    };
+
+    let builder = StreamingUploadBuilder::new();
+    let sealer = builder.content_sealer(&params);
+
+    // Pass 1: stream the plaintext content → (chunk_count, digest); sum ciphertext
+    // bytes for the advisory `total_bytes`. The ciphertext itself is discarded.
+    let mut in_file = std::fs::File::open(input_path)
+        .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
+    let mut ct_total: u64 = 0;
+    let (count, digest) = sealer
+        .seal_from_reader(&mut in_file, |_, ct| {
+            ct_total += ct.len() as u64;
+            Ok(())
+        })
+        .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
+    drop(in_file); // close before rename/copy
+
+    let records = builder
+        .finish(&params, &small, digest, count)
+        .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
+
+    // Place the plaintext content in the staging dir.
+    let store = StagingStore::new(staging_root);
+    let sdir = store.dir_for(&file_id.0);
+    std::fs::create_dir_all(&sdir)
+        .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
+    let dest = sdir.join(content_filename);
+    if move_input {
+        // MOVE the generated temp file. rename() can fail across volumes → copy+remove.
+        if std::fs::rename(input_path, &dest).is_err() {
+            std::fs::copy(input_path, &dest)
+                .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
+            let _ = std::fs::remove_file(input_path);
+        }
+    } else {
+        // COPY the user's OWN source file — never move or delete it.
+        std::fs::copy(input_path, &dest)
+            .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
+    }
+    // Delete the now-empty transcode temp dir (Low-IL container artifacts), if any.
+    if let Some(td) = temp_dir {
+        let _ = std::fs::remove_dir_all(td);
+    }
+    // Switch the cleanup guard to the staging dir: if persist (or a later step)
+    // fails, the staging dir is wiped on drop.
+    *dir_cleanup_slot = Some(sdir.clone());
+
+    let rec = StagingRecord {
+        file_id: file_id.0,
+        file_type: file_type_str.to_owned(),
+        title: title.to_owned(),
+        manifest: maxsecu_encoding::encode(&records.manifest),
+        manifest_sig: records.manifest_sig.to_vec(),
+        genesis: maxsecu_encoding::encode(&records.genesis),
+        genesis_sig: records.genesis_sig.to_vec(),
+        wraps: records
+            .wraps
+            .iter()
+            .map(|w| StagedWrap {
+                recipient_id: w.recipient_id.0,
+                recipient_type: if w.recipient_type == RecipientType::Recovery {
+                    "recovery".into()
+                } else {
+                    "user".into()
+                },
+                wrapped_dek: wrap_wire(w),
+                granted_by: w.granted_by.0,
+                grant: maxsecu_encoding::encode(&w.grant),
+                grant_sig: w.grant_sig.to_vec(),
+            })
+            .collect(),
+        out_mp4_path: dest,
+        chunk_size: CHUNK_SIZE,
+        content_chunk_count: count,
+        content_total_bytes: ct_total,
+        small_streams: records
+            .small_streams
+            .iter()
+            .map(|s| StagedSmallStream {
+                stream_type: s.stream_type as u8,
+                chunk_size: s.chunk_size,
+                chunk_count: s.chunk_count,
+                total_bytes: s.total_bytes,
+                digest: s.digest.to_vec(),
+                chunks: s.chunks.clone(),
+            })
+            .collect(),
+        progress: 0,
+        created_ms: now,
+        last_progress_ms: now,
+        finalized: false,
+    };
+    store
+        .persist(&rec)
+        .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
+    Ok((rec, sdir))
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,6 +1328,22 @@ mod tests {
     #[test]
     fn parse_file_id_hex_rejects_non_hex() {
         assert!(parse_file_id_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+    }
+
+    // ── prepare_generic_metadata unit test ───────────────────────────────────
+
+    #[test]
+    fn prepare_generic_metadata_carries_filename_title_tags() {
+        let bytes = crate::upload::prepare_generic_metadata(
+            "itinerary.pdf",
+            "Trip plan",
+            &["travel".to_owned(), "2026".to_owned()],
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["filename"], "itinerary.pdf");
+        assert_eq!(json["title"], "Trip plan");
+        assert_eq!(json["tags"][0], "travel");
+        assert_eq!(json["tags"][1], "2026");
     }
 
     // ── bytes_per_s tests (unchanged) ─────────────────────────────────────────

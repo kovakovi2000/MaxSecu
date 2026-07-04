@@ -31,6 +31,17 @@ pub fn build_metadata(title: &str, tags: &[String]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "title": title, "tags": tags })).unwrap_or_default()
 }
 
+/// Build the canonical **generic** (download-only) metadata blob: JSON
+/// `{"title","tags","filename"}` — the same title/tags shape [`build_metadata`]
+/// produces (so [`crate::commands::feed::parse_title_tags`] still reads it), plus
+/// the original `filename` so the viewer can offer a "download as <name>" action.
+pub fn prepare_generic_metadata(filename: &str, title: &str, tags: &[String]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "title": title, "tags": tags, "filename": filename,
+    }))
+    .unwrap_or_default()
+}
+
 /// Build the canonical **video** metadata blob: JSON `{"title","tags","fragments"}`
 /// where each fragment is `{seq,pts_ms,chunk_start,chunk_len}` — the EXACT shape the
 /// viewer's [`crate::video::parse_fragment_index`] reads back (the author→view seek
