@@ -2,33 +2,40 @@ import { call } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import { getUsername } from "../core/session.ts";
 import { toast } from "../core/toast.ts";
-import type { ResolvedRecipient, ReshareOutcome } from "../core/types.ts";
+import type { Contact, ResolvedRecipient, ReshareOutcome } from "../core/types.ts";
 import "./state-badge.ts";
 
-// <share-dialog> — the T4 post-upload multi-recipient sharing picker (spec §3/§5).
-// A modal recipient picker: add-by-username → D5-verify via resolve_recipient →
-// show a Verified/Rejected row (fingerprint + non-color-only <state-badge>) →
-// "Share" wraps+POSTs to every Verified row via reshare_file, rendering a
-// per-row outcome with a per-row Retry. FAIL-CLOSED BY CONSTRUCTION: a row only
-// becomes eligible for Share once resolve_recipient has RESOLVED it — a rejected
-// resolve is rendered and dropped, never fed to reshare_file. Every authed/D5
-// call (resolve_recipient, list_file_recipients, reshare_file) is routed through
-// the shared serial() FIFO queue (core/serial.ts) — the backend re-auths per
-// call and cannot run those concurrently with any other in-flight command.
+// <share-dialog> — the T4 multi-recipient sharing picker, now a tickable
+// CHECKLIST of known contacts (people you've successfully shared with before,
+// from list_contacts) PLUS the kept manual add-by-username input. Ticking a
+// contact is free (no network); the share security path (reshare_file) still
+// re-resolves + D5-verifies + TOFU-checks EVERY selected recipient at share
+// time, so the checklist is only a faster way to feed usernames into that
+// verified path. A contact who already has access is shown greyed + disabled.
 //
-// No secrets ever pass through this component: only usernames, hex user_ids,
-// fingerprints, booleans, and sanitized failure codes — the same DTOs the
-// backend already restricts itself to (dto.rs's "no key material" rule).
+// FAIL-CLOSED BY CONSTRUCTION is preserved: a manually-typed name still only
+// becomes shareable once resolve_recipient RESOLVED it; a rejected resolve is
+// rendered and dropped. Every authed/D5 call is routed through the shared
+// serial() FIFO queue. No secrets cross this component — only usernames, hex
+// ids, fingerprints, booleans, and sanitized codes.
 
-type RowStatus = "pending" | "verified" | "rejected" | "sharing" | "shared" | "share-failed";
+type RowStatus =
+  | "contact" // known contact, tickable, not yet verified this session
+  | "pending"
+  | "verified"
+  | "rejected"
+  | "sharing"
+  | "shared"
+  | "share-failed";
 
 interface Row {
-  key: string; // resolved user_id once known, else a synthetic per-attempt id
+  key: string; // resolved user_id when known, else a synthetic per-attempt id
   username: string;
   status: RowStatus;
+  selected: boolean; // checkbox state
   fingerprint?: string;
-  alreadyShared?: boolean;
-  message?: string; // rejection reason (rejected) or sanitized code (share-failed)
+  alreadyShared?: boolean; // has access → checkbox disabled
+  message?: string;
   code?: string | null;
 }
 
@@ -52,18 +59,18 @@ export class ShareDialog extends HTMLElement {
           tabindex="-1"
         >
           <div class="share-head">
-            <h2 id="sd-h">Share with more people</h2>
+            <h2 id="sd-h">Share with people</h2>
             <button type="button" id="sd-close" class="secondary">Close</button>
           </div>
           <form id="sd-add-form">
             <label>
-              Add a recipient by username
+              Add someone by username
               <input type="text" id="sd-username" name="username" autocomplete="off" />
             </label>
             <button type="submit" id="sd-add-btn">Add</button>
           </form>
           <p id="sd-status" role="status" aria-live="polite"></p>
-          <ul id="sd-rows" aria-label="Recipients" aria-live="polite"></ul>
+          <ul id="sd-rows" class="sd-roster" aria-label="People to share with" aria-live="polite"></ul>
           <div class="share-actions">
             <button type="button" id="sd-share-btn" disabled>Share</button>
           </div>
@@ -98,20 +105,14 @@ export class ShareDialog extends HTMLElement {
     this.alreadySharedIds = new Set();
     this.renderRows();
     this.updateShareEnabled();
-    const status = this.querySelector("#sd-status") as HTMLElement;
-    status.textContent = "";
+    (this.querySelector("#sd-status") as HTMLElement).textContent = "";
     this.hidden = false;
-    // Guard against a double-open (reopen before close()) registering the
-    // keydown handler twice: always remove any prior registration first.
     document.removeEventListener("keydown", this.keydownHandler);
     document.addEventListener("keydown", this.keydownHandler);
+    (this.querySelector("#sd-username") as HTMLInputElement).focus();
 
-    const input = this.querySelector("#sd-username") as HTMLInputElement;
-    input.focus();
-
-    // Best-effort duplicate-awareness (§3 step 7): fails open to "unknown" —
-    // never blocks the dialog, per list_file_recipients's own contract.
-    void this.loadAlreadyShared();
+    // Load the contacts roster + already-access set, then seed the checklist.
+    void this.loadRoster();
   }
 
   close() {
@@ -158,45 +159,74 @@ export class ShareDialog extends HTMLElement {
     ).filter((el) => el.offsetParent !== null || el === document.activeElement);
   }
 
-  private async loadAlreadyShared() {
+  /** Load contacts + the already-access set, then build the checklist. Fails
+   * open: an empty roster / failed cross-check still leaves a working dialog. */
+  private async loadRoster() {
+    let contacts: Contact[] = [];
+    try {
+      contacts = await serial(() => call<Contact[]>("list_contacts", {}));
+    } catch {
+      contacts = []; // fail-open: manual input still works
+    }
     try {
       const ids = await serial(() => call<string[]>("list_file_recipients", { fileId: this.fileId }));
       this.alreadySharedIds = new Set(ids);
-      // Cross-check already-verified rows (resolved before this returned).
-      for (const row of this.rows) {
-        if (row.status === "verified" && this.alreadySharedIds.has(row.key)) row.alreadyShared = true;
-      }
-      this.renderRows();
     } catch {
-      // Fail-open: "unknown" — the picker still works, just without the note.
+      // fail-open: "unknown who has access" — no rows disabled.
     }
+    // Seed contact rows, skipping any username already present (e.g. a manual add
+    // that landed while this was loading). Self is never a contact, but guard anyway.
+    const me = getUsername();
+    for (const c of contacts) {
+      if (me && c.username.toLowerCase() === me.toLowerCase()) continue;
+      if (this.rows.some((r) => r.username.toLowerCase() === c.username.toLowerCase())) continue;
+      if (this.rows.some((r) => r.key === c.user_id)) continue;
+      const already = this.alreadySharedIds.has(c.user_id);
+      this.rows.push({
+        key: c.user_id,
+        username: c.username,
+        status: "contact",
+        selected: false,
+        fingerprint: c.fingerprint,
+        alreadyShared: already,
+      });
+    }
+    this.renderRows();
+    this.updateShareEnabled();
   }
 
   private async addRecipient(username: string) {
     const status = this.querySelector("#sd-status") as HTMLElement;
 
-    // Reject self client-side (spec §3 step 4) — never call resolve_recipient.
     const me = getUsername();
     if (me && username.toLowerCase() === me.toLowerCase()) {
       this.rows.push({
         key: `rejected:${this.counter++}`,
         username,
         status: "rejected",
+        selected: false,
         message: "You are already the owner.",
       });
       this.renderRows();
       return;
     }
 
-    // Don't re-request a username that's already pending/verified/rejected in
-    // this session — the resolve is idempotent but pointless to repeat.
-    if (this.rows.some((r) => r.username.toLowerCase() === username.toLowerCase() && r.status !== "rejected")) {
-      status.textContent = `${username} is already in the list.`;
+    // If the username is already a row, just tick it (unless it already has access).
+    const existingRow = this.rows.find(
+      (r) => r.username.toLowerCase() === username.toLowerCase() && r.status !== "rejected",
+    );
+    if (existingRow) {
+      if (!existingRow.alreadyShared) existingRow.selected = true;
+      status.textContent = existingRow.alreadyShared
+        ? `${username} already has access.`
+        : `${username} is already in the list.`;
+      this.renderRows();
+      this.updateShareEnabled();
       return;
     }
 
     const pendingKey = `pending:${this.counter++}`;
-    this.rows.push({ key: pendingKey, username, status: "pending" });
+    this.rows.push({ key: pendingKey, username, status: "pending", selected: true });
     this.renderRows();
 
     try {
@@ -205,22 +235,25 @@ export class ShareDialog extends HTMLElement {
       );
       const idx = this.rows.findIndex((r) => r.key === pendingKey);
 
-      // Dedupe by resolved user_id (spec §8) — two usernames resolving to the
-      // same account collapse to one row.
-      const existing = this.rows.find((r) => r.key === resolved.user_id && r.status !== "rejected");
-      if (existing) {
+      // Dedupe by resolved user_id: collapse onto an existing row for the same account.
+      const dupe = this.rows.find((r) => r.key === resolved.user_id && r.status !== "rejected");
+      if (dupe) {
         if (idx >= 0) this.rows.splice(idx, 1);
+        if (!dupe.alreadyShared) dupe.selected = true;
         status.textContent = `${username} resolves to an account already in the list.`;
         this.renderRows();
+        this.updateShareEnabled();
         return;
       }
 
+      const already = resolved.already_shared || this.alreadySharedIds.has(resolved.user_id);
       const row: Row = {
         key: resolved.user_id,
         username: resolved.username,
         status: "verified",
+        selected: !already,
         fingerprint: resolved.fingerprint,
-        alreadyShared: resolved.already_shared || this.alreadySharedIds.has(resolved.user_id),
+        alreadyShared: already,
       };
       if (idx >= 0) this.rows[idx] = row;
       else this.rows.push(row);
@@ -229,30 +262,35 @@ export class ShareDialog extends HTMLElement {
       const idx = this.rows.findIndex((r) => r.key === pendingKey);
       const msg = errMessage(x, "This user's identity could not be verified.");
       if (idx >= 0) {
-        this.rows[idx] = { key: `rejected:${this.counter++}`, username, status: "rejected", message: msg };
+        this.rows[idx] = { key: `rejected:${this.counter++}`, username, status: "rejected", selected: false, message: msg };
       }
     }
     this.renderRows();
     this.updateShareEnabled();
   }
 
-  private removeRow(key: string) {
-    this.rows = this.rows.filter((r) => r.key !== key);
-    this.renderRows();
+  private toggleRow(key: string, checked: boolean) {
+    const row = this.rows.find((r) => r.key === key);
+    if (row && !row.alreadyShared) row.selected = checked;
     this.updateShareEnabled();
   }
 
   private updateShareEnabled() {
     const btn = this.querySelector("#sd-share-btn") as HTMLButtonElement;
-    btn.disabled = !this.rows.some((r) => r.status === "verified");
+    btn.disabled = !this.rows.some(
+      (r) => r.selected && (r.status === "contact" || r.status === "verified"),
+    );
   }
 
   private async share() {
-    const usernames = this.rows.filter((r) => r.status === "verified").map((r) => r.username);
+    const selected = this.rows.filter(
+      (r) => r.selected && (r.status === "contact" || r.status === "verified"),
+    );
+    const usernames = selected.map((r) => r.username);
     if (usernames.length === 0) return;
     const btn = this.querySelector("#sd-share-btn") as HTMLButtonElement;
     btn.disabled = true;
-    for (const r of this.rows) if (r.status === "verified") r.status = "sharing";
+    for (const r of selected) r.status = "sharing";
     this.renderRows();
 
     try {
@@ -263,8 +301,6 @@ export class ShareDialog extends HTMLElement {
       );
       this.applyOutcomes(outcomes);
     } catch (x) {
-      // A whole-command failure (e.g. offline before any POST) — every row that
-      // was attempted this round fails closed, individually retryable.
       const msg = errMessage(x, "Could not share this item right now.");
       for (const r of this.rows) {
         if (r.status === "sharing") {
@@ -305,6 +341,8 @@ export class ShareDialog extends HTMLElement {
       if (!row) continue;
       if (o.ok) {
         row.status = "shared";
+        row.selected = false;
+        row.alreadyShared = true;
         row.message = undefined;
         row.code = null;
       } else {
@@ -318,10 +356,6 @@ export class ShareDialog extends HTMLElement {
   private renderRows() {
     const ul = this.querySelector("#sd-rows") as HTMLUListElement;
 
-    // `replaceChildren()` below destroys every row's DOM, so a keyboard user who
-    // just activated a row's Retry/Remove would lose focus to <body> (the trap
-    // only recovers on the next Tab). If focus was on a control INSIDE a row,
-    // remember which row so we can restore an equivalent target after rebuild.
     const active = document.activeElement as HTMLElement | null;
     const actedRow = active && ul.contains(active) ? active.closest(".sd-row") : null;
     const actedRowKey = actedRow?.getAttribute("data-row") ?? null;
@@ -332,10 +366,30 @@ export class ShareDialog extends HTMLElement {
       li.className = "sd-row";
       li.setAttribute("data-row", row.key);
 
-      const name = document.createElement("span");
-      name.className = "sd-username";
-      name.textContent = row.username;
-      li.appendChild(name);
+      // A checkbox is offered only for tickable rows (contact/verified). Rejected
+      // and terminal (sharing/shared/share-failed) rows show status text instead.
+      const tickable = row.status === "contact" || row.status === "verified";
+      if (tickable) {
+        const label = document.createElement("label");
+        label.className = "sd-check";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = row.selected && !row.alreadyShared;
+        cb.disabled = !!row.alreadyShared;
+        if (row.alreadyShared) cb.setAttribute("aria-label", `${row.username} — already has access`);
+        cb.addEventListener("change", () => this.toggleRow(row.key, cb.checked));
+        const name = document.createElement("span");
+        name.className = "sd-username";
+        name.textContent = row.username;
+        label.appendChild(cb);
+        label.appendChild(name);
+        li.appendChild(label);
+      } else {
+        const name = document.createElement("span");
+        name.className = "sd-username";
+        name.textContent = row.username;
+        li.appendChild(name);
+      }
 
       if (row.fingerprint) {
         const fp = document.createElement("code");
@@ -345,12 +399,12 @@ export class ShareDialog extends HTMLElement {
       }
 
       const badge = document.createElement("state-badge");
-      const { state, label } = badgeFor(row);
+      const { state, label: badgeLabel } = badgeFor(row);
       badge.setAttribute("state", state);
-      badge.setAttribute("label", label);
+      badge.setAttribute("label", badgeLabel);
       li.appendChild(badge);
 
-      if (row.alreadyShared && (row.status === "verified" || row.status === "sharing")) {
+      if (row.alreadyShared && row.status !== "shared") {
         const note = document.createElement("span");
         note.className = "sd-note";
         note.textContent = "Already has access";
@@ -366,28 +420,15 @@ export class ShareDialog extends HTMLElement {
         li.appendChild(retry);
       }
 
-      if (row.status === "pending" || row.status === "verified" || row.status === "rejected") {
-        const remove = document.createElement("button");
-        remove.type = "button";
-        remove.className = "sd-remove secondary";
-        remove.textContent = "Remove";
-        remove.setAttribute("aria-label", `Remove ${row.username}`);
-        remove.addEventListener("click", () => this.removeRow(row.key));
-        li.appendChild(remove);
-      }
-
       ul.appendChild(li);
     }
 
-    // Restore focus after a row-level action rebuilt the list: prefer a button
-    // in the same (still-present) row; otherwise fall back to the add-username
-    // input. Never leave focus stranded on <body>.
     if (actedRowKey !== null) {
       const rebuilt = Array.from(ul.children).find(
         (li) => (li as HTMLElement).getAttribute("data-row") === actedRowKey,
       ) as HTMLElement | undefined;
       const target =
-        rebuilt?.querySelector<HTMLButtonElement>("button") ??
+        rebuilt?.querySelector<HTMLButtonElement | HTMLInputElement>("button, input") ??
         (this.querySelector("#sd-username") as HTMLInputElement);
       target.focus();
     }
@@ -396,6 +437,8 @@ export class ShareDialog extends HTMLElement {
 
 function badgeFor(row: Row): { state: string; label: string } {
   switch (row.status) {
+    case "contact":
+      return { state: "ready", label: "Contact" };
     case "pending":
       return { state: "verifying", label: "Verifying…" };
     case "verified":

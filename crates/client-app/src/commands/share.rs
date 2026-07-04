@@ -56,7 +56,8 @@ use crate::config::{load_directory_pub, load_sink_pins};
 use crate::directory::VerifiedAuthor;
 use crate::download::{parse_file_view, recover_own_dek};
 use crate::dto::{
-    ReshareOutcomeDto, ReshareRequest, ResolveRecipientRequest, ResolvedRecipientDto,
+    ContactDto, ReshareOutcomeDto, ReshareRequest, ResolveRecipientRequest,
+    ResolvedRecipientDto,
 };
 use crate::error::UiError;
 use crate::http_client::{get_json, post_json};
@@ -168,7 +169,7 @@ async fn reshare_inner(
     // identity-sealed TOFU pin store (alarm-B). Borrow the identity ONLY for these
     // synchronous calls (no await while borrowed) — the store keeps only its derived
     // sealing key, never the identity, so it can outlive the guard.
-    let (dek, mut tofu) = {
+    let (dek, mut tofu, mut contacts) = {
         let guard = session.0.lock().await;
         let identity = guard
             .identity
@@ -176,7 +177,10 @@ async fn reshare_inner(
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
         let dek = recover_own_dek(&view, file_id, identity, my_id)?;
         let tofu = TofuStore::open(&dir.0, identity)?;
-        (dek, tofu)
+        // Best-effort: a corrupt/unreadable contacts roster (UX-only) must NEVER
+        // block a share — degrade to no recording, unlike the fail-closed TOFU open.
+        let contacts = crate::contacts::ContactStore::open(&dir.0, identity).ok();
+        (dek, tofu, contacts)
     }; // guard drops here — identity no longer borrowed
 
     // Step 4: fetch the sink-anchored head out of band, then build the authenticated
@@ -208,6 +212,7 @@ async fn reshare_inner(
         &tombstones,
         session,
         &mut tofu,
+        contacts.as_mut(),
         &req.recipient_usernames,
         &verifier,
         &mut trust,
@@ -243,6 +248,7 @@ async fn run_reshare_batch(
     tombstones: &TombstoneSet,
     session: &Session,
     tofu: &mut TofuStore,
+    mut contacts: Option<&mut crate::contacts::ContactStore>,
     recipients: &[String],
     verifier: &DirectoryVerifier,
     trust: &mut (dyn TrustStore + Send),
@@ -349,6 +355,14 @@ async fn run_reshare_batch(
         let uri = format!("/v1/files/{file_id_hex}/wraps");
         match post_json(sender, &uri, &body, Some(token), host).await {
             Ok((st, _)) if st == hyper::StatusCode::CREATED => {
+                // Best-effort: remember this recipient as a contact (roster for the
+                // share checklist). A store-write failure must NEVER turn a
+                // successful share into a failure — swallow it (mirrors the
+                // best-effort index write in `feed.rs`).
+                let fp = crate::tofu::key_fingerprint(&author.enc_pub, &author.sig_pub);
+                if let Some(c) = contacts.as_deref_mut() {
+                    let _ = c.upsert(uname, author.user_id, fp);
+                }
                 push_outcome(&mut outcomes, emit, file_id_hex, uname, true, None);
             }
             Ok(_) => {
@@ -495,6 +509,43 @@ pub async fn list_file_recipients(
     Ok(rows.iter().map(|r| hex(&r.user_id)).collect())
 }
 
+// ---------------------------------------------------------------------------
+// list_contacts — the roster source for the share checklist
+// ---------------------------------------------------------------------------
+
+/// `list_contacts` — the local address book (people you've successfully shared
+/// with), the roster for the share checklist. Reads the identity-sealed
+/// [`crate::contacts::ContactStore`].
+///
+/// FAILS OPEN to an empty roster: a not-yet-signed-in identity, an absent store,
+/// or any store-open error all degrade to `Ok(vec![])` so the dialog is NEVER
+/// blocked (manual username input remains fully available). `fingerprint` is the
+/// first 8 bytes hex (matching `resolved_recipient_dto`). `already_shared` is not
+/// part of this DTO — the dialog computes access itself via `list_file_recipients`.
+#[tauri::command]
+pub async fn list_contacts(
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+) -> Result<Vec<ContactDto>, UiError> {
+    let guard = session.0.lock().await;
+    let Some(identity) = guard.identity.as_ref() else {
+        return Ok(Vec::new()); // not signed in → empty roster, fail-open
+    };
+    let store = match crate::contacts::ContactStore::open(&dir.0, identity) {
+        Ok(s) => s,
+        Err(_) => return Ok(Vec::new()), // corrupt/unreadable → empty, never block
+    };
+    Ok(store
+        .list()
+        .into_iter()
+        .map(|c| ContactDto {
+            username: c.username,
+            user_id: hex(&c.user_id),
+            fingerprint: hex(&c.fingerprint[..8]),
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +682,21 @@ mod tests {
         TofuStore::open(&dir, &Identity::generate()).unwrap()
     }
 
+    /// A fresh, empty ContactStore in a unique temp dir (so a batch test starts
+    /// with no contacts). Left in OS temp space; these are ephemeral test runs.
+    fn empty_contacts() -> crate::contacts::ContactStore {
+        let dir = std::env::temp_dir().join(format!(
+            "mxcontacts_share_{}_{}",
+            std::process::id(),
+            maxsecu_crypto::random_array::<8>()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::contacts::ContactStore::open(&dir, &Identity::generate()).unwrap()
+    }
+
     /// The batch-isolation contract (spec §5, testing plan step 5): a MIXED batch
     /// (one unresolvable username, one valid) returns EXACTLY one `ok:false` + one
     /// `ok:true`, in request order, never aborting the batch nor dropping a row.
@@ -680,6 +746,7 @@ mod tests {
             &tombstones,
             &session,
             &mut empty_tofu(),
+            Some(&mut empty_contacts()),
             &recipients,
             &verifier,
             &mut trust,
@@ -814,6 +881,7 @@ mod tests {
             &tombstones,
             &session,
             &mut empty_tofu(),
+            Some(&mut empty_contacts()),
             &recipients,
             &verifier,
             &mut trust,
@@ -901,6 +969,7 @@ mod tests {
             &tombstones,
             &session,
             &mut tofu,
+            Some(&mut empty_contacts()),
             &recipients,
             &verifier,
             &mut trust,
@@ -957,5 +1026,105 @@ mod tests {
             "recovery_recipient"
         );
         assert_eq!(reshare_error_code(&ReshareError::WrapFailed), "wrap_failed");
+    }
+
+    /// A successful share RECORDS the recipient as a contact; an unresolvable /
+    /// failed recipient records NOTHING. Uses the same `spawn_router` stub as the
+    /// isolation test (alice → 201 wrap; ghost → default 404 resolve).
+    #[tokio::test]
+    async fn successful_share_records_a_contact_failed_does_not() {
+        let d5 = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+        let mut trust = MemoryTrustStore::new();
+
+        let (_alice_sk, alice_pk) = generate_enc_keypair();
+        let dek = Dek::generate();
+        let tombstones = empty_tombstones();
+        let session = session_with_identity();
+
+        let file_id_hex: String = FILE_ID.iter().map(|b| format!("{b:02x}")).collect();
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/v1/directory/alice".to_owned(),
+            (hyper::StatusCode::OK, alice_binding(&d5, alice_pk.to_bytes())),
+        );
+        routes.insert(
+            format!("/v1/files/{file_id_hex}/wraps"),
+            (hyper::StatusCode::CREATED, "{}".to_owned()),
+        );
+        let addr = spawn_router(routes).await;
+        let mut sender = connect(&addr).await;
+
+        let mut contacts = empty_contacts();
+        let recipients = vec!["ghost".to_owned(), "alice".to_owned()];
+        let outcomes = run_reshare_batch(
+            &mut sender,
+            "localhost",
+            "tok",
+            &file_id_hex,
+            FILE_ID,
+            1,
+            dek.commit(),
+            Suite::V1,
+            GRANTER_ID,
+            &dek,
+            &tombstones,
+            &session,
+            &mut empty_tofu(),
+            Some(&mut contacts),
+            &recipients,
+            &verifier,
+            &mut trust,
+            NOW,
+            &|_| {},
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(!outcomes[0].ok, "ghost fails");
+        assert!(outcomes[1].ok, "alice succeeds");
+
+        // Only the successful recipient (alice) was recorded — ghost never resolved.
+        let list = contacts.list();
+        assert_eq!(list.len(), 1, "only the successful share is a contact");
+        assert_eq!(list[0].username, "alice");
+        // alice's binding uses user_id [0x0A; 16] (see `alice_binding`).
+        assert_eq!(list[0].user_id, [0x0A; 16]);
+    }
+
+    /// A recipient who RESOLVES but whose wrap POST fails (non-201) records NO
+    /// contact — proving recording is gated on the CREATED arm, not on resolve.
+    #[tokio::test]
+    async fn post_failure_records_no_contact() {
+        let d5 = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+        let mut trust = MemoryTrustStore::new();
+        let (_sk, pk) = generate_enc_keypair();
+        let dek = Dek::generate();
+        let tombstones = empty_tombstones();
+        let session = session_with_identity();
+        let file_id_hex: String = FILE_ID.iter().map(|b| format!("{b:02x}")).collect();
+
+        let addr = spawn_seq_wrap_stub(
+            alice_binding(&d5, pk.to_bytes()),
+            vec![hyper::StatusCode::INTERNAL_SERVER_ERROR],
+        )
+        .await;
+        let mut sender = connect(&addr).await;
+
+        let mut contacts = empty_contacts();
+        let recipients = vec!["alice".to_owned()];
+        let outcomes = run_reshare_batch(
+            &mut sender, "localhost", "tok", &file_id_hex, FILE_ID, 1,
+            dek.commit(), Suite::V1, GRANTER_ID, &dek, &tombstones, &session,
+            &mut empty_tofu(), Some(&mut contacts), &recipients,
+            &verifier, &mut trust, NOW, &|_| {},
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(!outcomes[0].ok, "the 500 POST fails the share");
+        assert!(contacts.list().is_empty(), "a POST failure records no contact");
     }
 }

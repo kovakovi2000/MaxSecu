@@ -256,6 +256,16 @@ pub struct ResolvedRecipientDto {
     pub already_shared: bool, // cross-checked against list_recipients
 }
 
+/// A known contact (roster row) for the share checklist — display-only, no key
+/// material. This roster carries no `already_shared` flag; the dialog computes
+/// access itself by cross-checking `user_id` against `list_file_recipients`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContactDto {
+    pub username: String,
+    pub user_id: String,     // hex16, opaque to the UI
+    pub fingerprint: String, // first 8 bytes hex, display-only
+}
+
 /// A request to share an already-uploaded file with more recipients. Carries
 /// only the requested usernames; the command re-resolves and re-verifies each
 /// one under the pinned D5 at share-time rather than trusting the picker's
@@ -382,6 +392,20 @@ mod reshare_dto_tests {
             serde_json::from_str(&serde_json::to_string(&login).unwrap()).unwrap();
         assert_eq!(v["status"], "admin-session");
         assert_eq!(v.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn contact_dto_serializes_all_fields() {
+        let dto = ContactDto {
+            username: "bob".into(),
+            user_id: "ab".repeat(8),
+            fingerprint: "deadbeefcafebabe".into(),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&dto).unwrap()).unwrap();
+        assert_eq!(v["username"], "bob");
+        assert_eq!(v["user_id"], "ab".repeat(8));
+        assert_eq!(v["fingerprint"], "deadbeefcafebabe");
     }
 
     #[test]

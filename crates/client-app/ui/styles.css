@@ -1750,12 +1750,59 @@ share-dialog .sd-row {
 share-dialog .sd-username { font-weight: 800; }
 share-dialog .sd-fingerprint { font-size: 0.78rem; color: var(--mx-muted); }
 share-dialog .sd-note { font-size: var(--mx-fs-1); color: var(--mx-info); }
-share-dialog .sd-retry, share-dialog .sd-remove {
+share-dialog .sd-retry {
   margin-left: auto;
   min-height: 2rem;
   padding: 0.32rem 0.6rem;
 }
 share-dialog .share-actions { display: flex; justify-content: end; margin-top: 0.6rem; }
+
+/* Share checklist: a bounded, scrollable list of tickable contacts. The
+   #id.class selector beats the base `share-dialog #sd-rows` grid rule so the
+   checklist owns its own layout (block rows separated by dividers, not a grid gap). */
+#sd-rows.sd-roster {
+  display: block;
+  max-height: 15rem;
+  overflow-y: auto;
+  margin: 0.5rem 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--mx-border);
+  border-radius: 6px;
+}
+#sd-rows.sd-roster:empty {
+  display: none; /* no chrome when the roster is empty (manual-only) — must
+                    out-specify the #sd-rows.sd-roster display:block above */
+}
+.sd-roster .sd-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  /* Reset the base .sd-row card look (all-sides border/radius/background) so
+     roster rows read as block rows separated by a single divider, not cards. */
+  border: none;
+  border-radius: 0;
+  background: none;
+  border-bottom: 1px solid var(--mx-border);
+}
+.sd-roster .sd-row:last-child {
+  border-bottom: none;
+}
+/* The checkbox+username label is the row's primary hit target. */
+.sd-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+.sd-check input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+}
+/* An already-has-access row is visibly de-emphasised (greyed). */
+.sd-row:has(input[type="checkbox"]:disabled) {
+  opacity: 0.6;
+}
 
 /* T13 shared fail-closed trust alarm (A/B/C). A blocking modal with no "continue"
    affordance — the strongest, most alarming surface in the app (highest z-index so
