@@ -1,6 +1,7 @@
 import { call } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import { decideCardOutcome } from "../core/card-retry.ts";
+import { cardHref, countsLabel } from "../core/card-view.ts";
 import type { Card } from "../core/types.ts";
 import "./state-badge.ts";
 
@@ -37,9 +38,10 @@ export class MediaCard extends HTMLElement {
         return;
       }
 
-      const href = version !== undefined
-        ? `#/viewer?id=${encodeURIComponent(id)}&v=${version}`
-        : `#/viewer?id=${encodeURIComponent(id)}`;
+      const isBundle = card.file_type === "bundle";
+      const isGeneric = card.file_type === "generic";
+      // A bundle links to the bundle screen; every other kind opens the viewer.
+      const href = cardHref(card.file_type, id, version);
 
       const link = document.createElement("a");
       link.className = "media-card-link";
@@ -59,6 +61,13 @@ export class MediaCard extends HTMLElement {
       type.className = "type-chip";
       type.textContent = card.file_type;
       top.append(badge, type);
+      if (isBundle) {
+        // A purple chip marking this card as a grouped post (routes to #/bundle).
+        const bundleBadge = document.createElement("span");
+        bundleBadge.className = "bundle-badge";
+        bundleBadge.textContent = "◆ BUNDLE";
+        top.appendChild(bundleBadge);
+      }
       article.appendChild(top);
 
       const thumb = document.createElement("div");
@@ -69,6 +78,15 @@ export class MediaCard extends HTMLElement {
         img.alt = card.title ? `Thumbnail: ${card.title}` : "Thumbnail";
         img.loading = "lazy";
         thumb.appendChild(img);
+      } else if (isGeneric) {
+        // A downloadable file with no visual: show a document icon, not a media
+        // placeholder, so it reads as a file at a glance.
+        thumb.classList.add("thumb-generic");
+        const icon = document.createElement("span");
+        icon.className = "file-icon";
+        icon.setAttribute("aria-hidden", "true");
+        icon.textContent = "📄";
+        thumb.appendChild(icon);
       } else {
         const placeholder = document.createElement("span");
         placeholder.textContent = card.file_type === "blog" ? "TEXT" : card.file_type.toUpperCase();
@@ -76,9 +94,22 @@ export class MediaCard extends HTMLElement {
       }
       article.appendChild(thumb);
 
+      if (isBundle) {
+        // The order-private member tally strip (omits zero categories). Skipped
+        // when the bundle reports no members (empty label).
+        const label = countsLabel(card.member_counts);
+        if (label) {
+          const counts = document.createElement("p");
+          counts.className = "bundle-counts";
+          counts.textContent = label;
+          article.appendChild(counts);
+        }
+      }
+
       const h = document.createElement("h3");
       h.className = "title";
-      h.textContent = card.title || "(untitled)";
+      // For a generic file the title IS the filename; fall back to "File".
+      h.textContent = card.title || (isGeneric ? "File" : "(untitled)");
       article.appendChild(h);
 
       const footer = document.createElement("div");
@@ -89,11 +120,23 @@ export class MediaCard extends HTMLElement {
         tags.textContent = card.tags.map((t) => `#${t}`).join(" ");
         footer.appendChild(tags);
       }
-      const cue = document.createElement("span");
-      cue.className = "open-cue";
-      cue.setAttribute("aria-hidden", "true");
-      cue.textContent = "Open node →";
-      footer.appendChild(cue);
+      if (isGeneric) {
+        // A downloadable file surfaces a Download affordance. WS5 wires the
+        // actual download_content handler; for now this is a disabled placeholder
+        // so the generic card visibly differs from a viewable media card.
+        const dl = document.createElement("button");
+        dl.type = "button";
+        dl.className = "card-download";
+        dl.disabled = true;
+        dl.textContent = "Download";
+        footer.appendChild(dl);
+      } else {
+        const cue = document.createElement("span");
+        cue.className = "open-cue";
+        cue.setAttribute("aria-hidden", "true");
+        cue.textContent = "Open node →";
+        footer.appendChild(cue);
+      }
       article.appendChild(footer);
 
       article.appendChild(link);

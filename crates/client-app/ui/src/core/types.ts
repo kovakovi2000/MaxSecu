@@ -36,6 +36,9 @@ export interface Card {
   mine: boolean;
   author_fp: string;
   recovery_ok: boolean;
+  // For a bundle card: how many members of each kind it groups (counts only,
+  // never member order). Always present — zeros for a non-bundle card.
+  member_counts: { video: number; image: number; blog: number; generic: number };
 }
 
 export interface OpenedContent {
