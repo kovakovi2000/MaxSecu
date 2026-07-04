@@ -33,6 +33,45 @@ pub struct VerifiedAuthor {
     pub mlkem_pub: Option<[u8; 1184]>,
 }
 
+/// Build the recipient-open [`VerifyContext`] shared by EVERY §12.5 open path
+/// (viewer content/video-header, feed card header, bundle content, video job).
+/// This is the ONE home for the content-substitution guard: `file_id` MUST be
+/// the REQUESTED id (the ladder binds the served record to it via
+/// `manifest.file_id != ctx.file_id => FileIdMismatch`; sourcing it from the
+/// served manifest would make that a tautology and let an untrusted server
+/// substitute any other validly-signed record the user can decrypt), the author/
+/// owner sig pubs are pinned to the D5-verified author, and — critically —
+/// `recipient_mlkem_seed` is `identity.mlkem_seed()` (NOT `None`): PQ-hybrid (V2)
+/// records wrap the DEK to the recipient's ML-KEM key too, so the seed is
+/// REQUIRED to unwrap them; passing `None` fails every V2 open closed. Keeping a
+/// single builder means a future security edit lands in all paths at once.
+///
+/// Pure. The `<'a>` ties the returned ctx to the `identity` borrow, so callers
+/// must hold it across a SYNCHRONOUS verify only (no await spanning the borrow).
+pub(crate) fn build_verify_ctx<'a>(
+    file_id: [u8; 16],
+    author: &VerifiedAuthor,
+    my_id: [u8; 16],
+    identity: &'a maxsecu_client_core::Identity,
+) -> maxsecu_client_core::VerifyContext<'a> {
+    use maxsecu_client_core::{VerifyContext, NO_ADMINS, NO_GRANTERS};
+    use maxsecu_encoding::types::{Id, RecipientType};
+    VerifyContext {
+        file_id: Id(file_id),
+        author_sig_pub: author.sig_pub,
+        owner_sig_pub: author.sig_pub,
+        recipient_id: Id(my_id),
+        recipient_type: RecipientType::User,
+        recipient_secret: identity.enc_secret(),
+        recipient_mlkem_seed: identity.mlkem_seed(),
+        seen_max_version: None,
+        granter_sig_pub: &NO_GRANTERS,
+        admin_sig_pub: &NO_ADMINS,
+        tombstones: None,
+        compromise: None,
+    }
+}
+
 /// Verify an already-fetched `(binding_bytes, signature)` under the pinned D5 and
 /// extract the trusted keys. Factored out of the network path so it is unit-
 /// testable without TLS. Any failure ⇒ a sanitized `untrusted` error.

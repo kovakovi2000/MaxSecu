@@ -40,12 +40,12 @@ use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use maxsecu_client_core::{
-    open_content_decryptor, verify_and_open_headers, ContentDecryptor, DirectoryVerifier,
-    Identity, MemoryTrustStore, StreamHeader, VerifyContext, NO_ADMINS, NO_GRANTERS,
+    open_content_decryptor, verify_and_open_headers, ContentDecryptor, DirectoryVerifier, Identity,
+    MemoryTrustStore, StreamHeader,
 };
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::Manifest;
-use maxsecu_encoding::types::{Id, RecipientType, StreamType};
+use maxsecu_encoding::types::StreamType;
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
@@ -98,24 +98,9 @@ fn open_video_job_core(
     my_id: [u8; 16],
     header: &StreamHeader,
 ) -> Result<(ContentDecryptor, Vec<FragmentEntry>), UiError> {
-    let ctx = VerifyContext {
-        file_id: Id(file_id),
-        author_sig_pub: author.sig_pub,
-        owner_sig_pub: author.sig_pub,
-        recipient_id: Id(my_id),
-        recipient_type: RecipientType::User,
-        recipient_secret: identity.enc_secret(),
-        // PQ-hybrid (V2) videos wrap the DEK to the recipient's ML-KEM key too, so
-        // the seed is REQUIRED to unwrap them — matching the sibling recipient-open
-        // paths (feed::open_my_header, viewer::{video_verify_ctx,run_open}). Passing
-        // None here made every V2 video fail closed (`video_failed`) at this verify.
-        recipient_mlkem_seed: identity.mlkem_seed(),
-        seen_max_version: None,
-        granter_sig_pub: &NO_GRANTERS,
-        admin_sig_pub: &NO_ADMINS,
-        tombstones: None,
-        compromise: None,
-    };
+    // The shared recipient-open ctx (content-substitution guard + the REQUIRED
+    // `recipient_mlkem_seed` for V2/PQ videos) lives in `build_verify_ctx`.
+    let ctx = crate::directory::build_verify_ctx(file_id, author, my_id, identity);
 
     // Verify the header + decode the small streams; take the authenticated
     // `metadata` plaintext and parse the (re-validated) fragment index from it.
@@ -805,9 +790,10 @@ mod tests {
     use maxsecu_client_core::{
         build_upload, PlaintextStreams, StreamChunks, UploadBundle, UploadParams,
     };
+    use maxsecu_client_core::{VerifyContext, NO_ADMINS, NO_GRANTERS};
     use maxsecu_crypto::generate_enc_keypair;
     use maxsecu_encoding::encode;
-    use maxsecu_encoding::types::{FileType, Timestamp};
+    use maxsecu_encoding::types::{FileType, Id, RecipientType, Timestamp};
 
     const OWNER_ID: Id = Id([0x11; 16]);
     const FILE_ID: Id = Id([0xF1; 16]);

@@ -185,22 +185,8 @@ fn open_my_header(
     my_id: [u8; 16],
     header: &maxsecu_client_core::StreamHeader,
 ) -> Result<maxsecu_client_core::OpenedHeader, UiError> {
-    use maxsecu_client_core::{verify_and_open_headers, VerifyContext, NO_ADMINS, NO_GRANTERS};
-    use maxsecu_encoding::types::{Id, RecipientType};
-    let ctx = VerifyContext {
-        file_id: Id(file_id),
-        author_sig_pub: author.sig_pub,
-        owner_sig_pub: author.sig_pub,
-        recipient_id: Id(my_id),
-        recipient_type: RecipientType::User,
-        recipient_secret: identity.enc_secret(),
-        recipient_mlkem_seed: identity.mlkem_seed(),
-        seen_max_version: None,
-        granter_sig_pub: &NO_GRANTERS,
-        admin_sig_pub: &NO_ADMINS,
-        tombstones: None,
-        compromise: None,
-    };
+    use maxsecu_client_core::verify_and_open_headers;
+    let ctx = crate::directory::build_verify_ctx(file_id, author, my_id, identity);
     verify_and_open_headers(&ctx, header)
         .map_err(|_| UiError::new("verify_failed", "This item failed verification."))
 }

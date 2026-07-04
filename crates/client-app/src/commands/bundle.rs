@@ -28,13 +28,10 @@ use crate::commands::feed::{file_type_name, hex};
 
 use tauri::State;
 
-use maxsecu_client_core::{
-    verify_and_open, DirectoryVerifier, Identity, MemoryTrustStore, VerifyContext, NO_ADMINS,
-    NO_GRANTERS,
-};
+use maxsecu_client_core::{DirectoryVerifier, MemoryTrustStore};
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::{BundleBody, Manifest};
-use maxsecu_encoding::types::{FileType, Id, RecipientType, StreamType};
+use maxsecu_encoding::types::{FileType, StreamType};
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
@@ -54,8 +51,11 @@ use crate::http_client::get_json;
 /// Mirrors the viewer's verify ladder (`open_content_inner`) by orchestrating the
 /// SAME shared primitives — `resolve_and_verify_author_logged`,
 /// `enforce_author_transparency`, `resolve_my_user_id`, `build_download_bundle`,
-/// `run_open` — including the direct-link retry-once-forced-proxy fallback. The
-/// bundle is bound to the REQUESTED `req_file_id` inside `run_open`.
+/// `viewer::run_open` — including the direct-link retry-once-forced-proxy
+/// fallback. The bundle is bound to the REQUESTED `req_file_id` inside `run_open`
+/// (via `build_verify_ctx`). Intentionally UNCACHED: the `ContentCache` stores
+/// `OpenedContentDto` (image/blog bytes), not a `BundleBody`, so every open does a
+/// fresh verify — bundles are small (an ordered id list) so this is cheap.
 pub(crate) async fn open_bundle_members(
     req_file_id: &str,
     dir: &State<'_, AppDir>,
@@ -95,7 +95,9 @@ pub(crate) async fn open_bundle_members(
     // A bundle only: reject any other served record type up front (defense in
     // depth — `run_open` also binds the requested id).
     if manifest.file_type != FileType::Bundle {
-        return Err(UiError::new("verify_failed", "Not a bundle."));
+        // A wrong requested record type is a request problem, not a verify
+        // failure — mirrors the viewer's symmetric `bad_request` for bundles.
+        return Err(UiError::new("bad_request", "Not a bundle."));
     }
     let (author, author_binding) = crate::directory::resolve_and_verify_author_logged(
         &mut sender,
@@ -145,7 +147,7 @@ pub(crate) async fn open_bundle_members(
             .identity
             .as_ref()
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-        run_open(identity, file_id, &author, my_id, &bundle)
+        crate::commands::viewer::run_open(identity, file_id, &author, my_id, &bundle)
     };
     let opened = match attempt {
         Ok(o) => o,
@@ -165,7 +167,8 @@ pub(crate) async fn open_bundle_members(
                 .identity
                 .as_ref()
                 .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-            run_open(identity, file_id, &author, my_id, &bundle).map_err(|_| e)?
+            crate::commands::viewer::run_open(identity, file_id, &author, my_id, &bundle)
+                .map_err(|_| e)?
         }
         Err(e) => return Err(e),
     };
@@ -180,37 +183,6 @@ pub(crate) async fn open_bundle_members(
     let body: BundleBody =
         decode(&content.plaintext).map_err(|_| UiError::new("untrusted", "Malformed bundle."))?;
     Ok((body, opened.version))
-}
-
-/// Build the VerifyContext and run the whole-buffer verify+decrypt. Synchronous —
-/// the caller holds the session lock across this so the identity borrow is safe.
-/// `file_id` MUST be the REQUESTED id, NOT `manifest.file_id`: `verify_header`
-/// binds the served record to the request via that id, so sourcing it from the
-/// manifest would make the check a tautology and let an untrusted server
-/// substitute any other validly-signed record the user can decrypt.
-fn run_open(
-    identity: &Identity,
-    file_id: [u8; 16],
-    author: &crate::directory::VerifiedAuthor,
-    my_id: [u8; 16],
-    bundle: &maxsecu_client_core::DownloadBundle,
-) -> Result<maxsecu_client_core::OpenedFile, UiError> {
-    let ctx = VerifyContext {
-        file_id: Id(file_id),
-        author_sig_pub: author.sig_pub,
-        owner_sig_pub: author.sig_pub,
-        recipient_id: Id(my_id),
-        recipient_type: RecipientType::User,
-        recipient_secret: identity.enc_secret(),
-        recipient_mlkem_seed: identity.mlkem_seed(),
-        seen_max_version: None,
-        granter_sig_pub: &NO_GRANTERS,
-        admin_sig_pub: &NO_ADMINS,
-        tombstones: None,
-        compromise: None,
-    };
-    verify_and_open(&ctx, bundle)
-        .map_err(|_| UiError::new("verify_failed", "This item failed verification."))
 }
 
 /// `open_bundle` — verify + decrypt a bundle file and return its ordered member
@@ -256,7 +228,7 @@ mod tests {
         let views = member_views_from_body(&body);
         assert_eq!(views.len(), 2);
         assert_eq!(views[0].file_type, "video");
-        assert_eq!(views[0].file_id, "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"); // hex16 of member id
+        assert_eq!(views[0].file_id, "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"); // hex of member id
         assert_eq!(views[1].file_type, "generic");
         assert!(views[0].title.is_empty() && views[0].thumbnail_b64.is_none());
     }

@@ -97,11 +97,10 @@ use tauri::{Emitter, State};
 
 use maxsecu_client_core::{
     verify_and_open, verify_and_open_headers, DirectoryVerifier, Identity, MemoryTrustStore,
-    VerifyContext, NO_ADMINS, NO_GRANTERS,
+    VerifyContext,
 };
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::Manifest;
-use maxsecu_encoding::types::{Id, RecipientType};
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
@@ -446,50 +445,22 @@ fn video_verify_ctx<'a>(
     my_id: [u8; 16],
     identity: &'a Identity,
 ) -> VerifyContext<'a> {
-    VerifyContext {
-        file_id: Id(file_id),
-        author_sig_pub: author.sig_pub,
-        owner_sig_pub: author.sig_pub,
-        recipient_id: Id(my_id),
-        recipient_type: RecipientType::User,
-        recipient_secret: identity.enc_secret(),
-        recipient_mlkem_seed: identity.mlkem_seed(),
-        seen_max_version: None,
-        granter_sig_pub: &NO_GRANTERS,
-        admin_sig_pub: &NO_ADMINS,
-        tombstones: None,
-        compromise: None,
-    }
+    crate::directory::build_verify_ctx(file_id, author, my_id, identity)
 }
 
 /// Build the VerifyContext and run the whole-buffer verify+decrypt. Synchronous —
 /// the caller holds the session lock across this so the identity borrow is safe.
-fn run_open(
+/// `pub(crate)` so the bundle command reuses this exact thin wrapper (identical
+/// verify + sanitized error) instead of duplicating it. The content-substitution
+/// guard (requested-id binding) lives in `build_verify_ctx`.
+pub(crate) fn run_open(
     identity: &Identity,
     file_id: [u8; 16],
     author: &crate::directory::VerifiedAuthor,
     my_id: [u8; 16],
     bundle: &maxsecu_client_core::DownloadBundle,
 ) -> Result<maxsecu_client_core::OpenedFile, UiError> {
-    // `file_id` MUST be the REQUESTED id, NOT `manifest.file_id`: `verify_header`
-    // binds the served record to the request via `manifest.file_id != ctx.file_id
-    // => FileIdMismatch`. Sourcing it from the manifest would make that check a
-    // tautology, letting an untrusted server substitute any other validly-signed
-    // record the user can decrypt.
-    let ctx = VerifyContext {
-        file_id: Id(file_id),
-        author_sig_pub: author.sig_pub,
-        owner_sig_pub: author.sig_pub,
-        recipient_id: Id(my_id),
-        recipient_type: RecipientType::User,
-        recipient_secret: identity.enc_secret(),
-        recipient_mlkem_seed: identity.mlkem_seed(),
-        seen_max_version: None,
-        granter_sig_pub: &NO_GRANTERS,
-        admin_sig_pub: &NO_ADMINS,
-        tombstones: None,
-        compromise: None,
-    };
+    let ctx = crate::directory::build_verify_ctx(file_id, author, my_id, identity);
     verify_and_open(&ctx, bundle)
         .map_err(|_| UiError::new("verify_failed", "This item failed verification."))
 }
