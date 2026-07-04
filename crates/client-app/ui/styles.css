@@ -1757,8 +1757,11 @@ share-dialog .sd-retry, share-dialog .sd-remove {
 }
 share-dialog .share-actions { display: flex; justify-content: end; margin-top: 0.6rem; }
 
-/* Share checklist: a bounded, scrollable list of tickable contacts. */
-.sd-roster {
+/* Share checklist: a bounded, scrollable list of tickable contacts. The
+   #id.class selector beats the base `share-dialog #sd-rows` grid rule so the
+   checklist owns its own layout (block rows separated by dividers, not a grid gap). */
+#sd-rows.sd-roster {
+  display: block;
   max-height: 15rem;
   overflow-y: auto;
   margin: 0.5rem 0;
