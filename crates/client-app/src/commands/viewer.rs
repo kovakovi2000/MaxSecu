@@ -32,6 +32,11 @@ pub(crate) fn shape_content(
             "codec_unavailable",
             "Video playback is not enabled yet.",
         )),
+        FileType::Generic => Ok((None, None)), // download-only: no inline render
+        FileType::Bundle => Err(UiError::new(
+            "verify_failed",
+            "A bundle has no direct content.",
+        )),
     }
 }
 
@@ -380,6 +385,8 @@ async fn open_content_inner(
             .map(|s| s.plaintext.clone()),
         FileType::Blog => blog_text.as_ref().map(|t| t.clone().into_bytes()),
         FileType::Video => None,
+        // download-only / container: nothing inline to cache.
+        FileType::Generic | FileType::Bundle => None,
     };
     let (title, tags) = opened
         .streams

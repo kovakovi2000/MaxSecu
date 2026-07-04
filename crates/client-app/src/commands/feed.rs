@@ -99,6 +99,8 @@ pub(crate) fn file_type_name(t: FileType) -> String {
         FileType::Image => "image",
         FileType::Video => "video",
         FileType::Blog => "blog",
+        FileType::Generic => "generic",
+        FileType::Bundle => "bundle",
     }
     .to_owned()
 }

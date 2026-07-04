@@ -526,6 +526,8 @@ fn bundle_file_type_str(b: &maxsecu_client_core::UploadBundle) -> String {
         FileType::Image => "image",
         FileType::Blog => "blog",
         FileType::Video => "video",
+        FileType::Generic => "generic",
+        FileType::Bundle => "bundle",
     }
     .to_owned()
 }

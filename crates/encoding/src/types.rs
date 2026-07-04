@@ -408,6 +408,8 @@ pub enum FileType {
     Video = 0x01,
     Image = 0x02,
     Blog = 0x03,
+    Generic = 0x04,
+    Bundle = 0x05,
 }
 
 impl Field for FileType {
@@ -419,10 +421,37 @@ impl Field for FileType {
             0x01 => Ok(FileType::Video),
             0x02 => Ok(FileType::Image),
             0x03 => Ok(FileType::Blog),
+            0x04 => Ok(FileType::Generic),
+            0x05 => Ok(FileType::Bundle),
             other => Err(DecodeError::UnknownEnum {
                 kind: "FileType",
                 value: other as u32,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_type_generic_and_bundle_roundtrip() {
+        for ft in [
+            FileType::Video,
+            FileType::Image,
+            FileType::Blog,
+            FileType::Generic,
+            FileType::Bundle,
+        ] {
+            let mut w = Writer::new();
+            ft.put(&mut w);
+            let bytes = w.into_bytes();
+            let mut r = Reader::new(&bytes);
+            assert_eq!(FileType::get(&mut r).unwrap(), ft);
+        }
+        // Unknown byte still fails closed.
+        let mut r = Reader::new(&[0xFF]);
+        assert!(FileType::get(&mut r).is_err());
     }
 }

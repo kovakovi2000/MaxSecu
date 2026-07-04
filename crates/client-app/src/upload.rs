@@ -353,6 +353,8 @@ fn file_type_str(t: FileType) -> &'static str {
         FileType::Image => "image",
         FileType::Blog => "blog",
         FileType::Video => "video",
+        FileType::Generic => "generic",
+        FileType::Bundle => "bundle",
     }
 }
 
