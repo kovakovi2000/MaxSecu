@@ -244,7 +244,7 @@ test("screens use a live region for feedback", () => {
     assert.match(sd, /createElement\("state-badge"\)/, "recipient rows must render a <state-badge>");
     assert.match(
       sd,
-      /badge\.setAttribute\("label",\s*label\)/,
+      /badge\.setAttribute\("label",\s*badgeLabel\)/,
       "the state-badge must be given a text label, not just a state/colour",
     );
   });
@@ -257,7 +257,6 @@ test("screens use a live region for feedback", () => {
     assert.match(sd, /id="sd-username"/, "the username field must be a real <input>");
     assert.match(sd, /id="sd-share-btn"/, "Share must be a real button");
     assert.match(sd, /retry\.type\s*=\s*"button"/, "Retry rows must create a real <button>");
-    assert.match(sd, /remove\.type\s*=\s*"button"/, "Remove rows must create a real <button>");
     // Guard against a regression to click-only divs: no element built via
     // createElement("div"/"span") should carry its own click listener in this
     // file (all actions above go through button/form elements instead).
@@ -274,6 +273,17 @@ test("screens use a live region for feedback", () => {
       /\.innerHTML\s*=\s*`[^`]*\$\{(?!esc\()/,
       "share-dialog must not interpolate unescaped dynamic data into innerHTML",
     );
+  });
+
+  test(`${sdPath}: contacts checklist is a labelled, scrollable roster of real checkboxes`, () => {
+    // The roster is a bounded <ul class="sd-roster"> with an accessible label,
+    // and each tickable contact is a real <input type="checkbox"> (keyboard- and
+    // AT-operable), never a click-only element. Already-shared rows disable the
+    // checkbox so they drop out of the tab order.
+    assert.match(sd, /class="sd-roster"/, "the checklist needs the sd-roster container");
+    assert.match(sd, /aria-label="People to share with"/, "the roster <ul> needs an accessible label");
+    assert.match(sd, /cb\.type\s*=\s*"checkbox"/, "tickable rows must be real checkbox inputs");
+    assert.match(sd, /cb\.disabled\s*=/, "already-shared rows must disable the checkbox");
   });
 
   const stPath = "src/components/share-tray.ts";
