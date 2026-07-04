@@ -412,6 +412,8 @@ async fn open_content_inner(
                 author_fp: hex(&author.fingerprint[..8]),
                 recovery_ok: opened.recovery_grant_ok,
                 mine: my_id == author.user_id,
+                // Viewer opens image/blog content, never a bundle → no member tally.
+                member_counts: crate::dto::MemberCounts::default(),
             },
             content,
         );

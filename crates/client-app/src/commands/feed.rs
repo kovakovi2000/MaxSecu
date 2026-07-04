@@ -93,6 +93,23 @@ pub(crate) fn parse_title_tags(meta: &[u8]) -> (String, Vec<String>) {
     }
 }
 
+/// Tally a bundle's members by kind into a [`crate::dto::MemberCounts`]
+/// (order-private — counts only, never the member order). `FileType::Bundle`
+/// can't be a member, so it is ignored. `pub(crate)` so it is unit-testable.
+pub(crate) fn histogram(members: &[FileType]) -> crate::dto::MemberCounts {
+    let mut c = crate::dto::MemberCounts::default();
+    for t in members {
+        match t {
+            FileType::Video => c.video += 1,
+            FileType::Image => c.image += 1,
+            FileType::Blog => c.blog += 1,
+            FileType::Generic => c.generic += 1,
+            FileType::Bundle => {} // a member can't be a bundle — count nowhere.
+        }
+    }
+    c
+}
+
 /// The UI-facing file-type string. `pub(crate)` so the viewer command reuses it.
 pub(crate) fn file_type_name(t: FileType) -> String {
     match t {
@@ -348,6 +365,30 @@ pub async fn decrypt_card(
         .map(|s| B64.encode(&s.plaintext));
     let mine = my_id == author.user_id;
 
+    // For a bundle card, compute the order-private member tally (VID/IMG/TXT/FILE)
+    // from the VERIFIED signed member list. Best-effort: if the member list can't
+    // be opened, the card still renders (with a bundle badge) at zero counts —
+    // a member-list failure must NOT fail the whole card. Non-bundle cards stay
+    // at the default zeros. This extra fetch only happens for bundles (small list)
+    // and its result is cached below.
+    let member_counts = if manifest.file_type == FileType::Bundle {
+        match crate::commands::bundle::open_bundle_members(
+            &req.file_id,
+            &dir,
+            &session,
+            &connect_lock,
+        )
+        .await
+        {
+            Ok((body, _version)) => {
+                histogram(&body.members.iter().map(|m| m.file_type).collect::<Vec<_>>())
+            }
+            Err(_) => crate::dto::MemberCounts::default(),
+        }
+    } else {
+        crate::dto::MemberCounts::default()
+    };
+
     let card = crate::dto::CardDto {
         file_id: req.file_id,
         file_type: file_type_name(manifest.file_type),
@@ -358,7 +399,7 @@ pub async fn decrypt_card(
         mine,
         author_fp: hex(&author.fingerprint[..8]),
         recovery_ok: opened.recovery_grant_ok,
-        member_counts: crate::dto::MemberCounts::default(),
+        member_counts: member_counts.clone(),
     };
 
     // Best-effort: index the decoded card for local search (D-F). An index failure
@@ -391,6 +432,7 @@ pub async fn decrypt_card(
             author_fp: card.author_fp.clone(),
             recovery_ok: card.recovery_ok,
             mine: card.mine,
+            member_counts: card.member_counts.clone(),
         },
     );
     Ok(card)
@@ -429,6 +471,13 @@ mod tests {
             entries.iter().map(|e| e.updated_at).collect::<Vec<_>>(),
             vec![100, 200, 300]
         );
+    }
+
+    #[test]
+    fn histogram_tallies_member_file_types() {
+        use maxsecu_encoding::types::FileType;
+        let h = histogram(&[FileType::Video, FileType::Image, FileType::Image, FileType::Generic]);
+        assert_eq!(h, crate::dto::MemberCounts { video: 1, image: 2, blog: 0, generic: 1 });
     }
 
     #[test]
