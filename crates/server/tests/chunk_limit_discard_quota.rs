@@ -529,27 +529,43 @@ async fn discard_by_non_owner_is_404() {
     );
 }
 
-/// DELETE of a finalized file → 409 CONFLICT; the file remains fully accessible.
+/// DELETE of a finalized file is an OWNER-ONLY permanent delete (Task 1.5): a
+/// non-owner is refused with 404 (no oracle) and the file survives; the owner
+/// gets 204 and the file is permanently gone.
 #[tokio::test]
-async fn discard_finalized_is_409_and_file_survives() {
+async fn delete_finalized_owner_only_removes_file() {
     const FILE: [u8; 16] = [0xD3; 16];
 
     let r = mk_router();
     let alice_sk = SigningKey::generate();
+    let bob_sk = SigningKey::generate();
     let (alice_id, alice_tok) = register_and_login(&r, "alice_fin", &alice_sk, VOUCHER).await;
+    let (_bob_id, bob_tok) = register_and_login(&r, "bob_fin", &bob_sk, VOUCHER2).await;
 
     // Stage + finalize a complete v1
     stage_finalize(&r, FILE, alice_id, &alice_tok, 1 << 20, 2).await;
 
-    // DELETE → 409 (finalized version blocks discard; append-only invariant)
+    // A non-owner DELETE of the finalized file → 404 (no oracle); it survives.
+    let st = send_status(&r, req_delete(&file_uri(FILE), &bob_tok)).await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "non-owner delete of a finalized file must be 404 (no oracle)"
+    );
+    let (st, _) = send(
+        &r,
+        req_get(&format!("{}?version=latest", file_uri(FILE)), &alice_tok),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "file survives a non-owner delete attempt");
+
+    // The OWNER DELETE → 204 permanent delete; the file is gone.
     let st = send_status(&r, req_delete(&file_uri(FILE), &alice_tok)).await;
     assert_eq!(
         st,
-        StatusCode::CONFLICT,
-        "discard of finalized file must be 409"
+        StatusCode::NO_CONTENT,
+        "owner delete of a finalized file must be 204"
     );
-
-    // The file is still served after the failed discard attempt
     let (st, _) = send(
         &r,
         req_get(&format!("{}?version=latest", file_uri(FILE)), &alice_tok),
@@ -557,8 +573,8 @@ async fn discard_finalized_is_409_and_file_survives() {
     .await;
     assert_eq!(
         st,
-        StatusCode::OK,
-        "finalized file must still be served after failed discard"
+        StatusCode::NOT_FOUND,
+        "finalized file must be gone after the owner's permanent delete"
     );
 }
 

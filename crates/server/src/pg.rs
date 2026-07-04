@@ -31,8 +31,8 @@ use time::OffsetDateTime;
 use crate::control::{decode_control, role_text};
 use crate::error::{ControlAppendError, StoreError};
 use crate::files::{
-    AddWrapError, DeleteWrapError, DiscardError, FinalizeError, ListFilter, ParsedStage, StageError,
-    VersionSelector, WrapInput,
+    AddWrapError, DeleteError, DeleteWrapError, DiscardError, FinalizeError, ListFilter,
+    ParsedStage, StageError, VersionSelector, WrapInput,
 };
 use crate::store::{
     ancestor_chain, ChunkSlot, EnrollOutcome, FileListEntry, FileMeta, FileView, RecipientView,
@@ -1286,6 +1286,95 @@ impl Store for PgStore {
             .map_err(serr)?;
 
         // Leave file_genesis (immutable, §11.7) and files (inert, current_version = 0).
+        Ok(blob_refs)
+    }
+
+    async fn delete_file(
+        &self,
+        file_id: [u8; 16],
+        owner_id: [u8; 16],
+    ) -> Result<Vec<String>, DeleteError> {
+        let op = "delete_file";
+        let serr = |e: sqlx::Error| DeleteError::Store(store_err(op)(e));
+        let mut tx = self.pool.begin().await.map_err(serr)?;
+
+        // Transaction-local carve-out over the append-only triggers (schema.sql):
+        // ONLY inside this `SET LOCAL` scope may `file_genesis` / a *finalized*
+        // `file_versions` row be deleted (the guards allow it iff this GUC is
+        // 'on'). `SET LOCAL` auto-resets at COMMIT/ROLLBACK, so no other
+        // statement or connection is ever affected, and every other code path
+        // leaves the GUC unset → immutability holds. `directory_bindings` and
+        // `control_log` keep their own shared guard and stay fully immutable.
+        sqlx::query("SET LOCAL maxsecu.allow_owner_delete = 'on'")
+            .execute(&mut *tx)
+            .await
+            .map_err(serr)?;
+
+        // Owner-check the target under a row lock. No oracle: an absent file and
+        // a non-owner both collapse to NotFound (early return → ROLLBACK, so the
+        // GUC never persists and nothing is deleted).
+        let frow = sqlx::query("SELECT owner_id, file_type FROM files WHERE file_id = $1 FOR UPDATE")
+            .bind(&file_id[..])
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(serr)?;
+        let Some(frow) = frow else {
+            return Err(DeleteError::NotFound);
+        };
+        let target_owner: [u8; 16] = col_fixed(&frow, op, "owner_id").map_err(DeleteError::Store)?;
+        if target_owner != owner_id {
+            return Err(DeleteError::NotFound); // non-owner is indistinguishable from missing
+        }
+        let file_type: i16 = frow.get("file_type");
+
+        // The delete set: the target plus — only for a bundle (file_type=5) —
+        // every member it OWNS. The `owner_id = $2` predicate makes the cascade
+        // owner-scoped so a member owned by someone else is never removed.
+        let mut targets: Vec<[u8; 16]> = vec![file_id];
+        if file_type == 5 {
+            let mrows =
+                sqlx::query("SELECT file_id FROM files WHERE bundle_id = $1 AND owner_id = $2")
+                    .bind(&file_id[..])
+                    .bind(&owner_id[..])
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(serr)?;
+            for r in &mrows {
+                targets.push(col_fixed(r, op, "file_id").map_err(DeleteError::Store)?);
+            }
+        }
+        let target_slices: Vec<Vec<u8>> = targets.iter().map(|t| t[..].to_vec()).collect();
+
+        // Every stream's blob_ref across all versions of all targets, collected
+        // before the rows go away so the handler can purge the blob tier.
+        let srows =
+            sqlx::query("SELECT blob_ref FROM file_streams WHERE file_id = ANY($1::bytea[])")
+                .bind(&target_slices)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(serr)?;
+        let blob_refs: Vec<String> = srows.iter().map(|r| r.get("blob_ref")).collect();
+
+        // Delete respecting FKs: file_versions first (ON DELETE CASCADE tears down
+        // file_streams + file_key_wraps), then the immutable file_genesis, then
+        // the files row — all under the GUC carve-out.
+        sqlx::query("DELETE FROM file_versions WHERE file_id = ANY($1::bytea[])")
+            .bind(&target_slices)
+            .execute(&mut *tx)
+            .await
+            .map_err(serr)?;
+        sqlx::query("DELETE FROM file_genesis WHERE file_id = ANY($1::bytea[])")
+            .bind(&target_slices)
+            .execute(&mut *tx)
+            .await
+            .map_err(serr)?;
+        sqlx::query("DELETE FROM files WHERE file_id = ANY($1::bytea[])")
+            .bind(&target_slices)
+            .execute(&mut *tx)
+            .await
+            .map_err(serr)?;
+
+        tx.commit().await.map_err(serr)?;
         Ok(blob_refs)
     }
 }

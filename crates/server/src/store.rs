@@ -11,8 +11,8 @@
 use crate::control::decode_control;
 use crate::error::{ControlAppendError, StoreError};
 use crate::files::{
-    AddWrapError, DeleteWrapError, DiscardError, FinalizeError, ListFilter, ParsedStage, StageError,
-    StreamRow, VersionSelector, WrapInput,
+    AddWrapError, DeleteError, DeleteWrapError, DiscardError, FinalizeError, ListFilter,
+    ParsedStage, StageError, StreamRow, VersionSelector, WrapInput,
 };
 use async_trait::async_trait;
 use maxsecu_crypto::random_array;
@@ -472,6 +472,29 @@ pub trait Store: Send + Sync {
         file_id: [u8; 16],
         caller_id: [u8; 16],
     ) -> Result<Vec<String>, DiscardError>;
+
+    /// **Permanently delete a finalized file, owner-only** (`DELETE
+    /// /v1/files/{id}` once a version is committed). Removes every version /
+    /// stream / wrap / genesis / files row of the target and — if the target is
+    /// a **bundle** (`file_type == 5`) — every member whose `bundle_id ==
+    /// file_id` **and** `owner_id == owner_id` (owner-scoped cascade; a
+    /// member owned by someone else is never touched). Returns every removed
+    /// stream's `blob_ref` so the handler can purge the blob tier (incl. cold).
+    ///
+    /// Owner-only with no oracle: a missing file **and** a non-owner both yield
+    /// [`DeleteError::NotFound`] (mirrors [`discard_unfinalized`] /
+    /// [`list_recipients`]). This is the ONLY path that removes finalized
+    /// content; the PgStore does so via a transaction-local GUC carve-out over
+    /// the append-only triggers (schema.sql), so every other path stays
+    /// immutable.
+    ///
+    /// [`discard_unfinalized`]: Store::discard_unfinalized
+    /// [`list_recipients`]: Store::list_recipients
+    async fn delete_file(
+        &self,
+        file_id: [u8; 16],
+        owner_id: [u8; 16],
+    ) -> Result<Vec<String>, DeleteError>;
 }
 
 /// Defensive cap on the server-assembled re-share ancestor chain (mirrors the
@@ -1237,6 +1260,44 @@ impl Store for MemoryStore {
         }
         Ok(blob_refs)
     }
+
+    async fn delete_file(
+        &self,
+        file_id: [u8; 16],
+        owner_id: [u8; 16],
+    ) -> Result<Vec<String>, DeleteError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Owner-check the target (no oracle: absent OR non-owner → NotFound).
+        let Some(target) = inner.files.get(&file_id) else {
+            return Err(DeleteError::NotFound);
+        };
+        if target.owner_id != owner_id {
+            return Err(DeleteError::NotFound);
+        }
+        // The delete set: the target plus — only for a bundle (file_type=5) —
+        // every member it OWNS (owner-scoped; another owner's file is untouched).
+        let is_bundle = target.file_type == 5;
+        let mut targets: Vec<[u8; 16]> = vec![file_id];
+        if is_bundle {
+            for (id, f) in inner.files.iter() {
+                if f.bundle_id == Some(file_id) && f.owner_id == owner_id {
+                    targets.push(*id);
+                }
+            }
+        }
+        // Remove each target, collecting every version's every stream's blob_ref.
+        let mut blob_refs: Vec<String> = Vec::new();
+        for id in targets {
+            if let Some(entry) = inner.files.remove(&id) {
+                for ver in entry.versions.values() {
+                    for s in &ver.streams {
+                        blob_refs.push(s.blob_ref.clone());
+                    }
+                }
+            }
+        }
+        Ok(blob_refs)
+    }
 }
 
 /// A [`Store`] whose every method returns `Err(StoreError)` — used to prove the
@@ -1446,6 +1507,14 @@ impl Store for FaultyStore {
     ) -> Result<Vec<String>, DiscardError> {
         Err(DiscardError::Store(Self::fault("discard_unfinalized")))
     }
+
+    async fn delete_file(
+        &self,
+        _file_id: [u8; 16],
+        _owner_id: [u8; 16],
+    ) -> Result<Vec<String>, DeleteError> {
+        Err(DeleteError::Store(Self::fault("delete_file")))
+    }
 }
 
 #[cfg(test)]
@@ -1509,6 +1578,83 @@ mod memory_store_tests {
 
         // Unknown file → Ok(None).
         assert!(store.get_file_meta([0xEEu8; 16]).await.unwrap().is_none());
+    }
+
+    /// A version-1 [`ParsedStage`] with an explicit `file_type` and one content
+    /// stream (so a delete yields a non-empty `blob_ref` set).
+    fn v1_parsed_typed(
+        file: [u8; 16],
+        owner: [u8; 16],
+        file_type: i16,
+        listed: bool,
+        bundle_id: Option<[u8; 16]>,
+    ) -> ParsedStage {
+        let mut hex = String::new();
+        for b in &file {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        ParsedStage {
+            streams: vec![StreamRow {
+                stream_type: 1,
+                compression: 0,
+                chunk_size: 1 << 20,
+                chunk_count: 1,
+                total_bytes: 100,
+                digest: [0u8; 32],
+                blob_ref: format!("{hex}/1/1"),
+            }],
+            file_type,
+            ..v1_parsed(file, owner, listed, bundle_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_file_owner_only_and_cascades_bundle() {
+        let store = MemoryStore::new();
+        let owner_o1 = [7u8; 16];
+        let bundle_b = [1u8; 16];
+        let member_m1 = [2u8; 16];
+        let member_m2 = [3u8; 16];
+
+        // O1 stages + FINALIZES a bundle (file_type=Bundle=5, listed=true) and two
+        // members (listed=false, bundle_id=Some(B)).
+        for (id, ftype, listed, parent) in [
+            (bundle_b, 5, true, None),
+            (member_m1, 3, false, Some(bundle_b)),
+            (member_m2, 3, false, Some(bundle_b)),
+        ] {
+            store
+                .stage_version(v1_parsed_typed(id, owner_o1, ftype, listed, parent), 1_000)
+                .await
+                .unwrap();
+            store.finalize_version(id, 1, owner_o1, 1_000).await.unwrap();
+        }
+
+        // Deleting the bundle removes B, M1, M2 and returns all their blob refs.
+        let refs = store.delete_file(bundle_b, owner_o1).await.unwrap();
+        assert!(store.get_file_meta(bundle_b).await.unwrap().is_none());
+        assert!(store.get_file_meta(member_m1).await.unwrap().is_none());
+        assert!(store.get_file_meta(member_m2).await.unwrap().is_none());
+        assert_eq!(refs.len(), 3); // one content stream per removed file
+
+        // A non-owner (or missing file) → NotFound, no oracle, no deletion.
+        let stray = [9u8; 16];
+        store
+            .stage_version(v1_parsed_typed(stray, owner_o1, 3, true, None), 1_000)
+            .await
+            .unwrap();
+        store.finalize_version(stray, 1, owner_o1, 1_000).await.unwrap();
+        assert!(matches!(
+            store.delete_file(stray, [0x42u8; 16]).await,
+            Err(DeleteError::NotFound)
+        ));
+        // The wrong-owner attempt left the file intact.
+        assert!(store.get_file_meta(stray).await.unwrap().is_some());
+        // A completely missing file is likewise NotFound.
+        assert!(matches!(
+            store.delete_file([0xEEu8; 16], owner_o1).await,
+            Err(DeleteError::NotFound)
+        ));
     }
 
     #[tokio::test]

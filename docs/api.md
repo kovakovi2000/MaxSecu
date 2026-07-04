@@ -178,12 +178,15 @@ Stages the owner-signed record set. The file is **not visible** until finalize (
                { "stream_type":"metadata", "chunk_count": 1, "chunk_size": 65536, "total_bytes": 4096 },
                { "stream_type":"thumbnail", "chunk_count": 1, … }, { "stream_type":"preview", … } ],
   "wraps": [ { "recipient_id":"…|recovery", "recipient_type":"user|recovery",
-               "wrapped_dek_b64":"…", "wrap_alg":"0x0001", "granted_by":"…", "grant_b64":"…", "grant_sig_b64":"…" }, … ] }
+               "wrapped_dek_b64":"…", "wrap_alg":"0x0001", "granted_by":"…", "grant_b64":"…", "grant_sig_b64":"…" }, … ],
+  "listed": true,                              // OPTIONAL, default true; set once at v1. false = a bundle member hidden from the feed listing (Task 1.4)
+  "bundle_id": "…hex16 owning bundle…" }       // OPTIONAL; the owning bundle's file_id for a member, else absent (Task 1.3)
 // res 201
 { "upload_token": "opaque, scopes the chunk PUTs below", "version": 1 }
 ```
 - Server **bound-checks** `chunk_size ∈ [4 KiB, 8 MiB]` and `chunk_count · chunk_size ≤ 256 GiB` (`parameters.md` §1.2) before accepting; `400`/`413` otherwise. It does **not** trust these for security (the signed manifest is authoritative) — they bound its own allocation.
 - `wraps` MUST include a `recovery` entry (the client also asserts `recovery_present` in the signed manifest; the server only mirrors). Coarse check: caller `== genesis.owner_id`.
+- `listed`/`bundle_id` are **set once at v1** and ignored on rotations. `listed:false` marks a **bundle member** the feed listing (§8.6) hides; `bundle_id` points a member at its owning bundle (a malformed hex `bundle_id` is `400`).
 
 ### 8.2 `POST /v1/files/{file_id}/versions` — stage a new version (rotation/update)
 Same body as §8.1 minus `genesis` (immutable, retained). `author_id` in the manifest must equal the owner (owner-only write, D29) — re-checked by **every downloader** (§8.5), the server only coarse-checks caller `== owner`. Returns `{ upload_token, version: N }` where the client proposes `N`; finalize enforces strict `+1` (§12).
@@ -228,7 +231,14 @@ The owner re-verifies each chain to the prior author (author/re-share edges only
                "streams": { "title": {"size":118}, "thumbnail": {"size":18342}, "preview": {"size":221904} } }, … ],
   "next_cursor": "…" }
 ```
-The client then fetches+decrypts the small `title`/`thumbnail` streams (§9) to render the browse view. The server can sort/filter **only** by `file_type`/size/time (§13).
+The client then fetches+decrypts the small `title`/`thumbnail` streams (§9) to render the browse view. The server can sort/filter **only** by `file_type`/size/time (§13). **Bundle members (`listed:false`) are excluded** from this listing (Task 1.4) — they are reached only through their bundle's member list, never the public feed.
+
+### 8.7 `DELETE /v1/files/{file_id}` — discard staged / owner-only permanent delete
+Owner-only, no oracle. Two behaviors on one endpoint:
+- **Staged (never finalized):** discards the staged version and frees its chunks — **idempotent** (an absent/already-discarded staged version is still `204`).
+- **Finalized:** performs an **owner-only permanent delete** — this is the ONE path that removes committed content (server-side, via a transaction-local carve-out over the append-only triggers; the transparency/tamper-evidence logs stay fully immutable). It removes the file and all its versions/streams/wraps/genesis, **cascades to bundle members the same owner owns** (a member owned by anyone else is never touched), and **purges every blob, including the cold tier**. Deletion is local only — it never writes to the append-only sink.
+
+`204` on success. `404` for an absent file **or** a non-owner (same code — no existence/ownership oracle). `400` on a malformed `file_id`; `500` on a backend fault. A non-owner of a finalized file is refused before the permanent-delete path is ever reached.
 
 ---
 

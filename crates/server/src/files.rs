@@ -247,6 +247,26 @@ impl From<StoreError> for DiscardError {
     }
 }
 
+/// Why an **owner-only permanent delete** of a *finalized* file (`DELETE
+/// /v1/files/{id}`) was rejected. Unlike [`DiscardError`] this path removes
+/// finalized content (via the transaction-local carve-out over the append-only
+/// triggers), so there is deliberately **no** `HasFinalizedVersion` variant.
+/// Fail-closed: a missing file and a non-owner collapse to the same `NotFound`
+/// (no oracle, §9.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteError {
+    /// The file is absent or the caller is not its owner — same code, no oracle.
+    NotFound,
+    /// A backend fault (→ 500, logged) — distinct from a business rejection.
+    Store(StoreError),
+}
+
+impl From<StoreError> for DeleteError {
+    fn from(e: StoreError) -> Self {
+        DeleteError::Store(e)
+    }
+}
+
 /// Which version of a file `GET /v1/files/{id}` should return (api.md §8.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionSelector {

@@ -137,6 +137,7 @@ CREATE TABLE files (
 );
 CREATE INDEX files_owner_idx ON files(owner_id);
 CREATE INDEX files_listing_idx ON files(file_type, updated_at DESC);  -- D35 listing: sort/filter on type/time only
+CREATE INDEX files_bundle_idx ON files(bundle_id) WHERE bundle_id IS NOT NULL;  -- bundle-member cascade (Task 1.5 delete_file scans WHERE bundle_id = $target)
 
 CREATE TABLE file_genesis (                       -- created once, never modified (§11.7)
   file_id            BYTEA PRIMARY KEY REFERENCES files(file_id),       -- one-genesis-per-file
@@ -146,8 +147,25 @@ CREATE TABLE file_genesis (                       -- created once, never modifie
   genesis_sig        BYTEA NOT NULL CHECK (octet_length(genesis_sig) = 64),
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- file_genesis is UPDATE-immutable always, and DELETE-immutable EXCEPT inside the
+-- owner-only permanent-delete path, which sets the transaction-local GUC
+-- `maxsecu.allow_owner_delete = 'on'` (Task 1.5). The dedicated guard keeps the
+-- SHARED `maxsecu_forbid_update_delete()` untouched, so directory_bindings and
+-- control_log (which still use it) stay FULLY immutable. `current_setting(name,
+-- true)` returns NULL (never matches 'on') whenever the GUC is unset — i.e. on
+-- every path but delete_file — so genesis removal remains impossible elsewhere.
+CREATE OR REPLACE FUNCTION file_genesis_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF current_setting('maxsecu.allow_owner_delete', true) = 'on' THEN
+      RETURN OLD;  -- authorized owner-only permanent delete
+    END IF;
+    RAISE EXCEPTION 'file_genesis is immutable';
+  END IF;
+  RAISE EXCEPTION 'file_genesis is immutable';  -- UPDATE always forbidden
+END $$;
 CREATE TRIGGER file_genesis_immutable BEFORE UPDATE OR DELETE ON file_genesis
-  FOR EACH ROW EXECUTE FUNCTION maxsecu_forbid_update_delete();
+  FOR EACH ROW EXECUTE FUNCTION file_genesis_guard();
 
 -- ============================================================================
 -- 11.2  file_versions  +  per-stream rows  (multi-stream, D33)
@@ -168,10 +186,17 @@ CREATE TABLE file_versions (
 CREATE OR REPLACE FUNCTION file_versions_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF TG_OP = 'DELETE' THEN
-    IF OLD.finalized THEN RAISE EXCEPTION 'cannot delete a finalized version'; END IF;  -- staged versions may be GC'd; finalized are pruned only by rotation logic via a privileged path
+    -- Staged versions may always be GC'd. A FINALIZED version may be deleted ONLY
+    -- inside the owner-only permanent-delete path, which sets the transaction-local
+    -- GUC `maxsecu.allow_owner_delete = 'on'` (Task 1.5). Everywhere else the GUC is
+    -- unset → current_setting(...,true) is NULL → finalized rows stay immutable.
+    IF OLD.finalized
+       AND current_setting('maxsecu.allow_owner_delete', true) IS DISTINCT FROM 'on' THEN
+      RAISE EXCEPTION 'cannot delete a finalized version';
+    END IF;
     RETURN OLD;
   END IF;
-  IF OLD.finalized THEN RAISE EXCEPTION 'finalized version is immutable'; END IF;
+  IF OLD.finalized THEN RAISE EXCEPTION 'finalized version is immutable'; END IF;  -- UPDATE of a finalized version is never allowed
   RETURN NEW;
 END $$;
 CREATE TRIGGER file_versions_guard_trg BEFORE UPDATE OR DELETE ON file_versions

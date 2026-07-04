@@ -16,7 +16,7 @@ use maxsecu_encoding::types::{
 };
 use maxsecu_encoding::{encode, RECOVERY_ID};
 use maxsecu_server::{
-    parse_stage, AddWrapError, AuthConfig, AuthService, DeleteWrapError, EnrollOutcome,
+    parse_stage, AddWrapError, AuthConfig, AuthService, DeleteError, DeleteWrapError, EnrollOutcome,
     FinalizeError, GenesisInput, ListFilter, PgStore, RecoveryAccount, SessionRecord, StageError,
     StageInput, StoredBinding, Store, VersionSelector, WrapInput,
 };
@@ -956,6 +956,62 @@ async fn reshare_and_soft_revoke_persist_in_postgres() {
     );
     db.store.delete_wrap(file, r, owner).await.expect("owner revokes");
     assert!(db.store.get_file(file, VersionSelector::Latest, r).await.unwrap().is_none());
+
+    db.teardown().await;
+}
+
+// ---- Task 1.5: owner-only permanent delete of a FINALIZED file + cascade ----
+
+/// This is the test that PROVES the transaction-local GUC carve-out
+/// (`SET LOCAL maxsecu.allow_owner_delete = 'on'`) actually defeats the append-only
+/// triggers on `file_versions` (finalized) and `file_genesis` over REAL Postgres —
+/// and that a non-owner delete is refused and removes NOTHING.
+#[tokio::test]
+async fn delete_finalized_file_cascades_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    db.seed_user(owner, "owner_del").await;
+    let bundle = [0xB1u8; 16];
+    let m1 = [0xB2u8; 16];
+    let m2 = [0xB3u8; 16];
+
+    // A finalized bundle (file_type=Bundle=5, listed) + two members it owns.
+    let pb = parse_stage(pg_stage_listed(
+        bundle, 1, owner, Some(pg_genesis(bundle, owner)), FileType::Bundle, true,
+    ))
+    .unwrap();
+    db.store.stage_version(pb, TS).await.unwrap();
+    db.store.finalize_version(bundle, 1, owner, TS + 1).await.unwrap();
+    for m in [m1, m2] {
+        let pm = parse_stage(StageInput {
+            bundle_id: Some(bundle),
+            ..pg_stage_listed(m, 1, owner, Some(pg_genesis(m, owner)), FileType::Blog, false)
+        })
+        .unwrap();
+        db.store.stage_version(pm, TS).await.unwrap();
+        db.store.finalize_version(m, 1, owner, TS + 2).await.unwrap();
+    }
+
+    // A NON-owner delete is refused (no oracle) AND removes nothing — the finalized
+    // rows survive precisely because the GUC is unset on this path (immutability
+    // holds), so the triggers would fire even if the code tried.
+    assert_eq!(db.store.delete_file(bundle, [0x77; 16]).await, Err(DeleteError::NotFound));
+    assert!(db.store.get_file_meta(bundle).await.unwrap().is_some());
+    assert!(db.store.get_file_meta(m1).await.unwrap().is_some());
+
+    // The OWNER permanently deletes the finalized bundle: the GUC carve-out lets
+    // the delete pass the file_versions + file_genesis triggers; the members
+    // cascade; every stream's blob_ref comes back for the caller to purge.
+    let refs = db.store.delete_file(bundle, owner).await.expect("owner delete succeeds over real triggers");
+    assert_eq!(refs.len(), 6); // 2 streams (content+metadata) × 3 files
+
+    // Prove durability via a FRESH pool — the rows are gone, listing is empty.
+    let fresh = db.reopen().await;
+    assert!(fresh.get_file_meta(bundle).await.unwrap().is_none());
+    assert!(fresh.get_file_meta(m1).await.unwrap().is_none());
+    assert!(fresh.get_file_meta(m2).await.unwrap().is_none());
+    let listed = fresh.list_files(ListFilter { file_type: None, limit: 50 }).await.unwrap();
+    assert!(listed.is_empty());
 
     db.teardown().await;
 }

@@ -11,8 +11,8 @@
 use crate::auth::AuthService;
 use crate::error::{AuthError, ChallengeError, ControlAppendError, ProveError};
 use crate::files::{
-    parse_stage, AddWrapError, DeleteWrapError, DiscardError, FinalizeError, GenesisInput,
-    ListFilter, StageError, StageInput, VersionSelector, WrapInput,
+    parse_stage, AddWrapError, DeleteError, DeleteWrapError, DiscardError, FinalizeError,
+    GenesisInput, ListFilter, StageError, StageInput, VersionSelector, WrapInput,
 };
 use crate::audit::{AuditSink, GrantAction, GrantEdge};
 use crate::blob::BlobStore;
@@ -1610,10 +1610,14 @@ async fn delete_wrap<S: Store + 'static>(
     }
 }
 
-/// `DELETE /v1/files/{file_id}` — discard a staged-but-never-finalized upload.
-/// Owner-only; idempotent (absent-or-already-discarded staged version is success).
-/// `204` on success; `404` for absent/not-owner (no oracle); `409` if a finalized
-/// version exists (append-only model — cannot remove committed content, §11.7).
+/// `DELETE /v1/files/{file_id}` — remove a file, owner-only. For a
+/// staged-but-never-finalized upload this discards the staged version
+/// (idempotent). Once a version is **finalized**, the same endpoint performs an
+/// owner-only **permanent delete**: it removes the file, cascades to any bundle
+/// members the owner owns, and purges every blob (incl. the cold tier). `204` on
+/// success; `404` for absent/not-owner (no oracle) — a non-owner of a finalized
+/// file is already `NotFound` from `discard_unfinalized`, so it never reaches
+/// `delete_file`.
 async fn discard_file<S: Store + 'static>(
     State(st): State<AppState<S>>,
     session: AuthedSession,
@@ -1633,7 +1637,23 @@ async fn discard_file<S: Store + 'static>(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(DiscardError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(DiscardError::HasFinalizedVersion) => StatusCode::CONFLICT.into_response(),
+        // A finalized version exists: fall through to the owner-only permanent
+        // delete (bundle cascade + blob purge). The owner is already established
+        // — discard_unfinalized returned NotFound (→404) for a non-owner.
+        Err(DiscardError::HasFinalizedVersion) => {
+            match st.auth.store().delete_file(file_id, session.user_id).await {
+                Ok(blob_refs) => {
+                    for r in &blob_refs {
+                        if let Err(e) = st.blobs.delete_stream(r).await {
+                            log_internal(e);
+                        }
+                    }
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                Err(DeleteError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+                Err(DeleteError::Store(e)) => internal_error(e),
+            }
+        }
         Err(DiscardError::Store(e)) => internal_error(e),
     }
 }
@@ -3155,6 +3175,115 @@ mod tests {
         bad["bundle_id"] = serde_json::json!("nothex");
         let (st, _) = post_json_auth(&router, "/v1/files", bad, &token).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    // A manifest whose committed `file_type` is `ftype` (the store records the
+    // manifest's type; the request `file_type` field is only advisory).
+    fn file_manifest_b64_typed(
+        file: [u8; 16],
+        version: u64,
+        author: [u8; 16],
+        ftype: maxsecu_encoding::types::FileType,
+    ) -> String {
+        use maxsecu_encoding::structs::{Manifest, Stream};
+        use maxsecu_encoding::types::{Compression, Id, StreamType, Suite};
+        let m = Manifest {
+            file_id: Id(file),
+            version,
+            file_type: ftype,
+            alg: Suite::V1,
+            chunk_size: 1 << 20,
+            dek_commit: Bytes32([0xDC; 32]),
+            streams: vec![
+                Stream {
+                    stream_type: StreamType::Content,
+                    compression: Compression::None,
+                    chunk_count: 2,
+                    digest: Bytes32([0xC0; 32]),
+                },
+                Stream {
+                    stream_type: StreamType::Metadata,
+                    compression: Compression::None,
+                    chunk_count: 1,
+                    digest: Bytes32([0x2E; 32]),
+                },
+            ],
+            recovery_present: true,
+            author_id: Id(author),
+            created_at: Timestamp(1_719_500_000_000 + version),
+        };
+        b64encode(&maxsecu_encoding::encode(&m))
+    }
+
+    /// A `POST /v1/files` body for a file whose manifest commits `ftype`, with the
+    /// given feed visibility + owning-bundle pointer (Task 1.3/1.5 helpers).
+    fn typed_file_body(
+        file: [u8; 16],
+        owner: [u8; 16],
+        ftype: maxsecu_encoding::types::FileType,
+        listed: bool,
+        bundle_id: Option<[u8; 16]>,
+    ) -> serde_json::Value {
+        let mut body = create_file_body(file, owner);
+        body["file_type"] = serde_json::json!(file_type_name(ftype as u8 as i16));
+        body["manifest_b64"] = serde_json::json!(file_manifest_b64_typed(file, 1, owner, ftype));
+        body["listed"] = serde_json::json!(listed);
+        if let Some(b) = bundle_id {
+            body["bundle_id"] = serde_json::json!(hex_encode(&b));
+        }
+        body
+    }
+
+    /// Stage v1, upload the declared chunks, and finalize a file over HTTP.
+    async fn stage_upload_finalize(router: &Router, body: serde_json::Value, file: [u8; 16], token: &str) {
+        let (st, _) = post_json_auth(router, "/v1/files", body, token).await;
+        assert_eq!(st, StatusCode::CREATED);
+        upload_declared_chunks(router, file, 1, token).await;
+        let (st, _) = post_json_auth(
+            router,
+            &format!("/v1/files/{}/versions/1/finalize", hex_encode(&file)),
+            serde_json::json!({}),
+            token,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_finalized_bundle_owner_only_over_http() {
+        use maxsecu_encoding::types::FileType;
+        let (router, admin_sk, bob_sk, auth, _audit) = admin_app_core().await;
+        let owner = [0xADu8; 16]; // admin's user_id
+        let token = login(&router, "admin", &admin_sk).await;
+
+        let bundle = [0xB1u8; 16];
+        let m1 = [0xB2u8; 16];
+        let m2 = [0xB3u8; 16];
+        // Owner finalizes a bundle + two members it owns.
+        stage_upload_finalize(&router, typed_file_body(bundle, owner, FileType::Bundle, true, None), bundle, &token).await;
+        stage_upload_finalize(&router, typed_file_body(m1, owner, FileType::Blog, false, Some(bundle)), m1, &token).await;
+        stage_upload_finalize(&router, typed_file_body(m2, owner, FileType::Blog, false, Some(bundle)), m2, &token).await;
+
+        // (a) A non-owner delete of the finalized bundle → 404 (no oracle) and
+        // nothing is removed.
+        let bob = login(&router, "bob", &bob_sk).await;
+        let st = delete_auth(&router, &format!("/v1/files/{}", hex_encode(&bundle)), &bob).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert!(auth.store().get_file_meta(bundle).await.unwrap().is_some());
+
+        // (b) Owner delete of the finalized bundle → 204; the bundle AND its
+        // members are gone; the feed listing is empty.
+        let st = delete_auth(&router, &format!("/v1/files/{}", hex_encode(&bundle)), &token).await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        assert!(auth.store().get_file_meta(bundle).await.unwrap().is_none());
+        assert!(auth.store().get_file_meta(m1).await.unwrap().is_none());
+        assert!(auth.store().get_file_meta(m2).await.unwrap().is_none());
+        let listed = auth
+            .store()
+            .list_files(ListFilter { file_type: None, limit: 50 })
+            .await
+            .unwrap();
+        assert!(listed.is_empty());
     }
 
     #[tokio::test]

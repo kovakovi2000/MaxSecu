@@ -47,8 +47,9 @@ use maxsecu_encoding::types::{
 };
 use maxsecu_encoding::structs::MLKEM768_PUB_LEN;
 use maxsecu_server::{
-    router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteWrapError,
-    DiscardError, EnrollOutcome, FileListEntry, FileMeta, FileView, FinalizeError, ListFilter,
+    router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteError,
+    DeleteWrapError, DiscardError, EnrollOutcome, FileListEntry, FileMeta, FileView, FinalizeError,
+    ListFilter,
     MemoryBlobStore, MemoryStore, NullAuditSink, ParsedStage, RecipientView,
     RecoveryAccount, SessionRecord, StageError, Store, StoreError, StoredBinding,
     StoredControlRecord, TlsExporter, UserRecord, VersionMeta, VersionSelector, WrapInput,
@@ -261,6 +262,13 @@ impl Store for FaultyStore {
     ) -> Result<Vec<String>, DiscardError> {
         Err(DiscardError::Store(bait("discard_unfinalized")))
     }
+    async fn delete_file(
+        &self,
+        _file_id: [u8; 16],
+        _owner_id: [u8; 16],
+    ) -> Result<Vec<String>, DeleteError> {
+        Err(DeleteError::Store(bait("delete_file")))
+    }
 }
 
 /// A backend that authenticates normally (delegates auth/session to an inner
@@ -438,6 +446,13 @@ impl Store for FileFaultyStore {
         _caller_id: [u8; 16],
     ) -> Result<Vec<String>, DiscardError> {
         Err(DiscardError::Store(bait("discard_unfinalized")))
+    }
+    async fn delete_file(
+        &self,
+        _file_id: [u8; 16],
+        _owner_id: [u8; 16],
+    ) -> Result<Vec<String>, DeleteError> {
+        Err(DeleteError::Store(bait("delete_file")))
     }
 }
 
