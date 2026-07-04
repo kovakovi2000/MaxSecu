@@ -5,6 +5,7 @@
 pub mod commands;
 pub mod config;
 pub mod content_cache;
+pub mod contacts;
 pub mod directory;
 pub mod direct_link;
 pub mod download;
