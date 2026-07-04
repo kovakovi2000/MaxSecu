@@ -192,7 +192,7 @@ fn open_my_header(
         recipient_id: Id(my_id),
         recipient_type: RecipientType::User,
         recipient_secret: identity.enc_secret(),
-        recipient_mlkem_seed: None,
+        recipient_mlkem_seed: identity.mlkem_seed(),
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS,
         admin_sig_pub: &NO_ADMINS,

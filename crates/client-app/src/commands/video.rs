@@ -105,7 +105,11 @@ fn open_video_job_core(
         recipient_id: Id(my_id),
         recipient_type: RecipientType::User,
         recipient_secret: identity.enc_secret(),
-        recipient_mlkem_seed: None,
+        // PQ-hybrid (V2) videos wrap the DEK to the recipient's ML-KEM key too, so
+        // the seed is REQUIRED to unwrap them — matching the sibling recipient-open
+        // paths (feed::open_my_header, viewer::{video_verify_ctx,run_open}). Passing
+        // None here made every V2 video fail closed (`video_failed`) at this verify.
+        recipient_mlkem_seed: identity.mlkem_seed(),
         seen_max_version: None,
         granter_sig_pub: &NO_GRANTERS,
         admin_sig_pub: &NO_ADMINS,
