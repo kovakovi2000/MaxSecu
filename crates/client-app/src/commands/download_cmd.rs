@@ -6,6 +6,7 @@
 //! the `ContentDecryptor`/`Identity`/plaintext-DEK never do.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -36,6 +37,11 @@ use crate::http_client::get_json;
 /// blog→`<title>.txt`, generic→the original `filename` (fallback `<title>` else
 /// `download.bin`), bundle→`"bundle"` (bundles download per-member, not directly).
 /// The title/filename are sanitized into a safe, non-path-traversing name.
+///
+/// NB: this (and `sanitize_name`) only PRE-FILLS the native "save as" dialog — it
+/// is a convenience default, NOT the path-safety boundary. The real boundary is
+/// the OS dialog / the caller-provided `save_path` that `download_content` writes
+/// to; do not rely on this function to harden an arbitrary destination path.
 pub fn suggested_filename(file_type: FileType, metadata_json: &[u8]) -> String {
     let v: serde_json::Value =
         serde_json::from_slice(metadata_json).unwrap_or(serde_json::Value::Null);
@@ -88,6 +94,83 @@ fn sanitize_name(raw: &str) -> String {
 
 fn write_failed() -> UiError {
     UiError::new("write_failed", "Could not write the file to disk.")
+}
+
+/// A crash-safe download sink: writes to a UNIQUE sibling temp file and only
+/// swaps it into place at `save_path` on an explicit [`AtomicFile::commit`].
+/// Until commit, the user's existing `save_path` is untouched — so a mid-download
+/// failure (chunk fetch/verify error, write error, early `?`-return) never leaves
+/// a partial/truncated file where the original stood. On any drop WITHOUT commit,
+/// the temp is best-effort removed (no stray `.part` files left behind). This is
+/// the same temp-then-rename discipline `keystore::change_password` uses.
+struct AtomicFile {
+    tmp: PathBuf,
+    save_path: PathBuf,
+    file: std::fs::File,
+    committed: bool,
+}
+
+impl AtomicFile {
+    /// Create (truncate) the temp sibling only — `save_path` is NOT touched yet.
+    fn create(save_path: &str) -> Result<Self, UiError> {
+        let save_path = PathBuf::from(save_path);
+        let tmp = temp_sibling(&save_path);
+        let file = std::fs::File::create(&tmp).map_err(|_| write_failed())?;
+        Ok(Self { tmp, save_path, file, committed: false })
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), UiError> {
+        self.file.write_all(buf).map_err(|_| write_failed())
+    }
+
+    /// Flush + fsync the temp, then atomically move it onto `save_path` (a same-
+    /// volume `rename`; cross-volume falls back to copy+remove, like the upload
+    /// staging move). Returns the committed `save_path`. After this the temp is
+    /// gone, so Drop does nothing.
+    fn commit(mut self) -> Result<String, UiError> {
+        self.file.flush().map_err(|_| write_failed())?;
+        self.file.sync_all().map_err(|_| write_failed())?;
+        match std::fs::rename(&self.tmp, &self.save_path) {
+            Ok(()) => {}
+            Err(_) => {
+                // Cross-volume: rename can't move across filesystems — copy then
+                // remove the temp (best-effort) so the destination is still whole.
+                std::fs::copy(&self.tmp, &self.save_path).map_err(|_| {
+                    let _ = std::fs::remove_file(&self.tmp);
+                    write_failed()
+                })?;
+                let _ = std::fs::remove_file(&self.tmp);
+            }
+        }
+        self.committed = true;
+        Ok(self.save_path.to_string_lossy().into_owned())
+    }
+}
+
+impl Drop for AtomicFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Failure/abort before commit — remove the partial temp, leaving the
+            // user's existing save_path untouched.
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+/// A UNIQUE (pid + nanos) `.part` sibling of `save_path` in the SAME directory —
+/// same volume, so the commit `rename` is atomic; unique so it never clobbers an
+/// unrelated pre-existing `<name>.part`.
+fn temp_sibling(save_path: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut name = save_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}.{nanos}.part", std::process::id()));
+    save_path.with_file_name(name)
 }
 
 /// `download_content` — verify + decrypt the REQUESTED post's original and write
@@ -273,10 +356,10 @@ async fn download_whole(
         .find(|s| s.stream_type == StreamType::Content)
         .ok_or_else(|| UiError::new("verify_failed", "Missing content."))?;
 
-    let mut file = std::fs::File::create(&req.save_path).map_err(|_| write_failed())?;
-    file.write_all(&content.plaintext).map_err(|_| write_failed())?;
-    file.flush().map_err(|_| write_failed())?;
-    Ok(req.save_path.clone())
+    // Temp-then-rename: the user's existing save_path is untouched until commit.
+    let mut sink = AtomicFile::create(&req.save_path)?;
+    sink.write_all(&content.plaintext)?;
+    sink.commit()
 }
 
 /// Video/generic: derive the in-TCB `ContentDecryptor` (the SAME header ladder the
@@ -301,8 +384,10 @@ async fn download_streaming(
     let direct_http = crate::direct_link::shared_direct_http();
 
     // Header (small streams only — no content fetched). Prefer the direct route.
+    // Use the canonical lowercase `file_id_hex` EVERYWHERE (header + every content
+    // chunk) so header and chunk URLs never diverge in casing.
     let (header, header_used_direct) =
-        build_stream_header(sender, host, token, &req.file_id, view, route_mode, direct_http)
+        build_stream_header(sender, host, token, file_id_hex, view, route_mode, direct_http)
             .await?;
 
     // Derive the decryptor under the session lock (sync verify; the identity borrow
@@ -326,7 +411,7 @@ async fn download_streaming(
                     sender,
                     host,
                     token,
-                    &req.file_id,
+                    file_id_hex,
                     view,
                     RouteMode::PreferServer,
                     None,
@@ -353,7 +438,10 @@ async fn download_streaming(
     let n = decryptor.content_chunk_count();
     let version = decryptor.version();
 
-    let mut file = std::fs::File::create(&req.save_path).map_err(|_| write_failed())?;
+    // Temp-then-rename: stream chunks into a temp sibling; the user's existing
+    // save_path is untouched until commit. Any early return below (chunk fetch or
+    // per-chunk AEAD failure) drops `sink`, removing the partial temp.
+    let mut sink = AtomicFile::create(&req.save_path)?;
     for i in 0..n {
         // Fetch this chunk's ciphertext, preferring the direct route. The real
         // per-chunk AEAD check is the `open_range` decrypt below; a direct-sourced
@@ -394,11 +482,10 @@ async fn download_streaming(
                 Err(_) => return Err(UiError::new("verify_failed", "This item failed verification.")),
             }
         };
-        file.write_all(&plaintext).map_err(|_| write_failed())?;
+        sink.write_all(&plaintext)?;
         // `plaintext` (Zeroizing) drops here → the chunk plaintext is zeroized.
     }
-    file.flush().map_err(|_| write_failed())?;
-    Ok(req.save_path.clone())
+    sink.commit()
 }
 
 #[cfg(test)]
@@ -449,5 +536,67 @@ mod tests {
     #[test]
     fn malformed_metadata_yields_a_safe_default() {
         assert_eq!(suggested_filename(FileType::Video, b"not json"), "download.mp4");
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("mxs-dl-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A committed AtomicFile atomically replaces the destination with the temp
+    /// contents and leaves NO `.part` file behind.
+    #[test]
+    fn atomic_file_commit_replaces_and_cleans_up() {
+        let dir = unique_dir("commit");
+        let save = dir.join("out.bin");
+        std::fs::write(&save, b"ORIGINAL").unwrap();
+
+        let save_str = save.to_string_lossy().into_owned();
+        let mut sink = AtomicFile::create(&save_str).unwrap();
+        // The original is still intact while writing to the temp.
+        assert_eq!(std::fs::read(&save).unwrap(), b"ORIGINAL");
+        sink.write_all(b"NEWDATA").unwrap();
+        let out = sink.commit().unwrap();
+        assert_eq!(out, save_str);
+        assert_eq!(std::fs::read(&save).unwrap(), b"NEWDATA");
+        // No stray temp siblings left in the directory.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "no .part temp should remain after commit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mid-write failure (drop WITHOUT commit) leaves the user's existing
+    /// save_path byte-for-byte intact and removes the partial temp — the data-loss
+    /// guarantee the atomic-rename discipline provides.
+    #[test]
+    fn atomic_file_abort_preserves_original_and_removes_temp() {
+        let dir = unique_dir("abort");
+        let save = dir.join("out.bin");
+        std::fs::write(&save, b"ORIGINAL").unwrap();
+        let save_str = save.to_string_lossy().into_owned();
+
+        {
+            let mut sink = AtomicFile::create(&save_str).unwrap();
+            sink.write_all(b"PARTIAL").unwrap();
+            // Simulate a mid-download error: drop the sink WITHOUT commit.
+        }
+        // The original is untouched (never truncated) and no temp remains.
+        assert_eq!(std::fs::read(&save).unwrap(), b"ORIGINAL", "original must survive an aborted download");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "aborted download must leave no .part temp");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
