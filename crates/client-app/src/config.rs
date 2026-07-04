@@ -244,24 +244,18 @@ pub struct BehaviorSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PerformanceSettings {
     pub ram_cache_cap_mb: u32,
-    /// How many feed cards to fetch/decode in parallel (clamped 1..=8). `#[serde(default)]`
-    /// lets an older `settings.json` without this key load with the default.
+    /// Feed cards fetched/decoded in parallel. Default 4; clamped 1..=8.
+    /// `#[serde(default)]` lets an older `settings.json` without this key load with the default.
     #[serde(default = "default_feed_concurrency")]
     pub feed_concurrency: u8,
-    /// Worker-thread budget for the confined author-side transcode (clamped 1..=cores).
+    /// Worker-thread budget for the confined author-side transcode. Default =
+    /// available parallelism (logical CPUs); clamped 1..=available.
     #[serde(default = "default_cpu_threads")]
     pub transcode_threads: u16,
-    /// Worker-thread budget for the confined decode path (clamped 1..=cores).
+    /// Worker-thread budget for the confined decode path. Default =
+    /// available parallelism (logical CPUs); clamped 1..=available.
     #[serde(default = "default_cpu_threads")]
     pub decode_threads: u16,
-}
-fn default_feed_concurrency() -> u8 {
-    4
-}
-fn default_cpu_threads() -> u16 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() as u16)
-        .unwrap_or(1)
 }
 impl Default for PerformanceSettings {
     fn default() -> Self {
@@ -272,6 +266,17 @@ impl Default for PerformanceSettings {
             decode_threads: default_cpu_threads(),
         }
     }
+}
+fn default_feed_concurrency() -> u8 {
+    4
+}
+/// Available parallelism (logical CPUs, includes SMT/hyperthreads), fallback 1.
+/// Saturating cast: a >u16::MAX logical-CPU count clamps to u16::MAX rather than
+/// truncating (a truncated 0 would make `normalized_with_ram`'s `clamp(1, 0)` panic).
+fn default_cpu_threads() -> u16 {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(u16::MAX as usize) as u16)
+        .unwrap_or(1)
 }
 
 /// The download/transport **route** the client uses (3-way, spec
