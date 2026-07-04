@@ -1579,10 +1579,13 @@ pub async fn cancel_bundle(
 /// Testable core of [`cancel_bundle`]: remove the `BundleJob` (if any) and
 /// best-effort wipe each member's staging dir. Always `Ok` (idempotent).
 async fn cancel_bundle_inner(jobs: &BundleJobs, job_id: &str) -> Result<(), UiError> {
-    if let Some(job) = jobs.0.lock().await.remove(job_id) {
+    // Take the job and RELEASE the async lock before any blocking fs I/O (the guard
+    // drops at the `;`), mirroring `confirm_bundle_inner`.
+    let job = jobs.0.lock().await.remove(job_id);
+    if let Some(job) = job {
         for m in &job.members {
-            if let Some(d) = &m.job_dir {
-                let _ = std::fs::remove_dir_all(d);
+            if let Some(dir) = &m.job_dir {
+                let _ = std::fs::remove_dir_all(dir);
             }
         }
     }
