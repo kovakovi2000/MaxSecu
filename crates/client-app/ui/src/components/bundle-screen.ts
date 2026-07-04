@@ -8,16 +8,20 @@ import {
 } from "../core/bundle-view.ts";
 import type { BundleView } from "../core/types.ts";
 import "./media-card.ts";
+import "./media-viewer.ts";
 import "./skeleton-card.ts";
 
 // Bundle screen (bundles feature, Task 3.3): opens one bundle (#/bundle?id=<hex>)
-// and shows its members in Gallery (a grid of <media-card>s) or Stacked (a
-// vertical, full-width per-member stack). Each member is a real <media-card> that
-// decrypts itself via decrypt_card through the shared serial queue and links to
-// its own viewer — so opening a bundle is O(members) card decrypts, no extra
-// crypto here. The chosen mode is remembered across opens (localStorage, default
-// Gallery). open_bundle is routed through the priority serial queue (the backend
-// re-auths per call and cannot run those concurrently with card decrypts).
+// and shows its members two ways (design §7):
+//  • Gallery — a grid of <media-card>s. Each decrypts itself (title/thumbnail)
+//    via decrypt_card and links to its own viewer (decrypt-on-tap).
+//  • Stacked — the members rendered inline, FULLY OPENED, in order: one embedded
+//    <media-viewer file-id="…" embedded> per member (same content the routed
+//    viewer shows — image/blog/video). The bundle screen owns the single #main
+//    landmark; the embedded viewers emit none.
+// The chosen mode is remembered across opens (localStorage, default Gallery).
+// open_bundle is routed through the priority serial queue (the backend re-auths
+// per call and cannot run those concurrently with card/member decrypts).
 //
 // XSS note: the innerHTML skeleton below is FULLY STATIC. All dynamic content
 // (member cards, status text) is built via createElement/textContent — never
@@ -115,19 +119,23 @@ export class BundleScreen extends HTMLElement {
     container.setAttribute("role", "list");
 
     for (const m of this.view.members) {
-      const card = document.createElement("media-card");
-      card.setAttribute("file-id", m.file_id);
-      card.setAttribute("file-type", m.file_type);
       if (this.mode === "gallery") {
-        // Gallery: a grid cell per member.
+        // Gallery: a decrypt-on-tap <media-card> grid cell per member.
+        const card = document.createElement("media-card");
+        card.setAttribute("file-id", m.file_id);
+        card.setAttribute("file-type", m.file_type);
         card.setAttribute("role", "listitem");
         container.appendChild(card);
       } else {
-        // Stacked: each member is its own full-width block, in bundle order.
+        // Stacked: each member is fully opened inline via an embedded
+        // <media-viewer> (no landmark/focus chrome), in bundle order.
         const item = document.createElement("section");
         item.className = "bundle-stack-item";
         item.setAttribute("role", "listitem");
-        item.appendChild(card);
+        const viewer = document.createElement("media-viewer");
+        viewer.setAttribute("file-id", m.file_id);
+        viewer.setAttribute("embedded", "");
+        item.appendChild(viewer);
         container.appendChild(item);
       }
     }

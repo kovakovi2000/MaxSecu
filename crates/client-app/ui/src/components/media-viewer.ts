@@ -20,15 +20,34 @@ export class MediaViewer extends HTMLElement {
   private reqId = "";
 
   connectedCallback() {
-    const params = new URLSearchParams(location.hash.split("?")[1] ?? "");
-    const id = params.get("id") ?? "";
-    const vParam = params.get("v");
-    const version = vParam !== null ? Number(vParam) : undefined;
+    // Two mount modes, sharing ALL content rendering (image/blog/video/meta):
+    //  • routed (default): the #/viewer?id= screen. Reads the id from the hash and
+    //    emits the full landmark chrome (`#main` + tabindex + focus + back-link).
+    //  • embedded (`embedded` attr; id from the `file-id` attr): a chrome-less
+    //    content block for inline reuse — a Stacked bundle mounts N of these. It
+    //    emits NO `#main` landmark and does NOT steal focus, so the host screen
+    //    (e.g. <bundle-screen>) keeps the single landmark and there is never a
+    //    duplicate `#main` id. The opened content shown is identical in both modes.
+    const embedded = this.hasAttribute("embedded");
+    const fileIdAttr = this.getAttribute("file-id");
+    let id: string;
+    let version: number | undefined;
+    if (fileIdAttr !== null) {
+      id = fileIdAttr;
+      version = undefined;
+    } else {
+      const params = new URLSearchParams(location.hash.split("?")[1] ?? "");
+      id = params.get("id") ?? "";
+      const vParam = params.get("v");
+      version = vParam !== null ? Number(vParam) : undefined;
+    }
     this.reqId = id;
-    this.innerHTML = `
-      <main id="main" class="viewer-main" tabindex="-1" aria-labelledby="vw-h">
-        <a href="#/feed" class="back-link">← Back to feed</a>
-        <section class="viewer-frame" aria-label="Opened post">
+
+    if (embedded) {
+      // Chrome-less: no <main>/tabindex landmark, no back-link — the host owns
+      // the single landmark. Fully static markup (no `${}` interpolation).
+      this.innerHTML = `
+        <section class="viewer-frame viewer-embedded" aria-label="Opened post">
           <div class="viewer-head">
             <p class="eyebrow">decrypted payload</p>
             <h1 id="vw-h">Loading…</h1>
@@ -39,9 +58,26 @@ export class MediaViewer extends HTMLElement {
           <div id="vw-body" class="viewer-body"></div>
           <dl id="vw-meta" class="viewer-meta"></dl>
         </section>
-      </main>
-      <share-dialog id="vw-share-dialog"></share-dialog>`;
-    (this.querySelector("#main") as HTMLElement).focus();
+        <share-dialog id="vw-share-dialog"></share-dialog>`;
+    } else {
+      this.innerHTML = `
+        <main id="main" class="viewer-main" tabindex="-1" aria-labelledby="vw-h">
+          <a href="#/feed" class="back-link">← Back to feed</a>
+          <section class="viewer-frame" aria-label="Opened post">
+            <div class="viewer-head">
+              <p class="eyebrow">decrypted payload</p>
+              <h1 id="vw-h">Loading…</h1>
+              <button id="vw-share-btn" type="button" class="secondary" hidden>Share…</button>
+              <p id="vw-status" role="status" aria-live="polite"></p>
+              <progress-meter id="vw-meter" hidden></progress-meter>
+            </div>
+            <div id="vw-body" class="viewer-body"></div>
+            <dl id="vw-meta" class="viewer-meta"></dl>
+          </section>
+        </main>
+        <share-dialog id="vw-share-dialog"></share-dialog>`;
+      (this.querySelector("#main") as HTMLElement).focus();
+    }
 
     // The Share… action (T4, D-OQ3): shown on ANY successful open (any current
     // wrap-holder can share — not ownership-gated), per OpenedContent.can_share.

@@ -95,14 +95,22 @@ test("bundle-screen drives the open_bundle command with the file_id", () => {
   assert.match(src, /file_id/);
 });
 
-test("bundle-screen renders a <media-card> per member (Gallery)", () => {
+test("Gallery mode renders a decrypt-on-tap <media-card> per member", () => {
   assert.match(src, /createElement\("media-card"\)/);
-  assert.match(src, /setAttribute\("file-id"/);
   assert.match(src, /setAttribute\("file-type"/);
 });
 
-test("bundle-screen renders a distinct per-member block for Stacked", () => {
+test("Stacked mode renders a fully-opened embedded <media-viewer> per member", () => {
+  assert.match(src, /createElement\("media-viewer"\)/);
+  assert.match(src, /setAttribute\("file-id"/);
+  assert.match(src, /setAttribute\("embedded"/);
   assert.match(src, /bundle-stack-item/);
+});
+
+test("Gallery and Stacked render provably distinct element types", () => {
+  // The whole point of the two modes: cards vs inline-opened viewers.
+  assert.match(src, /createElement\("media-card"\)/);
+  assert.match(src, /createElement\("media-viewer"\)/);
 });
 
 test("bundle-screen has a two-button Gallery/Stacked toggle with aria state", () => {
