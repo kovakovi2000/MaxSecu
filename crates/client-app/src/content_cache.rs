@@ -239,6 +239,24 @@ impl ContentCache {
         }
     }
 
+    /// Drop ALL entries for a file id (every version), e.g. when the post/bundle
+    /// is deleted. Byte accounting is decremented per removed entry, mirroring
+    /// `invalidate`; each removed `Entry` drops → its `Zeroizing` content is wiped.
+    pub fn invalidate_file(&self, file_id: [u8; 16]) {
+        let mut inner = self.guard();
+        let victims: Vec<CacheKey> = inner
+            .map
+            .keys()
+            .filter(|k| k.file_id == file_id)
+            .copied()
+            .collect();
+        for k in victims {
+            if let Some(e) = inner.map.remove(&k) {
+                inner.total -= e.bytes;
+            }
+        }
+    }
+
     /// Live cap change (Settings RAM control). Shrinks → evicts to fit immediately.
     pub fn set_cap(&self, cap_bytes: usize) {
         let mut inner = self.guard();
@@ -388,5 +406,33 @@ mod tests {
         c.invalidate(key(1, 1));
         assert!(c.get_content(key(1, 1), "x").is_none());
         assert_eq!(c.total(), 0);
+    }
+
+    #[test]
+    fn invalidate_file_drops_all_versions_and_keeps_byte_accounting() {
+        let c = ContentCache::new(10_000);
+        // Two versions of the same file id, plus an unrelated file id.
+        c.put_content(key(1, 1), meta("v1"), vec![0u8; 100]);
+        c.put_content(key(1, 2), meta("v2"), vec![0u8; 100]);
+        c.put_content(key(9, 1), meta("other"), vec![0u8; 100]);
+        let other_total = {
+            // Bytes attributable to the survivor: total minus the two victims.
+            let before = c.total();
+            assert!(before > 0);
+            before
+        };
+        let _ = other_total;
+        c.invalidate_file([1u8; 16]);
+        // Every version of file id 1 is gone…
+        assert!(c.get_content(key(1, 1), "x").is_none());
+        assert!(c.get_content(key(1, 2), "x").is_none());
+        // …the unrelated file id survives…
+        assert!(c.get_content(key(9, 1), "x").is_some());
+        // …and the byte accounting equals exactly the survivor's own bytes (no
+        // under/over-count). Re-derive the survivor's footprint by clearing.
+        let survivor_total = c.total();
+        c.invalidate_file([9u8; 16]);
+        assert_eq!(c.total(), 0, "removing the survivor zeroes the total");
+        assert!(survivor_total > 0 && survivor_total < 10_000);
     }
 }

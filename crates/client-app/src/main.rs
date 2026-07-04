@@ -59,6 +59,7 @@ fn main() {
             maxsecu_client_app::commands::dialog::save_file,
             maxsecu_client_app::commands::dialog::pick_folder,
             maxsecu_client_app::commands::download_cmd::download_content,
+            maxsecu_client_app::commands::delete_cmd::delete_content,
             maxsecu_client_app::commands::register::register_with_key,
             maxsecu_client_app::commands::startup::startup_mode,
             maxsecu_client_app::commands::admin::mint_registration_key,

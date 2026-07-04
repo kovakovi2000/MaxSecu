@@ -140,6 +140,14 @@ pub struct OpenContentRequest {
     pub version: Option<u64>,
 }
 
+/// A request to permanently delete an owned post/bundle (spec: bundles Task 6.1).
+/// Carries only the target `file_id` (hex16). The command validates + parses it,
+/// then issues `DELETE /v1/files/{file_id}`; no key material crosses the seam.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteRequest {
+    pub file_id: String,
+}
+
 /// The verified, decrypted content to display. Exactly one of `image_png_b64` /
 /// `blog_text` is set per `file_type`. No key material; the content shown is the
 /// product, not a TCB leak.

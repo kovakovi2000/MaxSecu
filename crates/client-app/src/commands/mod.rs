@@ -6,6 +6,7 @@ pub mod admin;
 pub mod auth;
 pub mod bundle;
 pub mod connection;
+pub mod delete_cmd;
 pub mod dialog;
 pub mod download_cmd;
 pub mod feed;
