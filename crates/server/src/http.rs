@@ -2513,18 +2513,21 @@ mod tests {
         (router, admin_sk, bob_sk)
     }
 
-    /// Like [`admin_app`] but returns a handle to the `MemoryAuditSink` so a
-    /// test can assert the grant edges the handlers emit (§16.5).
+    /// Shared D5-verified admin-app setup that both [`admin_app_audited`] and
+    /// [`admin_app_with_auth`] project from — the single source of truth for the
+    /// admin/bob fixture so neither helper drifts from the other.
     ///
     /// Admin authority is conferred the production way (D-K): the pinned D5 key
     /// signs a `{User, Admin}` binding for the admin, which the server verifies on
     /// every admin-gated request — the D5-verified `AdminSession` binding is the
     /// real gate. `bob` has a record but no binding, so he is a valid session yet
-    /// not an admin (→ 403).
-    async fn admin_app_audited() -> (
+    /// not an admin (→ 403). Returns the router, both signing keys, the
+    /// `Arc<AuthService>` (for direct store access), and the audit sink.
+    async fn admin_app_core() -> (
         Router,
         SigningKey,
         SigningKey,
+        Arc<AuthService<MemoryStore>>,
         Arc<crate::audit::MemoryAuditSink>,
     ) {
         use crate::audit::MemoryAuditSink;
@@ -2569,18 +2572,31 @@ mod tests {
                 sig_pub: bob_sk.verifying_key().to_bytes(),
             },
         );
+        let auth = Arc::new(AuthService::new(
+            store,
+            AuthConfig::default().with_directory_pub(d5.public_key()),
+        ));
         let audit = Arc::new(MemoryAuditSink::new());
         let router = router(AppState {
-            auth: Arc::new(AuthService::new(
-                store,
-                AuthConfig::default().with_directory_pub(d5.public_key()),
-            )),
+            auth: auth.clone(),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: audit.clone(),
             direct_links_enabled: false,
             max_file_bytes: None,
         })
         .layer(Extension(TlsExporter(EXPORTER)));
+        (router, admin_sk, bob_sk, auth, audit)
+    }
+
+    /// Like [`admin_app`] but returns a handle to the `MemoryAuditSink` so a
+    /// test can assert the grant edges the handlers emit (§16.5).
+    async fn admin_app_audited() -> (
+        Router,
+        SigningKey,
+        SigningKey,
+        Arc<crate::audit::MemoryAuditSink>,
+    ) {
+        let (router, admin_sk, bob_sk, _auth, audit) = admin_app_core().await;
         (router, admin_sk, bob_sk, audit)
     }
 
@@ -2588,50 +2604,7 @@ mod tests {
     /// so a test can query the store directly (e.g. `get_file_meta`) after driving
     /// the HTTP surface. Same D5-verified admin authority as [`admin_app_audited`].
     async fn admin_app_with_auth() -> (Router, SigningKey, Arc<AuthService<MemoryStore>>) {
-        use maxsecu_admin_core::DirectorySigner;
-        use maxsecu_encoding::encode;
-        use maxsecu_encoding::structs::DirBinding;
-        use maxsecu_encoding::types::{Id, RoleSet};
-
-        let d5 = DirectorySigner::generate();
-        let store = MemoryStore::new();
-        let admin_sk = SigningKey::generate();
-        store.add_user(
-            "admin",
-            UserRecord {
-                user_id: [0xAD; 16],
-                enc_pub: [0xE1; 32],
-                sig_pub: admin_sk.verifying_key().to_bytes(),
-            },
-        );
-        let admin_binding = DirBinding {
-            username: Text::new("admin").unwrap(),
-            user_id: Id([0xAD; 16]),
-            enc_pub: Bytes32([0xE1; 32]),
-            sig_pub: Bytes32(admin_sk.verifying_key().to_bytes()),
-            key_version: 1,
-            roles: RoleSet::new([Role::User, Role::Admin]),
-            not_before: Timestamp(0),
-            not_after: Timestamp(4_102_444_800_000),
-            mlkem_pub: None,
-        };
-        let signed = d5.sign_binding(&admin_binding, None);
-        store
-            .put_binding([0xAD; 16], 1, encode(&signed.binding), signed.signature)
-            .await
-            .unwrap();
-        let auth = Arc::new(AuthService::new(
-            store,
-            AuthConfig::default().with_directory_pub(d5.public_key()),
-        ));
-        let router = router(AppState {
-            auth: auth.clone(),
-            blobs: Arc::new(MemoryBlobStore::new()),
-            audit: Arc::new(crate::audit::MemoryAuditSink::new()),
-            direct_links_enabled: false,
-            max_file_bytes: None,
-        })
-        .layer(Extension(TlsExporter(EXPORTER)));
+        let (router, admin_sk, _bob_sk, auth, _audit) = admin_app_core().await;
         (router, admin_sk, auth)
     }
 
