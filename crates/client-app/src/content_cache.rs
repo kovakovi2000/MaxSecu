@@ -110,6 +110,7 @@ impl ContentCache {
             mine: m.mine,
             author_fp: m.author_fp.clone(),
             recovery_ok: m.recovery_ok,
+            member_counts: crate::dto::MemberCounts::default(),
         })
     }
 

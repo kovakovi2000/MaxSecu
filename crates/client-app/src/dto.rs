@@ -109,6 +109,10 @@ pub struct CardDto {
     pub author_fp: String,
     /// Whether a valid author recovery grant was present (anomaly flag, not fatal).
     pub recovery_ok: bool,
+    /// For a bundle card: how many members of each kind it groups (order-private —
+    /// counts only, never the member order). Zeros for a non-bundle card.
+    #[serde(default)]
+    pub member_counts: MemberCounts,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,12 +169,13 @@ pub struct SearchRequest {
 }
 
 /// What kind of content the user is staging for upload.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum UploadKind {
     Image,
     Blog,
     Video,
+    Generic,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -198,7 +203,7 @@ pub struct StageUploadRequest {
 
 /// A preview of a staged-but-not-uploaded post. No key material, no bundle —
 /// only what the UI renders before the user confirms.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UploadPreview {
     pub job_id: String,
     pub file_type: String,
@@ -208,6 +213,58 @@ pub struct UploadPreview {
     pub total_chunks: u64,
     /// A small canonical-PNG thumbnail (base64) for an image preview, else None.
     pub thumbnail_b64: Option<String>,
+}
+
+/// A tally of a bundle's members by kind. Order-private: this carries only how
+/// many members of each kind a bundle groups — never the member order itself.
+/// A seam DTO: plain counts, no key material. Defaults to all-zeros.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemberCounts {
+    pub video: u32,
+    pub image: u32,
+    pub blog: u32,
+    pub generic: u32,
+}
+
+/// One member of a bundle being staged, mirroring [`StageUploadRequest`]'s
+/// per-item fields. A seam DTO: plain data only, no key material, no identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundleMemberInput {
+    pub kind: UploadKind,
+    /// For an image / video / generic member: a filesystem path to the source
+    /// file. Ignored for blogs.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// For a blog member: the post body text. Ignored for other kinds.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// For a video member: the transcode shaping. Absent → default. Ignored
+    /// otherwise.
+    #[serde(default)]
+    pub options: Option<TranscodeOptions>,
+    pub title: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// A request to stage (but not yet upload) a bundle — its own title/tags plus an
+/// ordered list of members. A seam DTO: plain data only, no key material.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StageBundleRequest {
+    pub title: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub members: Vec<BundleMemberInput>,
+}
+
+/// A preview of a staged-but-not-uploaded bundle: a per-member preview list plus
+/// the order-private [`MemberCounts`] tally. A seam DTO: no key material, only
+/// what the UI renders before the user confirms.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundlePreview {
+    pub job_id: String,
+    pub member_previews: Vec<UploadPreview>,
+    pub counts: MemberCounts,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -406,6 +463,49 @@ mod reshare_dto_tests {
         assert_eq!(v["username"], "bob");
         assert_eq!(v["user_id"], "ab".repeat(8));
         assert_eq!(v["fingerprint"], "deadbeefcafebabe");
+    }
+
+    #[test]
+    fn bundle_dtos_serde_round_trip() {
+        let req = StageBundleRequest {
+            title: "Trip".into(),
+            tags: vec!["a".into()],
+            members: vec![
+                BundleMemberInput {
+                    kind: UploadKind::Image,
+                    path: Some("p.png".into()),
+                    content: None,
+                    options: None,
+                    title: "m1".into(),
+                    tags: vec![],
+                },
+                BundleMemberInput {
+                    kind: UploadKind::Generic,
+                    path: Some("it.pdf".into()),
+                    content: None,
+                    options: None,
+                    title: "m2".into(),
+                    tags: vec![],
+                },
+            ],
+        };
+        let back: StageBundleRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
+
+        let prev = BundlePreview {
+            job_id: "j".into(),
+            member_previews: vec![],
+            counts: MemberCounts {
+                video: 1,
+                image: 2,
+                blog: 0,
+                generic: 3,
+            },
+        };
+        let back2: BundlePreview =
+            serde_json::from_str(&serde_json::to_string(&prev).unwrap()).unwrap();
+        assert_eq!(back2, prev);
     }
 
     #[test]

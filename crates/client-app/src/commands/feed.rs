@@ -372,6 +372,7 @@ pub async fn decrypt_card(
         mine,
         author_fp: hex(&author.fingerprint[..8]),
         recovery_ok: opened.recovery_grant_ok,
+        member_counts: crate::dto::MemberCounts::default(),
     };
 
     // Best-effort: index the decoded card for local search (D-F). An index failure

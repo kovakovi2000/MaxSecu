@@ -217,6 +217,14 @@ pub async fn stage_upload(
             let (ft, s) = prepare_image_streams(&bytes, &req.title, &req.tags)?;
             (ft, Some(s), None)
         }
+        UploadKind::Generic => {
+            // Generic download-only uploads are wired in Task 2.2; staging one
+            // through this single-post path is not yet supported.
+            return Err(UiError::new(
+                "unsupported",
+                "Generic uploads are not supported yet.",
+            ));
+        }
         UploadKind::Video => {
             let path = req
                 .path
