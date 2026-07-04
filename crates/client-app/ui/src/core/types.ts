@@ -1,3 +1,5 @@
+import type { TranscodeOptions } from "./transcode-opts.ts";
+
 export interface ConnState { state: string }
 export interface AuthStateMsg { state: string }
 export interface MintedKeyResponse { registration_key: string }
@@ -118,7 +120,10 @@ export type FetchMsg =
   | { phase: "failed"; file_id: string; code: string };
 
 // --- Phase 4 (upload) DTO mirrors of the Rust serde shapes ---
-export type UploadKind = "image" | "blog" | "video";
+// Mirrors the Rust `UploadKind` enum (serde kebab-case). "generic" is the
+// download-only bundle-member kind (no in-app view); the single-post form only
+// exposes image/blog/video, but a bundle member may be generic.
+export type UploadKind = "image" | "blog" | "video" | "generic";
 
 export interface UploadPreview {
   job_id: string;
@@ -128,6 +133,38 @@ export interface UploadPreview {
   byte_size: number;
   total_chunks: number;
   thumbnail_b64: string | null;
+}
+
+// --- Bundle composer (Task 4.1) DTO mirrors of the Rust serde shapes ---
+// Order-private tally of a bundle's members by kind (mirrors Rust MemberCounts).
+export interface MemberCounts { video: number; image: number; blog: number; generic: number }
+
+// One member of a bundle being staged (mirrors Rust BundleMemberInput). Plain
+// data only — no key material. `path` for image/video/generic; `content` for a
+// blog; `options` shapes a video transcode. `title`/`tags` are per-member.
+export interface BundleMemberInput {
+  kind: UploadKind;
+  path?: string;
+  content?: string;
+  options?: TranscodeOptions;
+  title: string;
+  tags: string[];
+}
+
+// A request to stage (not yet upload) a bundle: its own title/tags + ordered
+// members (mirrors Rust StageBundleRequest). The member ORDER is authoritative.
+export interface StageBundleRequest {
+  title: string;
+  tags: string[];
+  members: BundleMemberInput[];
+}
+
+// A preview of a staged-but-not-uploaded bundle (mirrors Rust BundlePreview): a
+// per-member UploadPreview list + the order-private counts tally. No key material.
+export interface BundlePreview {
+  job_id: string;
+  member_previews: UploadPreview[];
+  counts: MemberCounts;
 }
 
 export type UploadMsg =

@@ -6,6 +6,7 @@ import { normalizeOptions, resolutionForPreset, suggestKbps } from "../core/tran
 import type { Bitrate, Resolution } from "../core/transcode-opts.ts";
 import "./video-player.ts";
 import type { VideoPlayer } from "./video-player.ts";
+import "./bundle-composer.ts";
 
 // Upload (spec §5): choose Image (file path), Blog (body text) or Video (a real
 // video file path + a resolution/bitrate menu) + title/tags → Preview
@@ -33,6 +34,11 @@ export class UploadScreen extends HTMLElement {
     this.innerHTML = `
       <main id="main" tabindex="-1" aria-labelledby="up-h">
         <h1 id="up-h">Upload a post</h1>
+        <div class="up-mode" role="group" aria-label="Post type">
+          <button id="up-mode-single" type="button" class="up-mode-btn active" aria-pressed="true">Single post</button>
+          <button id="up-mode-bundle" type="button" class="up-mode-btn" aria-pressed="false">New bundle</button>
+        </div>
+        <div id="up-single">
         <form id="up-form">
           <label>Type
             <select name="kind">
@@ -77,8 +83,38 @@ export class UploadScreen extends HTMLElement {
         </form>
         <p id="up-status" role="status" aria-live="polite"></p>
         <div id="up-preview"></div>
+        </div>
+        <div id="up-bundle" hidden></div>
       </main>`;
     (this.querySelector("#main") as HTMLElement).focus();
+
+    // Mode toggle: "Single post" (the form above) vs "New bundle" (mount the
+    // <bundle-composer> child region). upload-screen keeps the single #main
+    // landmark; the composer brings its own aria-live status region.
+    const single = this.querySelector("#up-single") as HTMLElement;
+    const bundleMount = this.querySelector("#up-bundle") as HTMLElement;
+    const singleBtn = this.querySelector("#up-mode-single") as HTMLButtonElement;
+    const bundleBtn = this.querySelector("#up-mode-bundle") as HTMLButtonElement;
+    const setMode = (mode: "single" | "bundle") => {
+      const isBundle = mode === "bundle";
+      single.hidden = isBundle;
+      bundleMount.hidden = !isBundle;
+      singleBtn.setAttribute("aria-pressed", String(!isBundle));
+      bundleBtn.setAttribute("aria-pressed", String(isBundle));
+      singleBtn.classList.toggle("active", !isBundle);
+      bundleBtn.classList.toggle("active", isBundle);
+      if (isBundle) {
+        // Mount a fresh composer (its connectedCallback focuses its region).
+        if (!bundleMount.querySelector("bundle-composer")) {
+          bundleMount.appendChild(document.createElement("bundle-composer"));
+        }
+      } else {
+        // Unmount so a not-yet-posted staged bundle is cancelled (disconnectedCallback).
+        bundleMount.replaceChildren();
+      }
+    };
+    singleBtn.addEventListener("click", () => setMode("single"));
+    bundleBtn.addEventListener("click", () => setMode("bundle"));
     const form = this.querySelector("#up-form") as HTMLFormElement;
     const kind = form.querySelector('select[name="kind"]') as HTMLSelectElement;
     const pathRow = this.querySelector("#path-row") as HTMLElement;
