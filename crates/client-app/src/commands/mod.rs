@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod bundle;
 pub mod connection;
 pub mod dialog;
 pub mod feed;

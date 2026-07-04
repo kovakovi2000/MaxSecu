@@ -156,6 +156,29 @@ pub struct OpenedContentDto {
     pub can_share: bool,
 }
 
+/// One member of an opened bundle, in the bundle's authoritative order. A seam
+/// DTO (Serialize — it crosses the boundary TO the UI): plain data only, no key
+/// material. `title` / `thumbnail_b64` are filled lazily by the UI (empty here);
+/// `file_id` comes from the SIGNED bundle body, never a server-served listing.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BundleMemberView {
+    pub file_id: String,
+    pub file_type: String,
+    pub title: String,
+    pub thumbnail_b64: Option<String>,
+}
+
+/// A verified, opened bundle: its own id/type/version plus the ordered member
+/// list. A seam DTO (Serialize — crosses TO the UI): no key material. The member
+/// ORDER is authoritative and comes verbatim from the signed `BundleBody`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BundleView {
+    pub file_id: String,
+    pub file_type: String,
+    pub version: u64,
+    pub members: Vec<BundleMemberView>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SearchHit {
     pub file_id: String,

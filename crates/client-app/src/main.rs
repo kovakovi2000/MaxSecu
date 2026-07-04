@@ -53,6 +53,7 @@ fn main() {
             maxsecu_client_app::commands::feed::list_feed,
             maxsecu_client_app::commands::feed::decrypt_card,
             maxsecu_client_app::commands::viewer::open_content,
+            maxsecu_client_app::commands::bundle::open_bundle,
             maxsecu_client_app::commands::search::search_local,
             maxsecu_client_app::commands::dialog::pick_file,
             maxsecu_client_app::commands::register::register_with_key,
