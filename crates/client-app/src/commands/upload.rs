@@ -32,13 +32,16 @@ use crate::commands::connection::{open_conn, reauth, server_of};
 use crate::config::load_directory_pub;
 use crate::directory::{resolve_my_binding, resolve_recovery_pin};
 use crate::dto::{
-    CancelUploadRequest, ConfirmUploadRequest, PendingUploadView, StageUploadRequest, UploadJobView,
-    UploadKind, UploadPreview,
+    BundlePreview, CancelUploadRequest, ConfirmUploadRequest, MemberCounts, PendingUploadView,
+    StageBundleRequest, StageUploadRequest, UploadJobView, UploadKind, UploadPreview,
 };
 use crate::error::UiError;
 use crate::ffmpeg_bin::ensure_ffmpeg;
 use crate::http_client::{delete_req, post_json};
-use crate::jobs::{StagedContent, StagedUpload, StagedVideoPreview, UploadJobs, VideoPrepareCancel};
+use crate::jobs::{
+    BundleJob, BundleJobs, MemberMeta, StagedContent, StagedUpload, StagedVideoPreview, UploadJobs,
+    VideoPrepareCancel,
+};
 use crate::state::{PreparePhase, UploadPhase, EVT_UPLOAD, EVT_VIDEO_PREPARE};
 use crate::upload::{
     file_type_str, prepare_blog_streams, prepare_generic_metadata, prepare_image_streams,
@@ -157,9 +160,22 @@ fn stage_body_from_record(rec: &StagingRecord) -> serde_json::Value {
 // stage_upload
 // ---------------------------------------------------------------------------
 
+/// The fully-staged result of ONE item (a single post OR one bundle member): the
+/// in-TCB [`StagedUpload`] plus the small facts a preview DTO and the bundle
+/// member metadata need. `staged` holds the `UploadBundle`/`StagingRecord` and
+/// NEVER crosses the Tauri seam; only DTOs derived from the other fields do.
+struct StagedItem {
+    staged: StagedUpload,
+    file_id: [u8; 16],
+    file_type: maxsecu_encoding::types::FileType,
+    thumbnail_b64: Option<String>,
+}
+
 /// `stage_upload` — prepare + encrypt/stage a post and hold it for preview.
 /// No network write. Video uploads are streaming (disk-backed); image/blog are
-/// in-RAM as before.
+/// in-RAM as before. Thin wrapper over [`stage_item`]: stage the single item,
+/// then register it in [`UploadJobs`] under a fresh `job_id` and return its
+/// preview.
 #[tauri::command]
 pub async fn stage_upload(
     req: StageUploadRequest,
@@ -169,6 +185,47 @@ pub async fn stage_upload(
     jobs: State<'_, UploadJobs>,
     prepare_cancel: State<'_, VideoPrepareCancel>,
 ) -> Result<UploadPreview, UiError> {
+    let item = stage_item(&req, &app, &dir, &session, &prepare_cancel).await?;
+    // Capture the preview fields BEFORE moving `staged` into the jobs map.
+    let file_type = item.staged.file_type.clone();
+    let total_chunks = item.staged.total_chunks;
+    let byte_size = item.staged.byte_size;
+    let thumbnail_b64 = item.thumbnail_b64;
+    let job_id = rand_job_id();
+    jobs.0.lock().await.insert(job_id.clone(), item.staged);
+    Ok(UploadPreview {
+        job_id,
+        file_type,
+        title: req.title,
+        tags: req.tags,
+        byte_size,
+        total_chunks,
+        thumbnail_b64,
+    })
+}
+
+/// Prepare + encrypt/stage ONE item (a single post or one bundle member) WITHOUT
+/// inserting it into any job registry and WITHOUT any network write. The reusable
+/// core shared by [`stage_upload`] (single post) and [`stage_bundle`] (per
+/// member). It performs, in order: (1) type-specific preparation (blog / image /
+/// generic / video — the video arm runs the confined transcode via
+/// `prepare_cancel`'s in-flight slot); (2) recipient resolution under the pinned
+/// D5 (unauth directory GETs + the embedded-pin recovery trust-alarm A);
+/// (3) content build (video/generic streaming disk-backed, image/blog in-RAM);
+/// (4) total-chunk / file-type-string / byte-size / thumbnail computation.
+///
+/// On Ok the returned [`StagedUpload`] OWNS its staging dir (if any); the internal
+/// stage-error cleanup guard is disarmed just before returning so the dir is NOT
+/// deleted. On ANY error the guard drops and wipes the partial staging dir, so a
+/// failed item leaves nothing on disk. Identity is borrowed only across the
+/// synchronous seal (as before) — no `.await` holds the identity.
+async fn stage_item(
+    req: &StageUploadRequest,
+    app: &tauri::AppHandle,
+    dir: &AppDir,
+    session: &Session,
+    prepare_cancel: &VideoPrepareCancel,
+) -> Result<StagedItem, UiError> {
     // RAII guard that deletes a dir on any error path before the job is inserted.
     // For video: initially guards the transcode temp dir; switched to the staging
     // dir once the file is moved. Disarmed after `jobs.insert`.
@@ -382,7 +439,7 @@ pub async fn stage_upload(
             preview: Some(vp.prepared.preview),
         };
         let (rec, staging_dir) = stage_streaming_content(
-            &session,
+            session,
             &vp.prepared.out_mp4_path,
             true, // MOVE the generated temp file
             "out.mp4",
@@ -419,7 +476,7 @@ pub async fn stage_upload(
             preview: None,
         };
         let (rec, staging_dir) = stage_streaming_content(
-            &session,
+            session,
             &g.src_path,
             false, // COPY the user's source (never move/delete)
             "content.bin",
@@ -478,29 +535,23 @@ pub async fn stage_upload(
         }
     };
 
-    // 5) Hold for preview (NO network). The content stays in the TCB.
-    let job_id = rand_job_id();
-    jobs.0.lock().await.insert(
-        job_id.clone(),
-        StagedUpload {
-            content,
-            file_type: file_type_str.clone(),
-            title: req.title.clone(),
-            total_chunks: total,
-            byte_size,
-            preview: final_preview,
-            job_dir: final_job_dir,
-        },
-    );
-    // Ownership of the dir now lives in StagedUpload — disarm the guard.
-    dir_cleanup.0 = None;
-    Ok(UploadPreview {
-        job_id,
+    // 5) Assemble the staged item (NO network). The content stays in the TCB.
+    let staged = StagedUpload {
+        content,
         file_type: file_type_str,
-        title: req.title,
-        tags: req.tags,
-        byte_size,
+        title: req.title.clone(),
         total_chunks: total,
+        byte_size,
+        preview: final_preview,
+        job_dir: final_job_dir,
+    };
+    // Ownership of the staging dir now lives in `staged` — disarm the guard so it
+    // is NOT deleted when this function returns.
+    dir_cleanup.0 = None;
+    Ok(StagedItem {
+        staged,
+        file_id: file_id.0,
+        file_type,
         thumbnail_b64,
     })
 }
@@ -515,6 +566,119 @@ fn bundle_file_type_str(b: &maxsecu_client_core::UploadBundle) -> String {
         FileType::Bundle => "bundle",
     }
     .to_owned()
+}
+
+/// Lowercase hex of a 16-byte id (file id / bundle id).
+fn hex16(b: &[u8; 16]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+// ---------------------------------------------------------------------------
+// stage_bundle
+// ---------------------------------------------------------------------------
+
+/// `stage_bundle` — prepare + encrypt/stage EVERY member of a bundle and hold them
+/// for preview. No network write beyond the per-member directory resolution that
+/// [`stage_item`] already performs. Members are staged sequentially in request
+/// order (the video transcode slot serves one at a time); that order IS the
+/// authoritative bundle member order carried in `BundleJob.member_meta`.
+///
+/// On any member's staging failure the whole bundle is aborted: the
+/// already-staged members' staging dirs are explicitly removed (dropping a
+/// [`StagedUpload`] does NOT delete its `job_dir`) so nothing leaks on disk, and
+/// the error is returned. On success a single [`BundleJob`] is registered in
+/// [`BundleJobs`] under a fresh `job_id`. Only the [`BundlePreview`] DTO crosses
+/// the seam — the staged members (and their keys/ciphertext) stay in the TCB.
+#[tauri::command]
+pub async fn stage_bundle(
+    req: StageBundleRequest,
+    app: tauri::AppHandle,
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    jobs: State<'_, BundleJobs>,
+    prepare_cancel: State<'_, VideoPrepareCancel>,
+) -> Result<BundlePreview, UiError> {
+    use maxsecu_encoding::types::FileType;
+
+    // Generate the bundle id up front (never leaves the TCB).
+    let bundle_id = maxsecu_crypto::random_array::<16>();
+
+    if req.members.is_empty() {
+        return Err(UiError::new("bad_request", "A bundle needs at least one item."));
+    }
+
+    let mut members: Vec<StagedUpload> = Vec::with_capacity(req.members.len());
+    let mut member_meta: Vec<MemberMeta> = Vec::with_capacity(req.members.len());
+    let mut member_previews: Vec<UploadPreview> = Vec::with_capacity(req.members.len());
+    let mut counts = MemberCounts::default();
+
+    for m in &req.members {
+        let member_req = StageUploadRequest {
+            kind: m.kind,
+            path: m.path.clone(),
+            content: m.content.clone(),
+            options: m.options.clone(),
+            title: m.title.clone(),
+            tags: m.tags.clone(),
+        };
+        match stage_item(&member_req, &app, &dir, &session, &prepare_cancel).await {
+            Ok(item) => {
+                match item.file_type {
+                    FileType::Video => counts.video += 1,
+                    FileType::Image => counts.image += 1,
+                    FileType::Blog => counts.blog += 1,
+                    FileType::Generic => counts.generic += 1,
+                    // A bundle member is never itself a bundle; leave counts as-is.
+                    FileType::Bundle => {}
+                }
+                // A member is not individually confirmable, so its preview `job_id`
+                // is a stable UI key derived from its file id (not a jobs-map key).
+                member_previews.push(UploadPreview {
+                    job_id: hex16(&item.file_id),
+                    file_type: item.staged.file_type.clone(),
+                    title: item.staged.title.clone(),
+                    tags: m.tags.clone(),
+                    byte_size: item.staged.byte_size,
+                    total_chunks: item.staged.total_chunks,
+                    thumbnail_b64: item.thumbnail_b64.clone(),
+                });
+                member_meta.push(MemberMeta {
+                    file_id: item.file_id,
+                    file_type: item.file_type,
+                });
+                members.push(item.staged);
+            }
+            Err(e) => {
+                // Abort the whole bundle: explicitly clean up the already-staged
+                // members' staging dirs (a `StagedUpload` drop does NOT delete
+                // `job_dir`), then propagate the error.
+                for s in &members {
+                    if let Some(d) = &s.job_dir {
+                        let _ = std::fs::remove_dir_all(d);
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    // Register the assembled bundle (NO network). The members stay in the TCB.
+    let job_id = rand_job_id();
+    jobs.0.lock().await.insert(
+        job_id.clone(),
+        BundleJob {
+            bundle_id,
+            title: req.title,
+            tags: req.tags,
+            members,
+            member_meta,
+        },
+    );
+    Ok(BundlePreview {
+        job_id,
+        member_previews,
+        counts,
+    })
 }
 
 /// The crypto/identity scalars forwarded verbatim into the [`UploadParams`] that
@@ -558,7 +722,7 @@ struct StagingCryptoInputs {
 // exceed clippy's default-7 threshold, so the allow stays.
 #[allow(clippy::too_many_arguments)]
 async fn stage_streaming_content(
-    session: &State<'_, Session>,
+    session: &Session,
     input_path: &std::path::Path,
     move_input: bool,
     content_filename: &str,

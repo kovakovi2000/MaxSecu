@@ -42,6 +42,7 @@ fn main() {
         .manage(ConnectLock::new())
         .manage(maxsecu_client_app::commands::recovery_login::RecoveryLogin::new())
         .manage(maxsecu_client_app::jobs::UploadJobs::new())
+        .manage(maxsecu_client_app::jobs::BundleJobs::new())
         .manage(maxsecu_client_app::jobs::VideoJobs::new())
         .manage(maxsecu_client_app::jobs::VideoPrepareCancel::default())
         .manage(ContentCache::new(cap_bytes))
@@ -60,6 +61,7 @@ fn main() {
             maxsecu_client_app::commands::recovery_login::request_recovery_challenge,
             maxsecu_client_app::commands::recovery_login::answer_recovery_challenge,
             maxsecu_client_app::commands::upload::stage_upload,
+            maxsecu_client_app::commands::upload::stage_bundle,
             maxsecu_client_app::commands::upload::confirm_upload,
             maxsecu_client_app::commands::upload::cancel_upload,
             maxsecu_client_app::commands::upload::cancel_video_prepare,

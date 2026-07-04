@@ -85,6 +85,48 @@ impl Default for UploadJobs {
     }
 }
 
+/// The identity of one bundle member: its `file_id` and `FileType`. Stored
+/// parallel to `BundleJob.members` (same index = same member), in the
+/// AUTHORITATIVE bundle member order. Kept in the TCB — it never crosses the
+/// Tauri seam.
+pub struct MemberMeta {
+    pub file_id: [u8; 16],
+    pub file_type: maxsecu_encoding::types::FileType,
+}
+
+/// One staged-but-not-yet-confirmed BUNDLE: the bundle's own `bundle_id`
+/// (generated at stage time), its title/tags, and its ordered members. Each
+/// member is a fully-staged [`StagedUpload`] (image/blog in-RAM, video/generic
+/// disk-backed) — exactly as a single-post `stage_upload` would produce. The
+/// `member_meta` vector is parallel to `members` (same index = same member) and
+/// its order IS the authoritative bundle member order. Like [`StagedUpload`],
+/// this holds `UploadBundle`/`StagingRecord` material and NEVER crosses the
+/// Tauri seam; only the [`crate::dto::BundlePreview`] DTO does.
+pub struct BundleJob {
+    pub bundle_id: [u8; 16],
+    pub title: String,
+    pub tags: Vec<String>,
+    /// Parallel to `member_meta`, same order.
+    pub members: Vec<StagedUpload>,
+    /// `(file_id, file_type)` per member, in order (authoritative bundle order).
+    pub member_meta: Vec<MemberMeta>,
+}
+
+/// Managed state: `job_id -> BundleJob`. Async mutex (commands are async).
+pub struct BundleJobs(pub Mutex<HashMap<String, BundleJob>>);
+
+impl BundleJobs {
+    pub fn new() -> Self {
+        BundleJobs(Mutex::new(HashMap::new()))
+    }
+}
+
+impl Default for BundleJobs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One live video-player session (Phase 7, Gate 4). Holds the in-TCB
 /// [`ContentDecryptor`] (the content subkey — NEVER crosses the Tauri seam), the
 /// authenticated fragment index (seek map), and the bounded on-disk **ciphertext**
@@ -209,5 +251,32 @@ mod tests {
         assert_eq!(taken.title, "T");
         assert!(matches!(taken.content, StagedContent::InRam(_)));
         assert!(jobs.0.lock().await.remove("job-1").is_none()); // gone
+    }
+
+    #[tokio::test]
+    async fn bundle_job_insert_take_round_trips() {
+        let jobs = BundleJobs::new();
+        let job = BundleJob {
+            bundle_id: [0xB1; 16],
+            title: "Trip".into(),
+            tags: vec!["a".into()],
+            members: vec![staged(), staged()],
+            member_meta: vec![
+                MemberMeta {
+                    file_id: [0x01; 16],
+                    file_type: maxsecu_encoding::types::FileType::Blog,
+                },
+                MemberMeta {
+                    file_id: [0x02; 16],
+                    file_type: maxsecu_encoding::types::FileType::Blog,
+                },
+            ],
+        };
+        jobs.0.lock().await.insert("b-1".into(), job);
+        let taken = jobs.0.lock().await.remove("b-1").unwrap();
+        assert_eq!(taken.members.len(), 2);
+        assert_eq!(taken.member_meta.len(), 2);
+        assert_eq!(taken.bundle_id.len(), 16);
+        assert!(jobs.0.lock().await.remove("b-1").is_none());
     }
 }
