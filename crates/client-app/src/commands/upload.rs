@@ -167,7 +167,9 @@ fn stage_body_from_record(rec: &StagingRecord) -> serde_json::Value {
 struct StagedItem {
     staged: StagedUpload,
     file_id: [u8; 16],
-    file_type: maxsecu_encoding::types::FileType,
+    /// The item's `FileType` enum. Named `kind` to avoid confusion with
+    /// `staged.file_type`, which is the wire STRING form ("image"/"blog"/…).
+    kind: maxsecu_encoding::types::FileType,
     thumbnail_b64: Option<String>,
 }
 
@@ -551,7 +553,7 @@ async fn stage_item(
     Ok(StagedItem {
         staged,
         file_id: file_id.0,
-        file_type,
+        kind: file_type,
         thumbnail_b64,
     })
 }
@@ -600,6 +602,23 @@ pub async fn stage_bundle(
 ) -> Result<BundlePreview, UiError> {
     use maxsecu_encoding::types::FileType;
 
+    // RAII guard that owns the accumulating staged members and wipes each one's
+    // staging dir on drop (a `StagedUpload` drop does NOT delete its `job_dir`).
+    // Disk hygiene is thus fail-closed BY CONSTRUCTION: an early return, a `?`, or
+    // a panic anywhere in the member loop drops this guard and cleans up every
+    // already-staged member. Disarmed via `std::mem::take` only just before the
+    // successful `jobs.insert`, at which point ownership passes to the `BundleJob`.
+    struct BundleStagingCleanup(Vec<StagedUpload>);
+    impl Drop for BundleStagingCleanup {
+        fn drop(&mut self) {
+            for s in &self.0 {
+                if let Some(d) = &s.job_dir {
+                    let _ = std::fs::remove_dir_all(d);
+                }
+            }
+        }
+    }
+
     // Generate the bundle id up front (never leaves the TCB).
     let bundle_id = maxsecu_crypto::random_array::<16>();
 
@@ -607,7 +626,9 @@ pub async fn stage_bundle(
         return Err(UiError::new("bad_request", "A bundle needs at least one item."));
     }
 
-    let mut members: Vec<StagedUpload> = Vec::with_capacity(req.members.len());
+    // The staged members accumulate INSIDE the guard; the parallel `member_meta`
+    // and previews accumulate alongside in the same order.
+    let mut cleanup = BundleStagingCleanup(Vec::with_capacity(req.members.len()));
     let mut member_meta: Vec<MemberMeta> = Vec::with_capacity(req.members.len());
     let mut member_previews: Vec<UploadPreview> = Vec::with_capacity(req.members.len());
     let mut counts = MemberCounts::default();
@@ -621,46 +642,38 @@ pub async fn stage_bundle(
             title: m.title.clone(),
             tags: m.tags.clone(),
         };
-        match stage_item(&member_req, &app, &dir, &session, &prepare_cancel).await {
-            Ok(item) => {
-                match item.file_type {
-                    FileType::Video => counts.video += 1,
-                    FileType::Image => counts.image += 1,
-                    FileType::Blog => counts.blog += 1,
-                    FileType::Generic => counts.generic += 1,
-                    // A bundle member is never itself a bundle; leave counts as-is.
-                    FileType::Bundle => {}
-                }
-                // A member is not individually confirmable, so its preview `job_id`
-                // is a stable UI key derived from its file id (not a jobs-map key).
-                member_previews.push(UploadPreview {
-                    job_id: hex16(&item.file_id),
-                    file_type: item.staged.file_type.clone(),
-                    title: item.staged.title.clone(),
-                    tags: m.tags.clone(),
-                    byte_size: item.staged.byte_size,
-                    total_chunks: item.staged.total_chunks,
-                    thumbnail_b64: item.thumbnail_b64.clone(),
-                });
-                member_meta.push(MemberMeta {
-                    file_id: item.file_id,
-                    file_type: item.file_type,
-                });
-                members.push(item.staged);
-            }
-            Err(e) => {
-                // Abort the whole bundle: explicitly clean up the already-staged
-                // members' staging dirs (a `StagedUpload` drop does NOT delete
-                // `job_dir`), then propagate the error.
-                for s in &members {
-                    if let Some(d) = &s.job_dir {
-                        let _ = std::fs::remove_dir_all(d);
-                    }
-                }
-                return Err(e);
-            }
+        // On error the `?` returns, dropping `cleanup` → all prior members' dirs
+        // are wiped. No manual cleanup arm needed.
+        let item = stage_item(&member_req, &app, &dir, &session, &prepare_cancel).await?;
+        match item.kind {
+            FileType::Video => counts.video += 1,
+            FileType::Image => counts.image += 1,
+            FileType::Blog => counts.blog += 1,
+            FileType::Generic => counts.generic += 1,
+            // A bundle member is never itself a bundle; leave counts as-is.
+            FileType::Bundle => {}
         }
+        // A member is not individually confirmable, so its preview `job_id` is a
+        // stable UI key derived from its file id (not a jobs-map key).
+        member_previews.push(UploadPreview {
+            job_id: hex16(&item.file_id),
+            file_type: item.staged.file_type.clone(),
+            title: item.staged.title.clone(),
+            tags: m.tags.clone(),
+            byte_size: item.staged.byte_size,
+            total_chunks: item.staged.total_chunks,
+            thumbnail_b64: item.thumbnail_b64.clone(),
+        });
+        member_meta.push(MemberMeta {
+            file_id: item.file_id,
+            file_type: item.kind,
+        });
+        cleanup.0.push(item.staged);
     }
+
+    // Disarm the guard: move the staged members out (their dirs now belong to the
+    // `BundleJob`). `member_meta` is parallel and same-order by construction above.
+    let members = std::mem::take(&mut cleanup.0);
 
     // Register the assembled bundle (NO network). The members stay in the TCB.
     let job_id = rand_job_id();
