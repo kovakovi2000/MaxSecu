@@ -943,7 +943,8 @@ impl Store for PgStore {
         let op = "list_files";
         let rows = sqlx::query(
             "SELECT file_id, file_type, current_version, updated_at FROM files \
-             WHERE current_version >= 1 AND ($1::smallint IS NULL OR file_type = $1) \
+             WHERE current_version >= 1 AND listed = true \
+             AND ($1::smallint IS NULL OR file_type = $1) \
              ORDER BY updated_at DESC, file_id LIMIT $2",
         )
         .bind(filter.file_type)

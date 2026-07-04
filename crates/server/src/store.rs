@@ -1017,6 +1017,7 @@ impl Store for MemoryStore {
             .files
             .iter()
             .filter(|(_, f)| f.current_version >= 1) // finalized only
+            .filter(|(_, f)| f.listed) // hide bundle members (Task 1.4)
             .filter(|(_, f)| filter.file_type.is_none_or(|t| t == f.file_type))
             .filter_map(|(id, f)| {
                 let ver = f.versions.get(&f.current_version)?;
@@ -1508,5 +1509,38 @@ mod memory_store_tests {
 
         // Unknown file → Ok(None).
         assert!(store.get_file_meta([0xEEu8; 16]).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn listing_excludes_bundle_members() {
+        let store = MemoryStore::new();
+        let owner = [7u8; 16];
+        let bundle_id = [1u8; 16];
+        let member_a = [2u8; 16];
+        let member_b = [3u8; 16];
+
+        // Stage + finalize the listed bundle and two unlisted members. list_files
+        // only returns finalized files (current_version >= 1), so finalize each.
+        for (id, listed, parent) in [
+            (bundle_id, true, None),
+            (member_a, false, Some(bundle_id)),
+            (member_b, false, Some(bundle_id)),
+        ] {
+            store
+                .stage_version(v1_parsed(id, owner, listed, parent), 1_000)
+                .await
+                .unwrap();
+            store.finalize_version(id, 1, owner, 1_000).await.unwrap();
+        }
+
+        let out = store
+            .list_files(ListFilter {
+                file_type: None,
+                limit: 50,
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].file_id, bundle_id);
     }
 }
