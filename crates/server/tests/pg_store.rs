@@ -965,17 +965,21 @@ async fn reshare_and_soft_revoke_persist_in_postgres() {
 /// This is the test that PROVES the transaction-local GUC carve-out
 /// (`SET LOCAL maxsecu.allow_owner_delete = 'on'`) actually defeats the append-only
 /// triggers on `file_versions` (finalized) and `file_genesis` over REAL Postgres —
-/// and that a non-owner delete is refused and removes NOTHING.
+/// that a non-owner delete is refused and removes NOTHING, and that the cascade is
+/// OWNER-SCOPED (a member another user pointed at the bundle survives).
 #[tokio::test]
 async fn delete_finalized_file_cascades_in_postgres() {
     let db = db_or_skip!();
     let owner = [0x11u8; 16];
+    let stranger = [0x22u8; 16];
     db.seed_user(owner, "owner_del").await;
+    db.seed_user(stranger, "stranger_del").await;
     let bundle = [0xB1u8; 16];
     let m1 = [0xB2u8; 16];
     let m2 = [0xB3u8; 16];
+    let foreign = [0xB4u8; 16]; // owned by `stranger`, but points at `owner`'s bundle
 
-    // A finalized bundle (file_type=Bundle=5, listed) + two members it owns.
+    // A finalized bundle (file_type=Bundle, listed) + two members it owns.
     let pb = parse_stage(pg_stage_listed(
         bundle, 1, owner, Some(pg_genesis(bundle, owner)), FileType::Bundle, true,
     ))
@@ -991,6 +995,14 @@ async fn delete_finalized_file_cascades_in_postgres() {
         db.store.stage_version(pm, TS).await.unwrap();
         db.store.finalize_version(m, 1, owner, TS + 2).await.unwrap();
     }
+    // `stranger` legitimately points THEIR OWN file at `owner`'s bundle_id.
+    let pf = parse_stage(StageInput {
+        bundle_id: Some(bundle),
+        ..pg_stage_listed(foreign, 1, stranger, Some(pg_genesis(foreign, stranger)), FileType::Blog, false)
+    })
+    .unwrap();
+    db.store.stage_version(pf, TS).await.unwrap();
+    db.store.finalize_version(foreign, 1, stranger, TS + 2).await.unwrap();
 
     // A NON-owner delete is refused (no oracle) AND removes nothing — the finalized
     // rows survive precisely because the GUC is unset on this path (immutability
@@ -1000,18 +1012,25 @@ async fn delete_finalized_file_cascades_in_postgres() {
     assert!(db.store.get_file_meta(m1).await.unwrap().is_some());
 
     // The OWNER permanently deletes the finalized bundle: the GUC carve-out lets
-    // the delete pass the file_versions + file_genesis triggers; the members
-    // cascade; every stream's blob_ref comes back for the caller to purge.
+    // the delete pass the file_versions + file_genesis triggers; the OWNED members
+    // cascade; every removed stream's blob_ref comes back for the caller to purge.
     let refs = db.store.delete_file(bundle, owner).await.expect("owner delete succeeds over real triggers");
-    assert_eq!(refs.len(), 6); // 2 streams (content+metadata) × 3 files
+    assert_eq!(refs.len(), 6); // 2 streams (content+metadata) × 3 OWNED files — NOT the foreign member
 
-    // Prove durability via a FRESH pool — the rows are gone, listing is empty.
+    // Prove durability via a FRESH pool — the owned rows are gone, and the
+    // foreign-owned member (owner-scoped predicate) SURVIVED intact.
     let fresh = db.reopen().await;
     assert!(fresh.get_file_meta(bundle).await.unwrap().is_none());
     assert!(fresh.get_file_meta(m1).await.unwrap().is_none());
     assert!(fresh.get_file_meta(m2).await.unwrap().is_none());
+    assert!(
+        fresh.get_file_meta(foreign).await.unwrap().is_some(),
+        "a foreign-owned member must survive the owner's bundle delete (owner-scoped cascade)"
+    );
+    // The stranger can still read their surviving file.
+    assert!(fresh.get_file(foreign, VersionSelector::Latest, stranger).await.unwrap().is_some());
     let listed = fresh.list_files(ListFilter { file_type: None, limit: 50 }).await.unwrap();
-    assert!(listed.is_empty());
+    assert!(listed.is_empty()); // all remaining files are unlisted members
 
     db.teardown().await;
 }

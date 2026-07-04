@@ -235,7 +235,10 @@ impl From<StoreError> for DeleteWrapError {
 pub enum DiscardError {
     /// The file is absent or the caller is not the owner — same code, no oracle.
     NotFound,
-    /// A finalized version exists; the append-only model forbids removal (§11.7).
+    /// A finalized version exists, so this is NOT a staged-discard. Internal
+    /// routing signal only: the `DELETE /v1/files/{id}` handler catches it and
+    /// dispatches to the owner-only permanent-delete path ([`DeleteError`] /
+    /// [`crate::store::Store::delete_file`]). The endpoint no longer returns 409.
     HasFinalizedVersion,
     /// A backend fault (→ 500, logged).
     Store(StoreError),

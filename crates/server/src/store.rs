@@ -20,6 +20,12 @@ use maxsecu_encoding::structs::MLKEM768_PUB_LEN;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+/// The advisory `files.file_type` codepoint for a **bundle** (encoding-spec
+/// `FileType::Bundle`). Used by [`Store::delete_file`] to decide whether to
+/// cascade to bundle members; named once here so the MemoryStore and PgStore
+/// paths (and their tests) can never drift on the magic number.
+pub(crate) const BUNDLE_FILE_TYPE: i16 = maxsecu_encoding::types::FileType::Bundle as i16;
+
 /// Public identity material the server stores for a user (schema.sql `users`).
 #[derive(Clone, Debug)]
 pub struct UserRecord {
@@ -1274,9 +1280,11 @@ impl Store for MemoryStore {
         if target.owner_id != owner_id {
             return Err(DeleteError::NotFound);
         }
-        // The delete set: the target plus — only for a bundle (file_type=5) —
-        // every member it OWNS (owner-scoped; another owner's file is untouched).
-        let is_bundle = target.file_type == 5;
+        // The delete set: the target plus — only for a bundle — every member it
+        // OWNS. The `f.owner_id == owner_id` guard is the owner-scoped cascade:
+        // a member another user pointed at this bundle (a member declares its own
+        // `bundle_id`) is NEVER removed by this owner's delete.
+        let is_bundle = target.file_type == BUNDLE_FILE_TYPE;
         let mut targets: Vec<[u8; 16]> = vec![file_id];
         if is_bundle {
             for (id, f) in inner.files.iter() {
@@ -1616,10 +1624,10 @@ mod memory_store_tests {
         let member_m1 = [2u8; 16];
         let member_m2 = [3u8; 16];
 
-        // O1 stages + FINALIZES a bundle (file_type=Bundle=5, listed=true) and two
+        // O1 stages + FINALIZES a bundle (file_type=Bundle, listed=true) and two
         // members (listed=false, bundle_id=Some(B)).
         for (id, ftype, listed, parent) in [
-            (bundle_b, 5, true, None),
+            (bundle_b, BUNDLE_FILE_TYPE, true, None),
             (member_m1, 3, false, Some(bundle_b)),
             (member_m2, 3, false, Some(bundle_b)),
         ] {
@@ -1655,6 +1663,51 @@ mod memory_store_tests {
             store.delete_file([0xEEu8; 16], owner_o1).await,
             Err(DeleteError::NotFound)
         ));
+    }
+
+    /// The critical safety property: the bundle cascade is OWNER-SCOPED. A member
+    /// is free to declare its own `bundle_id`, so user B can point one of B's files
+    /// at user A's bundle. When A deletes the bundle, B's file MUST survive and its
+    /// blob_ref MUST NOT be returned for purge.
+    #[tokio::test]
+    async fn delete_bundle_never_touches_a_foreign_owned_member() {
+        let store = MemoryStore::new();
+        let owner_a = [0xAAu8; 16];
+        let owner_b = [0xBBu8; 16];
+        let bundle_a = [1u8; 16];
+        let member_a = [2u8; 16]; // A's own member of A's bundle
+        let member_b = [3u8; 16]; // B's file, pointed at A's bundle by B
+
+        // A creates the bundle + A's member.
+        for (id, owner, ftype, parent) in [
+            (bundle_a, owner_a, BUNDLE_FILE_TYPE, None),
+            (member_a, owner_a, 3, Some(bundle_a)),
+        ] {
+            store
+                .stage_version(v1_parsed_typed(id, owner, ftype, id == bundle_a, parent), 1_000)
+                .await
+                .unwrap();
+            store.finalize_version(id, 1, owner, 1_000).await.unwrap();
+        }
+        // B legitimately points B's OWN file at A's bundle_id.
+        store
+            .stage_version(v1_parsed_typed(member_b, owner_b, 3, false, Some(bundle_a)), 1_000)
+            .await
+            .unwrap();
+        store.finalize_version(member_b, 1, owner_b, 1_000).await.unwrap();
+
+        // A deletes the bundle: A's bundle + A's member go; B's file is untouched.
+        let refs = store.delete_file(bundle_a, owner_a).await.unwrap();
+        assert!(store.get_file_meta(bundle_a).await.unwrap().is_none());
+        assert!(store.get_file_meta(member_a).await.unwrap().is_none());
+        assert!(
+            store.get_file_meta(member_b).await.unwrap().is_some(),
+            "a foreign-owned member must survive the owner's bundle delete"
+        );
+        assert_eq!(refs.len(), 2); // only A's bundle + A's member
+        // B's member's blob_ref (its `{hex}/1/1`) must NOT be in the purge set.
+        let b_ref = format!("{}/1/1", "03".repeat(16));
+        assert!(!refs.contains(&b_ref), "B's blob_ref must not be purged");
     }
 
     #[tokio::test]

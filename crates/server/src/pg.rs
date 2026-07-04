@@ -37,7 +37,7 @@ use crate::files::{
 use crate::store::{
     ancestor_chain, ChunkSlot, EnrollOutcome, FileListEntry, FileMeta, FileView, RecipientView,
     RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
-    UserRecord, VersionMeta, WrapView,
+    UserRecord, VersionMeta, WrapView, BUNDLE_FILE_TYPE,
 };
 
 /// Postgres [`Store`]. Cheap to clone (the pool is an `Arc` internally).
@@ -1327,11 +1327,16 @@ impl Store for PgStore {
         }
         let file_type: i16 = frow.get("file_type");
 
-        // The delete set: the target plus — only for a bundle (file_type=5) —
-        // every member it OWNS. The `owner_id = $2` predicate makes the cascade
-        // owner-scoped so a member owned by someone else is never removed.
+        // The delete set: the target plus — only for a bundle — every member it
+        // OWNS. The `owner_id = $2` predicate makes the cascade owner-scoped: a
+        // member another user pointed at this bundle (a member declares its own
+        // `bundle_id`) is NEVER removed by this owner's delete. NB: this SELECT is
+        // not `FOR UPDATE`, so a concurrent member-insert could race — benign here,
+        // since a bundle + its members are created atomically by the single owner
+        // and the enclosing txn already prevents a partial cascade (no locking /
+        // recursion needed).
         let mut targets: Vec<[u8; 16]> = vec![file_id];
-        if file_type == 5 {
+        if file_type == BUNDLE_FILE_TYPE {
             let mrows =
                 sqlx::query("SELECT file_id FROM files WHERE bundle_id = $1 AND owner_id = $2")
                     .bind(&file_id[..])
