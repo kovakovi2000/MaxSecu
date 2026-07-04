@@ -63,6 +63,13 @@ export interface ResolvedRecipient {
   already_shared: boolean;
 }
 
+// A known contact (roster row) for the share checklist — mirrors ContactDto.
+export interface Contact {
+  username: string;
+  user_id: string; // hex16, opaque to the UI
+  fingerprint: string; // first 8 bytes hex, display-only
+}
+
 // The per-recipient outcome of a reshare_file call, in request order.
 export interface ReshareOutcome {
   username: string;
