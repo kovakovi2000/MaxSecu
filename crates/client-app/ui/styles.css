@@ -1895,3 +1895,38 @@ trust-alarm .danger {
   border: 1px solid var(--mx-danger, #ff5a5a);
   border-radius: var(--mx-radius-sm);
 }
+
+/* Shared confirm-before-destructive modal (bundles Task 6.2). A generic
+   Cancel/Delete dialog raised by core/confirm.ts before a PERMANENT delete. */
+.confirm-host .confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 110;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(6, 8, 12, 0.66);
+  backdrop-filter: blur(4px);
+}
+.confirm-host .confirm-panel {
+  width: min(440px, 100%);
+  max-height: min(560px, calc(100vh - 2rem));
+  overflow-y: auto;
+  padding: clamp(1.1rem, 3vw, 1.5rem);
+  border: 1px solid color-mix(in srgb, var(--mx-danger, #ff5a5a) 55%, var(--mx-border, #333));
+  border-radius: var(--mx-radius-lg);
+  background: color-mix(in srgb, var(--mx-surface-1) 97%, transparent);
+  box-shadow: var(--mx-elev-2);
+}
+.confirm-host .confirm-h { margin: 0 0 0.5rem; font-size: var(--mx-fs-3); letter-spacing: -0.02em; }
+.confirm-host .confirm-msg { margin: 0 0 1rem; line-height: 1.5; color: var(--mx-muted, #bbb); }
+.confirm-host .confirm-actions { display: flex; justify-content: end; gap: 0.6rem; }
+.confirm-host .danger {
+  min-height: 2.4rem;
+  padding: 0.5rem 1rem;
+  font-weight: 800;
+  color: #fff;
+  background: var(--mx-danger, #d33);
+  border: 1px solid var(--mx-danger, #ff5a5a);
+  border-radius: var(--mx-radius-sm);
+}

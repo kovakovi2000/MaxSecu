@@ -1,6 +1,8 @@
 import { call, on } from "../core/rpc.ts";
-import { serialPriority } from "../core/serial.ts";
+import { serial, serialPriority } from "../core/serial.ts";
 import { runViewerOpen } from "../core/viewer-open.ts";
+import { needsConfirm, confirmModal } from "../core/confirm.ts";
+import { settingsStore } from "../core/settings.ts";
 import type { OpenedContent, FetchMsg } from "../core/types.ts";
 import "./progress-meter.ts";
 import "./skeleton-card.ts";
@@ -21,6 +23,10 @@ export class MediaViewer extends HTMLElement {
   private reqId = "";
   // The opened content (for the Download button), set on a successful open.
   private opened: OpenedContent | null = null;
+  // Whether this viewer is an embedded (Stacked bundle-member) instance. The
+  // owner-only Delete is shown ONLY in the routed viewer — deleting a lone member
+  // would break the bundle, so embedded viewers never surface Delete.
+  private embedded = false;
 
   connectedCallback() {
     // Two mount modes, sharing ALL content rendering (image/blog/video/meta):
@@ -32,6 +38,7 @@ export class MediaViewer extends HTMLElement {
     //    (e.g. <bundle-screen>) keeps the single landmark and there is never a
     //    duplicate `#main` id. The opened content shown is identical in both modes.
     const embedded = this.hasAttribute("embedded");
+    this.embedded = embedded;
     const fileIdAttr = this.getAttribute("file-id");
     let id: string;
     let version: number | undefined;
@@ -161,6 +168,20 @@ export class MediaViewer extends HTMLElement {
       (this.querySelector("#vw-share-btn") as HTMLElement).insertAdjacentElement("afterend", dlBtn);
     }
 
+    // Owner-only permanent Delete (bundles Task 6.2). Shown ONLY in the routed
+    // viewer (never embedded — a lone member delete would break its bundle) and
+    // only when THIS user authored the item (`c.mine`). Built via createElement so
+    // no dynamic data is templated into innerHTML.
+    if (c.mine && !this.embedded && !this.querySelector("#vw-del-btn")) {
+      const delBtn = document.createElement("button");
+      delBtn.id = "vw-del-btn";
+      delBtn.type = "button";
+      delBtn.className = "danger";
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", () => void this.onDelete(delBtn));
+      (this.querySelector("#vw-dl-btn") as HTMLElement).insertAdjacentElement("afterend", delBtn);
+    }
+
     const body = this.querySelector("#vw-body") as HTMLElement;
     body.replaceChildren();
 
@@ -205,6 +226,36 @@ export class MediaViewer extends HTMLElement {
     add("Version", String(c.version));
     if (c.tags.length) add("Tags", c.tags.map((t) => `#${t}`).join(" "));
     if (!c.recovery_ok) add("Note", "No recovery grant present.");
+  }
+
+  // Owner-only permanent delete. Honors the `confirm_destructive` behavior
+  // setting: when on (the default-safe path), a confirm modal surfaces the
+  // PERMANENT + already-downloaded-copies caveat first; when the user has opted
+  // out of prompts, the delete proceeds directly. On success → toast + navigate
+  // to #/feed (forces the feed to re-mount + refresh, dropping the deleted item);
+  // on error → error toast (the backend error is already sanitized — no oracle).
+  private async onDelete(btn: HTMLButtonElement) {
+    const confirmDestructive = settingsStore.get().behavior.confirm_destructive;
+    if (needsConfirm(confirmDestructive)) {
+      const ok = await confirmModal({
+        title: "Delete this post?",
+        message:
+          "Delete this permanently? This can't be undone. Copies others have " +
+          "already downloaded can't be reached.",
+      });
+      if (!ok) return;
+    }
+    btn.disabled = true;
+    try {
+      await serial(() => call<void>("delete_content", { req: { file_id: this.reqId } }));
+      toast("success", "Post deleted.");
+      // Navigate to the feed; the router re-mounts <feed-screen>, refreshing the
+      // listing so the deleted item is gone.
+      location.hash = "#/feed";
+    } catch (x) {
+      btn.disabled = false;
+      toast("error", viewerErr(x));
+    }
   }
 }
 

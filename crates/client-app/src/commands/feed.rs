@@ -380,7 +380,7 @@ pub async fn decrypt_card(
         )
         .await
         {
-            Ok((body, _version)) => {
+            Ok((body, _version, _mine)) => {
                 histogram(&body.members.iter().map(|m| m.file_type).collect::<Vec<_>>())
             }
             Err(_) => crate::dto::MemberCounts::default(),

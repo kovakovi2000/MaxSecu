@@ -56,6 +56,9 @@ export interface OpenedContent {
   // T4 (D-OQ3): true whenever the open succeeded, i.e. the caller holds a wrap
   // for this item — NOT ownership-gated. Gates the viewer's "Share…" action.
   can_share: boolean;
+  // Bundles Task 6.2: true iff THIS user authored the item — gates the
+  // owner-only permanent-Delete action (distinct from can_share).
+  mine: boolean;
 }
 
 // --- T4 (post-upload multi-recipient sharing) DTO mirrors ---
@@ -110,6 +113,9 @@ export interface BundleView {
   file_type: string;
   version: number;
   members: BundleMemberView[];
+  // Bundles Task 6.2: true iff THIS user authored the bundle — gates the
+  // owner-only "Delete bundle" action (server cascades member deletion).
+  mine: boolean;
 }
 
 export type FetchMsg =

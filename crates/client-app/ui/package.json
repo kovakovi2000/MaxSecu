@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "esbuild src/main.ts --bundle --format=esm --outfile=dist/main.js && node -e \"const fs=require('fs');fs.copyFileSync('index.html','dist/index.html');fs.copyFileSync('styles.css','dist/styles.css')\"",
-    "test": "node --experimental-strip-types --test src/core/store.test.ts src/core/settings-store.test.ts src/core/webgl-yuv.test.ts src/core/player.test.ts src/core/serial.test.ts src/core/toast.test.ts src/core/router.test.ts src/core/viewer-open.test.ts src/core/card-retry.test.ts src/core/transcode-opts.test.ts src/core/busy.test.ts src/core/format.test.ts src/core/gauge.test.ts src/core/trust-alarm.test.ts src/core/download-name.test.ts src/components/video-player.test.ts src/components/bundle-screen.test.ts src/components/bundle-composer.test.ts src/components/media-card.test.ts",
+    "test": "node --experimental-strip-types --test src/core/store.test.ts src/core/settings-store.test.ts src/core/webgl-yuv.test.ts src/core/player.test.ts src/core/serial.test.ts src/core/toast.test.ts src/core/router.test.ts src/core/viewer-open.test.ts src/core/card-retry.test.ts src/core/transcode-opts.test.ts src/core/busy.test.ts src/core/format.test.ts src/core/gauge.test.ts src/core/trust-alarm.test.ts src/core/download-name.test.ts src/core/confirm.test.ts src/components/video-player.test.ts src/components/bundle-screen.test.ts src/components/bundle-composer.test.ts src/components/media-card.test.ts",
     "test:a11y": "node --experimental-strip-types --test src/a11y.test.ts",
     "typecheck": "tsc --noEmit"
   },

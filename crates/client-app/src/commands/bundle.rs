@@ -61,7 +61,7 @@ pub(crate) async fn open_bundle_members(
     dir: &State<'_, AppDir>,
     session: &State<'_, Session>,
     connect_lock: &State<'_, ConnectLock>,
-) -> Result<(BundleBody, u64), UiError> {
+) -> Result<(BundleBody, u64, bool), UiError> {
     // Validate the REQUESTED id up front: `run_open` binds the served record to
     // it, and it rejects a malformed id before it is interpolated into the URL.
     let file_id = hex16(req_file_id)?;
@@ -182,7 +182,10 @@ pub(crate) async fn open_bundle_members(
         .ok_or_else(|| UiError::new("verify_failed", "Missing content."))?;
     let body: BundleBody =
         decode(&content.plaintext).map_err(|_| UiError::new("untrusted", "Malformed bundle."))?;
-    Ok((body, opened.version))
+    // Ownership (bundles Task 6.2): the caller authored this bundle iff their id
+    // matches the verified author. Gates the owner-only "Delete bundle" action.
+    let mine = my_id == author.user_id;
+    Ok((body, opened.version, mine))
 }
 
 /// `open_bundle` — verify + decrypt a bundle file and return its ordered member
@@ -196,12 +199,14 @@ pub async fn open_bundle(
     session: State<'_, Session>,
     connect_lock: State<'_, ConnectLock>,
 ) -> Result<BundleView, UiError> {
-    let (body, version) = open_bundle_members(&req.file_id, &dir, &session, &connect_lock).await?;
+    let (body, version, mine) =
+        open_bundle_members(&req.file_id, &dir, &session, &connect_lock).await?;
     Ok(BundleView {
         file_id: req.file_id,
         file_type: file_type_name(FileType::Bundle),
         version,
         members: member_views_from_body(&body),
+        mine,
     })
 }
 

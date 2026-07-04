@@ -148,6 +148,8 @@ impl ContentCache {
             // item successfully once (see `put_content`'s callers) — same D-OQ3
             // display-metadata semantics as a fresh open, not ownership-gated.
             can_share: true,
+            // Ownership was recorded at put time (bundles Task 6.2).
+            mine: e.meta.mine,
         })
     }
 

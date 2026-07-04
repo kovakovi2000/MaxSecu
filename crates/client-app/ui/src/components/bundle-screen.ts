@@ -1,6 +1,8 @@
 import { call } from "../core/rpc.ts";
 import { serial, serialPriority } from "../core/serial.ts";
 import { toast } from "../core/toast.ts";
+import { needsConfirm, confirmModal } from "../core/confirm.ts";
+import { settingsStore } from "../core/settings.ts";
 import { downloadName, dedupeName } from "../core/download-name.ts";
 import {
   readBundleViewMode,
@@ -47,6 +49,7 @@ export class BundleScreen extends HTMLElement {
             <button id="bd-stacked" type="button" class="bundle-mode">Stacked</button>
           </div>
           <button id="bd-download-all" type="button" class="secondary" disabled>Download all</button>
+          <button id="bd-delete" type="button" class="danger" hidden>Delete bundle</button>
         </div>
         <div id="bd-members"></div>
       </main>`;
@@ -61,6 +64,9 @@ export class BundleScreen extends HTMLElement {
     );
     (this.querySelector("#bd-download-all") as HTMLButtonElement).addEventListener("click", () =>
       void this.downloadAll(),
+    );
+    (this.querySelector("#bd-delete") as HTMLButtonElement).addEventListener("click", () =>
+      void this.onDelete(),
     );
 
     // Skeleton while the bundle resolves.
@@ -86,6 +92,8 @@ export class BundleScreen extends HTMLElement {
         n === 0 ? "This bundle is empty." : `${n} item${n === 1 ? "" : "s"}.`;
       // Download-all only makes sense once there is at least one member.
       (this.querySelector("#bd-download-all") as HTMLButtonElement).disabled = n === 0;
+      // Owner-only "Delete bundle" (bundles Task 6.2): shown only to the author.
+      (this.querySelector("#bd-delete") as HTMLButtonElement).hidden = !view.mine;
       this.render();
     } catch (x) {
       this.fail(bundleErr(x));
@@ -162,6 +170,37 @@ export class BundleScreen extends HTMLElement {
       toast(ok === total ? "success" : "info", `Downloaded ${ok} of ${total}.`);
     } finally {
       btn.disabled = false;
+    }
+  }
+
+  // Owner-only permanent delete of the WHOLE bundle (server cascades members).
+  // Honors `confirm_destructive`: when on (default-safe), a confirm modal surfaces
+  // the PERMANENT + member-cascade + already-downloaded-copies caveat first; when
+  // the user opted out of prompts, it proceeds directly. On success → toast +
+  // navigate to #/feed (re-mounts the feed, dropping the bundle and its members);
+  // on error → error toast (backend error already sanitized — no oracle).
+  private async onDelete() {
+    if (!this.view) return;
+    const bundleId = this.view.file_id;
+    const confirmDestructive = settingsStore.get().behavior.confirm_destructive;
+    if (needsConfirm(confirmDestructive)) {
+      const ok = await confirmModal({
+        title: "Delete this bundle?",
+        message:
+          "Delete this bundle and all its members permanently? This can't be " +
+          "undone. Copies others have already downloaded can't be reached.",
+      });
+      if (!ok) return;
+    }
+    const btn = this.querySelector("#bd-delete") as HTMLButtonElement;
+    btn.disabled = true;
+    try {
+      await serial(() => call<void>("delete_content", { req: { file_id: bundleId } }));
+      toast("success", "Bundle deleted.");
+      location.hash = "#/feed";
+    } catch (x) {
+      btn.disabled = false;
+      toast("error", bundleErr(x));
     }
   }
 

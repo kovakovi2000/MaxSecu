@@ -171,6 +171,10 @@ pub struct OpenedContentDto {
     /// therefore always `true` on a successful `OpenedContentDto`; there is no
     /// partial-open path that would set it `false`.
     pub can_share: bool,
+    /// `true` iff THIS user authored the item (`my_id == author.user_id`). Gates
+    /// the owner-only permanent-Delete affordance (bundles Task 6.2) — distinct
+    /// from `can_share`, which any current wrap-holder gets.
+    pub mine: bool,
 }
 
 /// One member of an opened bundle, in the bundle's authoritative order. A seam
@@ -194,6 +198,10 @@ pub struct BundleView {
     pub file_type: String,
     pub version: u64,
     pub members: Vec<BundleMemberView>,
+    /// `true` iff THIS user authored the bundle (`my_id == author.user_id`).
+    /// Gates the owner-only "Delete bundle" affordance (bundles Task 6.2); the
+    /// server cascades member deletion.
+    pub mine: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -463,10 +471,14 @@ mod reshare_dto_tests {
             author_fp: "deadbeef".into(),
             recovery_ok: true,
             can_share: true,
+            mine: false,
         };
         let s = serde_json::to_string(&dto).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["can_share"], true);
+        // `mine` is a distinct, independent flag from `can_share` (D-OQ3): a
+        // non-owner wrap-holder still gets `can_share: true` but `mine: false`.
+        assert_eq!(v["mine"], false);
     }
 
     #[test]

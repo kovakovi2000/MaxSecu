@@ -314,6 +314,8 @@ async fn open_content_inner(
             // holds a wrap — Share is available to ANY wrap-holder, not just the
             // author/owner. NOT gated on `my_id == author.user_id`.
             can_share: true,
+            // Ownership (bundles Task 6.2): gates the owner-only permanent Delete.
+            mine: my_id == author.user_id,
         });
     }
 
@@ -433,6 +435,8 @@ async fn open_content_inner(
         // holds a wrap — Share is available to ANY wrap-holder, not just the
         // author/owner. NOT gated on `my_id == author.user_id`.
         can_share: true,
+        // Ownership (bundles Task 6.2): gates the owner-only permanent Delete.
+        mine: my_id == author.user_id,
     })
 }
 
