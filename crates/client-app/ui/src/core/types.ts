@@ -90,6 +90,23 @@ export type SharePhase =
 
 export interface SearchHit { file_id: string; title: string; file_type: string }
 
+// --- Bundles DTO mirrors (open_bundle) ---
+// A bundle is a grouped post whose members are other posts, viewed in Gallery or
+// Stacked mode. Mirrors the Rust serde shapes; display-only, no key material.
+export interface BundleMemberView {
+  file_id: string;
+  file_type: string;
+  title: string;
+  thumbnail_b64: string | null;
+}
+
+export interface BundleView {
+  file_id: string;
+  file_type: string;
+  version: number;
+  members: BundleMemberView[];
+}
+
 export type FetchMsg =
   | { phase: "fetching"; file_id: string; fetched: number; total: number }
   | { phase: "verifying"; file_id: string }

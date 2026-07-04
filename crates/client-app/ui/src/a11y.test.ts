@@ -17,6 +17,7 @@ import { readFileSync } from "node:fs";
 const screens = [
   "src/components/feed-screen.ts",
   "src/components/media-viewer.ts",
+  "src/components/bundle-screen.ts",
   "src/components/upload-screen.ts",
   "src/components/settings-screen.ts",
   "src/components/admin-screen.ts",

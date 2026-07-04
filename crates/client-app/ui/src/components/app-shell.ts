@@ -8,6 +8,7 @@ import "./register-screen.ts";
 import "./admin-screen.ts";
 import "./feed-screen.ts";
 import "./media-viewer.ts";
+import "./bundle-screen.ts";
 import "./upload-screen.ts";
 import "./upload-tray.ts";
 import "./share-tray.ts";
@@ -116,6 +117,8 @@ export class AppShell extends HTMLElement {
           ? "<feed-screen></feed-screen>"
           : r === "viewer"
           ? "<media-viewer></media-viewer>"
+          : r === "bundle"
+          ? "<bundle-screen></bundle-screen>"
           : r === "upload"
           ? "<upload-screen></upload-screen>"
           : r === "settings"
