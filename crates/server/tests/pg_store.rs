@@ -817,6 +817,21 @@ async fn finalize_strict_plus_one_and_non_owner_rejected_in_postgres() {
     db.teardown().await;
 }
 
+/// Same as [`pg_stage`] but with an explicit `listed` flag (Task 1.4 regression).
+fn pg_stage_listed(
+    file: [u8; 16],
+    version: u64,
+    owner: [u8; 16],
+    genesis: Option<GenesisInput>,
+    ftype: FileType,
+    listed: bool,
+) -> StageInput {
+    StageInput {
+        listed,
+        ..pg_stage(file, version, owner, genesis, ftype)
+    }
+}
+
 #[tokio::test]
 async fn listing_filters_by_type_in_postgres() {
     let db = db_or_skip!();
@@ -844,6 +859,32 @@ async fn listing_filters_by_type_in_postgres() {
         .unwrap();
     assert_eq!(blogs.len(), 1);
     assert_eq!(blogs[0].file_id, blog);
+
+    db.teardown().await;
+}
+
+#[tokio::test]
+async fn listing_excludes_bundle_members_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    db.seed_user(owner, "owner").await;
+    let bundle = [0xB1u8; 16];
+    let member = [0x71u8; 16];
+
+    // A listed bundle and an unlisted member (listed=false), both finalized.
+    // `listed` is a post-scan filter on files_listing_idx; the PG query drops
+    // members with `AND listed = true` so they never reach the public feed.
+    let pb = parse_stage(pg_stage_listed(bundle, 1, owner, Some(pg_genesis(bundle, owner)), FileType::Blog, true)).unwrap();
+    db.store.stage_version(pb, TS).await.unwrap();
+    db.store.finalize_version(bundle, 1, owner, TS + 100).await.unwrap();
+    let pm = parse_stage(pg_stage_listed(member, 1, owner, Some(pg_genesis(member, owner)), FileType::Blog, false)).unwrap();
+    db.store.stage_version(pm, TS).await.unwrap();
+    db.store.finalize_version(member, 1, owner, TS + 200).await.unwrap();
+
+    let all = db.store.list_files(ListFilter { file_type: None, limit: 50 }).await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].file_id, bundle);
+    assert!(all.iter().all(|e| e.file_id != member)); // member hidden from the feed
 
     db.teardown().await;
 }
