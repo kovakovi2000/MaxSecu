@@ -359,7 +359,7 @@ pub(crate) fn wrap_wire(w: &WrapOut) -> Vec<u8> {
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
-fn file_type_str(t: FileType) -> &'static str {
+pub(crate) fn file_type_str(t: FileType) -> &'static str {
     match t {
         FileType::Image => "image",
         FileType::Blog => "blog",

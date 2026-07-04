@@ -41,8 +41,8 @@ use crate::http_client::{delete_req, post_json};
 use crate::jobs::{StagedContent, StagedUpload, StagedVideoPreview, UploadJobs, VideoPrepareCancel};
 use crate::state::{PreparePhase, UploadPhase, EVT_UPLOAD, EVT_VIDEO_PREPARE};
 use crate::upload::{
-    prepare_blog_streams, prepare_generic_metadata, prepare_image_streams, prepare_video_streams,
-    put_chunk_retried, run_pipeline, total_chunks, wrap_wire, PreparedVideo,
+    file_type_str, prepare_blog_streams, prepare_generic_metadata, prepare_image_streams,
+    prepare_video_streams, put_chunk_retried, run_pipeline, total_chunks, wrap_wire, PreparedVideo,
 };
 use crate::upload_staging::{StagedSmallStream, StagedWrap, StagingRecord, StagingStore};
 
@@ -388,14 +388,15 @@ pub async fn stage_upload(
             "out.mp4",
             Some(&vp.job_dir),
             file_type,
-            "video",
             small,
-            me.user_id,
-            me.key_version,
-            file_id,
-            recovery.enc_pub,
-            recovery.mlkem_pub,
-            now,
+            StagingCryptoInputs {
+                owner_id: me.user_id,
+                owner_key_version: me.key_version,
+                file_id,
+                recovery_enc_pub: recovery.enc_pub,
+                recovery_mlkem_pub: recovery.mlkem_pub,
+                created_at: now,
+            },
             &req.title,
             dir.0.join("staging"),
             &mut dir_cleanup.0,
@@ -424,14 +425,15 @@ pub async fn stage_upload(
             "content.bin",
             None,
             file_type,
-            "generic",
             small,
-            me.user_id,
-            me.key_version,
-            file_id,
-            recovery.enc_pub,
-            recovery.mlkem_pub,
-            now,
+            StagingCryptoInputs {
+                owner_id: me.user_id,
+                owner_key_version: me.key_version,
+                file_id,
+                recovery_enc_pub: recovery.enc_pub,
+                recovery_mlkem_pub: recovery.mlkem_pub,
+                created_at: now,
+            },
             &req.title,
             dir.0.join("staging"),
             &mut dir_cleanup.0,
@@ -515,6 +517,19 @@ fn bundle_file_type_str(b: &maxsecu_client_core::UploadBundle) -> String {
     .to_owned()
 }
 
+/// The crypto/identity scalars forwarded verbatim into the [`UploadParams`] that
+/// [`stage_streaming_content`] builds under the session lock. Grouping them keeps the
+/// helper signature small and prevents a caller from mis-ordering the several
+/// fixed-size byte arrays.
+struct StagingCryptoInputs {
+    owner_id: [u8; 16],
+    owner_key_version: u64,
+    file_id: Id,
+    recovery_enc_pub: [u8; 32],
+    recovery_mlkem_pub: Option<[u8; 1184]>,
+    created_at: u64,
+}
+
 /// Shared streaming-seal + stage for disk-backed uploads (video and generic).
 ///
 /// Under the session lock (identity borrowed only across the SYNCHRONOUS pass-1
@@ -530,12 +545,17 @@ fn bundle_file_type_str(b: &maxsecu_client_core::UploadBundle) -> String {
 ///    moved or deleted).
 /// 4. Removes `temp_dir` after the move, if any (the video transcode temp dir —
 ///    Low-IL container artifacts).
-/// 5. Builds + persists the `StagingRecord` under `file_type_str`.
+/// 5. Builds + persists the `StagingRecord` (its `file_type` string is derived from
+///    `file_type` via [`file_type_str`], so it can never drift from the wrapped
+///    `UploadParams.file_type`).
 ///
 /// `dir_cleanup_slot` is the caller's error-cleanup guard field: it is switched to
 /// the staging dir once the content is in place, so a later persist failure (or an
 /// error after this returns) wipes the staging dir. Returns the persisted record and
 /// its staging dir.
+// Grouping the six crypto scalars into `StagingCryptoInputs` cut this from 17 → 11
+// args; the remaining 11 (placement + I/O concerns, deliberately not bundled) still
+// exceed clippy's default-7 threshold, so the allow stays.
 #[allow(clippy::too_many_arguments)]
 async fn stage_streaming_content(
     session: &State<'_, Session>,
@@ -544,18 +564,14 @@ async fn stage_streaming_content(
     content_filename: &str,
     temp_dir: Option<&std::path::Path>,
     file_type: maxsecu_encoding::types::FileType,
-    file_type_str: &str,
     small: SmallStreams,
-    owner_id: [u8; 16],
-    owner_key_version: u64,
-    file_id: Id,
-    recovery_enc_pub: [u8; 32],
-    recovery_mlkem_pub: Option<[u8; 1184]>,
-    now: u64,
+    crypto: StagingCryptoInputs,
     title: &str,
     staging_root: std::path::PathBuf,
     dir_cleanup_slot: &mut Option<std::path::PathBuf>,
 ) -> Result<(StagingRecord, std::path::PathBuf), UiError> {
+    let now = crypto.created_at;
+    let file_id = crypto.file_id;
     // Pass 1 (digest) + finish (sign/wrap/seal small streams) + move/copy + persist
     // all happen under the session lock. There is NO `.await` while the identity is
     // borrowed — the seal/finish sequence is fully synchronous.
@@ -566,13 +582,13 @@ async fn stage_streaming_content(
         .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
     let params = UploadParams {
         owner: identity,
-        owner_id: Id(owner_id),
-        owner_key_version,
+        owner_id: Id(crypto.owner_id),
+        owner_key_version: crypto.owner_key_version,
         file_id,
         file_type,
         chunk_size: CHUNK_SIZE,
-        recovery_pub: EncPublicKey::from_bytes(recovery_enc_pub),
-        recovery_mlkem_pub,
+        recovery_pub: EncPublicKey::from_bytes(crypto.recovery_enc_pub),
+        recovery_mlkem_pub: crypto.recovery_mlkem_pub,
         created_at: Timestamp(now),
     };
 
@@ -624,7 +640,7 @@ async fn stage_streaming_content(
 
     let rec = StagingRecord {
         file_id: file_id.0,
-        file_type: file_type_str.to_owned(),
+        file_type: file_type_str(file_type).to_owned(),
         title: title.to_owned(),
         manifest: maxsecu_encoding::encode(&records.manifest),
         manifest_sig: records.manifest_sig.to_vec(),
@@ -927,7 +943,7 @@ async fn streaming_confirm(
 
     // Open the on-disk fMP4 for sequential read (pass 2).
     let mut mp4_file = std::fs::File::open(&rec.out_mp4_path)
-        .map_err(|_| UiError::new("upload_chunk_failed", "Cannot read the staged video file."))?;
+        .map_err(|_| UiError::new("upload_chunk_failed", "Cannot read the staged file."))?;
 
     let chunk_size = rec.chunk_size as u64;
     let count = rec.content_chunk_count;
@@ -945,10 +961,10 @@ async fn streaming_confirm(
     for i in rec.progress..count {
         // Seek to chunk boundary and read up to chunk_size bytes.
         mp4_file.seek(SeekFrom::Start(i * chunk_size)).map_err(|_| {
-            UiError::new("upload_chunk_failed", "Cannot seek in staged video file.")
+            UiError::new("upload_chunk_failed", "Cannot seek in staged file.")
         })?;
         let n = read_exact_or_eof(&mut mp4_file, &mut buf).map_err(|_| {
-            UiError::new("upload_chunk_failed", "Cannot read staged video file.")
+            UiError::new("upload_chunk_failed", "Cannot read staged file.")
         })?;
         let plaintext = &buf[..n];
         let is_last = i == count - 1;
