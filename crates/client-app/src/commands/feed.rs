@@ -272,11 +272,15 @@ pub async fn decrypt_card(
     // Borrow a channel from the pool instead of re-authing per call. Concurrent
     // `decrypt_card` calls take DIFFERENT cached channels (no ConnectLock contention,
     // no identity-take on the hot path); only a cold-start / expired channel mints a
-    // fresh one via `reauth` (under the pool's auth gate). If the FIRST server contact
-    // (the §8.5 view GET) returns 401 the pooled token has expired mid-life: mark the
-    // channel bad (discard, never reuse a stale token) and re-acquire ONCE — a fresh
-    // mint. A 200 here validates the token for the rest of this call's fetches (all
-    // within the same instant), so the sequence can't 401 downstream.
+    // fresh one via `reauth` (under the pool's auth gate). The §8.5 view GET is the
+    // FIRST use of the (possibly reused) channel, so it is the fail-closed check: if it
+    // returns 401 (pooled token expired mid-life) OR the transport errors (a stale
+    // pooled connection went dead), mark the channel bad — discard it, never reuse a
+    // stale token or a dead socket — and re-acquire ONCE (a fresh `reauth` mint). A 200
+    // here validates the channel+token for the rest of this call's fetches (all within
+    // the same instant), so the sequence can't 401 downstream; a downstream transport
+    // failure returns the channel to the pool and is caught by the next reuse's view GET
+    // (self-healing within one decode, never a persistent poison).
     let mut chan;
     let view_json;
     {
@@ -284,22 +288,30 @@ pub async fn decrypt_card(
         let mut attempt = 0u8;
         loop {
             attempt += 1;
+            let first = attempt == 1;
             let mut c = pool
                 .acquire(|| reauth_channel(&dir.0, &server, &session, &connect_lock))
                 .await?;
             let host = c.host.clone();
             let token = c.token.clone();
-            let (status, vj) = get_json(&mut c.sender, &view_uri, Some(&token), &host).await?;
-            if status == StatusCode::UNAUTHORIZED && attempt == 1 {
-                c.mark_bad(); // stale-token channel — discard + re-auth once.
-                continue;
+            match get_json(&mut c.sender, &view_uri, Some(&token), &host).await {
+                Ok((StatusCode::UNAUTHORIZED, _)) if first => {
+                    c.mark_bad(); // stale-token channel — discard + re-auth once.
+                    continue;
+                }
+                Ok((StatusCode::OK, vj)) => {
+                    chan = c;
+                    view_json = vj;
+                    break;
+                }
+                Ok(_) => return Err(UiError::new("fetch_failed", "That item is not available.")),
+                Err(e) if first => {
+                    c.mark_bad(); // dead pooled connection — discard + retry once.
+                    let _ = e;
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
-            if status != StatusCode::OK {
-                return Err(UiError::new("fetch_failed", "That item is not available."));
-            }
-            chan = c;
-            view_json = vj;
-            break;
         }
     }
     // The channel-bound host + token for this call's remaining authed fetches (owned
