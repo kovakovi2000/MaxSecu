@@ -422,8 +422,8 @@ async fn phase7_video_upload_over_real_tls() {
     //
     // INVARIANT (no-network-at-stage): the ingest happens with NO connection /
     // transport / server in scope. This is STRUCTURAL, not merely ordering:
-    // `prepare_video_streams` takes only `(input_path, ffmpeg_path, worker_path,
-    // options, bounds, title, tags, on_phase, cancel)` — a local progress sink + a
+    // `prepare_video_streams` takes only `(input_path, ffmpeg_path, options, bounds,
+    // transcode_threads, title, tags, on_phase, cancel)` — a local progress sink + a
     // cancel flag, NO `SendRequest`/host/socket parameter,
     // so it cannot reach the network even if a future refactor moved the server setup
     // earlier. The asserts below enforce that no networking object has been
@@ -437,6 +437,7 @@ async fn phase7_video_upload_over_real_tls() {
         &ffmpeg,
         &TranscodeOptions::default(),
         &VideoBounds::default(),
+        2, // transcode_threads budget → ffmpeg `-threads 2`
         "Holiday clip",
         &["beach".to_owned()],
         |_p| {},                                    // no-op progress sink (not asserted here)

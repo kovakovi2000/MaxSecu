@@ -254,6 +254,15 @@ pub struct PerformanceSettings {
     pub transcode_threads: u16,
     /// Worker-thread budget for the confined decode path. Default =
     /// available parallelism (logical CPUs); clamped 1..=available.
+    ///
+    /// NOTE (Task 7.3): video playback now uses the native `<video>` element
+    /// (WebView2's own decoder), and the confined decode worker (`media-worker`,
+    /// `SubprocessDecoder`/`AppContainerDecoder`) was RETIRED for viewing — see
+    /// `media-launcher`'s crate docs. There is therefore currently **no runtime
+    /// consumer** for this budget. It stays a surfaced, normalized setting reserved
+    /// for when a confined decode path returns (e.g. a preview/thumbnail decode) or
+    /// for parallel per-chunk work; wiring it would pass it as a launch ARG to that
+    /// worker (never an env var), consistent with the ffmpeg `-threads` path.
     #[serde(default = "default_cpu_threads")]
     pub decode_threads: u16,
 }

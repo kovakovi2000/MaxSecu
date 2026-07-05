@@ -196,6 +196,12 @@ pub fn prepare_video_streams(
     ffmpeg_path: &Path,
     options: &TranscodeOptions,
     bounds: &VideoBounds,
+    // Worker-thread budget for the confined ffmpeg (the user's
+    // `PerformanceSettings::transcode_threads`, already clamped 1..=cores by
+    // `SettingsConfig::normalized`). Flows verbatim into the pinned argv as
+    // `-threads N` — a plain value, never an env var, so it cannot influence the
+    // confinement.
+    transcode_threads: u16,
     title: &str,
     tags: &[String],
     on_phase: impl Fn(crate::state::PreparePhase) + Sync,
@@ -223,7 +229,14 @@ pub fn prepare_video_streams(
     // 3) The pinned argv: ONE confined ffmpeg run → out.mp4 (AV1+AAC) + thumb.png.
     let out_mp4 = dir.join("out.mp4");
     let thumb_png = dir.join("thumb.png");
-    let args = build_ffmpeg_args(&input_copy, &out_mp4, &thumb_png, options, bounds);
+    let args = build_ffmpeg_args(
+        &input_copy,
+        &out_mp4,
+        &thumb_png,
+        options,
+        bounds,
+        transcode_threads,
+    );
 
     // 4) Decode the untrusted source in the CONFINED ffmpeg (no net / keys /
     //    children, mem cap, bounded timeout). A nonzero exit fails closed; the

@@ -82,6 +82,7 @@ pub fn build_ffmpeg_args(
     thumbnail: &Path,
     opts: &TranscodeOptions,
     bounds: &VideoBounds,
+    threads: u16,
 ) -> Vec<OsString> {
     // Clamp the user-supplied shaping against the trusted bounds FIRST.
     let opts = opts.normalized(bounds);
@@ -118,6 +119,14 @@ pub fn build_ffmpeg_args(
     // Force 8-bit I420 — the only pixel layout the viewer decoder accepts.
     arg!("-pix_fmt");
     arg!("yuv420p");
+
+    // Encoder worker-thread budget (Task 7.3): the confined transcode honors the
+    // user's `transcode_threads` performance setting. Passed as a plain argv value
+    // into the confined ffmpeg (never an env var — consistent with every other flag
+    // here, so it cannot influence confinement). Clamp to >=1: a 0 would ask ffmpeg
+    // to auto-pick all cores, defeating the user's budget.
+    arg!("-threads");
+    arg!(threads.max(1).to_string());
 
     arg!("-c:v");
     arg!("libsvtav1");
@@ -249,7 +258,7 @@ mod tests {
             resolution: Resolution::Original,
             bitrate: Bitrate::Original,
         };
-        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds());
+        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds(), 4);
 
         // D-4: Original bitrate ⇒ NO -b:v, but an explicit high-quality -crf instead
         // of SVT-AV1's lossy default rate control.
@@ -314,7 +323,7 @@ mod tests {
             resolution: Resolution::Height(720),
             bitrate: Bitrate::Kbps(4000),
         };
-        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds());
+        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds(), 4);
 
         // Height: width = height × input display aspect (`dar`), even, output square.
         // For a square source `dar` is the storage ratio, matching the prior `-2:h`.
@@ -338,7 +347,7 @@ mod tests {
             },
             bitrate: Bitrate::Original,
         };
-        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds());
+        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds(), 4);
         // normalize floors each dim to even ⇒ 1920x1080; output marked square-pixel.
         assert_eq!(value_after(&args, "-vf"), "scale=1920:1080,setsar=1");
     }
@@ -353,7 +362,7 @@ mod tests {
             },
             bitrate: Bitrate::Kbps(10_000_000),
         };
-        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds());
+        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds(), 4);
         // Per-dim clamp to the 8K caps (7680x4320 fits max_pixels exactly); square-pixel.
         assert_eq!(value_after(&args, "-vf"), "scale=7680:4320,setsar=1");
         // Bitrate clamped down to the ceiling.
@@ -364,10 +373,33 @@ mod tests {
     }
 
     #[test]
+    fn ffmpeg_args_include_thread_budget() {
+        // The confined transcode honors the user's `transcode_threads` budget:
+        // the argv carries `-threads <n>` (Task 7.3).
+        let (i, o, t) = paths();
+        let opts = TranscodeOptions::default();
+        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds(), 3);
+        let pos = args
+            .iter()
+            .position(|a| a == "-threads")
+            .expect("-threads present");
+        assert_eq!(args[pos + 1], "3");
+    }
+
+    #[test]
+    fn thread_budget_is_clamped_to_at_least_one() {
+        // A 0 budget would ask ffmpeg to auto-pick all cores; clamp to >=1.
+        let (i, o, t) = paths();
+        let opts = TranscodeOptions::default();
+        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds(), 0);
+        assert_eq!(value_after(&args, "-threads"), "1");
+    }
+
+    #[test]
     fn main_output_is_fragmented_mp4() {
         let (i, o, t) = paths();
         let opts = TranscodeOptions::default();
-        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds());
+        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds(), 4);
 
         assert!(
             contains(&args, "-movflags"),
@@ -383,7 +415,7 @@ mod tests {
     fn paths_are_discrete_args_no_injection() {
         let (i, o, t) = paths();
         let opts = TranscodeOptions::default();
-        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds());
+        let args = build_ffmpeg_args(&i, &o, &t, &opts, &bounds(), 4);
 
         // -i is immediately followed by the EXACT input path (its own OsString),
         // so a '-'-leading basename can't be misparsed as an option and nothing

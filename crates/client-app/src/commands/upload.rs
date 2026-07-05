@@ -367,6 +367,11 @@ async fn stage_item(
             let ffmpeg_path = ensure_ffmpeg(&dir.0)
                 .map_err(|_| UiError::new("video_failed", "That video could not be processed."))?;
             let options = req.options.clone().unwrap_or_default();
+            // Honor the user's confined-transcode thread budget (Task 7.3). Read from
+            // the normalized settings (already clamped 1..=cores); flows into ffmpeg's
+            // `-threads N`.
+            let transcode_threads =
+                crate::config::SettingsConfig::load(&dir.0).performance.transcode_threads;
             let title = req.title.clone();
             let tags = req.tags.clone();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -382,6 +387,7 @@ async fn stage_item(
                     &ffmpeg_path,
                     &options,
                     &maxsecu_client_core::video::VideoBounds::default(),
+                    transcode_threads,
                     &title,
                     &tags,
                     on_phase,
