@@ -105,3 +105,27 @@ export function makePool(size: number): Pool {
 
   return { run, runPriority, cancelPending, setSize };
 }
+
+// The single shared feed-decode pool. Feed cards decode through `decodePool.run`
+// (bounded to `feed_concurrency`, resized live from the settings store — see
+// core/settings.ts `applySettings`); a viewer-open uses `decodePool.runPriority`
+// so it never waits behind a backlog of card decodes; leaving the feed calls
+// `decodePool.cancelPending()` to flush the queued (not-yet-started) backlog.
+//
+// Initial size is a sensible default (4) because settings load asynchronously
+// after module init; `setSize` is called once settings arrive (and on every live
+// `feed_concurrency` change). The backend clamps `feed_concurrency` to 1..=8 and
+// `setSize` floors it at 1.
+//
+// KNOWN LIMITATION (cold-mint reauth race): only `decrypt_card` uses the backend
+// authed-connection pool (Task 7.0). Every OTHER authed command (open_content
+// aside — it also decodes; but download/share/delete/list_feed/etc.) still calls
+// `reauth`, which `try_lock`s the ConnectLock + borrows the non-Clone identity.
+// So while cards decode concurrently AMONG THEMSELVES over the pool's warm
+// channels, a pool COLD-MINT (first feed load, or after a 401-drain) itself calls
+// `reauth` and can transiently race a concurrent `serial`-command `reauth` → a
+// fail-closed `busy`/`locked` error (retriable; card-retry handles the flush
+// path). Once the pool is warm, card decodes don't reauth and don't contend.
+// Fully removing this edge needs ALL authed commands routed through the backend
+// pool — a larger follow-up, intentionally out of scope for Task 7.2.
+export const decodePool: Pool = makePool(4);

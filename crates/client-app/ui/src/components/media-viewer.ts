@@ -1,5 +1,6 @@
 import { call, on } from "../core/rpc.ts";
-import { serial, serialPriority } from "../core/serial.ts";
+import { serial } from "../core/serial.ts";
+import { decodePool } from "../core/pool.ts";
 import { runViewerOpen } from "../core/viewer-open.ts";
 import { needsConfirm, confirmModal } from "../core/confirm.ts";
 import { settingsStore } from "../core/settings.ts";
@@ -16,8 +17,8 @@ import { downloadPost } from "../core/download.ts";
 // Viewer (spec §5): renders one decrypted post. Image → data: URL <img>; blog →
 // textContent (NEVER innerHTML). Subscribes to EVT_FETCH for live status. The
 // decrypted content shown is the product; no keys cross the boundary. open_content
-// is routed through the shared serial() queue (the backend re-auths per call and
-// cannot run those concurrently with in-flight card decrypts).
+// is routed through the shared decodePool's PRIORITY lane (decodePool.runPriority),
+// so opening the viewer never waits behind a backlog of in-flight card decodes.
 export class MediaViewer extends HTMLElement {
   private cleanup: (() => void) | null = null;
   private reqId = "";
@@ -130,7 +131,7 @@ export class MediaViewer extends HTMLElement {
           }
         }),
       open: () =>
-        serialPriority(() =>
+        decodePool.runPriority(() =>
           call<OpenedContent>("open_content", { req: { file_id: id, version } }),
         ),
       onResult: (c) => this.render(c),

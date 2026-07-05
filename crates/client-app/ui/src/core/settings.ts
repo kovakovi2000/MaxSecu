@@ -1,11 +1,12 @@
 import { call } from "./rpc.ts";
 import type { Settings } from "./types.ts";
 import { SettingsStore } from "./settings-store.ts";
+import { decodePool } from "./pool.ts";
 
 const DEFAULTS: Settings = {
   a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
   behavior: { confirm_destructive: false },
-  performance: { ram_cache_cap_mb: 256 },
+  performance: { ram_cache_cap_mb: 256, feed_concurrency: 4 },
   connection: { route_mode: "prefer-server" },
   appearance: { theme: "dark" },
 };
@@ -15,14 +16,19 @@ const DEFAULTS: Settings = {
 // and apply live.
 export const settingsStore = new SettingsStore(DEFAULTS);
 
-// Apply settings to the document: theme + a11y data-attrs. styles.css keys on
-// them. Reduced-motion ALSO respects the OS via a media query in styles.css.
+// Apply settings live: theme + a11y data-attrs (styles.css keys on them;
+// reduced-motion ALSO respects the OS via a media query), and resize the shared
+// feed-decode pool from `feed_concurrency`. This runs on boot (via
+// loadAndApplySettings) and on every store change (via bindDocumentToSettings),
+// so changing feed_concurrency in Settings takes effect immediately — the next
+// feed load decodes at the new concurrency without an app restart.
 export function applySettings(s: Settings): void {
   const root = document.documentElement;
   root.setAttribute("data-theme", s.appearance.theme);
   root.toggleAttribute("data-reduced-motion", s.a11y.reduced_motion);
   root.toggleAttribute("data-high-contrast", s.a11y.high_contrast);
   root.setAttribute("data-text-size", s.a11y.text_size);
+  decodePool.setSize(s.performance.feed_concurrency);
 }
 
 // Load persisted settings into the store and apply them. Safe on boot. Returns

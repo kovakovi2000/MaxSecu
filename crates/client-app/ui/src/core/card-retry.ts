@@ -1,12 +1,14 @@
 import { isCancelled } from "./serial.ts";
 
 // Decide what a self-decrypting feed card should do when its decrypt settles with
-// an error. This exists to fix a real bug: leaving the feed calls the GLOBAL
-// `cancelPending()`, which flushes the one shared serial queue used by EVERY
-// card. Under rapid feed → tab → feed navigation a card that is still on screen
-// could have its queued decrypt rejected with a benign "cancelled" and then
-// render that as a PERMANENT failure badge (the classic "the second image always
-// switches to cancelled" report) — with no retry.
+// an error. This exists to fix a real bug: leaving the feed calls the shared
+// `decodePool.cancelPending()`, which flushes the queued card-decode backlog used
+// by EVERY card. (The pool throws serial.ts's SAME `CancelledError`, so this
+// benign-flush handling is unchanged from the old single serial queue.) Under
+// rapid feed → tab → feed navigation a card that is still on screen could have its
+// queued decrypt rejected with a benign "cancelled" and then render that as a
+// PERMANENT failure badge (the classic "the second image always switches to
+// cancelled" report) — with no retry.
 //
 // The correct behavior:
 //   - a cancellation on a card that is NO LONGER in the live DOM → drop silently

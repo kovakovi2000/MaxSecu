@@ -1,5 +1,5 @@
 import { call } from "../core/rpc.ts";
-import { serial } from "../core/serial.ts";
+import { decodePool } from "../core/pool.ts";
 import { decideCardOutcome } from "../core/card-retry.ts";
 import { cardHref, countsLabel } from "../core/card-view.ts";
 import { downloadPost } from "../core/download.ts";
@@ -7,10 +7,11 @@ import type { Card } from "../core/types.ts";
 import "./state-badge.ts";
 
 // One feed item. Decrypts itself (title/tags/thumbnail) via decrypt_card — routed
-// through the shared serial queue so cards decode one-at-a-time (the backend
-// re-auths per call and cannot run those concurrently). The whole card gets
-// one accessible transparent overlay link to the viewer; no separate "View"
-// button or visible link chrome is needed.
+// through the shared `decodePool` (core/pool.ts) so cards decode CONCURRENTLY, up
+// to `feed_concurrency`. This reuses the backend authed-connection pool (Task 7.0),
+// which is what makes concurrent decrypt_card safe (no per-call reauth once warm).
+// The whole card gets one accessible transparent overlay link to the viewer; no
+// separate "View" button or visible link chrome is needed.
 export class MediaCard extends HTMLElement {
   // How many times this card's decrypt has been re-attempted after a benign
   // queue-flush cancellation (see core/card-retry.ts). Bounded so a pathological
@@ -31,7 +32,7 @@ export class MediaCard extends HTMLElement {
 
   private async decrypt(id: string, version: number | undefined) {
     try {
-      const card = await serial(() =>
+      const card = await decodePool.run(() =>
         call<Card>("decrypt_card", { req: { file_id: id, version } }),
       );
       if (this.hasAttribute("mine-only") && !card.mine) {
@@ -156,8 +157,10 @@ export class MediaCard extends HTMLElement {
 
       this.replaceChildren(article);
     } catch (x) {
-      // A "cancelled" rejection is the GLOBAL serial-queue flush (cancelPending),
-      // not a real failure. If this card is still on screen the flush wasn't meant
+      // A "cancelled" rejection is the decodePool queue flush (decodePool
+      // .cancelPending, called on feed teardown — the pool throws serial.ts's same
+      // CancelledError), not a real failure. If this card is still on screen the
+      // flush wasn't meant
       // for it — retry (bounded) so it can't get stuck on a permanent bogus
       // "cancelled" badge. If it's been torn down, drop silently.
       const outcome = decideCardOutcome(x, this.isConnected, this.attempts);

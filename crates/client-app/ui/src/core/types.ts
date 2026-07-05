@@ -208,7 +208,12 @@ export type RouteMode = "tor-only" | "prefer-server" | "prefer-dropbox";
 export interface Settings {
   a11y: { reduced_motion: boolean; high_contrast: boolean; text_size: "normal" | "large" | "larger" };
   behavior: { confirm_destructive: boolean };
-  performance: { ram_cache_cap_mb: number };
+  // `feed_concurrency` sizes the frontend decode pool (core/pool.ts): how many
+  // feed cards decode in parallel. Backend-clamped 1..=8. The Rust
+  // PerformanceSettings also carries transcode/decode thread budgets; those are
+  // serde-default-filled and preserved across a set_settings round-trip, so they
+  // don't need to be mirrored here to be retained.
+  performance: { ram_cache_cap_mb: number; feed_concurrency: number };
   connection: { route_mode: RouteMode };
   appearance: { theme: "dark" | "light" };
 }

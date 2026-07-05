@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makePool } from "./pool.ts";
+import { readFileSync } from "node:fs";
+import { makePool, decodePool } from "./pool.ts";
 import { isCancelled } from "./serial.ts";
 
 test("pool runs at most N concurrently and drains", async () => {
@@ -155,4 +156,36 @@ test("setSize raises the cap and lets queued tasks start", async () => {
 
   openGate();
   assert.deepEqual(await Promise.all(p), ["ok", "ok", "ok", "ok"]);
+});
+
+// --- The shared feed-decode pool singleton (Task 7.2) -----------------------
+
+test("decodePool is a shared pool exposing the full Pool interface", () => {
+  for (const m of ["run", "runPriority", "cancelPending", "setSize"] as const) {
+    assert.equal(typeof decodePool[m], "function", `decodePool.${m} missing`);
+  }
+});
+
+test("a decodePool decode still resolves normally through the shared pool", async () => {
+  assert.equal(await decodePool.run(async () => "decoded"), "decoded");
+});
+
+// Structural wiring: feed card decodes go through the pool's normal lane,
+// viewer-open through the priority lane, and feed teardown flushes the pool —
+// so card decodes run concurrently while a viewer-open never queues behind them,
+// and `card-retry`'s isCancelled benign-flush handling still applies (the pool
+// throws serial.ts's CancelledError).
+test("media-card decodes cards through decodePool.run", () => {
+  const src = readFileSync("src/components/media-card.ts", "utf8");
+  assert.match(src, /decodePool\.run\(/, "media-card must route decrypt_card through decodePool.run");
+});
+
+test("media-viewer opens through decodePool.runPriority", () => {
+  const src = readFileSync("src/components/media-viewer.ts", "utf8");
+  assert.match(src, /decodePool\.runPriority\(/, "media-viewer must open via the priority lane");
+});
+
+test("feed-screen teardown flushes decodePool.cancelPending", () => {
+  const src = readFileSync("src/components/feed-screen.ts", "utf8");
+  assert.match(src, /decodePool\.cancelPending\(/, "feed-screen teardown must flush the decodePool");
 });

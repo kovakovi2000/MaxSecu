@@ -11,7 +11,7 @@ import type { Settings, RamLimits } from "../core/types.ts";
 const DEFAULTS: Settings = {
   a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
   behavior: { confirm_destructive: false },
-  performance: { ram_cache_cap_mb: 256 },
+  performance: { ram_cache_cap_mb: 256, feed_concurrency: 4 },
   connection: { route_mode: "prefer-server" },
   appearance: { theme: "dark" },
 };
@@ -154,7 +154,14 @@ export class SettingsScreen extends HTMLElement {
         high_contrast: this.input("high_contrast").checked,
         text_size: text === "large" || text === "larger" ? text : "normal",
       },
-      performance: { ram_cache_cap_mb: Number.isFinite(ram) ? ram : DEFAULTS.performance.ram_cache_cap_mb },
+      performance: {
+        ram_cache_cap_mb: Number.isFinite(ram) ? ram : DEFAULTS.performance.ram_cache_cap_mb,
+        // Preserve the current feed_concurrency (this screen has no control for it
+        // yet — Task 7.4 adds one); overwriting the whole `performance` section
+        // otherwise resets it. Falls back to the default if unset.
+        feed_concurrency:
+          settingsStore.get().performance.feed_concurrency ?? DEFAULTS.performance.feed_concurrency,
+      },
       behavior: { confirm_destructive: this.input("confirm_destructive").checked },
       connection: { route_mode: this.sel("route_mode").value as Settings["connection"]["route_mode"] },
     };

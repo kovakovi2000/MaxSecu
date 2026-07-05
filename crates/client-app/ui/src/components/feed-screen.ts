@@ -1,5 +1,6 @@
 import { call, on } from "../core/rpc.ts";
-import { serial, cancelPending } from "../core/serial.ts";
+import { serial } from "../core/serial.ts";
+import { decodePool } from "../core/pool.ts";
 import { toast } from "../core/toast.ts";
 import type { FeedEntry, FeedFilter, FeedSort, SearchHit, UploadMsg } from "../core/types.ts";
 import "./media-card.ts";
@@ -107,7 +108,10 @@ export class FeedScreen extends HTMLElement {
   }
 
   disconnectedCallback() {
-    cancelPending();
+    // Flush the decodePool's queued card-decode backlog on feed teardown, so a
+    // stalled backlog can't wedge the pool and a still-live card gets a benign
+    // CancelledError it can retry (see media-card / core/card-retry.ts).
+    decodePool.cancelPending();
     const r = retained[this.key];
     if (r) r.scrollY = window.scrollY;
   }
