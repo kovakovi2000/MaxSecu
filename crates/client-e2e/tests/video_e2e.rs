@@ -372,9 +372,16 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
         &streams,
     )
     .unwrap();
-    run_pipeline(&mut c.sender, "localhost", &token, &bundle, |_d, _t| {})
-        .await
-        .expect("range test: video upload pipeline succeeds");
+    run_pipeline(
+        &mut c.sender,
+        "localhost",
+        &token,
+        &bundle,
+        |_d, _t| {},
+        maxsecu_client_app::upload::StageFlags::default(),
+    )
+    .await
+    .expect("range test: video upload pipeline succeeds");
 
     // ---- Build the VideoJob (mirror GATE 3 a-d from the phase7 test) ----
     let (st, view_json) = get_json(

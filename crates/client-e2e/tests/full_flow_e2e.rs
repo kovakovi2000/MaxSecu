@@ -396,6 +396,7 @@ async fn full_flow_setup_enroll_upload_recover() {
         &bob_token,
         &bundle,
         |_, _| {},
+        maxsecu_client_app::upload::StageFlags::default(),
     )
     .await
     .expect("the upload completes and the server accepts the recovery-wrapped file");

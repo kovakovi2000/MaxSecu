@@ -562,9 +562,16 @@ async fn phase7_video_upload_over_real_tls() {
         &streams,
     )
     .unwrap();
-    run_pipeline(&mut c.sender, "localhost", &token, &bundle, |_d, _t| {})
-        .await
-        .expect("GATE P: video upload pipeline succeeds");
+    run_pipeline(
+        &mut c.sender,
+        "localhost",
+        &token,
+        &bundle,
+        |_d, _t| {},
+        maxsecu_client_app::upload::StageFlags::default(),
+    )
+    .await
+    .expect("GATE P: video upload pipeline succeeds");
 
     let dl = download_bundle(&mut c, &token, &fid_hex).await;
     let ctx = VerifyContext {

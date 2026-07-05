@@ -472,6 +472,7 @@ async fn phase4_upload_over_real_tls() {
         &token,
         &image_bundle,
         |_d, _t| {},
+        maxsecu_client_app::upload::StageFlags::default(),
     )
     .await
     .unwrap();
@@ -532,6 +533,7 @@ async fn phase4_upload_over_real_tls() {
         &token,
         &blog_bundle,
         |_d, _t| {},
+        maxsecu_client_app::upload::StageFlags::default(),
     )
     .await
     .unwrap();
@@ -610,7 +612,7 @@ async fn phase4_upload_over_real_tls() {
         &mut c,
         "/v1/files",
         Some(&token),
-        maxsecu_client_app::upload::stage_body(&resume_bundle),
+        maxsecu_client_app::upload::stage_body(&resume_bundle, maxsecu_client_app::upload::StageFlags::default()),
     )
     .await;
     assert_eq!(st, StatusCode::CREATED, "GATE D: stage the resume file");

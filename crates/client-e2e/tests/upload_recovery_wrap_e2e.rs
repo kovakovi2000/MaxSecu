@@ -338,8 +338,15 @@ async fn recovery_wrap_targets_embedded_pin_and_decrypts() {
         matches!(bundle.manifest.alg, maxsecu_encoding::types::Suite::V2),
         "self+recovery both PQ ⇒ Suite::V2 hybrid wrap"
     );
-    maxsecu_client_app::upload::run_pipeline(&mut c.sender, "localhost", &token, &bundle, |_, _| {})
-        .await
+    maxsecu_client_app::upload::run_pipeline(
+        &mut c.sender,
+        "localhost",
+        &token,
+        &bundle,
+        |_, _| {},
+        maxsecu_client_app::upload::StageFlags::default(),
+    )
+    .await
         .unwrap();
 
     // The server persisted a recovery grant (the upload really wrapped to the pin).

@@ -726,6 +726,7 @@ impl Fixture {
             &self.owner_token,
             &bundle,
             |_d, _t| {},
+            maxsecu_client_app::upload::StageFlags::default(),
         )
         .await
         .unwrap();
