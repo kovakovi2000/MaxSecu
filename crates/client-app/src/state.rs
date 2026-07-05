@@ -59,6 +59,26 @@ pub enum UploadPhase {
     Failed { job_id: String, code: String },
 }
 
+pub const EVT_BUNDLE_STAGE: &str = "maxsecu://bundle-stage";
+
+/// Per-member progress for the bundle composer's staging pass (the "Preparing
+/// preview…" / "Preparing bundle…" step in `stage_bundle`), which stages members
+/// sequentially and can be slow when a member is a video (confined transcode).
+/// Emitted over [`EVT_BUNDLE_STAGE`] so the composer can show which member of how
+/// many is currently being prepared instead of a static spinner. For a video
+/// member, the finer transcode progress still arrives over [`EVT_VIDEO_PREPARE`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "phase")]
+pub enum BundleStagePhase {
+    /// Now staging member `index` of `total` (both 1-based). `title` is the
+    /// member's user-supplied title (no secret) for the progress read-out.
+    Member {
+        index: usize,
+        total: usize,
+        title: String,
+    },
+}
+
 /// The video **prepare** (author-side transcode) feedback channel — per-job progress
 /// for the confined ffmpeg ingest + re-mux that runs inside `stage_upload` for a
 /// video (before any bundle exists). Emitted over the Tauri event bus so the upload
@@ -251,6 +271,19 @@ mod prepare_phase_tests {
         })
         .unwrap();
         assert!(f.contains("\"phase\":\"failed\"") && f.contains("\"code\":\"video_failed\""));
+    }
+
+    #[test]
+    fn bundle_stage_phase_serializes_kebab_tagged() {
+        let s = serde_json::to_string(&BundleStagePhase::Member {
+            index: 2,
+            total: 5,
+            title: "My Video".into(),
+        })
+        .unwrap();
+        assert!(s.contains("\"phase\":\"member\""), "got {s}");
+        assert!(s.contains("\"index\":2") && s.contains("\"total\":5"), "got {s}");
+        assert!(s.contains("\"title\":\"My Video\""), "got {s}");
     }
 }
 

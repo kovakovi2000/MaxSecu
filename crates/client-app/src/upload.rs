@@ -19,10 +19,15 @@ use crate::error::UiError;
 /// value, so the content chunks line up one-for-one with the fragment ranges (a
 /// mismatch would silently misseek — `chunks_for_fragment` would resolve a
 /// fragment to the wrong byte range).
-pub const VIDEO_CHUNK_SIZE: u32 = 6 * 1024 * 1024;
+// 1 MiB (was 6 MiB): a smaller content chunk shrinks the FIRST fetch+decrypt a
+// native `<video>` needs before it can start (the initial range only has to pull
+// the covering 1 MiB chunk instead of 6 MiB), cutting time-to-first-frame. This is
+// FORWARD-ONLY: each file records its own `chunk_size` in the signed manifest and
+// the viewer reads it back, so already-uploaded videos keep their 6 MiB chunks.
+pub const VIDEO_CHUNK_SIZE: u32 = 1024 * 1024;
 
-/// Content chunks per fMP4 seek fragment: 1 content chunk (6 MiB) per fMP4
-/// seek fragment, matching the native `<video>` seek granularity for 6 MiB chunks.
+/// Content chunks per fMP4 seek fragment: 1 content chunk (1 MiB) per fMP4
+/// seek fragment, matching the native `<video>` seek granularity.
 const FRAG_CHUNKS: u64 = 1;
 
 /// Build the canonical metadata blob: JSON `{"title","tags"}` (UTF-8) — exactly
@@ -643,14 +648,14 @@ mod tests {
     fn video_chunk_size_matches_the_upload_chunk_size() {
         // The fragment index is in VIDEO_CHUNK_SIZE units; the upload stages video
         // content at exactly this chunk size so the ranges map one-for-one.
-        assert_eq!(VIDEO_CHUNK_SIZE, 6 * 1024 * 1024);
+        assert_eq!(VIDEO_CHUNK_SIZE, 1024 * 1024);
     }
 
     #[test]
-    fn chunk_grouped_index_covers_a_159mib_file_at_6mib() {
+    fn chunk_grouped_index_covers_a_159mib_file() {
         let cs = VIDEO_CHUNK_SIZE as u64;
         let file_len: u64 = 159 * 1024 * 1024;
-        let n_chunks = file_len.div_ceil(cs); // 27
+        let n_chunks = file_len.div_ceil(cs);
         let frags = chunk_grouped_index(n_chunks, FRAG_CHUNKS);
         // contiguous + coverage-complete
         assert_eq!(frags[0].chunk_start, 0);

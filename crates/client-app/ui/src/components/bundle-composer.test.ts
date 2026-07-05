@@ -113,7 +113,7 @@ test("composer uses the pure reorder/remove helpers", () => {
 test("composer offers Add media and Add text affordances", () => {
   assert.match(src, /Add media/i);
   assert.match(src, /Add text/i);
-  assert.match(src, /"pick_file"/, "Add media opens the native file dialog");
+  assert.match(src, /"pick_files"/, "Add media opens the native multi-select file dialog");
 });
 
 test("composer previews via the REAL stage_bundle command in two modes", () => {
@@ -126,6 +126,22 @@ test("composer posts via the REAL confirm_bundle and cancels stale via cancel_bu
   assert.match(src, /"confirm_bundle"/);
   assert.match(src, /"cancel_bundle"/);
   assert.match(src, /Post bundle/i);
+});
+
+test("composer lets an image OR video member be chosen as the bundle cover", () => {
+  // A radio (single-select via a shared group name) marks the cover member;
+  // buildRequest forwards its position as cover_index. Both image and video members
+  // (which yield a thumbnail / poster frame) are cover-eligible.
+  assert.match(src, /buildCoverToggle/, "cover-eligible rows offer a cover toggle");
+  assert.match(src, /name = "bc-cover"/, "cover toggles share one radio group");
+  assert.match(src, /Use as bundle cover/i, "the cover toggle is labelled");
+  assert.match(
+    src,
+    /m\.kind === "image" \|\| m\.kind === "video"/,
+    "image AND video members are cover-eligible",
+  );
+  assert.match(src, /req\.cover_index = coverIdx/, "buildRequest forwards cover_index");
+  assert.match(src, /ensureCover/, "a default cover is kept valid across edits");
 });
 
 test("composer single-flight-guards preview/post against a concurrent stage", () => {

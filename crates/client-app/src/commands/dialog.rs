@@ -31,6 +31,34 @@ pub async fn pick_file(extensions: Vec<String>) -> Result<Option<String>, UiErro
     Ok(picked.map(|p| p.to_string_lossy().into_owned()))
 }
 
+/// `pick_files` — like [`pick_file`] but allows selecting MULTIPLE files in one
+/// dialog, returning all chosen paths (empty vec if the user cancelled). The
+/// bundle composer's "Add media" calls this so members can be added in a single
+/// pick instead of one-by-one.
+///
+/// Same security posture as [`pick_file`]: UNAUTHENTICATED, touches no server
+/// channel / keystore / identity, returns only filesystem PATH strings (never any
+/// file bytes). The blocking native dialog runs on a `spawn_blocking` thread.
+#[tauri::command]
+pub async fn pick_files(extensions: Vec<String>) -> Result<Vec<String>, UiError> {
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = rfd::FileDialog::new();
+        if !extensions.is_empty() {
+            let refs: Vec<&str> = extensions.iter().map(String::as_str).collect();
+            dialog = dialog.add_filter("Supported files", &refs);
+        }
+        dialog.pick_files()
+    })
+    .await
+    .map_err(|_| UiError::new("dialog_failed", "Could not open the file dialog."))?;
+
+    Ok(picked
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect())
+}
+
 /// `pick_folder` — open the native "select folder" dialog and return the chosen
 /// directory path, or `None` if the user cancelled. The bundle screen's
 /// "Download all" (Task 5.2) calls this to pick ONE destination directory into

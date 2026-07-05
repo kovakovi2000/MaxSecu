@@ -303,6 +303,12 @@ pub struct StageBundleRequest {
     #[serde(default)]
     pub tags: Vec<String>,
     pub members: Vec<BundleMemberInput>,
+    /// Index (into `members`) of the member whose thumbnail becomes the bundle's
+    /// own cover/index preview (rendered on the bundle's feed card). Must point at
+    /// a member that produces a thumbnail (image/video); otherwise the bundle gets
+    /// no cover. `None` ⇒ no cover (the card falls back to the member previews).
+    #[serde(default)]
+    pub cover_index: Option<usize>,
 }
 
 /// A preview of a staged-but-not-uploaded bundle: a per-member preview list plus
@@ -540,6 +546,7 @@ mod reshare_dto_tests {
                     tags: vec![],
                 },
             ],
+            cover_index: Some(0),
         };
         let back: StageBundleRequest =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();

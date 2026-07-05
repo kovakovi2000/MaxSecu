@@ -35,18 +35,21 @@ use maxsecu_client_core::video::VideoBounds;
 
 use crate::transcode_opts::{Bitrate, Resolution, TranscodeOptions};
 
-/// Default SVT-AV1 `-preset` (speed/quality trade-off; lower = slower/better).
-/// `6` favours quality (a step slower than the old `8`); it does NOT affect the
-/// canonical fragment layout (ratification §2) and is freely tunable per deployment.
+/// Default SVT-AV1 `-preset` (speed/quality trade-off; lower = slower/better, on a
+/// 0..=13 scale). `6` is the encoder's quality sweet spot: high visual quality at a
+/// practical encode cost. It does NOT affect the canonical fragment layout
+/// (ratification §2) and is freely tunable per deployment (raise toward 10–12 for
+/// near-real-time at lower quality; lower toward 4 for maximum quality at much
+/// greater cost).
 pub const DEFAULT_PRESET: u32 = 6;
 
 /// Default SVT-AV1 constant-quality `-crf` used when the caller leaves the bitrate
-/// at [`Bitrate::Original`] (the default path). SVT-AV1's own fallback rate control
-/// (~CRF 35) is visibly lossy at 1080p; `18` is a near-lossless, essentially
-/// transparent target (larger files — can exceed the source). An explicit
+/// at [`Bitrate::Original`] (the default path), on a 0..=63 scale (lower = better /
+/// bigger / slower). `18` is a near-lossless, high-quality target. An explicit
 /// [`Bitrate::Kbps`] instead switches to bitrate-targeted `-b:v` (below). This is a
 /// pure quality knob — it does NOT change the canonical AV1/AAC fragment layout the
-/// viewer decodes, so it is freely tunable.
+/// viewer decodes, so it is freely tunable (raise toward ~28–35 for smaller/faster
+/// files at lower quality).
 pub const DEFAULT_CRF: u32 = 18;
 
 /// Default closed-GOP keyframe interval (`-g` / SVT-AV1 `keyint`). This is the
@@ -164,10 +167,17 @@ pub fn build_ffmpeg_args(
 
     // Fragmented-MP4: single continuous fMP4 (init moov + moof/mdat fragments)
     // proven to play natively in WebView2 via the Media Source Extensions path.
-    // Must be placed before the output path so it applies ONLY to the main mp4
-    // (not to the thumbnail second output).
+    // `+global_sidx` writes ONE segment-index box at the FRONT covering every
+    // fragment, so the native <video> learns total duration + all fragment byte
+    // offsets from a single leading range read — instead of walking a per-fragment
+    // sidx CHAIN across the whole file (which, over our decrypt-while-stream range
+    // server, forced a near-whole-file fetch+decrypt just to establish duration
+    // during `preload="metadata"`, before the first frame). This is the seek/
+    // time-to-first-frame index; it does NOT change the canonical AV1/AAC fragment
+    // layout the viewer decodes. Must be placed before the output path so it
+    // applies ONLY to the main mp4 (not to the thumbnail second output).
     arg!("-movflags");
-    arg!("+frag_keyframe+empty_moov+default_base_moof");
+    arg!("+frag_keyframe+empty_moov+default_base_moof+global_sidx");
 
     arg!(output.as_os_str());
 
@@ -407,7 +417,7 @@ mod tests {
         );
         assert_eq!(
             value_after(&args, "-movflags"),
-            "+frag_keyframe+empty_moov+default_base_moof"
+            "+frag_keyframe+empty_moov+default_base_moof+global_sidx"
         );
     }
 

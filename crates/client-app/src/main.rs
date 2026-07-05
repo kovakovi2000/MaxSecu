@@ -48,6 +48,7 @@ fn main() {
         .manage(maxsecu_client_app::jobs::VideoJobs::new())
         .manage(maxsecu_client_app::jobs::VideoPrepareCancel::default())
         .manage(ContentCache::new(cap_bytes))
+        .manage(maxsecu_client_app::directory::DirectoryCache::new())
         .manage(maxsecu_client_app::commands::pool::AppPool::new(pool_cap))
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
@@ -59,6 +60,7 @@ fn main() {
             maxsecu_client_app::commands::bundle::open_bundle,
             maxsecu_client_app::commands::search::search_local,
             maxsecu_client_app::commands::dialog::pick_file,
+            maxsecu_client_app::commands::dialog::pick_files,
             maxsecu_client_app::commands::dialog::save_file,
             maxsecu_client_app::commands::dialog::pick_folder,
             maxsecu_client_app::commands::download_cmd::download_content,
@@ -72,6 +74,7 @@ fn main() {
             maxsecu_client_app::commands::upload::stage_bundle,
             maxsecu_client_app::commands::upload::confirm_upload,
             maxsecu_client_app::commands::upload::confirm_bundle,
+            maxsecu_client_app::commands::upload::retry_confirm,
             maxsecu_client_app::commands::upload::cancel_upload,
             maxsecu_client_app::commands::upload::cancel_bundle,
             maxsecu_client_app::commands::upload::cancel_video_prepare,

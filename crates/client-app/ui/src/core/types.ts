@@ -163,6 +163,10 @@ export interface StageBundleRequest {
   title: string;
   tags: string[];
   members: BundleMemberInput[];
+  // Index (into `members`) of the member whose thumbnail becomes the bundle's own
+  // cover/index preview on its feed card. Must point at an image member; omitted ⇒
+  // no cover. Mirrors Rust `StageBundleRequest.cover_index`.
+  cover_index?: number;
 }
 
 // A preview of a staged-but-not-uploaded bundle (mirrors Rust BundlePreview): a
@@ -200,6 +204,12 @@ export type PreparePhase =
   | { phase: "finalizing" }
   | { phase: "cancelled" }
   | { phase: "failed"; code: string };
+
+// --- Bundle composer staging progress (maxsecu://bundle-stage) ---
+// Emitted once per member as `stage_bundle` prepares them sequentially. `index`
+// and `total` are 1-based; `title` is the member's (non-secret) title. Mirrors
+// the Rust `BundleStagePhase` serde shape.
+export type BundleStagePhase = { phase: "member"; index: number; total: number; title: string };
 
 // --- Phase 5 (settings + a11y) DTO mirror of the Rust SettingsConfig serde shape ---
 // Section objects, snake_case fields — match server/core serde exactly.

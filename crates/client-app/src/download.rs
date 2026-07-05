@@ -26,6 +26,11 @@ pub struct StreamSpec {
     pub stream_type: StreamType,
     pub chunk_count: u64,
     pub chunk_size: u64,
+    /// The server-advertised PLAINTEXT byte length of this stream (0 if absent).
+    /// Unauthenticated (not in the signed manifest) — a consumer must sanity-check
+    /// it against the authenticated `chunk_count`/`chunk_size` before trusting it
+    /// (see `commands::video::trusted_total_len`). Used to skip the last-chunk probe.
+    pub total_bytes: u64,
 }
 
 /// The parsed, non-secret framing of a file view: which streams exist + the
@@ -103,6 +108,9 @@ pub fn parse_file_view(json: &serde_json::Value) -> Result<ParsedView, UiError> 
             stream_type: st,
             chunk_count: s["chunk_count"].as_u64().ok_or_else(bad)?,
             chunk_size: s["chunk_size"].as_u64().ok_or_else(bad)?,
+            // Optional (absent on older records / minimal test views) → 0 = "unknown",
+            // which the consumer treats as "probe the authenticated length instead".
+            total_bytes: s["total_bytes"].as_u64().unwrap_or(0),
         });
     }
     Ok(ParsedView {
