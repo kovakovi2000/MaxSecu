@@ -241,6 +241,16 @@ pub struct BehaviorSettings {
     pub confirm_destructive: bool,
 }
 
+/// Where the ciphertext fragment cache lives. `Disk` (default) = today's
+/// `<dir>/cache/frag/*.frag`. `Memory` = an in-process ciphertext LRU that never
+/// touches disk (same byte budget). Both store ONLY ciphertext.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum FragmentCacheLocation {
+    #[default]
+    Disk,
+    Memory,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PerformanceSettings {
     pub ram_cache_cap_mb: u32,
@@ -265,6 +275,9 @@ pub struct PerformanceSettings {
     /// worker (never an env var), consistent with the ffmpeg `-threads` path.
     #[serde(default = "default_cpu_threads")]
     pub decode_threads: u16,
+    /// Fragment-cache backend. `#[serde(default)]` keeps older settings.json loading.
+    #[serde(default)]
+    pub fragment_cache_location: FragmentCacheLocation,
 }
 impl Default for PerformanceSettings {
     fn default() -> Self {
@@ -273,6 +286,7 @@ impl Default for PerformanceSettings {
             feed_concurrency: default_feed_concurrency(),
             transcode_threads: default_cpu_threads(),
             decode_threads: default_cpu_threads(),
+            fragment_cache_location: FragmentCacheLocation::default(),
         }
     }
 }
@@ -584,6 +598,17 @@ mod tests {
         assert_eq!(nrm.feed_concurrency, 8);
         assert_eq!(nrm.transcode_threads, cores);
         assert_eq!(nrm.decode_threads, 1);
+    }
+
+    #[test]
+    fn fragment_cache_location_defaults_to_disk_and_back_compat_loads() {
+        assert_eq!(
+            PerformanceSettings::default().fragment_cache_location,
+            FragmentCacheLocation::Disk
+        );
+        let json = r#"{"ram_cache_cap_mb":512}"#;
+        let p: PerformanceSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(p.fragment_cache_location, FragmentCacheLocation::Disk);
     }
 
     fn n() -> u128 {
