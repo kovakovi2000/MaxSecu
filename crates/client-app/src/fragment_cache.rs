@@ -30,6 +30,7 @@
 //! command. Any failure is ignored — it never fails the cache. On non-Windows
 //! platforms this is a no-op.
 
+use crate::config::FragmentCacheLocation;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -99,6 +100,27 @@ impl FragmentCache {
             tick: 0,
             index: BTreeMap::new(),
         })
+    }
+
+    /// Open the cache with the configured backend. `Disk` behaves exactly like
+    /// [`open`]; `Memory` holds ciphertext in-process and never touches disk.
+    pub fn open_located(
+        app_dir: &Path,
+        cap_bytes: u64,
+        location: FragmentCacheLocation,
+    ) -> io::Result<Self> {
+        match location {
+            FragmentCacheLocation::Disk => Self::open(app_dir, cap_bytes),
+            FragmentCacheLocation::Memory => Ok(Self {
+                backend: Backend::Memory {
+                    blobs: BTreeMap::new(),
+                },
+                cap_bytes,
+                total_bytes: 0,
+                tick: 0,
+                index: BTreeMap::new(),
+            }),
+        }
     }
 
     /// Store `ciphertext` (opaque bytes) under `(file_id_hex, seq)`, evicting
@@ -421,6 +443,35 @@ mod tests {
         // Evicting an absent key, or a malformed/traversal key, never panics/errors.
         c.evict("aa", 0);
         c.evict("../evil", 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_backend_roundtrips_and_writes_nothing_to_disk() {
+        let dir = tmp_dir("mem");
+        let mut c =
+            FragmentCache::open_located(&dir, 1024, crate::config::FragmentCacheLocation::Memory)
+                .unwrap();
+        let ct = b"\x00opaque\xff".to_vec();
+        c.put("aa", 0, &ct).unwrap();
+        assert_eq!(c.get("aa", 0).as_deref(), Some(ct.as_slice()));
+        assert!(!dir.join("cache").join("frag").join("aa_0.frag").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn memory_backend_evicts_lru_like_disk() {
+        let dir = tmp_dir("mem-lru");
+        let mut c =
+            FragmentCache::open_located(&dir, 30, crate::config::FragmentCacheLocation::Memory)
+                .unwrap();
+        let blob = |b: u8| vec![b; 10];
+        c.put("aa", 0, &blob(0)).unwrap();
+        c.put("aa", 1, &blob(1)).unwrap();
+        c.put("aa", 2, &blob(2)).unwrap();
+        assert!(c.get("aa", 0).is_some());
+        c.put("aa", 3, &blob(3)).unwrap();
+        assert_eq!(c.total_bytes(), 30);
+        assert_eq!(c.get("aa", 1), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
