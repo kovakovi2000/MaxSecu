@@ -117,27 +117,33 @@ h264_nvenc  (NVIDIA)  --init fails-->  h264_amf  (AMD)  --init fails-->  libx264
 
 ### A.4 Confinement level
 
-`FfmpegLauncher` gains an explicit confinement level; `win32::spawn_confined_exe`
-gains the corresponding relaxed spawn path.
+**Decision: spike the *targeted* path first (keys + network stay protected).** While
+mapping `win32.rs` we established that the protection stopping the confined ffmpeg
+from reading the keystore is the **AppContainer SID** (no ACE on the user's files),
+and no-network is the **capability-free AppContainer** — *not* the low-IL token
+(integrity blocks write-up, not read-down). So dropping the AppContainer to "make GPU
+work" would let the process decoding *attacker-authored* media read the keystore and
+reach the network. That is not acceptable to ship blind.
 
 | Spawn | Confinement |
 |---|---|
 | Probe (`ffmpeg -i`) | **Full** (unchanged Phase-7 hardening) |
 | Copy path | **Full** |
 | `libx264` re-encode | **Full** (CPU only — no reason to relax) |
-| `h264_nvenc` / `h264_amf` re-encode | **RelaxedGpu** |
+| `h264_nvenc` / `h264_amf` re-encode | **Full + GPU device grant** (spike-gated) |
 
-**RelaxedGpu** (user-chosen "relax fully for re-encode", with one retained
-protection): drops the low-integrity token, the `ActiveProcessLimit = 1` child-proc
-ban, and the AppContainer restriction that blocks the GPU device + driver DLLs
-(`nvEncodeAPI64.dll`, `nvcuda.dll`, `amfrt64.dll`). **Retained even when relaxed:**
-**no network** (a video encoder never needs it — highest-value protection against an
-RCE calling home) and a generous **memory cap** (GPU encode is light on system RAM, so
-the cap costs nothing and preserves the DoS ceiling). The exact relaxation is
-documented and re-reviewed in the security sign-off (§C).
+**Full + GPU device grant** = keep the AppContainer, low-IL token, no-network, memory
+cap, and `ActiveProcessLimit = 1`, and *add only* the minimum access for GPU device +
+driver DLLs (`nvEncodeAPI64.dll`, `nvcuda.dll`, `amfrt64.dll`, the `\\.\` GPU device
+objects). If the spike proves NVENC/AMF initialize in-container, we ship this with
+**zero security regression**. If they cannot, the implementer stops and reports back
+with the concrete failure so the user decides on a larger relaxation — the plan does
+**not** silently drop the AppContainer. Until/unless GPU is proven, `libx264`
+(confined) is the working re-encode floor, so the feature still ships its big win
+(remux-copy + fast CPU H.264) regardless of the spike outcome.
 
 Rationale for keeping `libx264` confined: it needs no GPU, so relaxing it would spend
-security for nothing. Only the spawns that actually touch the GPU relax.
+security for nothing. Only the spawns that actually touch the GPU take the added grant.
 
 ### A.5 Orchestration
 
@@ -204,11 +210,13 @@ extended to the Memory backend).
 
 A sign-off addendum (`docs/security-review-2026-07-05-remux-gpu-ingest.md`) covers:
 
-1. **Confinement relaxation** — exactly which protections drop for GPU spawns, which
-   are retained (no-network, memory cap), and the argument that the residual RCE
-   surface (ffmpeg decoding untrusted input) is bounded by no-network + no-key-access
-   + memory cap even when low-IL/child-ban are dropped. Note the copy path, probe, and
-   x264 path keep full confinement.
+1. **Confinement of GPU spawns** — document that GPU spawns keep the AppContainer +
+   low-IL + no-network + memory cap + `ActiveProcessLimit=1` and add only a GPU
+   device/driver-DLL grant (the spike-proven "targeted" path); confirm keys stay
+   unreadable and network stays blocked to the process decoding untrusted input. If
+   the spike forced a larger relaxation, that is a separate user-approved decision
+   documented here with its exact exposure. Note the copy path, probe, and x264 path
+   keep full confinement unchanged.
 2. **No new egress** — confirm no server-visible data added (no duration, no
    plaintext metadata); the server sees exactly today's ciphertext.
 3. **Codec target** — H.264/AAC/fMP4 only; no format that could smuggle active content.
@@ -246,9 +254,14 @@ A sign-off addendum (`docs/security-review-2026-07-05-remux-gpu-ingest.md`) cove
 
 ## Implementation waves (multi-subagent, Opus 4.8)
 
-- **Wave 1 (parallel):** argv builders; probe module; confinement level; RAM cache
-  backend + setting. Independent units, each TDD.
-- **Wave 2:** orchestration in `upload.rs` (probe → plan → GPU ladder + session
-  cache); wire the cache-location setting at cache construction.
+- **Wave 0 (spike, gates GPU mechanism only):** add a GPU device/driver-DLL grant to
+  the AppContainer spawn and test whether `h264_nvenc` / `h264_amf` initialize
+  in-container. Records the outcome; does NOT block Wave 1. If GPU can't init, report
+  back before any AppContainer drop; `libx264` confined remains the re-encode floor.
+- **Wave 1 (parallel, independent of the spike):** argv builders; probe module; RAM
+  cache backend + setting. Independent units, each TDD.
+- **Wave 2:** confinement-level plumbing (per spike outcome); orchestration in
+  `upload.rs` (probe → plan → GPU ladder + session cache); wire the cache-location
+  setting at cache construction + UI.
 - **Wave 3:** security sign-off; holistic verification (build + tests + a real upload
   on the dev machine to confirm copy-fast + GPU engages).
