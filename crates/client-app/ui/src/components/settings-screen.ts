@@ -11,7 +11,7 @@ import type { Settings, RamLimits } from "../core/types.ts";
 const DEFAULTS: Settings = {
   a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
   behavior: { confirm_destructive: false },
-  performance: { ram_cache_cap_mb: 256, feed_concurrency: 4 },
+  performance: { ram_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4 },
   connection: { route_mode: "prefer-server" },
   appearance: { theme: "dark" },
 };
@@ -54,6 +54,13 @@ export class SettingsScreen extends HTMLElement {
               <input type="range" name="ram_range" step="1" />
               <input type="number" name="ram_cache_cap_mb" step="1" /></label>
             <p id="ram-hint" class="hint"></p>
+            <label>Feed concurrency (cards decoded in parallel)
+              <input type="number" name="feed_concurrency" min="1" max="8" step="1" /></label>
+            <label>Transcode threads
+              <input type="number" name="transcode_threads" min="1" step="1" /></label>
+            <label>Decode threads
+              <input type="number" name="decode_threads" min="1" step="1" /></label>
+            <p id="cores-hint" class="hint"></p>
           </fieldset>
 
           <fieldset>
@@ -126,6 +133,14 @@ export class SettingsScreen extends HTMLElement {
     num.min = String(this.limits.min_mb); num.max = String(this.limits.max_mb);
     (this.querySelector("#ram-hint") as HTMLElement).textContent =
       `Allowed ${this.limits.min_mb}–${this.limits.max_mb} MB (cap = total RAM − 6 GB).`;
+    // Bound the thread budgets to the machine's logical-CPU count. The backend
+    // re-clamps 1..=cores on save, so this is a convenience bound, not the SoT.
+    let cores = 4;
+    try { cores = await call<number>("system_cores"); } catch { /* keep fallback */ }
+    this.input("transcode_threads").max = String(cores);
+    this.input("decode_threads").max = String(cores);
+    (this.querySelector("#cores-hint") as HTMLElement).textContent =
+      `Thread budgets: 1–${cores} (max = logical CPUs). Decode threads are reserved for a confined decode path.`;
     const loaded = await loadAndApplySettings();
     this.writeControls(loaded ?? DEFAULTS);
   }
@@ -147,6 +162,11 @@ export class SettingsScreen extends HTMLElement {
     }
     const ram = Number(this.input("ram_cache_cap_mb").value);
     const text = this.sel("text_size").value;
+    const cur = settingsStore.get().performance;
+    const numOr = (name: string, fallback: number) => {
+      const v = Number(this.input(name).value);
+      return Number.isFinite(v) ? v : fallback;
+    };
     const patch: Partial<Settings> = {
       appearance: { theme: this.sel("theme").value === "light" ? "light" : "dark" },
       a11y: {
@@ -156,11 +176,12 @@ export class SettingsScreen extends HTMLElement {
       },
       performance: {
         ram_cache_cap_mb: Number.isFinite(ram) ? ram : DEFAULTS.performance.ram_cache_cap_mb,
-        // Preserve the current feed_concurrency (this screen has no control for it
-        // yet — Task 7.4 adds one); overwriting the whole `performance` section
-        // otherwise resets it. Falls back to the default if unset.
-        feed_concurrency:
-          settingsStore.get().performance.feed_concurrency ?? DEFAULTS.performance.feed_concurrency,
+        // The three knobs round-trip through their inputs (the backend re-clamps
+        // feed 1..=8, threads 1..=cores). Fall back to the current stored value,
+        // then the default, if an input is empty/non-numeric.
+        feed_concurrency: numOr("feed_concurrency", cur.feed_concurrency ?? DEFAULTS.performance.feed_concurrency),
+        transcode_threads: numOr("transcode_threads", cur.transcode_threads ?? DEFAULTS.performance.transcode_threads),
+        decode_threads: numOr("decode_threads", cur.decode_threads ?? DEFAULTS.performance.decode_threads),
       },
       behavior: { confirm_destructive: this.input("confirm_destructive").checked },
       connection: { route_mode: this.sel("route_mode").value as Settings["connection"]["route_mode"] },
@@ -180,6 +201,9 @@ export class SettingsScreen extends HTMLElement {
     this.sel("text_size").value = s.a11y.text_size;
     this.input("ram_cache_cap_mb").value = String(s.performance.ram_cache_cap_mb);
     this.input("ram_range").value = String(s.performance.ram_cache_cap_mb);
+    this.input("feed_concurrency").value = String(s.performance.feed_concurrency);
+    this.input("transcode_threads").value = String(s.performance.transcode_threads);
+    this.input("decode_threads").value = String(s.performance.decode_threads);
     this.input("confirm_destructive").checked = s.behavior.confirm_destructive;
     this.sel("route_mode").value = s.connection.route_mode;
   }

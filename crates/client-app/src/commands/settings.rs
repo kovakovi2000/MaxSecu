@@ -8,6 +8,17 @@ use crate::dto::{ChangePasswordRequest, ExportKeystoreRequest};
 use crate::error::UiError;
 use crate::keystore;
 
+/// `system_cores` — the machine's available parallelism (logical CPUs), used by
+/// the Settings UI as the upper bound (`max`) for the transcode/decode thread
+/// budgets. Mirrors `config::default_cpu_threads`'s saturating fallback so the
+/// UI's `max` and the backend's clamp agree. Non-secret; no state needed.
+#[tauri::command]
+pub async fn system_cores() -> Result<u16, UiError> {
+    Ok(std::thread::available_parallelism()
+        .map(|n| n.get().min(u16::MAX as usize) as u16)
+        .unwrap_or(1))
+}
+
 /// `get_settings` — load the persisted settings (defaults if absent), normalized.
 #[tauri::command]
 pub async fn get_settings(dir: State<'_, AppDir>) -> Result<SettingsConfig, UiError> {

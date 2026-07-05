@@ -83,6 +83,7 @@ fn main() {
             maxsecu_client_app::commands::share::resolve_recipient,
             maxsecu_client_app::commands::share::list_file_recipients,
             maxsecu_client_app::commands::share::list_contacts,
+            maxsecu_client_app::commands::settings::system_cores,
             maxsecu_client_app::commands::settings::get_settings,
             maxsecu_client_app::commands::settings::set_settings,
             maxsecu_client_app::commands::settings::change_password,
