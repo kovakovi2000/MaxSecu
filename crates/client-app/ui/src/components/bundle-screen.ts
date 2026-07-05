@@ -13,6 +13,8 @@ import type { BundleView } from "../core/types.ts";
 import "./media-card.ts";
 import "./media-viewer.ts";
 import "./skeleton-card.ts";
+import "./share-dialog.ts";
+import type { ShareDialog } from "./share-dialog.ts";
 
 // Bundle screen (bundles feature, Task 3.3): opens one bundle (#/bundle?id=<hex>)
 // and shows its members two ways (design §7):
@@ -49,10 +51,12 @@ export class BundleScreen extends HTMLElement {
             <button id="bd-stacked" type="button" class="bundle-mode">Stacked</button>
           </div>
           <button id="bd-download-all" type="button" class="secondary" disabled>Download all</button>
+          <button id="bd-share" type="button" class="secondary" hidden>Share…</button>
           <button id="bd-delete" type="button" class="danger" hidden>Delete bundle</button>
         </div>
         <div id="bd-members"></div>
-      </main>`;
+      </main>
+      <share-dialog id="bd-share-dialog"></share-dialog>`;
     (this.querySelector("#main") as HTMLElement).focus();
 
     this.syncToggle();
@@ -68,6 +72,15 @@ export class BundleScreen extends HTMLElement {
     (this.querySelector("#bd-delete") as HTMLButtonElement).addEventListener("click", () =>
       void this.onDelete(),
     );
+    // Share… (bundles Task 8.1): any wrap-holder who opened the bundle may share
+    // it. The dialog is told the target is a "bundle" so Share fans out over the
+    // bundle AND every member as a unit (reshare_bundle).
+    const shareBtn = this.querySelector("#bd-share") as HTMLButtonElement;
+    shareBtn.addEventListener("click", () => {
+      if (!this.view) return;
+      const dialog = this.querySelector("#bd-share-dialog") as ShareDialog;
+      dialog.openFor(this.view.file_id, shareBtn, "bundle");
+    });
 
     // Skeleton while the bundle resolves.
     const members = this.querySelector("#bd-members") as HTMLElement;
@@ -94,6 +107,9 @@ export class BundleScreen extends HTMLElement {
       (this.querySelector("#bd-download-all") as HTMLButtonElement).disabled = n === 0;
       // Owner-only "Delete bundle" (bundles Task 6.2): shown only to the author.
       (this.querySelector("#bd-delete") as HTMLButtonElement).hidden = !view.mine;
+      // Share… is available to ANY wrap-holder who could open the bundle (not
+      // ownership-gated) — mirrors the viewer's can_share affordance.
+      (this.querySelector("#bd-share") as HTMLButtonElement).hidden = false;
       this.render();
     } catch (x) {
       this.fail(bundleErr(x));

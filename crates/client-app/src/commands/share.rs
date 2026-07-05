@@ -46,10 +46,11 @@ use maxsecu_client_core::{
 };
 use maxsecu_crypto::{Dek, EncPublicKey};
 use maxsecu_encoding::decode;
-use maxsecu_encoding::structs::Manifest;
+use maxsecu_encoding::structs::{BundleBody, Manifest};
 use maxsecu_encoding::types::{Id, Suite, Timestamp};
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
+use crate::commands::bundle::open_bundle_members;
 use crate::commands::connection::{open_conn, reauth, server_of};
 use crate::commands::feed::{hex, hex16, now_ms};
 use crate::config::{load_directory_pub, load_sink_pins};
@@ -222,6 +223,127 @@ async fn reshare_inner(
     .await;
 
     Ok(outcomes)
+}
+
+// ---------------------------------------------------------------------------
+// reshare_bundle — share a bundle AND all its members as a unit (WS8, Task 8.1)
+// ---------------------------------------------------------------------------
+
+/// The ordered set of file ids a bundle-reshare must fan out to: the bundle file
+/// FIRST, then every member in the bundle's SIGNED order. Pure + testable. The
+/// member ids come from the verified `BundleBody` (the decrypted signed content),
+/// NEVER a server-served listing — content-substitution defense.
+pub(crate) fn bundle_share_targets(bundle_id: [u8; 16], body: &BundleBody) -> Vec<[u8; 16]> {
+    let mut targets = Vec::with_capacity(1 + body.members.len());
+    targets.push(bundle_id);
+    for m in &body.members {
+        targets.push(m.file_id.0);
+    }
+    targets
+}
+
+/// Collapse the per-TARGET reshare results (one inner Vec per target file, each
+/// with exactly one row per recipient in `recipients` order) into ONE aggregate
+/// row per recipient: a recipient's bundle-share SUCCEEDS only if EVERY target
+/// (the bundle file and all its members) shared to them. The first failing
+/// target's sanitized code is surfaced. Pure + testable; per-recipient
+/// fail-isolated (each recipient's aggregate is independent).
+fn aggregate_bundle_outcomes(
+    per_target: &[Vec<ReshareOutcomeDto>],
+    recipients: &[String],
+) -> Vec<ReshareOutcomeDto> {
+    recipients
+        .iter()
+        .enumerate()
+        .map(|(i, uname)| {
+            // A recipient fails the bundle if ANY target failed (or dropped) its row.
+            let mut code: Option<String> = None;
+            for target in per_target {
+                match target.get(i) {
+                    Some(o) if o.ok => {}
+                    Some(o) => {
+                        code = o.code.clone().or_else(|| Some("share_failed".to_owned()));
+                        break;
+                    }
+                    None => {
+                        code = Some("share_failed".to_owned());
+                        break;
+                    }
+                }
+            }
+            ReshareOutcomeDto {
+                username: uname.clone(),
+                ok: code.is_none(),
+                code,
+            }
+        })
+        .collect()
+}
+
+/// `reshare_bundle` — re-share a bundle AND all of its members to N recipients as
+/// a UNIT. The verified member list is sourced from the SIGNED `BundleBody`
+/// (`open_bundle_members`) — never a server listing — so the fan-out set is
+/// tamper-proof. Each target file is reshared via the same per-recipient
+/// machinery as [`reshare_file`] (`reshare_inner`), then the per-target results
+/// are aggregated to ONE outcome per recipient: a recipient's share succeeds only
+/// if the bundle file and EVERY member shared to them. Per-recipient
+/// fail-isolated; emits [`SharePhase`] over [`EVT_RESHARE`] (per-target progress
+/// plus a bundle-scoped `Done`).
+#[tauri::command]
+pub async fn reshare_bundle(
+    req: ReshareRequest,
+    app: tauri::AppHandle,
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
+) -> Result<Vec<ReshareOutcomeDto>, UiError> {
+    let emit = |p: SharePhase| {
+        let _ = app.emit(EVT_RESHARE, p);
+    };
+
+    // Validate the requested id + fetch the VERIFIED signed member list. A failure
+    // here (can't verify the bundle) is a whole-command Err: without the authentic
+    // membership we cannot safely fan out (content-substitution discipline).
+    let bundle_id = hex16(&req.file_id)?;
+    let (body, _version, _mine) =
+        open_bundle_members(&req.file_id, &dir, &session, &connect_lock).await?;
+    let targets = bundle_share_targets(bundle_id, &body);
+
+    // Fan out to each target [bundle, members…] reusing the per-recipient reshare
+    // machinery. A per-TARGET prerequisite failure (a member that can't be opened
+    // / reshared at all) is absorbed into a per-recipient failure for THAT target
+    // rather than aborting the whole bundle — the aggregate then marks every
+    // recipient failed (they did not get the complete bundle).
+    let mut per_target: Vec<Vec<ReshareOutcomeDto>> = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let sub = ReshareRequest {
+            file_id: hex(target),
+            recipient_usernames: req.recipient_usernames.clone(),
+        };
+        let outcomes = match reshare_inner(&sub, &dir, &session, &connect_lock, &emit).await {
+            Ok(o) => o,
+            Err(e) => req
+                .recipient_usernames
+                .iter()
+                .map(|u| ReshareOutcomeDto {
+                    username: u.clone(),
+                    ok: false,
+                    code: Some(e.code.clone()),
+                })
+                .collect(),
+        };
+        per_target.push(outcomes);
+    }
+
+    let aggregate = aggregate_bundle_outcomes(&per_target, &req.recipient_usernames);
+    let shared = aggregate.iter().filter(|o| o.ok).count() as u32;
+    let failed = aggregate.len() as u32 - shared;
+    emit(SharePhase::Done {
+        file_id: req.file_id.clone(),
+        shared,
+        failed,
+    });
+    Ok(aggregate)
 }
 
 /// The per-recipient loop (spec §4 steps 5–8, §5 batch isolation). Takes plain,
@@ -1091,6 +1213,105 @@ mod tests {
         assert_eq!(list[0].username, "alice");
         // alice's binding uses user_id [0x0A; 16] (see `alice_binding`).
         assert_eq!(list[0].user_id, [0x0A; 16]);
+    }
+
+    #[test]
+    fn bundle_share_targets_lists_bundle_then_members() {
+        use maxsecu_encoding::structs::{BundleBody, BundleMember};
+        use maxsecu_encoding::types::{FileType, Id};
+        let bundle_id = [0xB1; 16];
+        let body = BundleBody {
+            members: vec![
+                BundleMember {
+                    file_id: Id([0x01; 16]),
+                    file_type: FileType::Video,
+                },
+                BundleMember {
+                    file_id: Id([0x02; 16]),
+                    file_type: FileType::Image,
+                },
+            ],
+        };
+        let t = bundle_share_targets(bundle_id, &body);
+        assert_eq!(t, vec![[0xB1; 16], [0x01; 16], [0x02; 16]]);
+    }
+
+    #[test]
+    fn bundle_share_targets_is_just_the_bundle_when_empty() {
+        use maxsecu_encoding::structs::BundleBody;
+        let t = bundle_share_targets([0xB2; 16], &BundleBody { members: vec![] });
+        assert_eq!(t, vec![[0xB2; 16]]);
+    }
+
+    /// Aggregation (Task 8.1): a recipient's bundle-share succeeds ONLY if every
+    /// target (bundle + all members) shared to them; the first failing target's
+    /// code is surfaced. Per-recipient independent.
+    #[test]
+    fn aggregate_bundle_outcomes_requires_every_target_per_recipient() {
+        let recipients = vec!["a".to_owned(), "b".to_owned()];
+        // Two targets. `a` shares in both. `b` shares in the bundle but the
+        // member wrap fails.
+        let per_target = vec![
+            vec![
+                ReshareOutcomeDto {
+                    username: "a".into(),
+                    ok: true,
+                    code: None,
+                },
+                ReshareOutcomeDto {
+                    username: "b".into(),
+                    ok: true,
+                    code: None,
+                },
+            ],
+            vec![
+                ReshareOutcomeDto {
+                    username: "a".into(),
+                    ok: true,
+                    code: None,
+                },
+                ReshareOutcomeDto {
+                    username: "b".into(),
+                    ok: false,
+                    code: Some("share_failed".into()),
+                },
+            ],
+        ];
+        let agg = aggregate_bundle_outcomes(&per_target, &recipients);
+        assert_eq!(agg.len(), 2, "one aggregate row per recipient");
+        assert_eq!(agg[0].username, "a");
+        assert!(agg[0].ok, "a got every target → bundle-share succeeds");
+        assert!(agg[0].code.is_none());
+        assert_eq!(agg[1].username, "b");
+        assert!(!agg[1].ok, "b missed a member → bundle-share fails");
+        assert_eq!(agg[1].code.as_deref(), Some("share_failed"));
+    }
+
+    #[test]
+    fn aggregate_bundle_outcomes_surfaces_first_failing_targets_code() {
+        let recipients = vec!["a".to_owned()];
+        // The bundle file itself failed to reshare (e.g. untrusted) → the whole
+        // bundle-share fails for this recipient with that first code.
+        let per_target = vec![
+            vec![ReshareOutcomeDto {
+                username: "a".into(),
+                ok: false,
+                code: Some("untrusted".into()),
+            }],
+            vec![ReshareOutcomeDto {
+                username: "a".into(),
+                ok: false,
+                code: Some("share_failed".into()),
+            }],
+        ];
+        let agg = aggregate_bundle_outcomes(&per_target, &recipients);
+        assert_eq!(agg.len(), 1);
+        assert!(!agg[0].ok);
+        assert_eq!(
+            agg[0].code.as_deref(),
+            Some("untrusted"),
+            "the FIRST failing target's code wins"
+        );
     }
 
     /// A recipient who RESOLVES but whose wrap POST fails (non-201) records NO

@@ -41,6 +41,10 @@ interface Row {
 
 export class ShareDialog extends HTMLElement {
   private fileId = "";
+  // The share target's file_type. When "bundle" the Share action fans out over
+  // the bundle AND all its members (reshare_bundle); otherwise a single file
+  // (reshare_file). The returned outcome shape is identical either way.
+  private fileType = "";
   private invoker: HTMLElement | null = null;
   private rows: Row[] = [];
   private alreadySharedIds = new Set<string>();
@@ -97,9 +101,12 @@ export class ShareDialog extends HTMLElement {
     document.removeEventListener("keydown", this.keydownHandler);
   }
 
-  /** Open the dialog for `fileId`; `invoker` regains focus when it closes. */
-  openFor(fileId: string, invoker: HTMLElement) {
+  /** Open the dialog for `fileId`; `invoker` regains focus when it closes.
+   * `fileType` routes the Share action: "bundle" shares the bundle AND every
+   * member as a unit (reshare_bundle), anything else shares the single file. */
+  openFor(fileId: string, invoker: HTMLElement, fileType = "") {
     this.fileId = fileId;
+    this.fileType = fileType;
     this.invoker = invoker;
     this.rows = [];
     this.alreadySharedIds = new Set();
@@ -282,6 +289,13 @@ export class ShareDialog extends HTMLElement {
     );
   }
 
+  /** The reshare command for this target: a bundle fans out over itself + all
+   * its members (reshare_bundle); any other file shares just itself. Both return
+   * the same ReshareOutcome[] shape, so the outcome rendering is unchanged. */
+  private shareCommand(): "reshare_bundle" | "reshare_file" {
+    return this.fileType === "bundle" ? "reshare_bundle" : "reshare_file";
+  }
+
   private async share() {
     const selected = this.rows.filter(
       (r) => r.selected && (r.status === "contact" || r.status === "verified"),
@@ -295,7 +309,7 @@ export class ShareDialog extends HTMLElement {
 
     try {
       const outcomes = await serial(() =>
-        call<ReshareOutcome[]>("reshare_file", {
+        call<ReshareOutcome[]>(this.shareCommand(), {
           req: { file_id: this.fileId, recipient_usernames: usernames },
         }),
       );
@@ -322,7 +336,7 @@ export class ShareDialog extends HTMLElement {
     this.renderRows();
     try {
       const outcomes = await serial(() =>
-        call<ReshareOutcome[]>("reshare_file", {
+        call<ReshareOutcome[]>(this.shareCommand(), {
           req: { file_id: this.fileId, recipient_usernames: [row.username] },
         }),
       );

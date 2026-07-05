@@ -80,6 +80,7 @@ fn main() {
             maxsecu_client_app::commands::upload::list_pending_uploads,
             maxsecu_client_app::commands::upload::dismiss_pending_upload,
             maxsecu_client_app::commands::share::reshare_file,
+            maxsecu_client_app::commands::share::reshare_bundle,
             maxsecu_client_app::commands::share::resolve_recipient,
             maxsecu_client_app::commands::share::list_file_recipients,
             maxsecu_client_app::commands::share::list_contacts,
