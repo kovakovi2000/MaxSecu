@@ -8,6 +8,8 @@ use tauri::State;
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
+use crate::commands::pool::AppPool;
+use crate::jobs::AuthedChannel;
 use crate::dto::{FeedEntryDto, FeedFilter, FeedSort, ListFeedRequest};
 use crate::error::UiError;
 use crate::http_client::get_json;
@@ -208,6 +210,25 @@ fn open_my_header(
         .map_err(|_| UiError::new("verify_failed", "This item failed verification."))
 }
 
+/// Mint a fresh authed channel for the pool by reusing the EXISTING `reauth`
+/// VERBATIM and wrapping its `(sender, host, token)` into an [`AuthedChannel`] — the
+/// three parts stay bound together as one channel-bound unit. The pool only calls
+/// this under its internal auth gate, so `reauth`'s `ConnectLock` `try_lock` is never
+/// contended.
+async fn reauth_channel(
+    dir: &std::path::Path,
+    server: &str,
+    session: &Session,
+    connect_lock: &ConnectLock,
+) -> Result<AuthedChannel, UiError> {
+    let (sender, host, token) = reauth(dir, server, session, connect_lock).await?;
+    Ok(AuthedChannel {
+        sender,
+        host,
+        token,
+    })
+}
+
 /// `decrypt_card` — fetch + verify one item's card (title/tags/thumbnail), header-
 /// only (no content fetch). Verifies the author binding under the pinned D5, runs
 /// the §12.5 header ladder, returns render-ready metadata. Sanitized errors.
@@ -218,6 +239,7 @@ pub async fn decrypt_card(
     session: State<'_, Session>,
     connect_lock: State<'_, ConnectLock>,
     cache: State<'_, crate::content_cache::ContentCache>,
+    pool: State<'_, AppPool>,
 ) -> Result<crate::dto::CardDto, UiError> {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
@@ -246,19 +268,45 @@ pub async fn decrypt_card(
     .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
 
     let server = server_of(&dir.0)?;
-    let (mut sender, host, token) = reauth(&dir.0, &server, &session, &connect_lock).await?;
 
-    // §8.5 view (carries the manifest/genesis/wrap/streams).
-    let (status, view_json) = get_json(
-        &mut sender,
-        &format!("/v1/files/{}?version=latest", req.file_id),
-        Some(&token),
-        &host,
-    )
-    .await?;
-    if status != StatusCode::OK {
-        return Err(UiError::new("fetch_failed", "That item is not available."));
+    // Borrow a channel from the pool instead of re-authing per call. Concurrent
+    // `decrypt_card` calls take DIFFERENT cached channels (no ConnectLock contention,
+    // no identity-take on the hot path); only a cold-start / expired channel mints a
+    // fresh one via `reauth` (under the pool's auth gate). If the FIRST server contact
+    // (the §8.5 view GET) returns 401 the pooled token has expired mid-life: mark the
+    // channel bad (discard, never reuse a stale token) and re-acquire ONCE — a fresh
+    // mint. A 200 here validates the token for the rest of this call's fetches (all
+    // within the same instant), so the sequence can't 401 downstream.
+    let mut chan;
+    let view_json;
+    {
+        let view_uri = format!("/v1/files/{}?version=latest", req.file_id);
+        let mut attempt = 0u8;
+        loop {
+            attempt += 1;
+            let mut c = pool
+                .acquire(|| reauth_channel(&dir.0, &server, &session, &connect_lock))
+                .await?;
+            let host = c.host.clone();
+            let token = c.token.clone();
+            let (status, vj) = get_json(&mut c.sender, &view_uri, Some(&token), &host).await?;
+            if status == StatusCode::UNAUTHORIZED && attempt == 1 {
+                c.mark_bad(); // stale-token channel — discard + re-auth once.
+                continue;
+            }
+            if status != StatusCode::OK {
+                return Err(UiError::new("fetch_failed", "That item is not available."));
+            }
+            chan = c;
+            view_json = vj;
+            break;
+        }
     }
+    // The channel-bound host + token for this call's remaining authed fetches (owned
+    // clones so `&mut chan.sender` can be borrowed alongside them). The pooled channel
+    // returns to the pool on `chan` drop at the end of the command.
+    let host = chan.host.clone();
+    let token = chan.token.clone();
     let view = crate::download::parse_file_view(&view_json)?;
     if req.version.is_none() {
         // NB: keyed on the UNVERIFIED envelope `view.version`; if it diverges from the
@@ -275,7 +323,7 @@ pub async fn decrypt_card(
 
     // Resolve the author (Phase 3: author == owner) + my own id, under the pinned D5.
     let (author, author_binding) = crate::directory::resolve_and_verify_author_logged(
-        &mut sender,
+        &mut chan.sender,
         &host,
         &hex(&manifest.author_id.0),
         &verifier,
@@ -289,7 +337,7 @@ pub async fn decrypt_card(
     // a KT key is pinned, ANY failure blocks the card as `server_untrusted`.
     enforce_author_transparency(&dir.0, session.inner(), author_binding).await?;
     let my_id = crate::directory::resolve_my_user_id(
-        &mut sender,
+        &mut chan.sender,
         &host,
         &username,
         &verifier,
@@ -304,7 +352,7 @@ pub async fn decrypt_card(
     let route_mode = crate::config::SettingsConfig::load(&dir.0).connection.route_mode;
     let direct_http = crate::direct_link::shared_direct_http();
     let (header, header_used_direct) = crate::download::build_stream_header(
-        &mut sender,
+        &mut chan.sender,
         &host,
         &token,
         &req.file_id,
@@ -333,7 +381,7 @@ pub async fn decrypt_card(
         Ok(opened) => opened,
         Err(e) if header_used_direct => {
             let (header, _) = crate::download::build_stream_header(
-                &mut sender,
+                &mut chan.sender,
                 &host,
                 &token,
                 &req.file_id,

@@ -24,12 +24,13 @@ fn main() {
     // `load` normalizes a present file, but the missing-file default (1 GiB)
     // is not; `normalized()` here also bounds that first-run default to the
     // (total − 6 GB) ceiling so a small-RAM machine can't start over-cap. MiB → bytes.
-    let cap_bytes = SettingsConfig::load(&app_dir)
-        .normalized()
-        .performance
-        .ram_cache_cap_mb as usize
-        * 1024
-        * 1024;
+    let normalized = SettingsConfig::load(&app_dir).normalized();
+    let cap_bytes = normalized.performance.ram_cache_cap_mb as usize * 1024 * 1024;
+    // Live-channel cap for the authed connection pool = the persisted feed
+    // concurrency (already clamped to 1..=8 by `normalized`). Feed-card decodes
+    // borrow up to this many concurrent authed channels; the UI never drives more
+    // than `feed_concurrency` at once.
+    let pool_cap = normalized.performance.feed_concurrency as usize;
 
     // Initialize the process-wide Tor state (arti state under <app-dir>/config/tor).
     // Lazily bootstrapped on the first TorOnly connect; read only by the connection
@@ -46,6 +47,7 @@ fn main() {
         .manage(maxsecu_client_app::jobs::VideoJobs::new())
         .manage(maxsecu_client_app::jobs::VideoPrepareCancel::default())
         .manage(ContentCache::new(cap_bytes))
+        .manage(maxsecu_client_app::commands::pool::AppPool::new(pool_cap))
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
             maxsecu_client_app::commands::auth::unlock_keystore,

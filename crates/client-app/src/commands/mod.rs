@@ -10,6 +10,7 @@ pub mod delete_cmd;
 pub mod dialog;
 pub mod download_cmd;
 pub mod feed;
+pub mod pool;
 pub mod recovery_login;
 pub mod register;
 pub mod search;
