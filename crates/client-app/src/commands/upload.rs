@@ -42,7 +42,10 @@ use crate::jobs::{
     BundleJob, BundleJobs, MemberMeta, StagedContent, StagedUpload, StagedVideoPreview, UploadJobs,
     VideoPrepareCancel,
 };
-use crate::state::{PreparePhase, UploadPhase, EVT_UPLOAD, EVT_VIDEO_PREPARE};
+use crate::state::{
+    BundleStagePhase, H264EncoderCache, PreparePhase, UploadPhase, EVT_BUNDLE_STAGE, EVT_UPLOAD,
+    EVT_VIDEO_PREPARE,
+};
 use crate::upload::{
     apply_stage_flags, build_metadata, file_type_str, prepare_blog_streams,
     prepare_generic_metadata, prepare_image_streams, prepare_video_streams, put_chunk_retried,
@@ -192,8 +195,9 @@ pub async fn stage_upload(
     session: State<'_, Session>,
     jobs: State<'_, UploadJobs>,
     prepare_cancel: State<'_, VideoPrepareCancel>,
+    encoder_cache: State<'_, H264EncoderCache>,
 ) -> Result<UploadPreview, UiError> {
-    let item = stage_item(&req, &app, &dir, &session, &prepare_cancel).await?;
+    let item = stage_item(&req, &app, &dir, &session, &prepare_cancel, &encoder_cache).await?;
     // Capture the preview fields BEFORE moving `staged` into the jobs map.
     let file_type = item.staged.file_type.clone();
     let total_chunks = item.staged.total_chunks;
@@ -270,6 +274,7 @@ async fn stage_item(
     dir: &AppDir,
     session: &Session,
     prepare_cancel: &VideoPrepareCancel,
+    encoder_cache: &H264EncoderCache,
 ) -> Result<StagedItem, UiError> {
     // RAII guard that deletes a dir on any error path before the job is inserted.
     // For video: initially guards the transcode temp dir; switched to the staging
@@ -378,6 +383,9 @@ async fn stage_item(
             *prepare_cancel.0.lock().unwrap() = Some(cancel.clone());
             let handle = app.clone();
             let cancel_task = cancel.clone();
+            // Clone the session encoder-cache Arc so it can cross the spawn_blocking
+            // boundary; the confined ladder records its winning rung here.
+            let enc_cache = encoder_cache.0.clone();
             let staged = tokio::task::spawn_blocking(move || {
                 let on_phase = move |phase: PreparePhase| {
                     let _ = handle.emit(EVT_VIDEO_PREPARE, phase);
@@ -392,6 +400,7 @@ async fn stage_item(
                     &tags,
                     on_phase,
                     &cancel_task,
+                    &enc_cache,
                 )
             })
             .await;
@@ -652,6 +661,7 @@ pub async fn stage_bundle(
     session: State<'_, Session>,
     jobs: State<'_, BundleJobs>,
     prepare_cancel: State<'_, VideoPrepareCancel>,
+    encoder_cache: State<'_, H264EncoderCache>,
 ) -> Result<BundlePreview, UiError> {
     use maxsecu_encoding::types::FileType;
 
@@ -685,8 +695,24 @@ pub async fn stage_bundle(
     let mut member_meta: Vec<MemberMeta> = Vec::with_capacity(req.members.len());
     let mut member_previews: Vec<UploadPreview> = Vec::with_capacity(req.members.len());
     let mut counts = MemberCounts::default();
+    // Raw PNG bytes of the cover member's thumbnail (from `cover_index`), captured
+    // as we stage that member. Sealed into the bundle file's Thumbnail stream below.
+    let mut cover_thumbnail: Option<Vec<u8>> = None;
 
-    for m in &req.members {
+    let total = req.members.len();
+    for (i, m) in req.members.iter().enumerate() {
+        // Progress feedback: tell the composer which member (1-based) of how many
+        // is now being staged so the "Preparing preview…" step is not a silent
+        // spinner. For a video member, finer transcode progress still streams over
+        // EVT_VIDEO_PREPARE. Best-effort: a dropped event never fails staging.
+        let _ = app.emit(
+            EVT_BUNDLE_STAGE,
+            BundleStagePhase::Member {
+                index: i + 1,
+                total,
+                title: m.title.clone(),
+            },
+        );
         let member_req = StageUploadRequest {
             kind: m.kind,
             path: m.path.clone(),
@@ -697,7 +723,7 @@ pub async fn stage_bundle(
         };
         // On error the `?` returns, dropping `cleanup` → all prior members' dirs
         // are wiped. No manual cleanup arm needed.
-        let item = stage_item(&member_req, &app, &dir, &session, &prepare_cancel).await?;
+        let item = stage_item(&member_req, &app, &dir, &session, &prepare_cancel, &encoder_cache).await?;
         match item.kind {
             FileType::Video => counts.video += 1,
             FileType::Image => counts.image += 1,
@@ -717,6 +743,12 @@ pub async fn stage_bundle(
             total_chunks: item.staged.total_chunks,
             thumbnail_b64: item.thumbnail_b64.clone(),
         });
+        // Capture the chosen cover member's thumbnail (decoded to raw PNG). If the
+        // cover member has no thumbnail (e.g. a generic/blog member), the bundle
+        // simply gets no cover.
+        if req.cover_index == Some(i) {
+            cover_thumbnail = item.thumbnail_b64.as_ref().and_then(|b| B64.decode(b).ok());
+        }
         member_meta.push(MemberMeta {
             file_id: item.file_id,
             file_type: item.kind,
@@ -738,6 +770,7 @@ pub async fn stage_bundle(
             tags: req.tags,
             members,
             member_meta,
+            cover_thumbnail,
         },
     );
     Ok(BundlePreview {
@@ -825,16 +858,18 @@ async fn stage_streaming_content(
     let builder = StreamingUploadBuilder::new();
     let sealer = builder.content_sealer(&params);
 
-    // Pass 1: stream the plaintext content → (chunk_count, digest); sum ciphertext
-    // bytes for the advisory `total_bytes`. The ciphertext itself is discarded.
+    // Pass 1: stream the plaintext content → (chunk_count, digest). The ciphertext
+    // is discarded (re-sealed on confirm). The content stream's advisory
+    // `total_bytes` is the PLAINTEXT length = the input file size (the fMP4 for a
+    // video, the user's file for a generic) — recorded so the viewer can learn
+    // total_len WITHOUT fetching + decrypting the last chunk (see
+    // `commands::video::trusted_total_len`). Metadata is read before sealing
+    // consumes the reader (it is independent of read position).
     let mut in_file = std::fs::File::open(input_path)
         .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
-    let mut ct_total: u64 = 0;
+    let plaintext_total = in_file.metadata().map(|m| m.len()).unwrap_or(0);
     let (count, digest) = sealer
-        .seal_from_reader(&mut in_file, |_, ct| {
-            ct_total += ct.len() as u64;
-            Ok(())
-        })
+        .seal_from_reader(&mut in_file, |_, _| Ok(()))
         .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
     drop(in_file); // close before rename/copy
 
@@ -895,7 +930,7 @@ async fn stage_streaming_content(
         out_mp4_path: dest,
         chunk_size: CHUNK_SIZE,
         content_chunk_count: count,
-        content_total_bytes: ct_total,
+        content_total_bytes: plaintext_total,
         small_streams: records
             .small_streams
             .iter()
@@ -1317,6 +1352,30 @@ pub async fn confirm_bundle(
     out
 }
 
+/// `retry_confirm` — the uploads tray's Retry entry point. A tray row only knows a
+/// `job_id` (from the `EVT_UPLOAD` event); it cannot tell a single-file job from a
+/// bundle job, and the two live in DIFFERENT registries ([`UploadJobs`] vs
+/// [`BundleJobs`]). This dispatches by looking the id up in [`BundleJobs`] first: a
+/// hit routes to [`confirm_bundle`], otherwise to [`confirm_upload`]. Without this a
+/// bundle retry always hit `no_such_job` (it was hard-wired to `confirm_upload`).
+#[tauri::command]
+pub async fn retry_confirm(
+    req: ConfirmUploadRequest,
+    app: tauri::AppHandle,
+    dir: State<'_, AppDir>,
+    session: State<'_, Session>,
+    connect_lock: State<'_, ConnectLock>,
+    bundle_jobs: State<'_, BundleJobs>,
+    upload_jobs: State<'_, UploadJobs>,
+) -> Result<String, UiError> {
+    let is_bundle = bundle_jobs.0.lock().await.contains_key(&req.job_id);
+    if is_bundle {
+        confirm_bundle(req, app, dir, session, connect_lock, bundle_jobs).await
+    } else {
+        confirm_upload(req, app, dir, session, connect_lock, upload_jobs).await
+    }
+}
+
 async fn confirm_bundle_inner(
     req: &ConfirmUploadRequest,
     dir: &State<'_, AppDir>,
@@ -1426,13 +1485,14 @@ async fn run_bundle_pipeline(
             recovery_mlkem_pub: recovery.mlkem_pub,
             created_at: Timestamp(now),
         };
-        // Thumbnail is best-effort None: member thumbnails are already sealed into
-        // each member and not retained in plaintext here, so the bundle file carries
-        // no derived thumbnail (the feed card falls back to the member previews).
+        // The bundle's cover: the chosen member's thumbnail (captured at stage time
+        // via `cover_index`), sealed here into the bundle file's Thumbnail stream so
+        // the bundle's own feed card shows a cover image. `None` ⇒ no cover (the card
+        // falls back to the member previews).
         let streams = maxsecu_client_core::PlaintextStreams {
             content: bundle_content,
             metadata: Some(build_metadata(&job.title, &job.tags)),
-            thumbnail: None,
+            thumbnail: job.cover_thumbnail.clone(),
             preview: None,
         };
         build_upload(&params, &streams)
@@ -1469,15 +1529,17 @@ async fn run_bundle_pipeline(
                 .await?;
             }
             StagedContent::Streaming(rec) => {
-                // Rewrite the member's own (done,total) into the aggregate frame;
-                // suppress the member's per-file Finalizing/Staging phases.
+                // Rewrite the member's own (done,total) into the aggregate frame,
+                // but CARRY THROUGH the member's real throughput so the tray shows
+                // MB/s during a bundle's video upload (same as a single video). The
+                // member's per-file Finalizing/Staging phases are suppressed.
                 let member_emit = |p: UploadPhase| {
-                    if let UploadPhase::Uploading { done, .. } = p {
+                    if let UploadPhase::Uploading { done, bytes_per_s, .. } = p {
                         emit(UploadPhase::Uploading {
                             job_id: job_id.to_owned(),
                             done: base + done,
                             total: grand_total,
-                            bytes_per_s: 0,
+                            bytes_per_s,
                         });
                     }
                 };
@@ -2182,6 +2244,7 @@ mod tests {
                     file_type: maxsecu_encoding::types::FileType::Blog,
                 },
             ],
+            cover_thumbnail: None,
         };
         jobs.0.lock().await.insert("b-1".into(), job);
 

@@ -23,7 +23,14 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 pub mod ffmpeg_args;
-pub use ffmpeg_args::build_ffmpeg_args;
+pub use ffmpeg_args::{
+    build_ingest_args, build_probe_args, plan_ingest, H264Encoder, IngestPlan, VideoArg,
+};
+
+pub mod probe;
+pub use probe::{parse_probe, AudioCodec, ProbeResult, VideoCodec};
+#[cfg(windows)]
+pub use probe::probe_source;
 
 pub mod transcode_opts;
 pub use transcode_opts::{Bitrate, Resolution, TranscodeOptions};

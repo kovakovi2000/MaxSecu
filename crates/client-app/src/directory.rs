@@ -16,6 +16,69 @@ use maxsecu_encoding::RECOVERY_ID;
 use crate::error::UiError;
 use crate::http_client::get_json;
 
+/// TTL (ms) for a cached, verified author binding. Bounds how long a reused D5
+/// verification + transparency result stays valid within a burst of opens (e.g.
+/// every video in one bundle), short enough that an author key rotation is picked
+/// up promptly on the next open.
+const AUTHOR_CACHE_TTL_MS: u64 = 60_000;
+
+/// Session-scoped memoization of the directory verify chain so opening several
+/// videos in quick succession (a bundle's members, or a re-open) does not re-run
+/// the same directory GET + D5 verify + transparency check each time.
+///
+/// SECURITY: only SUCCESSFULLY verified results are ever stored. A cached
+/// [`VerifiedAuthor`] was D5-verified AND transparency-checked at insert time, so
+/// reusing it within the TTL is equivalent to re-deriving it — the content is still
+/// AEAD-verified against these keys downstream. `my_id` is keyed by username so a
+/// re-login as a different user misses. Uses a plain `std::sync::Mutex` held only
+/// across trivial map ops (never across an `.await`).
+#[derive(Default)]
+pub struct DirectoryCache {
+    inner: std::sync::Mutex<DirCacheInner>,
+}
+
+#[derive(Default)]
+struct DirCacheInner {
+    my_id: Option<(String, [u8; 16])>,
+    authors: std::collections::HashMap<[u8; 16], (VerifiedAuthor, u64)>,
+}
+
+impl DirectoryCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// My resolved `user_id` for `username`, if cached this session.
+    pub fn my_id(&self, username: &str) -> Option<[u8; 16]> {
+        let g = self.inner.lock().unwrap();
+        g.my_id
+            .as_ref()
+            .filter(|(u, _)| u == username)
+            .map(|(_, id)| *id)
+    }
+
+    pub fn put_my_id(&self, username: &str, id: [u8; 16]) {
+        self.inner.lock().unwrap().my_id = Some((username.to_owned(), id));
+    }
+
+    /// A cached, still-fresh (< [`AUTHOR_CACHE_TTL_MS`]) verified author for `author_id`.
+    pub fn author(&self, author_id: &[u8; 16], now_ms: u64) -> Option<VerifiedAuthor> {
+        let g = self.inner.lock().unwrap();
+        g.authors
+            .get(author_id)
+            .filter(|(_, at)| now_ms.saturating_sub(*at) < AUTHOR_CACHE_TTL_MS)
+            .map(|(a, _)| a.clone())
+    }
+
+    pub fn put_author(&self, author_id: [u8; 16], author: VerifiedAuthor, now_ms: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .authors
+            .insert(author_id, (author, now_ms));
+    }
+}
+
 /// A directory-verified author/owner: exactly the key bytes the §12.5 ladder
 /// needs. No signed-record interior is retained.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +398,42 @@ mod tests {
     use maxsecu_encoding::types::{Bytes32, Id, MlKemPub, Role, RoleSet, Text, Timestamp};
 
     const NOW: u64 = 1_719_500_000_000;
+
+    fn sample_author(id: u8) -> VerifiedAuthor {
+        VerifiedAuthor {
+            user_id: [id; 16],
+            sig_pub: [id; 32],
+            enc_pub: [id; 32],
+            fingerprint: [id; 32],
+            key_version: 1,
+            mlkem_pub: None,
+        }
+    }
+
+    #[test]
+    fn directory_cache_my_id_is_username_scoped() {
+        let c = DirectoryCache::new();
+        assert_eq!(c.my_id("alice"), None);
+        c.put_my_id("alice", [7u8; 16]);
+        assert_eq!(c.my_id("alice"), Some([7u8; 16]));
+        // A different username never reads alice's id (fail-safe on re-login).
+        assert_eq!(c.my_id("bob"), None);
+    }
+
+    #[test]
+    fn directory_cache_author_hits_within_ttl_and_expires_after() {
+        let c = DirectoryCache::new();
+        let id = [9u8; 16];
+        assert_eq!(c.author(&id, NOW), None); // cold miss
+        c.put_author(id, sample_author(9), NOW);
+        // Fresh hit.
+        assert_eq!(c.author(&id, NOW), Some(sample_author(9)));
+        assert_eq!(c.author(&id, NOW + AUTHOR_CACHE_TTL_MS - 1), Some(sample_author(9)));
+        // At/after the TTL → miss (re-verify).
+        assert_eq!(c.author(&id, NOW + AUTHOR_CACHE_TTL_MS), None);
+        // A different author id misses.
+        assert_eq!(c.author(&[1u8; 16], NOW), None);
+    }
 
     fn signed_binding(d5: &SigningKey) -> (Vec<u8>, [u8; 64]) {
         let b = DirBinding {

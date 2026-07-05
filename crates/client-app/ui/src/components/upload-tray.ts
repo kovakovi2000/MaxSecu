@@ -111,7 +111,9 @@ export class UploadTray extends HTMLElement {
     btn.addEventListener("click", async () => {
       btn.disabled = true;
       try {
-        await serial(() => call<string>("confirm_upload", { req: { job_id: jobId } }));
+        // `retry_confirm` routes to the right registry (single upload vs bundle);
+        // the tray only knows the job_id, not which kind it is.
+        await serial(() => call<string>("retry_confirm", { req: { job_id: jobId } }));
         btn.remove(); // success drives a fresh `done` event which clears the row
       } catch {
         btn.disabled = false; // a fresh `failed` event will refresh the label

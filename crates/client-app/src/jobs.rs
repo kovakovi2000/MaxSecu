@@ -110,6 +110,10 @@ pub struct BundleJob {
     pub members: Vec<StagedUpload>,
     /// `(file_id, file_type)` per member, in order (authoritative bundle order).
     pub member_meta: Vec<MemberMeta>,
+    /// Raw PNG thumbnail bytes of the chosen cover member (from the stage request's
+    /// `cover_index`), sealed into the bundle file's Thumbnail stream so the bundle's
+    /// feed card shows a cover image. `None` ⇒ no cover (card falls back to members).
+    pub cover_thumbnail: Option<Vec<u8>>,
 }
 
 /// Managed state: `job_id -> BundleJob`. Async mutex (commands are async).
@@ -271,6 +275,7 @@ mod tests {
                     file_type: maxsecu_encoding::types::FileType::Blog,
                 },
             ],
+            cover_thumbnail: None,
         };
         jobs.0.lock().await.insert("b-1".into(), job);
         let taken = jobs.0.lock().await.remove("b-1").unwrap();

@@ -61,9 +61,14 @@ use crate::state::{PlayerPhase, EVT_PLAYER};
 use crate::video::{chunks_for_fragment, FragmentEntry};
 
 /// Cap on a single range response body (open-ended `bytes=N-` streams in pieces).
-/// Must be ≥ the content chunk size (currently 6 MiB) so a range request can
-/// span a full chunk/fMP4 fragment in one response without being truncated.
-const MAX_RANGE_BODY: u64 = 8 * 1024 * 1024;
+/// Kept small (2 MiB) so the FIRST `bytes=0-` request a native `<video>` issues
+/// only pulls ~2 covering 1 MiB chunks before returning — the browser then streams
+/// the rest in bounded pieces, cutting time-to-first-frame. This need NOT be ≥ the
+/// content chunk size: `assemble_range` always decrypts the whole covering
+/// fragment and `slice_range` returns only the requested sub-range, so older
+/// 6 MiB-chunk videos still serve correctly (a 2 MiB response slices a 6 MiB
+/// fragment; the fragment is cached, so later slices of it need no refetch).
+const MAX_RANGE_BODY: u64 = 2 * 1024 * 1024;
 
 /// The body + metadata of one satisfied range response (206). `total_len` is the
 /// Content-Range denominator; `start`/`len` describe the returned slice.
@@ -259,6 +264,26 @@ async fn probe_total_len(
     }
 }
 
+/// Trust the server-advertised plaintext content length ONLY if it is internally
+/// consistent with the AUTHENTICATED `content_chunk_count` (`n`) and `chunk_size`:
+/// the total must land in the last chunk, i.e. `(n-1)*cs < total <= n*cs`. Returns
+/// `None` (⇒ fall back to the authenticated last-chunk probe) when the length is
+/// absent (0), outside that band, or on any arithmetic overflow.
+///
+/// Rationale: this lets a normal open SKIP fetching + decrypting the final content
+/// chunk just to learn `total_len`. The server value is unauthenticated, but it is
+/// bounded here to at most one `chunk_size` of slack, and `total_len` only affects
+/// range CLAMPING of the final chunk (availability) — every served content chunk is
+/// still AEAD-verified, so a dishonest length can never inject or substitute bytes.
+fn trusted_total_len(n: u64, chunk_size: u64, server_total: u64) -> Option<u64> {
+    if n == 0 || chunk_size == 0 || server_total == 0 {
+        return None;
+    }
+    let hi = n.checked_mul(chunk_size)?;
+    let lo = (n - 1).checked_mul(chunk_size)?;
+    (server_total > lo && server_total <= hi).then_some(server_total)
+}
+
 /// `open_video` — open + verify a video and register its decrypt-while-stream
 /// session (D5-verifies the author, derives the in-TCB `ContentDecryptor`, parses
 /// the fragment index, and probes the total plaintext length). Plays nothing: the
@@ -273,8 +298,9 @@ pub async fn open_video(
     session: State<'_, Session>,
     connect_lock: State<'_, ConnectLock>,
     jobs: State<'_, VideoJobs>,
+    dir_cache: State<'_, crate::directory::DirectoryCache>,
 ) -> Result<(), UiError> {
-    let out = open_video_inner(&file_id, &dir, &session, &connect_lock, &jobs).await;
+    let out = open_video_inner(&file_id, &dir, &session, &connect_lock, &jobs, &dir_cache).await;
     if let Err(e) = &out {
         let _ = app.emit(
             EVT_PLAYER,
@@ -296,6 +322,7 @@ async fn open_video_inner(
     session: &State<'_, Session>,
     connect_lock: &State<'_, ConnectLock>,
     jobs: &State<'_, VideoJobs>,
+    dir_cache: &State<'_, crate::directory::DirectoryCache>,
 ) -> Result<(), UiError> {
     // Validate the REQUESTED id up front (it is what the served record must bind to
     // and is interpolated into the request URL). Canonical lowercase hex is the
@@ -337,23 +364,47 @@ async fn open_video_inner(
     let manifest: Manifest =
         decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
 
-    // D5-verify the author binding (fail-closed) BEFORE any decode.
-    let (author, author_binding) = resolve_and_verify_author_logged(
-        &mut sender,
-        &host,
-        &hex(&manifest.author_id.0),
-        &verifier,
-        &mut trust,
-        now,
-    )
-    .await?;
-    // Trust-alarm C (spec §0-C/§7): block the streaming OPEN unless the served
-    // author binding is provably present in the directory key-transparency log
-    // under a pinned, non-equivocating checkpoint (opt-in; mirrors feed/viewer).
-    crate::commands::feed::enforce_author_transparency(&dir.0, session.inner(), author_binding)
-        .await?;
-    let my_id =
-        resolve_my_user_id(&mut sender, &host, &username, &verifier, &mut trust, now).await?;
+    // D5-verify the author binding (fail-closed) BEFORE any decode — reusing the
+    // session cache when a recent open already verified this author (a bundle's
+    // videos share one author). A cache entry was D5-verified AND transparency-
+    // checked at insert time, so a hit safely skips both network round-trips.
+    let author_id = manifest.author_id.0;
+    let author = match dir_cache.author(&author_id, now) {
+        Some(a) => a,
+        None => {
+            let (author, author_binding) = resolve_and_verify_author_logged(
+                &mut sender,
+                &host,
+                &hex(&author_id),
+                &verifier,
+                &mut trust,
+                now,
+            )
+            .await?;
+            // Trust-alarm C (spec §0-C/§7): block the streaming OPEN unless the served
+            // author binding is provably present in the directory key-transparency log
+            // under a pinned, non-equivocating checkpoint (opt-in; mirrors feed/viewer).
+            crate::commands::feed::enforce_author_transparency(
+                &dir.0,
+                session.inner(),
+                author_binding,
+            )
+            .await?;
+            dir_cache.put_author(author_id, author.clone(), now);
+            author
+        }
+    };
+    // My own user_id is stable for the session — cache it after the first resolve.
+    let my_id = match dir_cache.my_id(&username) {
+        Some(id) => id,
+        None => {
+            let id =
+                resolve_my_user_id(&mut sender, &host, &username, &verifier, &mut trust, now)
+                    .await?;
+            dir_cache.put_my_id(&username, id);
+            id
+        }
+    };
 
     // Header (small streams only — no content fetched here). Prefers the
     // direct-link route per the effective `route_mode`.
@@ -406,21 +457,27 @@ async fn open_video_inner(
     };
     let version = decryptor.version();
 
-    // Content chunk size from the (authenticated-envelope) view — the byte↔chunk
-    // unit for range serving.
-    let chunk_size = view
+    // Content stream descriptor from the (authenticated-envelope) view — `chunk_size`
+    // is the byte↔chunk unit for range serving.
+    let content_stream = view
         .streams
         .iter()
         .find(|s| s.stream_type == StreamType::Content)
-        .map(|s| s.chunk_size)
         .ok_or_else(player_err)?;
+    let chunk_size = content_stream.chunk_size;
+    // Prefer the server-advertised plaintext length when it is consistent with the
+    // AUTHENTICATED content_chunk_count (skips the last-chunk fetch+decrypt probe →
+    // faster time-to-first-frame). `None` ⇒ fall back to the authenticated probe.
+    let trusted_total =
+        trusted_total_len(decryptor.content_chunk_count(), chunk_size, content_stream.total_bytes);
 
-    // Register the session first (so the fragment cache exists), then probe the
-    // total plaintext length by decrypting ONLY the last fragment once
-    // (`settings`/`route_mode` were already loaded above, at the top of this
-    // function, and reused for every network fetch in the session).
+    // Register the session first (so the fragment cache exists); probe the total
+    // plaintext length by decrypting ONLY the last fragment once, but ONLY when the
+    // server length was unusable (`settings`/`route_mode` were loaded above and are
+    // reused for every network fetch in the session).
     let cap = settings.performance.ram_cache_cap_mb as u64 * 1024 * 1024;
-    let cache = FragmentCache::open(&dir.0, cap).map_err(|_| player_err())?;
+    let location = settings.performance.fragment_cache_location;
+    let cache = FragmentCache::open_located(&dir.0, cap, location).map_err(|_| player_err())?;
 
     // Move the open-time authed connection into a persistent channel for all range
     // fetches in this session (probe_total_len + every serve_range). After this point
@@ -438,17 +495,19 @@ async fn open_video_inner(
             file_id_hex: file_id_hex.clone(),
             version,
             chunk_size,
-            total_len: 0, // set below
+            total_len: trusted_total.unwrap_or(0), // authenticated probe below if None
             channel: Some(channel),
             route_mode,
         },
     );
 
-    // Probe total_len via the last fragment (uses the job's persistent channel —
-    // no extra reauth needed).
-    let total = probe_total_len(jobs, &file_id_hex, chunk_size, route_mode).await?;
-    if let Some(job) = jobs.0.lock().await.get_mut(&file_id_hex) {
-        job.total_len = total;
+    // Only probe (fetch + decrypt the last chunk) when the server length was absent
+    // or inconsistent with the authenticated chunk count.
+    if trusted_total.is_none() {
+        let total = probe_total_len(jobs, &file_id_hex, chunk_size, route_mode).await?;
+        if let Some(job) = jobs.0.lock().await.get_mut(&file_id_hex) {
+            job.total_len = total;
+        }
     }
     Ok(())
 }
@@ -1036,6 +1095,25 @@ mod tests {
             !jobs.0.lock().await.contains_key(&file_id_hex()),
             "session gone after cancel"
         );
+    }
+
+    #[test]
+    fn trusted_total_len_accepts_only_last_chunk_consistent_lengths() {
+        let cs = 1024 * 1024;
+        // n=3 chunks: total must be in ((3-1)*cs, 3*cs] = (2 MiB, 3 MiB].
+        assert_eq!(super::trusted_total_len(3, cs, 2 * cs + 1), Some(2 * cs + 1)); // just over lo
+        assert_eq!(super::trusted_total_len(3, cs, 3 * cs), Some(3 * cs)); // full last chunk
+        assert_eq!(super::trusted_total_len(3, cs, 2 * cs + 500), Some(2 * cs + 500));
+        // Out of band → probe (None).
+        assert_eq!(super::trusted_total_len(3, cs, 2 * cs), None); // == lo (too small)
+        assert_eq!(super::trusted_total_len(3, cs, 3 * cs + 1), None); // > hi
+        assert_eq!(super::trusted_total_len(3, cs, 0), None); // absent
+        assert_eq!(super::trusted_total_len(0, cs, 100), None); // no chunks
+        assert_eq!(super::trusted_total_len(3, 0, 100), None); // no chunk size
+        // n=1: total in (0, cs].
+        assert_eq!(super::trusted_total_len(1, cs, 1), Some(1));
+        assert_eq!(super::trusted_total_len(1, cs, cs), Some(cs));
+        assert_eq!(super::trusted_total_len(1, cs, cs + 1), None);
     }
 
     #[test]

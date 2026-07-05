@@ -1,4 +1,4 @@
-import { call } from "../core/rpc.ts";
+import { call, on } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import { setBusy, clearBusy } from "../core/busy.ts";
 import { toast } from "../core/toast.ts";
@@ -12,6 +12,8 @@ import type { Bitrate, Resolution, TranscodeOptions } from "../core/transcode-op
 import type {
   BundleMemberInput,
   BundlePreview,
+  BundleStagePhase,
+  PreparePhase,
   StageBundleRequest,
   UploadPreview,
 } from "../core/types.ts";
@@ -50,6 +52,12 @@ export class BundleComposer extends HTMLElement {
   // lastJobId — which would orphan the first staged bundle's on-disk staging dir.
   // Covers BOTH preview() and post() since they share the stage/cancel/job_id state.
   private staging = false;
+
+  // The member chosen as the bundle's cover — its thumbnail becomes the bundle's
+  // own feed-card preview. Tracked by object REFERENCE so it survives reorder/remove
+  // (both preserve member object identity). Only image members are cover-eligible;
+  // ensureCover() keeps this valid (defaults to the first image member, or null).
+  private coverMember: BundleMemberInput | null = null;
 
   // Nominal 16:9 dims per height preset — only a starting bitrate-suggestion source
   // (mirrors <upload-screen>). The Rust side re-clamps authoritatively.
@@ -114,14 +122,17 @@ export class BundleComposer extends HTMLElement {
 
   private async onAddMedia() {
     try {
-      // Empty extensions ⇒ the dialog shows ALL files; detectKind classifies the
-      // pick (image / video / generic). One file per click (pick_file is single).
-      const path = await call<string | null>("pick_file", { extensions: [] });
-      if (!path) return;
-      const kind = detectKind(path);
-      const member: BundleMemberInput = { kind, path, title: basename(path), tags: [] };
-      if (kind === "video") member.options = { resolution: "Original", bitrate: "Original" };
-      this.members = [...this.members, member];
+      // Empty extensions ⇒ the dialog shows ALL files; detectKind classifies each
+      // pick (image / video / generic). Multi-select: every chosen file is added.
+      const paths = await call<string[]>("pick_files", { extensions: [] });
+      if (!paths || paths.length === 0) return;
+      const added = paths.map((path): BundleMemberInput => {
+        const kind = detectKind(path);
+        const member: BundleMemberInput = { kind, path, title: basename(path), tags: [] };
+        if (kind === "video") member.options = { resolution: "Original", bitrate: "Original" };
+        return member;
+      });
+      this.members = [...this.members, ...added];
       this.markDirty();
       this.renderMembers();
     } catch (x) {
@@ -162,7 +173,25 @@ export class BundleComposer extends HTMLElement {
       list.appendChild(empty);
       return;
     }
+    this.ensureCover();
     this.members.forEach((m, i) => list.appendChild(this.buildRow(m, i)));
+  }
+
+  // A member eligible to be the bundle cover: one that yields a thumbnail — an
+  // image OR a video (whose poster frame is its thumbnail). Blog/generic members
+  // have no thumbnail, so they can't be the cover.
+  private coverEligible(m: BundleMemberInput): boolean {
+    return m.kind === "image" || m.kind === "video";
+  }
+
+  // Keep `coverMember` valid: if unset or no longer a present cover-eligible member,
+  // default to the first eligible member (or null when the bundle has none). Called
+  // on every render so reorder/remove/add can't leave a dangling cover reference.
+  private ensureCover() {
+    const eligible = this.members.filter((m) => this.coverEligible(m));
+    if (!this.coverMember || !eligible.includes(this.coverMember)) {
+      this.coverMember = eligible[0] ?? null;
+    }
   }
 
   private buildRow(m: BundleMemberInput, i: number): HTMLElement {
@@ -232,9 +261,29 @@ export class BundleComposer extends HTMLElement {
       src.className = "bc-src";
       src.textContent = m.path ? basename(m.path) : "";
       row.appendChild(src);
+      if (this.coverEligible(m)) row.appendChild(this.buildCoverToggle(m));
       if (m.kind === "video") row.appendChild(this.buildVideoOpts(m));
     }
     return row;
+  }
+
+  // A radio marking THIS image member as the bundle's cover (its thumbnail becomes
+  // the bundle's feed-card preview). Single-select across image members via the
+  // shared radio-group name, so picking one deselects the rest on the next render.
+  private buildCoverToggle(m: BundleMemberInput): HTMLElement {
+    const label = document.createElement("label");
+    label.className = "bc-cover";
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "bc-cover";
+    radio.checked = m === this.coverMember;
+    radio.addEventListener("change", () => {
+      this.coverMember = m;
+      this.markDirty();
+      this.renderMembers();
+    });
+    label.append(radio, document.createTextNode(" Use as bundle cover"));
+    return label;
   }
 
   // A real, labelled, keyboard-operable icon button.
@@ -339,7 +388,12 @@ export class BundleComposer extends HTMLElement {
       }
       return out;
     });
-    return { title, tags, members };
+    const req: StageBundleRequest = { title, tags, members };
+    // Cover: the chosen image member's position (1:1 with `members` above, since the
+    // map preserves order). Only an image member is cover-eligible (yields a thumb).
+    const coverIdx = this.coverMember ? this.members.indexOf(this.coverMember) : -1;
+    if (coverIdx >= 0 && this.coverEligible(this.members[coverIdx])) req.cover_index = coverIdx;
+    return req;
   }
 
   // Stage (if needed) and render the member previews in the chosen mode. A fresh
@@ -365,7 +419,7 @@ export class BundleComposer extends HTMLElement {
     this.cancelStale();
     setBusy("Preparing bundle");
     try {
-      const preview = await call<BundlePreview>("stage_bundle", { req: this.buildRequest() });
+      const preview = await this.stageWithProgress("Preparing preview");
       this.lastJobId = preview.job_id;
       this.lastPreview = preview;
       this.dirty = false;
@@ -455,8 +509,7 @@ export class BundleComposer extends HTMLElement {
       // Ensure a fresh staged job: (re)stage if never previewed or edited since.
       if (this.dirty || !this.lastJobId) {
         this.cancelStale();
-        this.status("Preparing bundle…");
-        const preview = await call<BundlePreview>("stage_bundle", { req: this.buildRequest() });
+        const preview = await this.stageWithProgress("Preparing bundle");
         this.lastJobId = preview.job_id;
         this.lastPreview = preview;
         this.dirty = false;
@@ -489,6 +542,44 @@ export class BundleComposer extends HTMLElement {
 
   private status(msg: string) {
     (this.querySelector("#bc-status") as HTMLElement).textContent = msg;
+  }
+
+  // Run `stage_bundle` while streaming live progress into the status line: which
+  // member (index/total) is being prepared and, for a video member, its transcode
+  // percent. `label` is the leading verb ("Preparing preview", "Preparing
+  // bundle"). Subscriptions are set up before the call and always torn down after,
+  // even on error. The single-flight guard guarantees this is the only stage in
+  // flight, so the events we hear belong to this call.
+  private async stageWithProgress(label: string): Promise<BundlePreview> {
+    let line = ""; // "— item 2/5: My Video"
+    let detail = ""; // " (transcoding 42%)"
+    const render = () => this.status(`${label}${line ? " " + line : "…"}${detail}`);
+    render();
+    const unlisten: Array<() => void> = [];
+    try {
+      unlisten.push(
+        await on<BundleStagePhase>("maxsecu://bundle-stage", (p) => {
+          line = `— item ${p.index}/${p.total}: ${p.title || "(untitled)"}`;
+          detail = ""; // reset per-member video detail
+          render();
+        }),
+      );
+      unlisten.push(
+        await on<PreparePhase>("maxsecu://video-prepare", (p) => {
+          if (p.phase === "transcoding") {
+            detail = ` (transcoding ${p.percent == null ? "…" : p.percent + "%"})`;
+          } else if (p.phase === "remuxing") {
+            detail = " (finishing video…)";
+          } else {
+            detail = "";
+          }
+          render();
+        }),
+      );
+      return await call<BundlePreview>("stage_bundle", { req: this.buildRequest() });
+    } finally {
+      for (const u of unlisten) u();
+    }
   }
 }
 

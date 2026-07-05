@@ -4,6 +4,14 @@
 
 use serde::Serialize;
 
+/// The H.264 encoder the runtime ladder settled on (probed once per session so later
+/// uploads skip dead GPU rungs). `None` until the first re-encode probes it. Held in an
+/// `Arc<Mutex<_>>` so it can be cloned into any `spawn_blocking` context.
+#[derive(Clone, Default)]
+pub struct H264EncoderCache(
+    pub std::sync::Arc<std::sync::Mutex<Option<maxsecu_media_launcher::H264Encoder>>>,
+);
+
 pub const EVT_CONNECTION: &str = "maxsecu://connection-state";
 pub const EVT_AUTH: &str = "maxsecu://auth-state";
 
@@ -57,6 +65,26 @@ pub enum UploadPhase {
     Done { job_id: String, file_id: String },
     /// Failed with a sanitized code (no oracle).
     Failed { job_id: String, code: String },
+}
+
+pub const EVT_BUNDLE_STAGE: &str = "maxsecu://bundle-stage";
+
+/// Per-member progress for the bundle composer's staging pass (the "Preparing
+/// preview…" / "Preparing bundle…" step in `stage_bundle`), which stages members
+/// sequentially and can be slow when a member is a video (confined transcode).
+/// Emitted over [`EVT_BUNDLE_STAGE`] so the composer can show which member of how
+/// many is currently being prepared instead of a static spinner. For a video
+/// member, the finer transcode progress still arrives over [`EVT_VIDEO_PREPARE`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "phase")]
+pub enum BundleStagePhase {
+    /// Now staging member `index` of `total` (both 1-based). `title` is the
+    /// member's user-supplied title (no secret) for the progress read-out.
+    Member {
+        index: usize,
+        total: usize,
+        title: String,
+    },
 }
 
 /// The video **prepare** (author-side transcode) feedback channel — per-job progress
@@ -251,6 +279,19 @@ mod prepare_phase_tests {
         })
         .unwrap();
         assert!(f.contains("\"phase\":\"failed\"") && f.contains("\"code\":\"video_failed\""));
+    }
+
+    #[test]
+    fn bundle_stage_phase_serializes_kebab_tagged() {
+        let s = serde_json::to_string(&BundleStagePhase::Member {
+            index: 2,
+            total: 5,
+            title: "My Video".into(),
+        })
+        .unwrap();
+        assert!(s.contains("\"phase\":\"member\""), "got {s}");
+        assert!(s.contains("\"index\":2") && s.contains("\"total\":5"), "got {s}");
+        assert!(s.contains("\"title\":\"My Video\""), "got {s}");
     }
 }
 

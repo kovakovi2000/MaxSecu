@@ -6,11 +6,13 @@
 //
 // Semantics mirror `serial.ts` so existing card-retry logic keeps working:
 //   - reuses `CancelledError`/`isCancelled` (imported, not redefined),
-//   - `runPriority` is for a viewer-open that must not wait behind card decodes:
-//     it BYPASSES the concurrency cap and runs immediately (matching the intent
-//     of `serialPriority`, taken further — a priority task never queues at all),
+//   - `runPriority` runs a task immediately, BYPASSING the concurrency cap
+//     (matching the intent of `serialPriority`, taken further — a priority task
+//     never queues at all). NOTE: the viewer-open no longer uses this — open_content
+//     is connect-lock-bound and must serialize, so it goes through serial() instead;
+//     runPriority remains for any future decode that must jump the card backlog,
 //   - `cancelPending` rejects QUEUED normal tasks with `CancelledError` and
-//     RETAINS queued priority tasks (a viewer-open must survive a feed teardown),
+//     RETAINS queued priority tasks,
 //   - every task releases its slot on success AND throw (sync or async) so the
 //     pool can never wedge.
 //
@@ -108,9 +110,10 @@ export function makePool(size: number): Pool {
 
 // The single shared feed-decode pool. Feed cards decode through `decodePool.run`
 // (bounded to `feed_concurrency`, resized live from the settings store — see
-// core/settings.ts `applySettings`); a viewer-open uses `decodePool.runPriority`
-// so it never waits behind a backlog of card decodes; leaving the feed calls
+// core/settings.ts `applySettings`); leaving the feed calls
 // `decodePool.cancelPending()` to flush the queued (not-yet-started) backlog.
+// The viewer-open does NOT use this pool: open_content is connect-lock-bound and
+// routes through serial() so concurrent opens (Stacked bundle view) can't race.
 //
 // Initial size is a sensible default (4) because settings load asynchronously
 // after module init; `setSize` is called once settings arrive (and on every live
@@ -118,8 +121,8 @@ export function makePool(size: number): Pool {
 // `setSize` floors it at 1.
 //
 // KNOWN LIMITATION (cold-mint reauth race): only `decrypt_card` uses the backend
-// authed-connection pool (Task 7.0). Every OTHER authed command (open_content
-// aside — it also decodes; but download/share/delete/list_feed/etc.) still calls
+// authed-connection pool (Task 7.0). Every OTHER authed command
+// (open_content/download/share/delete/list_feed/etc.) still calls
 // `reauth`, which `try_lock`s the ConnectLock + borrows the non-Clone identity.
 // So while cards decode concurrently AMONG THEMSELVES over the pool's warm
 // channels, a pool COLD-MINT (first feed load, or after a 401-drain) itself calls

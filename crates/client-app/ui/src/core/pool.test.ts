@@ -180,9 +180,14 @@ test("media-card decodes cards through decodePool.run", () => {
   assert.match(src, /decodePool\.run\(/, "media-card must route decrypt_card through decodePool.run");
 });
 
-test("media-viewer opens through decodePool.runPriority", () => {
+test("media-viewer opens through the serial() connect-lock FIFO, not the decode pool", () => {
   const src = readFileSync("src/components/media-viewer.ts", "utf8");
-  assert.match(src, /decodePool\.runPriority\(/, "media-viewer must open via the priority lane");
+  // open_content does a connect-lock-bound reauth (single holder), so concurrent
+  // opens (e.g. the Stacked bundle view's embedded viewers) MUST serialize or the
+  // second races the lock and fails "busy". It must NOT go through the concurrent
+  // decode pool.
+  assert.match(src, /serial\(\(\) =>\s*\n?\s*call<[^>]*>\("open_content"/, "media-viewer must open via serial()");
+  assert.doesNotMatch(src, /decodePool/, "media-viewer must not open through the concurrent decodePool");
 });
 
 test("feed-screen teardown flushes decodePool.cancelPending", () => {

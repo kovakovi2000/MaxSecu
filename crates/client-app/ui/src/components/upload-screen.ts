@@ -1,17 +1,29 @@
 import { call, on } from "../core/rpc.ts";
 import { serial } from "../core/serial.ts";
 import { setBusy, clearBusy } from "../core/busy.ts";
-import type { PreparePhase, UploadKind, UploadPreview } from "../core/types.ts";
+import type { PreparePhase, UploadPreview } from "../core/types.ts";
+import { detectKind } from "../core/composer.ts";
+import type { MediaKind } from "../core/composer.ts";
 import { normalizeOptions, resolutionForPreset, suggestKbps } from "../core/transcode-opts.ts";
 import type { Bitrate, Resolution } from "../core/transcode-opts.ts";
+
+// Human labels for the auto-detected file kind (shown next to the file field so
+// the user sees what the post will be without choosing a type).
+const DETECTED_LABEL: Record<MediaKind, string> = {
+  image: "Image",
+  video: "Video (will transcode)",
+  generic: "File (download-only)",
+};
 import "./video-player.ts";
 import type { VideoPlayer } from "./video-player.ts";
 import "./bundle-composer.ts";
 
-// Upload (spec §5): choose Image (file path), Blog (body text) or Video (a real
-// video file path + a resolution/bitrate menu) + title/tags → Preview
-// (stage_upload — transcodes/encrypts LOCALLY, NO network write) → Confirm
-// (confirm_upload — staged → resumable PUT → finalize, routed through serial()).
+// Upload (spec §5): pick a File (its kind is AUTO-DETECTED from the extension —
+// image / video / generic download-only; no manual type picker) or write a Text
+// post + title/tags → Preview (stage_upload — transcodes/encrypts LOCALLY, NO
+// network write) → Confirm (confirm_upload — staged → resumable PUT → finalize,
+// routed through serial()). A detected video reveals the resolution/bitrate menu;
+// anything not an image/video extension uploads as a generic download-only file.
 //
 // For a Video the stage runs the CONFINED ffmpeg ingest + transcode worker against
 // the chosen real video file (only its PATH crosses the seam — no bytes); the
@@ -29,6 +41,10 @@ export class UploadScreen extends HTMLElement {
   // no transcode is running). Always cleared on completion/cancel/failure and on
   // teardown so no listener leaks.
   private prepareUnlisten: (() => void) | null = null;
+  // The kind auto-detected from the chosen file's extension (image/video/generic).
+  // Drives the video-shaping controls' visibility and the submit path. Recomputed
+  // whenever the file path changes (browse or manual edit).
+  private detectedKind: MediaKind = "image";
 
   connectedCallback() {
     this.innerHTML = `
@@ -40,23 +56,20 @@ export class UploadScreen extends HTMLElement {
         </div>
         <div id="up-single">
         <form id="up-form">
-          <label>Type
-            <select name="kind">
-              <option value="image">Image</option>
-              <option value="blog">Blog</option>
-              <option value="video">Video</option>
+          <label>Post kind
+            <select name="mode">
+              <option value="file">File (auto-detected)</option>
+              <option value="text">Text post</option>
             </select></label>
-          <div id="path-row">
-            <label>Image file path
+          <div id="file-row">
+            <label>File
               <input name="path" type="text" autocomplete="off" /></label>
-            <button id="pick-image" type="button" aria-label="Browse for an image file">Browse…</button>
+            <button id="pick-file" type="button" aria-label="Browse for a file">Browse…</button>
+            <p id="up-detected" class="up-detected" aria-live="polite"></p>
           </div>
           <label id="body-row" hidden>Post body
             <textarea name="content" rows="6"></textarea></label>
           <div id="video-row" hidden>
-            <label>Video file
-              <input name="vpath" type="text" autocomplete="off" /></label>
-            <button id="pick-video" type="button" aria-label="Browse for a video file">Browse…</button>
             <label>Resolution
               <select name="resolution">
                 <option value="original">Original (keep source)</option>
@@ -116,18 +129,28 @@ export class UploadScreen extends HTMLElement {
     singleBtn.addEventListener("click", () => setMode("single"));
     bundleBtn.addEventListener("click", () => setMode("bundle"));
     const form = this.querySelector("#up-form") as HTMLFormElement;
-    const kind = form.querySelector('select[name="kind"]') as HTMLSelectElement;
-    const pathRow = this.querySelector("#path-row") as HTMLElement;
+    const mode = form.querySelector('select[name="mode"]') as HTMLSelectElement;
+    const fileRow = this.querySelector("#file-row") as HTMLElement;
     const bodyRow = this.querySelector("#body-row") as HTMLElement;
     const videoRow = this.querySelector("#video-row") as HTMLElement;
-    const syncKind = () => {
-      const k = kind.value;
-      pathRow.hidden = k !== "image";
-      bodyRow.hidden = k !== "blog";
-      videoRow.hidden = k !== "video";
+    const pathInput = form.querySelector('input[name="path"]') as HTMLInputElement;
+    const detected = this.querySelector("#up-detected") as HTMLElement;
+    // Auto-detect the picked file's kind (image/video/generic) from its extension —
+    // no manual type picker. The video-shaping controls appear ONLY for a detected
+    // video; a non-image/-video extension uploads as a generic download-only file.
+    // "Text post" mode has no file (an explicit choice, since text can't be sniffed).
+    const refresh = () => {
+      const isText = mode.value === "text";
+      fileRow.hidden = isText;
+      bodyRow.hidden = !isText;
+      const path = pathInput.value.trim();
+      this.detectedKind = path ? detectKind(path) : "image";
+      videoRow.hidden = isText || this.detectedKind !== "video";
+      detected.textContent = isText || !path ? "" : `Detected: ${DETECTED_LABEL[this.detectedKind]}`;
     };
-    kind.addEventListener("change", syncKind);
-    syncKind();
+    mode.addEventListener("change", refresh);
+    pathInput.addEventListener("input", refresh);
+    refresh();
 
     // Resolution/bitrate menu wiring. Custom W/H are revealed only for "custom".
     // Changing resolution AWAY from Original auto-suggests a starting bitrate
@@ -176,24 +199,20 @@ export class UploadScreen extends HTMLElement {
     chInput.addEventListener("input", onCustomDims);
     customRes.hidden = resSel.value !== "custom";
 
-    // "Browse…" opens the native OS file dialog (pick_file) and drops the chosen
-    // path into the matching text field — no bytes cross here, only a path.
-    const pathInput = form.querySelector('input[name="path"]') as HTMLInputElement;
-    const vpathInput = form.querySelector('input[name="vpath"]') as HTMLInputElement;
-    const pickInto = async (input: HTMLInputElement, extensions: string[]) => {
+    // "Browse…" opens the native OS file dialog (pick_file, ANY file) and drops the
+    // chosen path into the field — no bytes cross here, only a path. Detection then
+    // runs on the resulting value (reveals the video controls for a video, etc.).
+    this.querySelector("#pick-file")?.addEventListener("click", async () => {
       try {
-        const p = await call<string | null>("pick_file", { extensions });
-        if (p) input.value = p;
+        const p = await call<string | null>("pick_file", { extensions: [] });
+        if (p) {
+          pathInput.value = p;
+          refresh();
+        }
       } catch (x) {
         (this.querySelector("#up-status") as HTMLElement).textContent =
           errMsg(x, "Could not open the file dialog.");
       }
-    };
-    this.querySelector("#pick-image")?.addEventListener("click", () => {
-      void pickInto(pathInput, ["png", "jpg", "jpeg", "webp", "gif", "bmp"]);
-    });
-    this.querySelector("#pick-video")?.addEventListener("click", () => {
-      void pickInto(vpathInput, ["mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg", "wmv", "flv", "ts"]);
     });
 
     form.addEventListener("submit", (e) => this.onPreview(e, form));
@@ -205,37 +224,41 @@ export class UploadScreen extends HTMLElement {
     const submitBtn = form.querySelector('button[type="submit"]') as HTMLButtonElement;
     status.textContent = "Preparing…";
     const d = new FormData(form);
-    const kind = (d.get("kind") as UploadKind) ?? "image";
+    const mode = String(d.get("mode") ?? "file");
     const tags = String(d.get("tags") ?? "").split(",").map((t) => t.trim()).filter((t) => t.length > 0);
-    const req: Record<string, unknown> = { kind, title: d.get("title"), tags };
-    if (kind === "blog") {
+    const req: Record<string, unknown> = { title: d.get("title"), tags };
+    if (mode === "text") {
+      req.kind = "blog";
       req.content = d.get("content");
-    } else if (kind === "video") {
-      const vpath = String(d.get("vpath") ?? "").trim();
-      if (!vpath) {
-        status.textContent = "Choose a video file.";
+    } else {
+      const path = String(d.get("path") ?? "").trim();
+      if (!path) {
+        status.textContent = "Choose a file.";
         return;
       }
-      // Build the transcode shaping options from the menu. The JSON shape mirrors
-      // the Rust `TranscodeOptions` enum; normalizeOptions clamps as a UX nicety
-      // (the Rust side ALWAYS re-clamps against the authoritative VideoBounds).
-      const resVal = String(d.get("resolution") ?? "original");
-      let resolution: Resolution;
-      if (resVal === "original") {
-        resolution = "Original";
-      } else if (resVal === "custom") {
-        resolution = { Custom: { width: Number(d.get("cw")), height: Number(d.get("ch")) } };
-      } else {
-        resolution = resolutionForPreset(resVal);
+      // Kind is AUTO-DETECTED from the file (image/video/generic) — no type picker.
+      const kind = this.detectedKind;
+      req.kind = kind;
+      req.path = path;
+      if (kind === "video") {
+        // Build the transcode shaping options from the menu. The JSON shape mirrors
+        // the Rust `TranscodeOptions` enum; normalizeOptions clamps as a UX nicety
+        // (the Rust side ALWAYS re-clamps against the authoritative VideoBounds).
+        const resVal = String(d.get("resolution") ?? "original");
+        let resolution: Resolution;
+        if (resVal === "original") {
+          resolution = "Original";
+        } else if (resVal === "custom") {
+          resolution = { Custom: { width: Number(d.get("cw")), height: Number(d.get("ch")) } };
+        } else {
+          resolution = resolutionForPreset(resVal);
+        }
+        const bitrate: Bitrate = d.get("origbitrate") != null ? "Original" : { Kbps: Number(d.get("kbps")) };
+        req.options = normalizeOptions({ resolution, bitrate });
+        // Video: stage under a live transcode-progress + Cancel UI (own path).
+        await this.previewVideo(req, status, submitBtn);
+        return;
       }
-      const bitrate: Bitrate = d.get("origbitrate") != null ? "Original" : { Kbps: Number(d.get("kbps")) };
-      req.path = vpath;
-      req.options = normalizeOptions({ resolution, bitrate });
-      // Video: stage under a live transcode-progress + Cancel UI (own path).
-      await this.previewVideo(req, status, submitBtn);
-      return;
-    } else {
-      req.path = d.get("path");
     }
     try {
       const preview = await call<UploadPreview>("stage_upload", { req });
