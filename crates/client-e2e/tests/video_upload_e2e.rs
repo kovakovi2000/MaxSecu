@@ -57,7 +57,9 @@ use maxsecu_client_core::{
 use maxsecu_crypto::{sha256, EncPublicKey, SigningKey, WrappedDek};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::types::{FileType, Id, Role, StreamType, Timestamp};
-use maxsecu_media_launcher::TranscodeOptions;
+use maxsecu_media_launcher::{
+    plan_ingest, probe_source, AudioCodec, H264Encoder, TranscodeOptions, VideoCodec,
+};
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuthConfig, AuthService, FsBlobStore, MemoryStore,
 };
@@ -621,4 +623,129 @@ async fn phase7_video_upload_over_real_tls() {
     );
 
     let _ = std::fs::remove_dir_all(&blob_dir);
+}
+
+/// GATE C (fast-ingest copy path, NO network): an ALREADY-player-compatible source
+/// (H.264 8-bit-4:2:0 video + AAC audio, at Original res/bitrate) must be classified
+/// copyable by `probe_source` + `plan_ingest` and stream-COPIED — NOT re-encoded —
+/// while still producing a valid, streamable canonical fMP4 with a parseable fragment
+/// index. This exercises the new remux-first fast path that the raw-`.y4m` re-encode
+/// gate (`phase7_video_upload_over_real_tls`) does not: there, `plan_ingest` forces a
+/// re-encode; here, both streams are copy-eligible so no H.264 encoder rung runs at all.
+///
+/// The H.264/AAC fixture is synthesized UNCONFINED with the vendored ffmpeg (fixture
+/// creation is not the code under test); the probe/plan/copy that ARE under test all run
+/// under the same full AppContainer/Job-Object confinement as the re-encode gate.
+#[tokio::test]
+async fn copy_path_taken_for_h264_aac_source() {
+    let Some(ffmpeg) = vendored_ffmpeg() else {
+        eprintln!(
+            "SKIP copy_path_taken_for_h264_aac_source: vendored ffmpeg \
+             (vendor/ffmpeg/ffmpeg.exe) not present; run scripts/fetch-ffmpeg.ps1 to exercise the \
+             confined copy path."
+        );
+        return;
+    };
+
+    // ---- 1) Synthesize an H.264/AAC MP4 fixture UNCONFINED (not the code under test) ----
+    let jobdir = temp_dir("copy");
+    let src_mp4 = jobdir.join("source.mp4");
+    let status = std::process::Command::new(&ffmpeg)
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=30:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+        ])
+        .arg(&src_mp4)
+        .status()
+        .expect("spawn ffmpeg to build the H.264/AAC fixture");
+    assert!(status.success(), "fixture ffmpeg exited non-zero");
+    assert!(
+        std::fs::metadata(&src_mp4).map(|m| m.len()).unwrap_or(0) > 0,
+        "fixture H.264/AAC MP4 is non-empty"
+    );
+
+    // ---- 2) Probe (confined `ffmpeg -i`): classify the source ----
+    let probe = probe_source(&ffmpeg, &src_mp4, &jobdir).expect("confined probe of the fixture");
+    assert_eq!(probe.video, VideoCodec::H264, "fixture video is H.264");
+    assert!(
+        probe.video_8bit_420,
+        "yuv420p fixture is plain 8-bit 4:2:0 (copy-eligible)"
+    );
+    assert_eq!(probe.audio, AudioCodec::Aac, "fixture audio is AAC");
+
+    // ---- 3) Plan (the core gate): H.264/AAC 8-bit @ Original must stream-COPY ----
+    let plan = plan_ingest(&probe, &TranscodeOptions::default());
+    assert!(
+        !plan.reencode_video,
+        "H.264/AAC 8-bit original must stream-copy, not re-encode"
+    );
+    assert!(!plan.reencode_audio, "AAC audio must stream-copy");
+
+    // ---- 4) Copy produces a valid, streamable fMP4 (confined, NO network) ----
+    //
+    // Same structural no-network guarantee as GATE T: `prepare_video_streams` takes only
+    // local paths / a progress sink / a cancel flag / the session encoder cache — no
+    // transport in scope. Because `plan_ingest` chose copy, the H.264 encoder ladder
+    // (NVENC/AMF/x264) does not run at all; `encoder_cache` stays `None`.
+    let enc_cache: std::sync::Mutex<Option<H264Encoder>> = std::sync::Mutex::new(None);
+    let prepared = prepare_video_streams(
+        &src_mp4,
+        &ffmpeg,
+        &TranscodeOptions::default(),
+        &VideoBounds::default(),
+        2,
+        "Copy clip",
+        &["beach".to_owned()],
+        |_p| {},
+        &std::sync::atomic::AtomicBool::new(false),
+        &enc_cache,
+    )
+    .expect("GATE C: the confined copy path produced canonical streams");
+    assert!(
+        enc_cache.lock().unwrap().is_none(),
+        "GATE C: copy path ran no H.264 encoder rung (encoder cache stays unset)"
+    );
+
+    // The copy output is a real, non-empty fMP4 on disk with a parseable fragment index
+    // (the author→view contract) — proving the fast path yields a valid streamable fMP4.
+    let content = std::fs::read(&prepared.out_mp4_path).expect("read copied fMP4");
+    assert!(!content.is_empty(), "GATE C: copied content is non-empty");
+    assert!(
+        !prepared.fragments.is_empty(),
+        "GATE C: the copy produced at least one canonical fragment"
+    );
+    let meta_json: serde_json::Value =
+        serde_json::from_slice(&prepared.metadata).expect("metadata is JSON");
+    let parsed = parse_fragment_index(&meta_json).expect("GATE C: fragment index parses");
+    assert_eq!(
+        parsed.len(),
+        prepared.fragments.len(),
+        "GATE C: the parsed index matches the copy output's fragments"
+    );
+    let last = parsed.last().unwrap();
+    let total_chunks = (content.len() as u64).div_ceil(CHUNK as u64);
+    assert_eq!(
+        last.chunk_start + last.chunk_len,
+        total_chunks,
+        "GATE C: fragment ranges cover the copied content's chunk count exactly"
+    );
+
+    let _ = std::fs::remove_dir_all(&prepared.job_dir);
+    let _ = std::fs::remove_dir_all(&jobdir);
 }
