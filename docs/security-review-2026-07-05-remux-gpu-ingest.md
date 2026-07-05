@@ -6,7 +6,7 @@
 
 **Companion to / builds on:** `docs/security-review-universal-video-ingest.md` (the embedded-ffmpeg confinement model this extends), `docs/security-review-phase7-mediaapp.md` (the AppContainer + Job Object decode-isolation model), and `docs/media-sandbox.md`.
 
-**Verdict:** **PASS** — no Critical/High/Medium open against the committed path. Confinement is **UNCHANGED**; no GPU-device grant or capability relaxation was added; the server sees exactly today's ciphertext (no new plaintext/metadata). The one residual (real GPU-encode under confinement) is deferred behind a driver update + an in-container spike and carries **no code residual** — the ladder already degrades to confined x264.
+**Verdict:** **PASS** — no Critical/High/Medium open against the committed path. Confinement is **UNCHANGED**; no GPU-device grant or capability relaxation was added; the server sees exactly today's ciphertext (no new plaintext/metadata). The former GPU residual is now **resolved**: with an adequate driver, NVENC **and** AMF were confirmed to initialize **inside the full confinement** (spike, 2026-07-05) — full GPU speed at zero security cost; on a host with too-old a driver the ladder degrades to confined x264.
 
 ---
 
@@ -36,12 +36,12 @@ Every ffmpeg spawn on the ingest path runs under the **identical** Phase-7 confi
 
 This holds for **all three** spawn kinds — the **probe** (`ffmpeg -i`), the **copy** (`-c copy`), and **every re-encode rung** (NVENC/AMF/x264). **No relaxation, no GPU-device grant, and no new capability was added.**
 
-**The "relax for GPU" option was NOT taken.** The design contemplated granting the confined process access to a GPU device to let NVENC/AMF initialize. The GPU-encode spike found this unnecessary on the current machine: NVENC and AMF **do not initialize at all**, for a driver/runtime **version** reason independent of confinement —
+**The "relax for GPU" option was NOT taken — and the spike proved it is unnecessary.** The design contemplated granting the confined process access to a GPU device to let NVENC/AMF initialize. The GPU-encode spike (`crates/media-launcher/tests/gpu_confined_spike.rs`, run 2026-07-05 on an RTX 5090 + AMD iGPU) established two things:
 
-- NVENC: *"Required nvenc API 13.1, Found 13.0, min driver 610.00"* (the vendored ffmpeg is newer than the installed NVIDIA driver);
-- AMF: `AMFQueryVersion failed`.
+1. **Initial driver gap (since resolved by the operator).** On the first run NVENC/AMF failed to load *even unconfined*, for a driver/runtime **version** reason independent of confinement (NVENC: *"Required nvenc API 13.1, Found 13.0, min driver 610.00"* — the vendored ffmpeg was newer than the installed NVIDIA driver; AMF: `AMFQueryVersion failed`). After the operator updated the NVIDIA driver (to `32.0.16.1062`), both encoders load unconfined.
+2. **GPU initializes INSIDE the full confinement.** With a working driver, `h264_nvenc` **and** `h264_amf` both run to a valid non-empty output through the *unchanged* `FfmpegLauncher` — the same capability-free AppContainer + low-IL + no-network + Job-Object confinement listed above (`nvenc_initializes_inside_appcontainer` / `amf_initializes_inside_appcontainer`, both exit 0). **The sandbox does not block GPU device / driver-DLL access.**
 
-Because the GPU encoders fail to load on this host regardless of sandboxing, **no relaxation was needed** — the ladder simply falls through to confined x264. When the driver is updated, whether NVENC initializes **under full confinement** is the open spike; only if it fails there would a separately user-approved, narrowly-scoped device grant even be considered, and that would be a security-reviewed change.
+Therefore the app uses hardware H.264 encoding with **zero confinement relaxation, no GPU-device grant, and no new capability** — keys and network stay blocked to the process decoding attacker media. The only host dependency is a GPU driver new enough for the vendored ffmpeg's NVENC/AMF API; on a host without one, the ladder transparently falls through to confined x264.
 
 ---
 
@@ -96,7 +96,7 @@ Both pass on this GPU-less host (NVENC/AMF unavailable per §2; the re-encode la
 
 | Residual | Severity | Disposition |
 |---|---|---|
-| **Real GPU (NVENC/AMF) encode** | Deferred (functional) | Blocked by a host driver/runtime **version** gap (vendored ffmpeg newer than the installed NVIDIA driver; AMF query fails), **independent of confinement**. **No code residual** — the ladder already degrades to confined x264. On a driver update, the open spike is whether NVENC initializes **under full confinement**; a device grant would only be considered if it fails there, and would be a separately user-approved, security-reviewed change. |
+| **Real GPU (NVENC/AMF) encode** | Resolved | Initially blocked by a host driver **version** gap; after a driver update, NVENC **and** AMF were confirmed (spike, 2026-07-05) to initialize and produce valid output **inside the unchanged full confinement** — no device grant, no relaxation. Only host dependency: a GPU driver new enough for the vendored ffmpeg's NVENC/AMF API. Too-old a driver → transparent fall-through to confined x264. |
 | **Copy path inherits source GOP** | Low (QoE, not security) | Unlike the re-encode path (`-g 48` ≈ 1 s fragments), a stream-copied source keeps its own keyframe interval, so `VideoBounds::max_fragment_bytes` (16 MiB) is **not** enforced on copy output. This is **not** a correctness/security break: the fragment seek index is **byte-based and GOP-agnostic** (`chunk_grouped_index` maps 1 MiB byte bands, `pts_ms=0`), range serving is byte-ranged under the 2 MiB cap, and `+global_sidx` supplies the time→byte seek index for copy and encode alike. A pathological long-GOP / sparse-keyframe source only yields larger moof fragments → **coarser seek granularity + higher time-to-first-frame** (the least-tested new behavior). `max_fragment_bytes` was never hard-asserted against actual output even pre-change; the copy path merely widens that pre-existing gap. |
 
 **Standing.** The Phase-7 / universal-video-ingest view-side and confinement residuals stand unchanged; the sandbox **contains, it does not eliminate**. Treat any change to a confined process's privilege, the canonical format, the ffmpeg pin/argv, or the copy-eligibility gate as a security-reviewed change.
