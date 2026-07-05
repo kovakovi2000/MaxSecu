@@ -37,14 +37,11 @@ use maxsecu_client_core::video::VideoBounds;
 use crate::probe::{AudioCodec, ProbeResult, VideoCodec};
 use crate::transcode_opts::{Bitrate, Resolution, TranscodeOptions};
 
-/// Default constant-quality `-crf` used when the caller leaves the bitrate at
-/// [`Bitrate::Original`], on a 0..=63 scale (lower = better). Retained for callers
-/// that still reference the canonical high-quality target; the H.264 CPU fallback
-/// uses [`DEFAULT_X264_CRF`] below.
+/// Default libx264 CRF for the CPU fallback (visually near-lossless), on a 0..=51
+/// scale (lower = better). Used when the caller leaves the bitrate at
+/// [`Bitrate::Original`]; an explicit [`Bitrate::Kbps`] switches to `-b:v` instead.
 pub const DEFAULT_CRF: u32 = 18;
 
-/// Default libx264 CRF for the CPU fallback (visually near-lossless).
-pub const DEFAULT_X264_CRF: u32 = 18;
 /// Default NVENC constant-quality value (near-transparent H.264).
 pub const DEFAULT_NVENC_CQ: u32 = 19;
 /// Default AMF constant-QP value.
@@ -81,10 +78,15 @@ pub enum VideoArg { Copy, Encode(H264Encoder) }
 pub struct IngestPlan { pub reencode_video: bool, pub reencode_audio: bool }
 
 /// Decide per-stream copy-vs-reencode from the probe + shaping options. A video
-/// stream is copyable only if already H.264/AV1 AND no rescale/re-rate is asked
-/// (copy cannot filter). Audio is copyable iff already AAC (or absent).
+/// stream is copyable only if already H.264/AV1, **already a plain 8-bit 4:2:0**
+/// (`probe.video_8bit_420`), AND no rescale/re-rate is asked (copy cannot filter).
+/// A 10/12-bit, HDR, or 4:2:2/4:4:4 source — even if H.264/AV1 — is re-encoded to
+/// 8-bit 4:2:0 H.264 so it is guaranteed to play in the WebView2 `<video>` decoder
+/// (a deliberate conservative tradeoff: guaranteed playability over a lossless copy).
+/// Audio is copyable iff already AAC (or absent).
 pub fn plan_ingest(probe: &ProbeResult, opts: &TranscodeOptions) -> IngestPlan {
     let vid_copy_ok = matches!(probe.video, VideoCodec::H264 | VideoCodec::Av1)
+        && probe.video_8bit_420
         && matches!(opts.resolution, Resolution::Original)
         && matches!(opts.bitrate, Bitrate::Original);
     let aud_reencode = matches!(probe.audio, AudioCodec::Opus | AudioCodec::Mp3 | AudioCodec::Other);
@@ -225,7 +227,7 @@ pub fn build_ingest_args(
                     match opts.bitrate {
                         Bitrate::Original => {
                             arg!("-crf");
-                            arg!(DEFAULT_X264_CRF.to_string());
+                            arg!(DEFAULT_CRF.to_string());
                         }
                         Bitrate::Kbps(n) => {
                             arg!("-b:v");
@@ -353,7 +355,7 @@ mod tests {
     #[test]
     fn plan_copy_when_h264_aac_original() {
         use crate::probe::{AudioCodec, ProbeResult, VideoCodec};
-        let p = ProbeResult { video: VideoCodec::H264, audio: AudioCodec::Aac };
+        let p = ProbeResult { video: VideoCodec::H264, audio: AudioCodec::Aac, video_8bit_420: true };
         let plan = plan_ingest(&p, &TranscodeOptions::default());
         assert!(!plan.reencode_video && !plan.reencode_audio);
     }
@@ -361,7 +363,7 @@ mod tests {
     #[test]
     fn plan_reencodes_video_when_hevc_and_audio_when_opus() {
         use crate::probe::{AudioCodec, ProbeResult, VideoCodec};
-        let p = ProbeResult { video: VideoCodec::Hevc, audio: AudioCodec::Opus };
+        let p = ProbeResult { video: VideoCodec::Hevc, audio: AudioCodec::Opus, video_8bit_420: false };
         let plan = plan_ingest(&p, &TranscodeOptions::default());
         assert!(plan.reencode_video && plan.reencode_audio);
     }
@@ -369,7 +371,7 @@ mod tests {
     #[test]
     fn plan_reencodes_video_when_rescale_requested_even_if_h264() {
         use crate::probe::{AudioCodec, ProbeResult, VideoCodec};
-        let p = ProbeResult { video: VideoCodec::H264, audio: AudioCodec::Aac };
+        let p = ProbeResult { video: VideoCodec::H264, audio: AudioCodec::Aac, video_8bit_420: true };
         let opts = TranscodeOptions { resolution: Resolution::Height(720), bitrate: Bitrate::Original };
         let plan = plan_ingest(&p, &opts);
         assert!(plan.reencode_video);
@@ -377,9 +379,20 @@ mod tests {
     }
 
     #[test]
+    fn plan_reencodes_video_when_10bit_even_if_h264_original() {
+        // A 10-bit H.264 at Original res is NOT copy-safe (WebView2 can't decode it):
+        // the 8-bit-4:2:0 gate forces a re-encode.
+        use crate::probe::{AudioCodec, ProbeResult, VideoCodec};
+        let p = ProbeResult { video: VideoCodec::H264, audio: AudioCodec::Aac, video_8bit_420: false };
+        let plan = plan_ingest(&p, &TranscodeOptions::default());
+        assert!(plan.reencode_video, "10-bit source must re-encode even at Original");
+        assert!(!plan.reencode_audio);
+    }
+
+    #[test]
     fn plan_no_audio_reencode_when_absent() {
         use crate::probe::{AudioCodec, ProbeResult, VideoCodec};
-        let p = ProbeResult { video: VideoCodec::Av1, audio: AudioCodec::None };
+        let p = ProbeResult { video: VideoCodec::Av1, audio: AudioCodec::None, video_8bit_420: true };
         let plan = plan_ingest(&p, &TranscodeOptions::default());
         assert!(!plan.reencode_video && !plan.reencode_audio);
     }
@@ -399,8 +412,21 @@ mod tests {
             .expect("output path present");
         assert!(!args[..out_idx].iter().any(|a| a == "-vf"), "copy main output must not scale");
         assert!(!contains(&args, "-pix_fmt"));
+        // Copy carries no encoder GOP flag either (nothing is being encoded).
+        assert!(!contains(&args, "-g"), "copy must not set an encoder GOP");
         assert_eq!(value_after(&args, "-movflags"), "+frag_keyframe+empty_moov+default_base_moof+global_sidx");
         assert_eq!(value_after(&args, "-frames:v"), "1");
+    }
+
+    #[test]
+    fn copy_video_but_reencode_audio() {
+        // A copyable H.264 video with a non-AAC audio track: copy the video, re-encode
+        // only the audio to AAC.
+        let (i, o, t) = paths();
+        let args = build_ingest_args(&i, &o, &t, VideoArg::Copy, true, &TranscodeOptions::default(), &bounds(), 4);
+        assert_eq!(value_after(&args, "-c:v"), "copy");
+        assert_eq!(value_after(&args, "-c:a"), "aac");
+        assert_eq!(value_after(&args, "-b:a"), AUDIO_BITRATE);
     }
 
     #[test]

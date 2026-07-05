@@ -15,23 +15,63 @@ pub enum VideoCodec { H264, Hevc, Av1, Vp9, Vp8, Other }
 pub enum AudioCodec { Aac, Opus, Mp3, Other, None }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProbeResult { pub video: VideoCodec, pub audio: AudioCodec }
+pub struct ProbeResult {
+    pub video: VideoCodec,
+    pub audio: AudioCodec,
+    /// FACT reported by the classifier: the real video stream's pixel format is a
+    /// plain 8-bit 4:2:0 the WebView2 player reliably decodes (so the stream is a
+    /// copy candidate). 10/12-bit, HDR, or 4:2:2/4:4:4 → `false` (must re-encode).
+    /// No video stream → `false` (irrelevant; nothing to copy).
+    pub video_8bit_420: bool,
+}
 
-/// Parse ffmpeg stderr for the FIRST `… Video: <codec>` and `… Audio: <codec>`
-/// tokens. No video line → `Other`; no audio line → `None`.
+/// Parse ffmpeg stderr for the FIRST real `Stream #… Video: <codec>` and
+/// `Stream #… Audio: <codec>` tokens. Only lines containing `"Stream #"` are
+/// considered, so the Input/Metadata block (filename, `title`, `comment`) can never
+/// false-match — a source named `My Video: h264.mkv` cannot spoof the codec. An
+/// `attached pic` video line (cover art on an audio file) is NOT a real video stream
+/// and is skipped. No video line → `Other`; no audio line → `None`.
 pub fn parse_probe(stderr: &[u8]) -> ProbeResult {
     let text = String::from_utf8_lossy(stderr);
     let mut video: Option<VideoCodec> = None;
+    let mut video_8bit_420 = false;
     let mut audio: Option<AudioCodec> = None;
     for line in text.lines() {
-        if video.is_none() {
-            if let Some(tok) = codec_after(line, "Video:") { video = Some(classify_video(&tok)); }
+        // Only stream-declaration lines carry real codec info; skip the
+        // Input/Metadata/filename block entirely.
+        if !line.contains("Stream #") {
+            continue;
+        }
+        // Cover art (`attached pic`) is a still image, not a real video track.
+        if video.is_none() && !line.contains("attached pic") {
+            if let Some(tok) = codec_after(line, "Video:") {
+                video = Some(classify_video(&tok));
+                video_8bit_420 = is_8bit_420(line);
+            }
         }
         if audio.is_none() {
             if let Some(tok) = codec_after(line, "Audio:") { audio = Some(classify_audio(&tok)); }
         }
     }
-    ProbeResult { video: video.unwrap_or(VideoCodec::Other), audio: audio.unwrap_or(AudioCodec::None) }
+    ProbeResult {
+        video: video.unwrap_or(VideoCodec::Other),
+        audio: audio.unwrap_or(AudioCodec::None),
+        video_8bit_420,
+    }
+}
+
+/// True iff the ffmpeg video stream line shows a plain 8-bit 4:2:0 pixel format
+/// (yuv420p / yuvj420p / nv12) — NOT 10/12-bit or 4:2:2/4:4:4. Conservative: an
+/// unparseable/absent pix_fmt returns false (→ re-encode, which guarantees a
+/// player-safe output).
+fn is_8bit_420(video_line: &str) -> bool {
+    let l = video_line;
+    let high_bit = l.contains("10le") || l.contains("10be") || l.contains("12le")
+        || l.contains("12be") || l.contains("p010") || l.contains("yuv420p10")
+        || l.contains("yuv420p12");
+    let high_subsampling = l.contains("yuv422") || l.contains("yuv444");
+    let ok_420 = l.contains("yuv420p") || l.contains("yuvj420p") || l.contains("nv12");
+    ok_420 && !high_bit && !high_subsampling
 }
 
 /// The codec token right after `marker` on a line: the run of `[a-z0-9]` after the
@@ -95,17 +135,48 @@ At least one output file must be specified\n";
 
     const VP9_NOAUDIO: &[u8] = b"  Stream #0:0: Video: vp9 (Profile 0), yuv420p, 1280x720\n";
 
+    // A hostile filename + metadata that both contain `Video: h264` BEFORE the real
+    // (HEVC) stream line. The parser must anchor on `Stream #` and ignore these.
+    const TRICKY_FILENAME: &[u8] = b"\
+Input #0, matroska,webm, from '/jobs/My Video: h264 remaster.mkv':\n\
+  Metadata:\n\
+    title           : Video: h264 fake\n\
+  Stream #0:0: Video: hevc (Main) (hev1 / 0x31766568), yuv420p10le, 3840x2160\n";
+
+    // An MP3 with attached cover art (mjpeg still image) — NOT a real video track.
+    const MP3_COVER: &[u8] = b"\
+Input #0, mp3, from '/jobs/song.mp3':\n\
+  Stream #0:0: Video: mjpeg (Baseline) (attached pic), yuvj420p(pc), 600x600\n\
+  Stream #0:1: Audio: mp3, 44100 Hz, stereo, fltp, 320 kb/s\n";
+
     #[test]
     fn parses_h264_aac() {
         let r = parse_probe(H264_AAC);
         assert_eq!(r.video, VideoCodec::H264);
         assert_eq!(r.audio, AudioCodec::Aac);
+        assert!(r.video_8bit_420, "yuv420p source is 8-bit 4:2:0");
     }
     #[test]
     fn parses_hevc_opus() {
         let r = parse_probe(HEVC_OPUS);
         assert_eq!(r.video, VideoCodec::Hevc);
         assert_eq!(r.audio, AudioCodec::Opus);
+        assert!(!r.video_8bit_420, "yuv420p10le is 10-bit, not copy-safe");
+    }
+    #[test]
+    fn stream_anchor_ignores_filename_and_metadata() {
+        // `Video: h264` appears in the filename and title lines; the real stream is
+        // HEVC. Anchoring on `Stream #` must yield Hevc, not H264.
+        let r = parse_probe(TRICKY_FILENAME);
+        assert_eq!(r.video, VideoCodec::Hevc);
+        assert!(!r.video_8bit_420);
+    }
+    #[test]
+    fn attached_cover_art_is_not_a_video_stream() {
+        let r = parse_probe(MP3_COVER);
+        assert_eq!(r.video, VideoCodec::Other, "attached pic is not a real video");
+        assert_eq!(r.audio, AudioCodec::Mp3);
+        assert!(!r.video_8bit_420);
     }
     #[test]
     fn no_audio_stream_is_none() {
