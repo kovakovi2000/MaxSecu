@@ -476,7 +476,8 @@ async fn open_video_inner(
     // server length was unusable (`settings`/`route_mode` were loaded above and are
     // reused for every network fetch in the session).
     let cap = settings.performance.ram_cache_cap_mb as u64 * 1024 * 1024;
-    let cache = FragmentCache::open(&dir.0, cap).map_err(|_| player_err())?;
+    let location = settings.performance.fragment_cache_location;
+    let cache = FragmentCache::open_located(&dir.0, cap, location).map_err(|_| player_err())?;
 
     // Move the open-time authed connection into a persistent channel for all range
     // fetches in this session (probe_total_len + every serve_range). After this point
