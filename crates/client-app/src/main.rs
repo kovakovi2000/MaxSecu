@@ -29,7 +29,8 @@ fn main() {
     // Live-channel cap for the authed connection pool = the persisted feed
     // concurrency (already clamped to 1..=8 by `normalized`). Feed-card decodes
     // borrow up to this many concurrent authed channels; the UI never drives more
-    // than `feed_concurrency` at once.
+    // than `feed_concurrency` at once. Read ONCE at startup — changing
+    // `feed_concurrency` in settings takes effect on the next app restart.
     let pool_cap = normalized.performance.feed_concurrency as usize;
 
     // Initialize the process-wide Tor state (arti state under <app-dir>/config/tor).

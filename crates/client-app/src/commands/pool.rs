@@ -137,6 +137,20 @@ impl<C: Send + 'static> AuthedPool<C> {
         Ok(self.guard_from(conn, permit))
     }
 
+    /// Discard ALL cached idle channels (clear the idle set). A `401` on an authed
+    /// GET means the SESSION token was rejected — server restart or session
+    /// invalidation makes EVERY pooled sibling channel (same-era token) stale, not
+    /// just the one that hit the 401. So a caller that saw a 401 drains the whole idle
+    /// set; the next [`acquire`](Self::acquire) then finds it empty and is FORCED to
+    /// mint a fresh channel via `reauth`, instead of drawing another stale sibling.
+    /// Permits for currently-BORROWED channels are untouched (their guards still hold
+    /// them); those channels are individually discarded by their borrowers via
+    /// [`PooledGuard::mark_bad`].
+    pub fn drain_idle(&self) {
+        let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        idle.clear();
+    }
+
     /// Pop the newest idle channel that is still within the reuse window, discarding
     /// (dropping/closing) any expired ones encountered.
     fn take_fresh_idle(&self) -> Option<PooledConn<C>> {
@@ -339,6 +353,35 @@ mod tests {
         // The next acquire must mint a fresh channel (nothing to reuse).
         drop(pool.acquire(|| auth.mint()).await.unwrap());
         assert_eq!(auth.total.load(Ordering::SeqCst), 2, "bad channel forces a re-auth");
+    }
+
+    #[tokio::test]
+    async fn authed_pool_drain_idle_forces_fresh_mint_over_a_stale_sibling() {
+        // cap=2 so a sibling channel can sit idle while another is (was) borrowed.
+        let pool = AuthedPool::<FakeChan>::new(2);
+        let auth = FakeAuth::default();
+
+        // Mint two channels, return BOTH to idle (2 stale siblings pooled).
+        let a = pool.acquire(|| auth.mint()).await.unwrap();
+        let b = pool.acquire(|| auth.mint()).await.unwrap();
+        let (a_id, b_id) = (a.id, b.id);
+        drop(a);
+        drop(b);
+        assert_eq!(auth.total.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.idle.lock().unwrap().len(), 2, "two siblings pooled");
+
+        // Simulate the decrypt_card 401 path: the current channel is bad AND the whole
+        // session is stale — drain ALL idle siblings, then re-acquire.
+        pool.drain_idle();
+        assert!(pool.idle.lock().unwrap().is_empty(), "drain cleared every sibling");
+
+        // The retry acquire is now FORCED to mint a fresh channel (id 2) — it can NOT
+        // hand back a stale sibling (ids 0/1), which is the bug being guarded against.
+        let fresh = pool.acquire(|| auth.mint()).await.unwrap();
+        assert_eq!(auth.total.load(Ordering::SeqCst), 3, "drain forces a fresh mint");
+        assert_ne!(fresh.id, a_id);
+        assert_ne!(fresh.id, b_id);
+        assert_eq!(fresh.id, 2);
     }
 
     #[tokio::test]

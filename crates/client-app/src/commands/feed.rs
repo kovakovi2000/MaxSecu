@@ -273,11 +273,18 @@ pub async fn decrypt_card(
     // `decrypt_card` calls take DIFFERENT cached channels (no ConnectLock contention,
     // no identity-take on the hot path); only a cold-start / expired channel mints a
     // fresh one via `reauth` (under the pool's auth gate). The §8.5 view GET is the
-    // FIRST use of the (possibly reused) channel, so it is the fail-closed check: if it
-    // returns 401 (pooled token expired mid-life) OR the transport errors (a stale
-    // pooled connection went dead), mark the channel bad — discard it, never reuse a
-    // stale token or a dead socket — and re-acquire ONCE (a fresh `reauth` mint). A 200
-    // here validates the channel+token for the rest of this call's fetches (all within
+    // FIRST use of the (possibly reused) channel, so it is the fail-closed check:
+    //   * 401 — the SESSION token was rejected (expired mid-life, or the server
+    //     restarted / invalidated the session), which makes EVERY pooled sibling
+    //     channel (same-era token) stale, not just this one. So `drain_idle()` the
+    //     whole pool AND `mark_bad()` this channel, then re-acquire ONCE: with idle
+    //     empty the pool is FORCED to mint a genuinely-fresh channel via `reauth`
+    //     (it can't hand back a stale sibling). A SECOND 401 after that fresh mint is a
+    //     genuinely-expired session — surface it as an auth error (`locked`,
+    //     "reconnect"), NOT `fetch_failed` (which would mislabel it "item unavailable").
+    //   * transport error — a stale pooled connection went dead; discard THIS one
+    //     channel and retry once (not session-wide — the token may still be valid).
+    // A 200 validates the channel+token for the rest of this call's fetches (all within
     // the same instant), so the sequence can't 401 downstream; a downstream transport
     // failure returns the channel to the pool and is caught by the next reuse's view GET
     // (self-healing within one decode, never a persistent poison).
@@ -296,8 +303,16 @@ pub async fn decrypt_card(
             let token = c.token.clone();
             match get_json(&mut c.sender, &view_uri, Some(&token), &host).await {
                 Ok((StatusCode::UNAUTHORIZED, _)) if first => {
-                    c.mark_bad(); // stale-token channel — discard + re-auth once.
+                    // Session-wide auth failure: drain every stale sibling + discard this
+                    // channel, forcing the retry to mint a fresh one via reauth.
+                    pool.drain_idle();
+                    c.mark_bad();
                     continue;
+                }
+                Ok((StatusCode::UNAUTHORIZED, _)) => {
+                    // Still 401 after a fresh reauth ⇒ the session is genuinely expired.
+                    c.mark_bad();
+                    return Err(UiError::new("locked", "Your session expired. Reconnect."));
                 }
                 Ok((StatusCode::OK, vj)) => {
                     chan = c;
