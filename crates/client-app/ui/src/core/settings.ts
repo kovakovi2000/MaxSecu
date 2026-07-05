@@ -6,7 +6,7 @@ import { decodePool } from "./pool.ts";
 const DEFAULTS: Settings = {
   a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
   behavior: { confirm_destructive: false },
-  performance: { ram_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4 },
+  performance: { ram_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4, fragment_cache_location: "Disk" },
   connection: { route_mode: "prefer-server" },
   appearance: { theme: "dark" },
 };

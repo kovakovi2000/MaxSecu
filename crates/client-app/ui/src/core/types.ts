@@ -228,6 +228,10 @@ export interface Settings {
     feed_concurrency: number;
     transcode_threads: number;
     decode_threads: number;
+    // Where stream fragments are cached during playback. "Disk" (default) spills
+    // ciphertext fragments to a temp dir; "Memory" keeps them in RAM only.
+    // Mirrors Rust `FragmentCacheLocation` (serde bare string "Disk"/"Memory").
+    fragment_cache_location: "Disk" | "Memory";
   };
   connection: { route_mode: RouteMode };
   appearance: { theme: "dark" | "light" };

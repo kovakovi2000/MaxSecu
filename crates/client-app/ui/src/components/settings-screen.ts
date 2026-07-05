@@ -11,7 +11,7 @@ import type { Settings, RamLimits } from "../core/types.ts";
 const DEFAULTS: Settings = {
   a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
   behavior: { confirm_destructive: false },
-  performance: { ram_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4 },
+  performance: { ram_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4, fragment_cache_location: "Disk" },
   connection: { route_mode: "prefer-server" },
   appearance: { theme: "dark" },
 };
@@ -61,6 +61,12 @@ export class SettingsScreen extends HTMLElement {
             <label>Decode threads
               <input type="number" name="decode_threads" min="1" step="1" /></label>
             <p id="cores-hint" class="hint"></p>
+            <label>Fragment cache
+              <select name="fragment_cache_location">
+                <option value="Disk">Disk</option>
+                <option value="Memory">Memory (RAM only)</option>
+              </select></label>
+            <p class="hint">Memory keeps stream fragments in RAM only — nothing written to disk.</p>
           </fieldset>
 
           <fieldset>
@@ -182,6 +188,7 @@ export class SettingsScreen extends HTMLElement {
         feed_concurrency: numOr("feed_concurrency", cur.feed_concurrency ?? DEFAULTS.performance.feed_concurrency),
         transcode_threads: numOr("transcode_threads", cur.transcode_threads ?? DEFAULTS.performance.transcode_threads),
         decode_threads: numOr("decode_threads", cur.decode_threads ?? DEFAULTS.performance.decode_threads),
+        fragment_cache_location: this.sel("fragment_cache_location").value === "Memory" ? "Memory" : "Disk",
       },
       behavior: { confirm_destructive: this.input("confirm_destructive").checked },
       connection: { route_mode: this.sel("route_mode").value as Settings["connection"]["route_mode"] },
@@ -204,6 +211,7 @@ export class SettingsScreen extends HTMLElement {
     this.input("feed_concurrency").value = String(s.performance.feed_concurrency);
     this.input("transcode_threads").value = String(s.performance.transcode_threads);
     this.input("decode_threads").value = String(s.performance.decode_threads);
+    this.sel("fragment_cache_location").value = s.performance.fragment_cache_location ?? "Disk";
     this.input("confirm_destructive").checked = s.behavior.confirm_destructive;
     this.sel("route_mode").value = s.connection.route_mode;
   }
