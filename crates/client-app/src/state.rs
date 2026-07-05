@@ -4,6 +4,14 @@
 
 use serde::Serialize;
 
+/// The H.264 encoder the runtime ladder settled on (probed once per session so later
+/// uploads skip dead GPU rungs). `None` until the first re-encode probes it. Held in an
+/// `Arc<Mutex<_>>` so it can be cloned into any `spawn_blocking` context.
+#[derive(Clone, Default)]
+pub struct H264EncoderCache(
+    pub std::sync::Arc<std::sync::Mutex<Option<maxsecu_media_launcher::H264Encoder>>>,
+);
+
 pub const EVT_CONNECTION: &str = "maxsecu://connection-state";
 pub const EVT_AUTH: &str = "maxsecu://auth-state";
 

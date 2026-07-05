@@ -5,13 +5,14 @@
 //!
 //! - GATE T (confined ingest, NO network): `upload::prepare_video_streams` runs the
 //!   embedded, AppContainer/Job-Object-confined `ffmpeg.exe` directly on a small
-//!   real `.y4m` source, producing canonical AV1/AAC fMP4 `out.mp4` + a first-frame
+//!   real `.y4m` source, producing canonical H.264/AAC fMP4 `out.mp4` + a first-frame
 //!   `thumb.png` (thumbnail/preview derived from it via the pure-Rust image codec).
 //!   This step makes NO server call (no `Conn`/TLS is even created before it) — it
 //!   is the preview-before-upload transcode. There is no separate re-mux worker
-//!   spawn: `prepare_video_streams` stores the confined ffmpeg's fMP4 output
-//!   directly (`(input_path, ffmpeg_path, options, bounds, title, tags, on_phase,
-//!   cancel)` — no `worker_path` parameter).
+//!   spawn: `prepare_video_streams` probes the source, then stores one confined
+//!   ffmpeg ingest/re-encode rung's fMP4 output directly (`(input_path, ffmpeg_path,
+//!   options, bounds, transcode_threads, title, tags, on_phase, cancel,
+//!   encoder_cache)` — no `worker_path` parameter).
 //! - GATE M (metadata round-trip): `parse_fragment_index` over the staged metadata
 //!   returns the SAME fragments the transcode produced (the author→view contract).
 //! - GATE P (confirm pipeline): `build_upload` (FileType::Video, chunk_size 4096) +
@@ -95,8 +96,8 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 /// Build a real, decodable raw video as YUV4MPEG2 (`.y4m`) bytes — the confined
 /// ffmpeg under test reads this with its built-in demuxer (no external codec), then
-/// transcodes it to canonical AV1. `w`/`h` must be even (4:2:0). No audio track (the
-/// re-mux worker handles an audio-absent source).
+/// re-encodes it to canonical H.264. `w`/`h` must be even (4:2:0). No audio track (an
+/// audio-absent source needs no audio re-encode).
 fn make_y4m(w: u32, h: u32, frames: u32, fps: u32) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(format!("YUV4MPEG2 W{w} H{h} F{fps}:1 Ip A1:1 C420jpeg\n").as_bytes());
@@ -423,15 +424,20 @@ async fn phase7_video_upload_over_real_tls() {
     // INVARIANT (no-network-at-stage): the ingest happens with NO connection /
     // transport / server in scope. This is STRUCTURAL, not merely ordering:
     // `prepare_video_streams` takes only `(input_path, ffmpeg_path, options, bounds,
-    // transcode_threads, title, tags, on_phase, cancel)` — a local progress sink + a
-    // cancel flag, NO `SendRequest`/host/socket parameter,
-    // so it cannot reach the network even if a future refactor moved the server setup
-    // earlier. The asserts below enforce that no networking object has been
-    // constructed yet at this point: the only bindings in scope are the source +
-    // tool paths (the server harness — `listener`/`addr`/`Conn`/`AppState` — is built
-    // only AFTER this gate). The two confined spawns (ffmpeg, then the re-mux worker)
-    // each run with no net/keys/children; `prepare_video_streams`'s signature is the
-    // hard guarantee.
+    // transcode_threads, title, tags, on_phase, cancel, encoder_cache)` — a local
+    // progress sink, a cancel flag, and a local session encoder cache; NO
+    // `SendRequest`/host/socket parameter, so it cannot reach the network even if a
+    // future refactor moved the server setup earlier. The asserts below enforce that no
+    // networking object has been constructed yet at this point: the only bindings in
+    // scope are the source + tool paths (the server harness — `listener`/`addr`/`Conn`/
+    // `AppState` — is built only AFTER this gate). The confined spawns (probe, then the
+    // ingest/re-encode rung) each run with no net/keys/children;
+    // `prepare_video_streams`'s signature is the hard guarantee.
+    //
+    // The `.y4m` source is RAW video, so `plan_ingest` requires a re-encode: the ladder
+    // tries NVENC → AMF (both fail on this GPU-less CI host) then x264 (always-present
+    // pure-CPU floor), producing a canonical H.264 fMP4.
+    let enc_cache = std::sync::Mutex::new(None);
     let prepared = prepare_video_streams(
         &source_path,
         &ffmpeg,
@@ -442,8 +448,9 @@ async fn phase7_video_upload_over_real_tls() {
         &["beach".to_owned()],
         |_p| {},                                    // no-op progress sink (not asserted here)
         &std::sync::atomic::AtomicBool::new(false), // never cancelled
+        &enc_cache,
     )
-    .expect("GATE T: the confined ffmpeg + re-mux produced canonical streams");
+    .expect("GATE T: the confined ffmpeg ingest produced canonical streams");
     let _ = std::fs::remove_dir_all(&src_dir);
     // The handle keeps the transcoded fMP4 on DISK (content is not in RAM). Reconstruct
     // the in-memory `PlaintextStreams`/`fragments` the round-trip gates work against.
@@ -597,7 +604,7 @@ async fn phase7_video_upload_over_real_tls() {
         .plaintext;
     assert_eq!(
         got_content, &canonical,
-        "GATE P: canonical AV1/CMAF content round-trips byte-exactly"
+        "GATE P: canonical H.264/CMAF content round-trips byte-exactly"
     );
     let got_meta = &opened
         .streams

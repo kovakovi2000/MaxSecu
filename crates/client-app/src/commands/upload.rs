@@ -43,7 +43,8 @@ use crate::jobs::{
     VideoPrepareCancel,
 };
 use crate::state::{
-    BundleStagePhase, PreparePhase, UploadPhase, EVT_BUNDLE_STAGE, EVT_UPLOAD, EVT_VIDEO_PREPARE,
+    BundleStagePhase, H264EncoderCache, PreparePhase, UploadPhase, EVT_BUNDLE_STAGE, EVT_UPLOAD,
+    EVT_VIDEO_PREPARE,
 };
 use crate::upload::{
     apply_stage_flags, build_metadata, file_type_str, prepare_blog_streams,
@@ -194,8 +195,9 @@ pub async fn stage_upload(
     session: State<'_, Session>,
     jobs: State<'_, UploadJobs>,
     prepare_cancel: State<'_, VideoPrepareCancel>,
+    encoder_cache: State<'_, H264EncoderCache>,
 ) -> Result<UploadPreview, UiError> {
-    let item = stage_item(&req, &app, &dir, &session, &prepare_cancel).await?;
+    let item = stage_item(&req, &app, &dir, &session, &prepare_cancel, &encoder_cache).await?;
     // Capture the preview fields BEFORE moving `staged` into the jobs map.
     let file_type = item.staged.file_type.clone();
     let total_chunks = item.staged.total_chunks;
@@ -272,6 +274,7 @@ async fn stage_item(
     dir: &AppDir,
     session: &Session,
     prepare_cancel: &VideoPrepareCancel,
+    encoder_cache: &H264EncoderCache,
 ) -> Result<StagedItem, UiError> {
     // RAII guard that deletes a dir on any error path before the job is inserted.
     // For video: initially guards the transcode temp dir; switched to the staging
@@ -380,6 +383,9 @@ async fn stage_item(
             *prepare_cancel.0.lock().unwrap() = Some(cancel.clone());
             let handle = app.clone();
             let cancel_task = cancel.clone();
+            // Clone the session encoder-cache Arc so it can cross the spawn_blocking
+            // boundary; the confined ladder records its winning rung here.
+            let enc_cache = encoder_cache.0.clone();
             let staged = tokio::task::spawn_blocking(move || {
                 let on_phase = move |phase: PreparePhase| {
                     let _ = handle.emit(EVT_VIDEO_PREPARE, phase);
@@ -394,6 +400,7 @@ async fn stage_item(
                     &tags,
                     on_phase,
                     &cancel_task,
+                    &enc_cache,
                 )
             })
             .await;
@@ -654,6 +661,7 @@ pub async fn stage_bundle(
     session: State<'_, Session>,
     jobs: State<'_, BundleJobs>,
     prepare_cancel: State<'_, VideoPrepareCancel>,
+    encoder_cache: State<'_, H264EncoderCache>,
 ) -> Result<BundlePreview, UiError> {
     use maxsecu_encoding::types::FileType;
 
@@ -715,7 +723,7 @@ pub async fn stage_bundle(
         };
         // On error the `?` returns, dropping `cleanup` → all prior members' dirs
         // are wiped. No manual cleanup arm needed.
-        let item = stage_item(&member_req, &app, &dir, &session, &prepare_cancel).await?;
+        let item = stage_item(&member_req, &app, &dir, &session, &prepare_cancel, &encoder_cache).await?;
         match item.kind {
             FileType::Video => counts.video += 1,
             FileType::Image => counts.image += 1,

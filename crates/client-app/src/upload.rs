@@ -10,7 +10,10 @@ use maxsecu_client_core::media::FragmentEntry as TranscodeFragment;
 use maxsecu_client_core::video::VideoBounds;
 use maxsecu_client_core::{MediaBounds, PlaintextStreams, RustImageCodec, Transcoder};
 use maxsecu_encoding::types::FileType;
-use maxsecu_media_launcher::{build_ffmpeg_args, FfmpegLauncher, TranscodeOptions};
+use maxsecu_media_launcher::{
+    build_ingest_args, plan_ingest, probe_source, FfmpegLauncher, FfmpegOutcome, H264Encoder,
+    IngestPlan, TranscodeOptions, VideoArg,
+};
 
 use crate::error::UiError;
 
@@ -160,27 +163,31 @@ fn chunk_grouped_index(n_chunks: u64, frag_chunks: u64) -> Vec<TranscodeFragment
     frags
 }
 
-/// Transcode the author's **arbitrary** source video to a canonical AV1+AAC
-/// fragmented-MP4 (`fMP4`) via ONE confined spawn, keeping this key-holding process
-/// CODEC-FREE (it links only the codec-free `media-launcher` + the pure-Rust
-/// `RustImageCodec`; rav1d / symphonia never enter it).
+/// Transcode the author's **arbitrary** source video to a canonical, WebView2-playable
+/// H.264+AAC fragmented-MP4 (`fMP4`), keeping this key-holding process CODEC-FREE (it
+/// links only the codec-free `media-launcher` + the pure-Rust `RustImageCodec`; rav1d /
+/// symphonia never enter it).
 ///
-/// Flow (single confined spawn):
+/// Flow (all spawns fully confined — probe, copy, and every re-encode rung):
 /// 1. A fresh, unique, freshly-created per-job dir is made; a [`JobDirGuard`]
 ///    recursively deletes the WHOLE dir on every return path (the
 ///    [`FfmpegLauncher::run`] cleanup obligation).
 /// 2. The source is COPIED into the granted dir (the confined ffmpeg reads it under
 ///    the single ReadWrite grant), preserving the extension so ffmpeg can sniff it.
-/// 3. **Confined ffmpeg** ([`FfmpegLauncher`], no net/keys/children, mem cap,
-///    bounded timeout) runs the pinned [`build_ffmpeg_args`] argv — ONE invocation
-///    producing both `out.mp4` (AV1+AAC fragmented-MP4 via `-movflags
-///    +frag_keyframe+empty_moov+default_base_moof`) and `thumb.png` (first frame). A
-///    nonzero exit fails closed; the bounded stderr tail is diagnostic only and never
-///    surfaced to the UI (no decode oracle).
-/// 4. `out.mp4` is stored DIRECTLY as the encrypted content (no re-mux worker). The
+/// 3. **Confined probe** ([`probe_source`]) classifies the source; [`plan_ingest`]
+///    decides per-stream copy-vs-reencode against the requested shaping options.
+/// 4. **Confined ingest.** A copyable video streams straight through
+///    ([`VideoArg::Copy`] via [`build_ingest_args`]); otherwise the GPU→CPU H.264
+///    ladder ([`run_reencode_ladder`]) walks NVENC→AMF→x264 (all under the SAME full
+///    confinement — no relaxation), remembering the winning encoder for later uploads.
+///    Every rung runs one confined ffmpeg ([`FfmpegLauncher`], no net/keys/children,
+///    mem cap, bounded timeout) producing `out.mp4` (streamable fMP4) + `thumb.png`
+///    (first frame). A nonzero exit fails the rung / falls closed; the bounded stderr
+///    tail is diagnostic only and never surfaced to the UI (no decode oracle).
+/// 5. `out.mp4` is stored DIRECTLY as the encrypted content (no re-mux worker). The
 ///    fragment seek index is built by [`chunk_grouped_index`] over the content's
 ///    [`VIDEO_CHUNK_SIZE`]-chunk count, grouped in [`FRAG_CHUNKS`]-sized bands.
-/// 5. The real thumbnail + preview are derived from `thumb.png` via the pure-Rust
+/// 6. The real thumbnail + preview are derived from `thumb.png` via the pure-Rust
 ///    [`RustImageCodec`] (the same path image uploads use).
 ///
 /// Maps `out.mp4` bytes → `content`, the derived image streams →
@@ -191,10 +198,10 @@ fn chunk_grouped_index(n_chunks: u64, frag_chunks: u64) -> Vec<TranscodeFragment
 /// **Defense-in-depth.** After building the chunk-grouped index, `prepare_video_streams`
 /// round-trips the metadata through `parse_fragment_index` and asserts the last
 /// fragment covers exactly `n_chunks`, failing closed on any mismatch.
-// Each input is a distinct concern of the single confined transcode (source path,
-// the confined binary, options/bounds, the title/tags baked into metadata, the
-// progress sink, and the cancel flag); a params struct would only indirect the one
-// call site in `commands::upload::stage_upload`.
+// Each input is a distinct concern of the confined ingest (source path, the confined
+// binary, options/bounds, the title/tags baked into metadata, the progress sink, the
+// cancel flag, and the session encoder cache); a params struct would only indirect the
+// one call site in `commands::upload::stage_item`.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_video_streams(
     input_path: &Path,
@@ -211,6 +218,9 @@ pub fn prepare_video_streams(
     tags: &[String],
     on_phase: impl Fn(crate::state::PreparePhase) + Sync,
     cancel: &std::sync::atomic::AtomicBool,
+    // Session encoder cache: once the GPU→CPU ladder settles on an H.264 encoder it is
+    // remembered here so later uploads in the same session skip dead GPU rungs.
+    encoder_cache: &std::sync::Mutex<Option<H264Encoder>>,
 ) -> Result<PreparedVideo, UiError> {
     // 1) Fresh, unique, freshly-created per-job dir. The guard recursively deletes
     //    the WHOLE dir on every return path (security cleanup, see JobDirGuard).
@@ -231,33 +241,48 @@ pub fn prepare_video_streams(
     };
     std::fs::copy(input_path, &input_copy).map_err(|_| video_prep_err())?;
 
-    // 3) The pinned argv: ONE confined ffmpeg run → out.mp4 (AV1+AAC) + thumb.png.
     let out_mp4 = dir.join("out.mp4");
     let thumb_png = dir.join("thumb.png");
-    let args = build_ffmpeg_args(
-        &input_copy,
-        &out_mp4,
-        &thumb_png,
-        options,
-        bounds,
-        transcode_threads,
-    );
 
-    // 4) Decode the untrusted source in the CONFINED ffmpeg (no net / keys /
-    //    children, mem cap, bounded timeout). A nonzero exit fails closed; the
-    //    bounded stderr is diagnostic only and never reaches the UI.
-    //    `on_progress` forwards ffmpeg's sanitized percent to the UI as a
-    //    `Transcoding{percent}` phase; `cancel` is polled throughout so a user cancel
-    //    / app shutdown tears the confined child down (RAII grant revoked on that path
-    //    exactly as on every other) and returns the DISTINCT `cancelled` error.
-    let outcome = FfmpegLauncher::new(ffmpeg_path)
-        .run(
-            &args,
-            &dir,
-            |p| on_phase(crate::state::PreparePhase::Transcoding { percent: p.percent }),
+    // 3) Probe the source (confined) and plan per-stream copy vs re-encode. The probe
+    //    touches the untrusted input under the SAME full confinement; a spawn failure
+    //    fails closed as a sanitized video error (no decode oracle).
+    let probe = probe_source(ffmpeg_path, &input_copy, &dir).map_err(|_| video_prep_err())?;
+    let plan = plan_ingest(&probe, options);
+
+    // 4) Execute the plan. Copy / x264 / GPU rungs ALL run under the SAME full
+    //    confinement (no relaxation): a copyable source needs no re-encode; otherwise
+    //    walk the GPU→CPU H.264 ladder, remembering the winning encoder for later
+    //    uploads. `cancel` is polled throughout so a user cancel / app shutdown tears
+    //    the confined child down (RAII grant revoked on that path exactly as on every
+    //    other) and returns the DISTINCT `cancelled` error.
+    let outcome = if !plan.reencode_video {
+        let args = build_ingest_args(
+            &input_copy,
+            &out_mp4,
+            &thumb_png,
+            VideoArg::Copy,
+            plan.reencode_audio,
+            options,
+            bounds,
+            transcode_threads,
+        );
+        run_confined_ingest(ffmpeg_path, &args, &dir, &on_phase, cancel)?
+    } else {
+        run_reencode_ladder(
+            ffmpeg_path,
+            &input_copy,
+            &out_mp4,
+            &thumb_png,
+            &plan,
+            options,
+            bounds,
+            transcode_threads,
+            &on_phase,
             cancel,
-        )
-        .map_err(|_| video_prep_err())?;
+            encoder_cache,
+        )?
+    };
     if outcome.cancelled {
         return Err(video_cancelled_err());
     }
@@ -317,6 +342,82 @@ pub fn prepare_video_streams(
         preview: derived.preview,
         fragments,
     })
+}
+
+/// Run one ingest spawn under the existing full confinement (probe/copy/x264/GPU).
+/// There is NO confinement relaxation for the GPU rungs — every spawn goes through the
+/// plain [`FfmpegLauncher::new`] (no net/keys/children, mem cap, bounded timeout). The
+/// launcher's sanitized `-progress` percent is forwarded to the UI as a
+/// `Transcoding{percent}` phase; a spawn error maps to the sanitized `video_failed`.
+fn run_confined_ingest(
+    ffmpeg_path: &Path,
+    args: &[std::ffi::OsString],
+    dir: &Path,
+    on_phase: &(impl Fn(crate::state::PreparePhase) + Sync),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<FfmpegOutcome, UiError> {
+    FfmpegLauncher::new(ffmpeg_path)
+        .run(
+            args,
+            dir,
+            |p| on_phase(crate::state::PreparePhase::Transcoding { percent: p.percent }),
+            cancel,
+        )
+        .map_err(|_| video_prep_err())
+}
+
+/// Re-encode the video to H.264, walking NVENC → AMF → x264 (all fully confined —
+/// NO relaxation, exactly the same [`FfmpegLauncher`] confinement as the probe/copy
+/// spawns). A real user cancel short-circuits (returned verbatim as a `cancelled`
+/// outcome); a GPU rung that fails to initialise / encode (nonzero exit) falls through
+/// to the next rung, and x264 is the always-available floor. The winning rung is cached
+/// in `encoder_cache` so later uploads in this session skip the dead GPU rungs (today
+/// the GPU rungs fail on this machine's driver gap and fall back to x264; they light up
+/// automatically once the driver is updated — still under full confinement).
+#[allow(clippy::too_many_arguments)]
+fn run_reencode_ladder(
+    ffmpeg_path: &Path,
+    input: &Path,
+    out_mp4: &Path,
+    thumb: &Path,
+    plan: &IngestPlan,
+    options: &TranscodeOptions,
+    bounds: &VideoBounds,
+    threads: u16,
+    on_phase: &(impl Fn(crate::state::PreparePhase) + Sync),
+    cancel: &std::sync::atomic::AtomicBool,
+    encoder_cache: &std::sync::Mutex<Option<H264Encoder>>,
+) -> Result<FfmpegOutcome, UiError> {
+    // If a prior upload already settled on an encoder, try only that one; otherwise
+    // walk the full GPU→CPU ladder. The lock is taken briefly and released before any
+    // spawn so the confined ffmpeg never runs while the mutex is held.
+    let order: Vec<H264Encoder> = match *encoder_cache.lock().unwrap() {
+        Some(enc) => vec![enc],
+        None => vec![H264Encoder::Nvenc, H264Encoder::Amf, H264Encoder::X264],
+    };
+    let mut last_err = video_prep_err();
+    for enc in order {
+        let args = build_ingest_args(
+            input,
+            out_mp4,
+            thumb,
+            VideoArg::Encode(enc),
+            plan.reencode_audio,
+            options,
+            bounds,
+            threads,
+        );
+        let outcome = run_confined_ingest(ffmpeg_path, &args, out_mp4.parent().unwrap(), on_phase, cancel)?;
+        if outcome.cancelled {
+            return Ok(outcome);
+        }
+        if outcome.exit_code == 0 {
+            *encoder_cache.lock().unwrap() = Some(enc);
+            return Ok(outcome);
+        }
+        last_err = video_prep_err();
+    }
+    Err(last_err)
 }
 
 /// Blog: `content` is the plain UTF-8 bytes; metadata is the JSON title/tags; no

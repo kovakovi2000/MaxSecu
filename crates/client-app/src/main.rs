@@ -47,6 +47,7 @@ fn main() {
         .manage(maxsecu_client_app::jobs::BundleJobs::new())
         .manage(maxsecu_client_app::jobs::VideoJobs::new())
         .manage(maxsecu_client_app::jobs::VideoPrepareCancel::default())
+        .manage(maxsecu_client_app::state::H264EncoderCache::default())
         .manage(ContentCache::new(cap_bytes))
         .manage(maxsecu_client_app::directory::DirectoryCache::new())
         .manage(maxsecu_client_app::commands::pool::AppPool::new(pool_cap))
