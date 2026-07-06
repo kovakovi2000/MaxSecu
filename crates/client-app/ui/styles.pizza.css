@@ -3263,3 +3263,551 @@ progress::-webkit-progress-value {
   animation: none !important;
   transition: none !important;
 }
+
+/* ---------- Cheese-Pizza refinement pass ----------
+   Converts the tech-heavy panels into crust / sauce / molten-cheese components
+   without changing layout contracts or backend behaviour. */
+:root {
+  --mx-accent-1: #ffd15c;
+  --mx-accent-2: #f17a24;
+  --mx-accent-3: #fff1a6;
+  --mx-accent-solid: #ffc447;
+  --mx-accent-strong: #ba3516;
+  --mx-accent: linear-gradient(135deg, #fff0a6 0%, #ffc447 38%, #f17a24 72%, #b73517 100%);
+
+  --mx-base: #1c0d06;
+  --mx-base-2: #351208;
+  --mx-surface-1: rgba(49, 21, 10, 0.93);
+  --mx-surface-2: rgba(78, 29, 13, 0.88);
+  --mx-surface-3: rgba(111, 44, 18, 0.82);
+  --mx-surface-solid: #3a170a;
+  --mx-text: #fff8e7;
+  --mx-muted: #f2d49b;
+  --mx-faint: #c98b54;
+  --mx-border: rgba(246, 179, 82, 0.32);
+  --mx-border-strong: rgba(255, 216, 132, 0.52);
+
+  --mx-neon-cyan: #ffd15c;
+  --mx-neon-violet: #d94a20;
+  --mx-neon-lime: #7bc45a;
+  --mx-on-bright: #311204;
+  --mx-panel-bg:
+    radial-gradient(circle at 18% 0, rgba(255, 208, 92, 0.13), transparent 18rem),
+    linear-gradient(150deg, rgba(112, 39, 14, 0.75), rgba(45, 17, 8, 0.94) 58%, rgba(91, 25, 11, 0.78));
+  --mx-card-bg:
+    radial-gradient(circle at 16% 5%, rgba(255, 216, 108, 0.13), transparent 13rem),
+    linear-gradient(150deg, rgba(93, 34, 14, 0.88), rgba(44, 17, 8, 0.96));
+  --mx-glow: 0 0 0 1px rgba(255, 210, 86, 0.34), 0 18px 46px rgba(178, 48, 16, 0.25);
+  --mx-elev-1: 0 12px 28px rgba(43, 13, 3, 0.42);
+  --mx-elev-2: 0 28px 76px rgba(34, 9, 2, 0.56);
+}
+
+body {
+  background:
+    radial-gradient(circle at 7% 0%, rgba(255, 202, 74, 0.16), transparent 26rem),
+    radial-gradient(circle at 96% 6%, rgba(178, 48, 16, 0.28), transparent 30rem),
+    radial-gradient(circle at 50% 112%, rgba(118, 45, 17, 0.58), transparent 38rem),
+    linear-gradient(135deg, #170905 0%, #351208 54%, #231006 100%);
+}
+
+body::before {
+  opacity: 0.22;
+  background-image:
+    radial-gradient(circle, rgba(255, 226, 139, 0.18) 0 1px, transparent 1.9px),
+    radial-gradient(circle, rgba(164, 35, 20, 0.28) 0 3px, transparent 3.3px),
+    linear-gradient(115deg, rgba(255, 193, 70, 0.045) 0 12px, transparent 12px 31px);
+  background-size: 42px 42px, 168px 168px, 82px 82px;
+}
+
+body::after {
+  opacity: 0.18;
+  background:
+    radial-gradient(circle at 18% 22%, rgba(187, 36, 20, 0.8) 0 0.34rem, transparent 0.37rem),
+    radial-gradient(circle at 82% 18%, rgba(126, 184, 84, 0.52) 0 0.22rem, transparent 0.25rem),
+    radial-gradient(circle at 72% 78%, rgba(187, 36, 20, 0.62) 0 0.28rem, transparent 0.31rem),
+    radial-gradient(circle at 26% 86%, rgba(255, 219, 109, 0.42) 0 0.2rem, transparent 0.23rem);
+  background-size: 19rem 19rem, 22rem 22rem, 24rem 24rem, 20rem 20rem;
+}
+
+/* Remove the previous header garnish/top-drip that read as a giant yellow bar. */
+.header-deco,
+.pizza-header-accent,
+.pizza-bg-layer .cheese-drips {
+  display: none !important;
+}
+
+.app-header {
+  grid-template-columns: auto 1fr auto;
+  grid-template-areas: "brand nav actions";
+  border-bottom-color: rgba(132, 69, 28, 0.75);
+  background:
+    linear-gradient(180deg, rgba(65, 28, 12, 0.96), rgba(37, 15, 7, 0.9)),
+    radial-gradient(circle at 10% 0, rgba(255, 204, 75, 0.14), transparent 22rem);
+  box-shadow: 0 0.35rem 0 rgba(117, 59, 24, 0.22), var(--mx-elev-1), var(--mx-inset);
+}
+.app-header::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 3px;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse at 8% 0, rgba(255, 211, 89, 0.75) 0 0.75rem, transparent 0.82rem),
+    radial-gradient(ellipse at 44% 0, rgba(255, 192, 63, 0.58) 0 0.46rem, transparent 0.52rem),
+    radial-gradient(ellipse at 79% 0, rgba(255, 220, 112, 0.62) 0 0.58rem, transparent 0.65rem),
+    linear-gradient(90deg, rgba(129, 65, 25, 0.5), rgba(255, 205, 77, 0.65), rgba(129, 65, 25, 0.5));
+}
+.app-brand-mark {
+  border-radius: 48% 52% 45% 55%;
+  background:
+    radial-gradient(circle at 31% 38%, #b92d1a 0 0.22rem, transparent 0.24rem),
+    radial-gradient(circle at 62% 59%, #7cbf55 0 0.14rem, transparent 0.16rem),
+    conic-gradient(from -36deg, #ffd15c, #ffb03d, #9a4f22, #ffd15c);
+  color: #351405;
+  box-shadow: 0 0.45rem 1.35rem rgba(234, 116, 35, 0.28), inset 0 0 0 2px rgba(255, 244, 184, 0.22);
+  text-shadow: none;
+}
+.nav-rail a {
+  border-radius: 999px 999px 0.85rem 0.85rem;
+  color: #f2d49b;
+}
+.nav-rail a:hover {
+  color: #fff8e7;
+  background:
+    radial-gradient(circle at 20% 30%, rgba(186, 43, 22, 0.22) 0 0.22rem, transparent 0.24rem),
+    rgba(88, 36, 16, 0.74);
+}
+.nav-rail a.active,
+.nav-rail a[aria-current="true"] {
+  color: #2f1205;
+  background:
+    radial-gradient(circle at 18% 37%, #b92d1a 0 0.16rem, transparent 0.18rem),
+    radial-gradient(circle at 76% 62%, #b92d1a 0 0.13rem, transparent 0.15rem),
+    linear-gradient(135deg, #fff1a6, #ffc447 62%, #ec7b25);
+  border-color: rgba(255, 232, 150, 0.75);
+  box-shadow: 0 0 0 1px rgba(255, 238, 170, 0.28), 0 10px 24px rgba(180, 54, 18, 0.24);
+}
+
+.pizza-bg-layer .cheese-sun {
+  right: -12rem;
+  top: 3rem;
+  opacity: 0.52;
+  background: radial-gradient(circle, rgba(255, 208, 80, 0.24), rgba(255, 154, 52, 0.08) 50%, transparent 72%);
+}
+.pizza-bg-layer .tomato-orbit {
+  border-color: rgba(178, 44, 22, 0.24);
+  box-shadow: inset 0 0 5rem rgba(178, 44, 22, 0.08), 0 0 3rem rgba(255, 196, 71, 0.08);
+}
+.pizza-bg-layer .crust-ring {
+  border-color: rgba(139, 72, 28, 0.22);
+}
+.pizza-bg-layer .basil-fleck,
+.pizza-bg-layer .pepperoni-fleck {
+  width: 11rem;
+  height: 11rem;
+  border-radius: 50%;
+  opacity: 0.2;
+  filter: blur(0.1rem);
+}
+.pizza-bg-layer .basil-fleck {
+  left: 8%;
+  top: 18%;
+  background: radial-gradient(ellipse at 50% 50%, rgba(112, 188, 78, 0.62), transparent 58%);
+  transform: rotate(-28deg) scaleX(0.55);
+}
+.pizza-bg-layer .pepperoni-fleck {
+  right: 14%;
+  bottom: 18%;
+  background: radial-gradient(circle, rgba(176, 42, 24, 0.6), transparent 63%);
+}
+
+/* Component surfaces: darker sauce/crust base, with contained molten-cheese edges. */
+:is(form, fieldset, section[aria-labelledby], #up-preview, #vw-body, #vw-meta, main > dl, #pq-list, #controls,
+.connect-hero, .connect-card, .auth-copy, .auth-card, media-card article.media-card-shell,
+.bundle-head, .composer, .settings-card, .share-panel, .confirm-panel, .tray-row) {
+  position: relative;
+  overflow: hidden;
+  border-color: rgba(211, 128, 55, 0.46);
+  background:
+    radial-gradient(circle at 20% 0, rgba(255, 210, 91, 0.12), transparent 16rem),
+    radial-gradient(circle at 88% 100%, rgba(169, 39, 21, 0.14), transparent 14rem),
+    linear-gradient(150deg, rgba(84, 32, 14, 0.86), rgba(39, 15, 7, 0.96));
+  box-shadow: inset 0 1px 0 rgba(255, 238, 172, 0.14), 0 18px 46px rgba(43, 13, 3, 0.34);
+}
+:is(form, fieldset, section[aria-labelledby], #up-preview, #vw-body, #vw-meta, main > dl, #pq-list, #controls,
+.connect-hero, .connect-card, .auth-copy, .auth-card, media-card article.media-card-shell,
+.bundle-head, .composer, .settings-card, .share-panel, .confirm-panel, .tray-row)::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1.25rem;
+  pointer-events: none;
+  opacity: 0.92;
+  background:
+    radial-gradient(ellipse at 9% 0, #ffe686 0 0.86rem, transparent 0.93rem),
+    radial-gradient(ellipse at 27% 0, #ffc44c 0 0.54rem, transparent 0.61rem),
+    radial-gradient(ellipse at 54% 0, #ffe089 0 0.75rem, transparent 0.82rem),
+    radial-gradient(ellipse at 82% 0, #ffbb3c 0 0.46rem, transparent 0.54rem),
+    linear-gradient(180deg, rgba(255, 204, 73, 0.86), rgba(255, 174, 49, 0.18) 72%, transparent);
+}
+:is(form, fieldset, section[aria-labelledby], #up-preview, #vw-body, #vw-meta, main > dl, #pq-list, #controls,
+.connect-hero, .connect-card, .auth-copy, .auth-card, media-card article.media-card-shell,
+.bundle-head, .composer, .settings-card, .share-panel, .confirm-panel, .tray-row) > * {
+  position: relative;
+  z-index: 1;
+}
+
+button, .button, .buttonish, .connect-submit,
+media-card .card-download,
+main > a:first-child {
+  border-color: rgba(147, 75, 30, 0.7);
+  border-radius: 1rem 1rem 0.55rem 0.55rem;
+  background:
+    radial-gradient(circle at 21% 44%, rgba(181, 44, 24, 0.46) 0 0.18rem, transparent 0.2rem),
+    radial-gradient(circle at 73% 62%, rgba(117, 184, 83, 0.36) 0 0.13rem, transparent 0.15rem),
+    linear-gradient(135deg, #fff0a4 0%, #ffc447 48%, #f1882b 100%);
+  color: #311204;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.34), 0 13px 26px rgba(140, 42, 15, 0.24);
+  text-shadow: 0 1px 0 rgba(255,255,255,0.24);
+}
+button.secondary, .button.secondary, button.ghost, .button.ghost, #qs-btn, .qs #qs-btn {
+  color: #fff8e7;
+  background:
+    radial-gradient(circle at 18% 40%, rgba(185, 45, 26, 0.18) 0 0.17rem, transparent 0.19rem),
+    linear-gradient(145deg, rgba(89, 35, 15, 0.78), rgba(48, 19, 9, 0.92));
+  border-color: rgba(213, 132, 59, 0.42);
+}
+button:hover { filter: brightness(1.06) saturate(1.08); }
+
+input[type="text"], input[type="search"], input[type="number"], input[type="password"], input:not([type]), textarea, select {
+  background:
+    linear-gradient(180deg, rgba(255, 232, 154, 0.08), rgba(60, 20, 8, 0.24)),
+    rgba(28, 11, 5, 0.78);
+  border-color: rgba(219, 139, 59, 0.48);
+  border-radius: 0.75rem 1.05rem 0.75rem 1.05rem;
+}
+input[type="text"]:focus-visible, input[type="search"]:focus-visible, input[type="number"]:focus-visible,
+input[type="password"]:focus-visible, input:not([type]):focus-visible, textarea:focus-visible, select:focus-visible {
+  border-color: #ffd15c;
+  box-shadow: 0 0 0 4px rgba(255, 196, 71, 0.22), 0 0 26px rgba(196, 65, 23, 0.18);
+}
+label { color: #f2d49b; }
+legend, .settings-card legend { color: #fff5d0; }
+
+/* Login/auth overhaul: contained pizza artwork, no floating overlap. */
+.connect-stage,
+.auth-stage {
+  align-items: stretch;
+}
+.connect-stage::before,
+.auth-stage::before {
+  clip-path: none;
+  opacity: 0.18;
+  background:
+    radial-gradient(circle at 20% 12%, rgba(255, 208, 85, 0.3), transparent 16rem),
+    radial-gradient(circle at 78% 84%, rgba(171, 42, 21, 0.32), transparent 18rem);
+  filter: blur(12px);
+}
+.connect-hero {
+  min-height: 34rem;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-top: clamp(1.2rem, 3vw, 2.2rem);
+  background:
+    radial-gradient(circle at 78% 25%, rgba(255, 216, 107, 0.18), transparent 14rem),
+    radial-gradient(circle at 20% 70%, rgba(183, 42, 22, 0.2), transparent 15rem),
+    linear-gradient(150deg, rgba(88, 33, 14, 0.94), rgba(39, 15, 7, 0.98));
+}
+.connect-card,
+.auth-card {
+  background:
+    radial-gradient(circle at 14% 0, rgba(255, 211, 91, 0.13), transparent 12rem),
+    linear-gradient(160deg, rgba(60, 23, 10, 0.95), rgba(33, 12, 6, 0.98));
+}
+.connect-visual {
+  display: none !important;
+}
+.pizza-login-deco {
+  position: relative;
+  inset: auto;
+  z-index: 2;
+  width: min(20rem, 72%);
+  max-width: 100%;
+  aspect-ratio: 1.18 / 1;
+  margin: 0 auto clamp(0.5rem, 2vw, 1.2rem);
+  pointer-events: none;
+  filter: drop-shadow(0 1.2rem 2.2rem rgba(54, 15, 3, 0.44));
+}
+.auth-copy .pizza-login-deco {
+  width: min(16rem, 72%);
+  margin-inline: 0 auto;
+  margin-bottom: clamp(0.9rem, 2vw, 1.4rem);
+}
+.pizza-login-deco img {
+  position: absolute;
+  z-index: 3;
+  left: 7%;
+  top: 2%;
+  width: 86%;
+  height: 86%;
+  object-fit: contain;
+  transform: rotate(-7deg);
+}
+.pizza-plate {
+  position: absolute;
+  z-index: 1;
+  left: 9%;
+  right: 3%;
+  bottom: 4%;
+  height: 28%;
+  border-radius: 50%;
+  background: radial-gradient(ellipse, rgba(92, 39, 17, 0.5), transparent 68%);
+  filter: blur(0.1rem);
+}
+.pizza-login-glow {
+  position: absolute;
+  inset: 6% 2% 3%;
+  z-index: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255, 216, 89, 0.32), rgba(196, 65, 23, 0.13) 54%, transparent 72%);
+  filter: blur(0.45rem);
+}
+.pizza-drip {
+  position: absolute;
+  z-index: 2;
+  width: 9%;
+  border-radius: 999px 999px 58% 58%;
+  background: linear-gradient(#fff1a6, #ffc447 62%, #f18a29);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.42), 0 0.7rem 1.4rem rgba(244, 150, 38, 0.24);
+}
+.pizza-drip-a { height: 22%; right: 18%; top: 54%; transform: rotate(-3deg); }
+.pizza-drip-b { height: 17%; right: 36%; top: 61%; transform: rotate(5deg); }
+.pizza-drip-c { height: 13%; right: 55%; top: 57%; transform: rotate(-7deg); }
+.pizza-steam {
+  position: absolute;
+  z-index: 2;
+  left: 9%;
+  top: 4%;
+  width: 52%;
+  height: 48%;
+  border-radius: 50%;
+  border-top: 1px solid rgba(255, 244, 190, 0.42);
+  opacity: 0.32;
+  transform: rotate(-19deg);
+}
+.connect-hero h1,
+.auth-copy h1 {
+  color: #fff8e7;
+  text-shadow: 0 0.16rem 0 rgba(94, 31, 10, 0.72), 0 0 1.4rem rgba(255, 197, 73, 0.2);
+}
+.eyebrow {
+  color: #ffe089;
+  letter-spacing: 0.13em;
+}
+.hero-copy,
+.auth-copy p,
+.auth-note,
+.form-head p:not(.eyebrow),
+#rg-status,
+#rl-status,
+.connect-status {
+  color: #f2d49b;
+}
+.hero-grid span,
+.type-chip,
+.open-cue,
+.bundle-badge,
+.state-badge,
+.status-pill,
+status-pill,
+state-badge,
+progress-meter,
+.tor-switch,
+.auth-note {
+  border-color: rgba(255, 202, 78, 0.32);
+  border-radius: 0.8rem 1rem 0.55rem 1rem;
+  background:
+    radial-gradient(circle at 18% 44%, rgba(180, 43, 24, 0.24) 0 0.15rem, transparent 0.17rem),
+    rgba(255, 203, 76, 0.08);
+  color: #ffe6a6;
+}
+.type-chip::before,
+.open-cue::before,
+.bundle-badge::before {
+  content: "";
+  display: inline-block;
+  width: 0.48rem;
+  height: 0.48rem;
+  margin-right: 0.35rem;
+  border-radius: 50%;
+  background: #b92d1a;
+  box-shadow: 0.22rem -0.06rem 0 -0.08rem #7bbb55;
+}
+.boot-console {
+  border-color: rgba(255, 202, 78, 0.28);
+  background:
+    linear-gradient(180deg, rgba(92, 37, 16, 0.66), rgba(35, 13, 6, 0.78));
+  color: #ffe6a6;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  text-transform: none;
+  letter-spacing: 0.01em;
+}
+.boot-console span::before {
+  content: "🍕 ";
+  color: inherit;
+}
+.connect-core {
+  border-color: rgba(255, 202, 78, 0.32);
+  background: rgba(255, 203, 76, 0.07);
+}
+.core-dot {
+  background: #b92d1a;
+  box-shadow: 0 0 18px rgba(255, 196, 71, 0.42);
+}
+.core-line { background: rgba(255, 203, 76, 0.18); }
+.core-line::before { background: linear-gradient(90deg, transparent, #ffe089, #7bc45a, transparent); }
+.connect-card::after {
+  opacity: 0.12;
+  background:
+    linear-gradient(90deg, transparent 0 48%, rgba(255, 221, 119, 0.55) 49% 50%, transparent 51%),
+    repeating-linear-gradient(180deg, transparent 0 11px, rgba(255, 230, 144, 0.15) 12px 13px);
+}
+.connect-card.is-loading {
+  border-color: rgba(255, 209, 92, 0.7);
+  box-shadow: 0 0 0 1px rgba(255, 209, 92, 0.22), 0 0 42px rgba(210, 65, 23, 0.2), var(--mx-elev-2);
+}
+.connect-card.is-loading .connect-submit {
+  background: linear-gradient(135deg, #fff1a6, #ffc447, #7bc45a);
+  color: #2e1205;
+}
+
+/* Feed/viewer/upload/settings details get toppings instead of neon scanning. */
+media-card article.media-card-shell {
+  border-radius: 1.2rem 1.6rem 0.95rem 1.35rem;
+  background:
+    radial-gradient(circle at 18% 18%, rgba(184, 42, 23, 0.22) 0 0.34rem, transparent 0.36rem),
+    radial-gradient(circle at 82% 26%, rgba(121, 186, 84, 0.16) 0 0.18rem, transparent 0.2rem),
+    radial-gradient(circle at 62% 86%, rgba(255, 213, 91, 0.13) 0 0.4rem, transparent 0.43rem),
+    linear-gradient(150deg, rgba(82, 31, 14, 0.94), rgba(37, 14, 7, 0.98));
+}
+media-card article.media-card-shell::after {
+  height: 4px;
+  background: linear-gradient(90deg, rgba(119, 61, 25, 0.7), rgba(255, 197, 72, 0.74), rgba(185, 47, 24, 0.56), rgba(119, 61, 25, 0.7));
+  opacity: 0.9;
+}
+media-card article.media-card-shell:hover,
+media-card article.media-card-shell:focus-within {
+  border-color: rgba(255, 208, 89, 0.62);
+  box-shadow: 0 0 0 1px rgba(255, 217, 105, 0.28), 0 0 32px rgba(192, 58, 21, 0.2), var(--mx-elev-2);
+}
+media-card article.media-card-shell:hover::before,
+media-card article.media-card-shell:focus-within::before {
+  animation: none;
+}
+.thumb-frame,
+media-card img,
+#vw-body img,
+#up-preview img,
+video-player {
+  border-color: rgba(157, 83, 35, 0.58);
+  background:
+    radial-gradient(circle at 20% 20%, rgba(178, 42, 22, 0.16), transparent 4rem),
+    rgba(30, 12, 6, 0.82);
+  box-shadow: inset 0 1px 0 rgba(255, 230, 155, 0.12), 0 15px 34px rgba(36, 10, 3, 0.34);
+}
+.card-footer .open-cue {
+  color: #ffe089;
+}
+.card-footer .open-cue::after {
+  content: "";
+  display: inline-block;
+  width: 1.05rem;
+  height: 0.18rem;
+  margin-left: 0.35rem;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #ffe089, #f1892b);
+  box-shadow: 0 0.28rem 0 -0.05rem rgba(255, 196, 71, 0.45);
+}
+
+.ram-gauge-track,
+progress {
+  border-color: rgba(151, 78, 31, 0.58);
+  background: rgba(29, 11, 5, 0.74);
+}
+.ram-gauge-fill,
+progress::-webkit-progress-value {
+  background:
+    radial-gradient(circle at 25% 45%, rgba(183, 43, 24, 0.4) 0 0.15rem, transparent 0.17rem),
+    linear-gradient(90deg, #fff1a6, #ffc447, #f1892b, #ba3516);
+}
+progress::-moz-progress-bar {
+  background: linear-gradient(90deg, #fff1a6, #ffc447, #f1892b, #ba3516);
+}
+
+.status-strip > * {
+  border-color: rgba(211, 128, 55, 0.42);
+  background:
+    radial-gradient(circle at 16% 46%, rgba(185, 45, 26, 0.2) 0 0.16rem, transparent 0.18rem),
+    rgba(58, 23, 10, 0.84);
+}
+.tray-stack .tray-row,
+.toast,
+trust-alarm {
+  border-color: rgba(211, 128, 55, 0.44);
+  background:
+    radial-gradient(circle at 16% 0, rgba(255, 205, 75, 0.11), transparent 10rem),
+    linear-gradient(145deg, rgba(72, 28, 12, 0.94), rgba(34, 13, 6, 0.96));
+}
+
+@media (max-width: 860px) {
+  .connect-hero { min-height: 26rem; }
+  .pizza-login-deco { width: min(15rem, 64%); }
+  .auth-copy .pizza-login-deco { width: min(13rem, 64%); }
+}
+
+@media (max-width: 520px) {
+  .pizza-login-deco { width: min(12rem, 72%); }
+  .connect-hero { min-height: 24rem; }
+  .app-header::after { height: 2px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .connect-stage::before,
+  .auth-stage::before,
+  .core-line::before {
+    animation: none !important;
+  }
+}
+
+:root[data-reduced-motion] .connect-stage::before,
+:root[data-reduced-motion] .auth-stage::before,
+:root[data-reduced-motion] .core-line::before {
+  animation: none !important;
+}
+
+/* Preserve structural behaviours that broad pizza skinning must not disturb. */
+settings-screen #set-form {
+  position: relative;
+  overflow: visible;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+settings-screen #set-form::before { content: none; display: none; }
+media-card article.media-card-shell > .media-card-link,
+media-card article.media-card-shell > .media-card-link:link,
+media-card article.media-card-shell > .media-card-link:visited,
+media-card article.media-card-shell > .media-card-link:hover,
+media-card article.media-card-shell > .media-card-link:active,
+media-card article.media-card-shell > .media-card-link:focus,
+media-card article.media-card-shell > .media-card-link:focus-visible {
+  position: absolute !important;
+  inset: 0 !important;
+  z-index: 4 !important;
+}
+media-card article.media-card-shell > .card-download {
+  z-index: 5 !important;
+}
