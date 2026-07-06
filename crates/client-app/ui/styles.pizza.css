@@ -113,18 +113,6 @@ body {
   line-height: 1.55;
   overflow-x: hidden;
 }
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  opacity: 0.42;
-  background-image:
-    linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,0.028) 1px, transparent 1px);
-  background-size: 44px 44px;
-  mask-image: radial-gradient(circle at 50% 0%, black, transparent 78%);
-}
 a { color: #9ec5ff; text-underline-offset: 0.18em; }
 a:hover { color: var(--mx-text); }
 img, canvas { max-width: 100%; }
@@ -868,16 +856,6 @@ body {
     radial-gradient(circle at 50% 115%, rgba(167, 255, 63, 0.08), transparent 38rem),
     linear-gradient(135deg, var(--mx-base), var(--mx-base-2) 46%, #050711);
   font-family: var(--mx-font-display);
-}
-
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  opacity: 0.12;
-  background: repeating-linear-gradient(180deg, transparent 0 6px, rgba(255,255,255,0.16) 7px 8px);
-  mix-blend-mode: overlay;
 }
 
 a { text-decoration: none; }
@@ -2969,30 +2947,6 @@ body {
     linear-gradient(135deg, var(--mx-base), var(--mx-base-2));
 }
 
-body::before {
-  opacity: 0.32;
-  background-image:
-    radial-gradient(circle, rgba(255, 235, 166, 0.1) 0 1px, transparent 1.7px),
-    linear-gradient(115deg, rgba(255, 198, 83, 0.05) 0 12px, transparent 12px 28px);
-  background-size: 38px 38px, 70px 70px;
-  mask-image: radial-gradient(circle at 50% 8%, black, transparent 82%);
-}
-
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 0;
-  opacity: 0.28;
-  background:
-    radial-gradient(circle at 16% 22%, rgba(195, 35, 21, 0.68) 0 0.32rem, transparent 0.35rem),
-    radial-gradient(circle at 82% 18%, rgba(255, 238, 163, 0.52) 0 0.22rem, transparent 0.25rem),
-    radial-gradient(circle at 72% 78%, rgba(195, 35, 21, 0.56) 0 0.28rem, transparent 0.31rem),
-    radial-gradient(circle at 26% 86%, rgba(255, 238, 163, 0.42) 0 0.2rem, transparent 0.23rem);
-  background-size: 18rem 18rem, 20rem 20rem, 23rem 23rem, 19rem 19rem;
-}
-
 app-shell,
 .app-header,
 .status-strip,
@@ -3308,25 +3262,6 @@ body {
     radial-gradient(circle at 96% 6%, rgba(178, 48, 16, 0.28), transparent 30rem),
     radial-gradient(circle at 50% 112%, rgba(118, 45, 17, 0.58), transparent 38rem),
     linear-gradient(135deg, #170905 0%, #351208 54%, #231006 100%);
-}
-
-body::before {
-  opacity: 0.22;
-  background-image:
-    radial-gradient(circle, rgba(255, 226, 139, 0.18) 0 1px, transparent 1.9px),
-    radial-gradient(circle, rgba(164, 35, 20, 0.28) 0 3px, transparent 3.3px),
-    linear-gradient(115deg, rgba(255, 193, 70, 0.045) 0 12px, transparent 12px 31px);
-  background-size: 42px 42px, 168px 168px, 82px 82px;
-}
-
-body::after {
-  opacity: 0.18;
-  background:
-    radial-gradient(circle at 18% 22%, rgba(187, 36, 20, 0.8) 0 0.34rem, transparent 0.37rem),
-    radial-gradient(circle at 82% 18%, rgba(126, 184, 84, 0.52) 0 0.22rem, transparent 0.25rem),
-    radial-gradient(circle at 72% 78%, rgba(187, 36, 20, 0.62) 0 0.28rem, transparent 0.31rem),
-    radial-gradient(circle at 26% 86%, rgba(255, 219, 109, 0.42) 0 0.2rem, transparent 0.23rem);
-  background-size: 19rem 19rem, 22rem 22rem, 24rem 24rem, 20rem 20rem;
 }
 
 /* Remove the previous header garnish/top-drip that read as a giant yellow bar. */
@@ -3812,9 +3747,10 @@ media-card article.media-card-shell > .card-download {
   z-index: 5 !important;
 }
 
-/* ---------- Pizza v3 feedback pass: compact spacing + proper brand slice ----------
-   Keeps the pizza skin decorative, but stops the theme from visually adding
-   large empty bands under every panel/card. */
+/* ---------- Pizza v6 comparison pass: original-sample parity fixes ----------
+   The original first sample had no pizza-added full-page pseudo layers. Keep the
+   pizza look on real components, but remove the new page-end pseudo band and make
+   the brand slice independent from child SVG visibility. */
 :root {
   --mx-space-5: 1rem;
   --mx-space-6: 1.15rem;
@@ -3822,8 +3758,68 @@ media-card article.media-card-shell > .card-download {
   --mx-space-10: 1.9rem;
 }
 
-main {
-  padding-bottom: 2.25rem;
+body::before,
+body::after,
+#outlet::before,
+#outlet::after,
+app-shell::before,
+app-shell::after,
+main::before,
+main::after,
+connect-screen #main.connect-main::before,
+connect-screen #main.connect-main::after,
+.auth-main::before,
+.auth-main::after {
+  content: none !important;
+  display: none !important;
+  position: static !important;
+  inset: auto !important;
+  width: 0 !important;
+  height: 0 !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  background: none !important;
+  box-shadow: none !important;
+}
+
+html,
+body,
+app-shell,
+#outlet {
+  min-height: 0 !important;
+  margin-bottom: 0 !important;
+  padding-bottom: 0 !important;
+}
+
+body {
+  min-height: 100vh !important;
+}
+
+app-shell {
+  min-height: 100dvh !important;
+}
+
+#outlet {
+  display: flow-root;
+  margin-bottom: 0 !important;
+  padding-bottom: 0 !important;
+}
+
+#main,
+main,
+connect-screen #main.connect-main,
+.auth-main {
+  margin-bottom: 0 !important;
+  padding-bottom: 0 !important;
+}
+
+#outlet > :last-child,
+#outlet > :last-child #main,
+#outlet > main:last-child,
+#main > :last-child {
+  margin-bottom: 0 !important;
 }
 
 #grid,
@@ -3857,7 +3853,6 @@ settings-screen #set-form > fieldset.privacy {
   padding: clamp(0.85rem, 1.7vw, 1.15rem);
 }
 
-/* Smaller contained cheese lip: decorative only, not a thick visual spacer. */
 :is(form, fieldset, section[aria-labelledby], #up-preview, #vw-body, #vw-meta, main > dl, #pq-list, #controls,
 .connect-hero, .connect-card, .auth-copy, .auth-card, media-card article.media-card-shell,
 .bundle-head, .composer, .settings-card, .share-panel, .confirm-panel, .tray-row)::before {
@@ -3877,199 +3872,47 @@ media-card article.media-card-shell {
   padding: 0.72rem;
 }
 
-/* Replace the old abstract diamond with an actual pizza-slice icon. */
-.app-brand-mark {
-  width: 42px;
-  height: 42px;
-  min-width: 42px;
-  border-radius: 14px;
-  display: inline-grid;
-  place-items: center;
-  color: transparent;
-  font-size: 0;
-  background:
-    radial-gradient(circle at 58% 28%, rgba(185, 45, 26, 0.32) 0 0.2rem, transparent 0.23rem),
-    linear-gradient(145deg, rgba(95, 39, 16, 0.88), rgba(38, 15, 7, 0.94));
-  border: 1px solid rgba(255, 211, 89, 0.46);
-  box-shadow: 0 0.45rem 1.2rem rgba(234, 116, 35, 0.22), inset 0 1px 0 rgba(255, 244, 184, 0.24);
-  transform: none;
-  overflow: visible;
-}
-.app-brand-mark::before {
-  content: "🍕";
-  font-size: 38px;
-  line-height: 1;
-  transform: rotate(-13deg) translateY(-1px);
-  filter: drop-shadow(0 0.22rem 0.18rem rgba(42, 12, 3, 0.34));
-}
-.app-brand-mark::after {
-  content: "";
-  position: absolute;
-  left: 11px;
-  right: 9px;
-  bottom: 5px;
-  height: 4px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, rgba(255, 238, 166, 0), rgba(255, 204, 73, 0.78), rgba(255, 238, 166, 0));
-  pointer-events: none;
-}
-
-/* ---------- Pizza v4 feedback pass: no page-bottom dead space + real header slice ---------- */
-/* Remove the extra empty band that the original tech layout kept under each routed page.
-   Bottom-docked status/upload controls are fixed overlays, so the pizza skin should not
-   reserve a large visual spacer at the page end. */
-main,
-connect-screen #main.connect-main,
-.auth-main {
-  padding-bottom: 0 !important;
-}
-
-#outlet > main:last-child,
-#outlet > *:last-child main:last-child {
-  margin-bottom: 0 !important;
-}
-
-/* The pizza frontend now uses a real inline SVG slice instead of trying to draw over
-   the old diamond with pseudo-content. */
-.app-brand-mark {
+.app-header .app-brand .app-brand-mark {
   position: relative;
-  width: 42px !important;
-  height: 42px !important;
-  min-width: 42px !important;
+  width: 46px !important;
+  height: 46px !important;
+  min-width: 46px !important;
+  min-height: 46px !important;
+  max-width: 46px !important;
+  max-height: 46px !important;
   padding: 0 !important;
-  border-radius: 14px !important;
   display: inline-grid !important;
   place-items: center !important;
   color: transparent !important;
   font-size: 0 !important;
-  line-height: 1 !important;
+  line-height: 0 !important;
   overflow: visible !important;
-  transform: none !important;
+  border-radius: 15px !important;
   background:
-    radial-gradient(circle at 58% 28%, rgba(185, 45, 26, 0.24) 0 0.2rem, transparent 0.23rem),
-    linear-gradient(145deg, rgba(95, 39, 16, 0.9), rgba(38, 15, 7, 0.96)) !important;
-  border: 1px solid rgba(255, 211, 89, 0.5);
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath fill='%23b96a2b' d='M11 9c10.5-5.2 28.7-4.8 42.4 2.1 2.8 1.4 3.7 5 1.8 7.5l-4 5.2C40.4 18 25.2 15.3 9.1 17.5l-1.5-2.7C6.4 12.7 7.6 10.7 11 9Z'/%3E%3Cpath fill='%23ffd45f' d='M9.1 17.5c16.1-2.2 31.3.5 42.1 6.3L27.7 58.6c-1.5 2.2-4.9 1.5-5.4-1.1L9.1 17.5Z'/%3E%3Cpath fill='none' stroke='%23fff0a8' stroke-width='3.5' stroke-linecap='round' d='M9.1 17.5c16.1-2.2 31.3.5 42.1 6.3'/%3E%3Ccircle fill='%23c73422' cx='27' cy='26' r='4.4'/%3E%3Ccircle fill='%23c73422' cx='39' cy='35' r='3.9'/%3E%3Cpath fill='%2376ad4a' d='M23 41c4.6-2.7 7.5-1.6 8.9 2.9-4.2 2.9-7.1 1.7-8.9-2.9Z'/%3E%3Cpath fill='none' stroke='%23fff3a7' stroke-width='3' stroke-linecap='round' d='M18.6 31c2.2 1.4 3.2 3.8 2.7 6.8-.4 2.5.5 4 2.3 4.5'/%3E%3C/svg%3E") center / 38px 38px no-repeat,
+    radial-gradient(circle at 72% 26%, rgba(255, 224, 121, 0.34) 0 0.35rem, transparent 0.38rem),
+    linear-gradient(145deg, rgba(95, 39, 16, 0.92), rgba(38, 15, 7, 0.98)) !important;
+  border: 1px solid rgba(255, 211, 89, 0.52) !important;
   box-shadow: 0 0.45rem 1.2rem rgba(234, 116, 35, 0.22), inset 0 1px 0 rgba(255, 244, 184, 0.24) !important;
+  transform: none !important;
 }
 
-.app-brand-mark::before,
-.app-brand-mark::after {
+.app-header .app-brand .app-brand-mark::before,
+.app-header .app-brand .app-brand-mark::after {
   content: none !important;
   display: none !important;
 }
 
-.app-brand-mark .default-brand-glyph {
+.app-header .app-brand .app-brand-mark > * {
   display: none !important;
 }
 
-.app-brand-mark .pizza-brand-slice {
-  display: block !important;
-  width: 38px !important;
-  height: 38px !important;
-  overflow: visible;
-  transform: rotate(-12deg) translateY(-1px);
-  filter: drop-shadow(0 0.22rem 0.18rem rgba(42, 12, 3, 0.35));
-}
-
-.pizza-brand-crust { fill: #b96a2b; }
-.pizza-brand-cheese { fill: #ffd45f; }
-.pizza-brand-edge {
-  fill: none;
-  stroke: #fff0a8;
-  stroke-width: 3.5;
-  stroke-linecap: round;
-}
-.pizza-brand-pepperoni { fill: #c73422; }
-.pizza-brand-basil { fill: #76ad4a; }
-.pizza-brand-melt {
-  fill: none;
-  stroke: #fff3a7;
-  stroke-width: 3;
-  stroke-linecap: round;
-}
-
-
-/* ---------- Pizza v5 feedback pass: remove pseudo-element bottom band + force real slice ---------- */
-/* The reported bottom dead-space highlights only when DevTools targets pseudo-elements.
-   Disable the global body texture pseudo-layers in the pizza frontend so they cannot
-   create or visually mark an extra page-end band. Component cheese lips remain intact. */
-body::before,
-body::after {
-  content: none !important;
-  display: none !important;
-}
-
-#outlet::before,
-#outlet::after,
-app-shell::before,
-app-shell::after,
-main::before,
-main::after,
-connect-screen #main.connect-main::before,
-connect-screen #main.connect-main::after,
-.auth-main::before,
-.auth-main::after {
-  content: none !important;
-  display: none !important;
-}
-
-html,
-body,
-app-shell,
-#outlet {
-  min-height: 0 !important;
-}
-
-body {
-  min-height: 100vh !important;
-}
-
-app-shell {
-  min-height: 100dvh !important;
-  padding-bottom: 0 !important;
-}
-
-#outlet {
-  display: flow-root;
-  padding-bottom: 0 !important;
-  margin-bottom: 0 !important;
-}
-
-#outlet > :last-child,
-#outlet > :last-child #main,
-#outlet > main:last-child {
-  margin-bottom: 0 !important;
-  padding-bottom: 0 !important;
-}
-
-#main {
-  padding-bottom: 0 !important;
-}
-
-/* Hard-target the visible top-left brand mark. Do not rely on emoji pseudo-content or
-   an inline-hidden SVG: show the actual inline slice at a guaranteed 38px size. */
-.app-header .app-brand .app-brand-mark {
-  width: 42px !important;
-  height: 42px !important;
-  min-width: 42px !important;
-  max-width: 42px !important;
-  min-height: 42px !important;
-  padding: 0 !important;
-  display: inline-grid !important;
-  place-items: center !important;
-  overflow: visible !important;
-}
-
-.app-header .app-brand .app-brand-mark .default-brand-glyph {
-  display: none !important;
-}
-
-.app-header .app-brand .app-brand-mark .pizza-brand-slice {
-  display: block !important;
-  width: 38px !important;
-  min-width: 38px !important;
-  height: 38px !important;
-  min-height: 38px !important;
-  opacity: 1 !important;
-  visibility: visible !important;
+@media (max-width: 520px) {
+  .app-header .app-brand .app-brand-mark {
+    width: 42px !important;
+    height: 42px !important;
+    min-width: 42px !important;
+    min-height: 42px !important;
+    background-size: 38px 38px, auto, auto !important;
+  }
 }
