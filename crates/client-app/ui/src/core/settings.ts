@@ -2,6 +2,7 @@ import { call } from "./rpc.ts";
 import type { Settings } from "./types.ts";
 import { SettingsStore } from "./settings-store.ts";
 import { decodePool } from "./pool.ts";
+import { applyFrontend } from "./frontends.ts";
 
 const DEFAULTS: Settings = {
   a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
@@ -11,52 +12,19 @@ const DEFAULTS: Settings = {
   appearance: { theme: "dark" },
 };
 
-export type ThemePreset = "tech" | "cheese" | "pottery";
-const THEME_PRESET_KEY = "maxsecu.themePreset";
-
-function normalizeThemePreset(value: unknown): ThemePreset {
-  return value === "cheese" || value === "pottery" || value === "tech" ? value : "tech";
-}
-
-export function getThemePreset(): ThemePreset {
-  try {
-    return normalizeThemePreset(window.localStorage.getItem(THEME_PRESET_KEY));
-  } catch {
-    return "tech";
-  }
-}
-
-export function setThemePreset(value: unknown): ThemePreset {
-  const preset = normalizeThemePreset(value);
-  try {
-    window.localStorage.setItem(THEME_PRESET_KEY, preset);
-  } catch {
-    // Local storage can be unavailable in tests or locked-down webviews; the
-    // visual preset still applies for this session through the DOM attribute.
-  }
-  applyThemePreset(preset);
-  return preset;
-}
-
-export function applyThemePreset(value: unknown = getThemePreset()): ThemePreset {
-  const preset = normalizeThemePreset(value);
-  document.documentElement.setAttribute("data-theme", preset);
-  return preset;
-}
-
 // The single shared settings store (spec §7). Settings screen, the header RAM
 // gauge, and the shell theme all read/write THIS instance, so they always agree
 // and apply live.
 export const settingsStore = new SettingsStore(DEFAULTS);
 
-// Apply settings live: visual theme preset + a11y data-attrs (styles.css keys on
+// Apply settings live: active frontend + a11y data-attrs (styles.css keys on
 // them; reduced-motion ALSO respects the OS via a media query), and resize the
 // shared feed-decode pool from `feed_concurrency`. Theme presets are deliberately
 // frontend-only placeholders; the persisted backend appearance contract remains
 // the existing dark setting.
 export function applySettings(s: Settings): void {
   const root = document.documentElement;
-  applyThemePreset();
+  applyFrontend();
   root.toggleAttribute("data-reduced-motion", s.a11y.reduced_motion);
   root.toggleAttribute("data-high-contrast", s.a11y.high_contrast);
   root.setAttribute("data-text-size", s.a11y.text_size);

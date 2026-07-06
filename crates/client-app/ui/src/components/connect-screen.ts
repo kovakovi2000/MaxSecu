@@ -5,7 +5,7 @@ import type { Settings } from "../core/types.ts";
 export class ConnectScreen extends HTMLElement {
   connectedCallback() {
     this.innerHTML = `
-      <main id="main" class="connect-main" tabindex="-1" aria-labelledby="cn-h">
+      <main id="main" class="connect-main" tabindex="-1" aria-labelledby="cn-h" data-deco-slot="login">
         <section class="connect-stage" aria-label="MaxSecu sign in">
           <div class="connect-hero">
             <div class="connect-visual" aria-hidden="true">

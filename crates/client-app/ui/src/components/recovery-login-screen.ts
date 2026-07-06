@@ -13,7 +13,7 @@ import type { RecoveryChallengeDto, RecoveryLoginDto } from "../core/types.ts";
 export class RecoveryLoginScreen extends HTMLElement {
   connectedCallback() {
     this.innerHTML = `
-      <main id="main" class="auth-main recovery-main" tabindex="-1" aria-labelledby="rl-h" aria-describedby="rl-status">
+      <main id="main" class="auth-main recovery-main" tabindex="-1" aria-labelledby="rl-h" aria-describedby="rl-status" data-deco-slot="login">
         <section class="auth-stage" aria-label="Recovery gate">
           <div class="auth-copy">
             <p class="eyebrow">cold-key recovery</p>

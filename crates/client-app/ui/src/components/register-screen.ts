@@ -14,7 +14,7 @@ import type { RegisteredDto } from "../core/types.ts";
 export class RegisterScreen extends HTMLElement {
   connectedCallback() {
     this.innerHTML = `
-      <main id="main" class="auth-main register-main" tabindex="-1" aria-labelledby="rg-h" aria-describedby="rg-status">
+      <main id="main" class="auth-main register-main" tabindex="-1" aria-labelledby="rg-h" aria-describedby="rg-status" data-deco-slot="login">
         <section class="auth-stage" aria-label="Registration gate">
           <div class="auth-copy">
             <p class="eyebrow">one-time enrollment</p>
