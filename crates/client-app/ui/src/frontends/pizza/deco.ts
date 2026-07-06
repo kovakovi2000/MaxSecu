@@ -14,7 +14,7 @@ function clearBodyEndGap(doc: Document): void {
   if (!body.hasAttribute(ORIGINAL_BODY_PADDING_BOTTOM_ATTR)) {
     body.setAttribute(ORIGINAL_BODY_PADDING_BOTTOM_ATTR, body.style.getPropertyValue("padding-bottom"));
   }
-  body.style.setProperty("margin-bottom", "0px", "important");
+  body.style.setProperty("margin-bottom", "128px", "important");
   body.style.setProperty("padding-bottom", "0px", "important");
 }
 
