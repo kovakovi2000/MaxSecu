@@ -6,8 +6,8 @@
 //! decrypt-while-play discipline: only ciphertext is cached, plaintext is
 //! bounded + zeroized, the decryptor never crosses the seam.
 
+use crate::blob_cache::{BlobCache, Ns};
 use crate::error::UiError;
-use crate::fragment_cache::FragmentCache;
 use crate::video::FragmentEntry;
 use maxsecu_client_core::ContentDecryptor;
 
@@ -103,7 +103,8 @@ pub fn plan_range(
 /// opaque ciphertext for ABSOLUTE content chunk `i`.
 pub fn assemble_range<F>(
     index: &[FragmentEntry],
-    cache: &mut FragmentCache,
+    cache: &mut BlobCache,
+    ns: Ns,
     decryptor: &ContentDecryptor,
     file_id_hex: &str,
     plan: &RangePlan,
@@ -118,6 +119,7 @@ where
         crate::video::feed_fragment(
             index,
             cache,
+            ns,
             decryptor,
             file_id_hex,
             seq,
@@ -173,7 +175,7 @@ mod tests {
     const FILE_ID: Id = Id([0xF1; 16]);
     const NOW: Timestamp = Timestamp(1_719_500_000_000);
 
-    fn tmp_cache(tag: &str) -> FragmentCache {
+    fn tmp_cache(tag: &str) -> BlobCache {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -181,7 +183,7 @@ mod tests {
         let dir = std::env::temp_dir()
             .join(format!("mxstream-{tag}-{}-{nanos}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        FragmentCache::open(&dir, 1 << 20).unwrap()
+        BlobCache::open(&dir, 1 << 20).unwrap()
     }
 
     /// Build a 6-chunk video-shaped upload; return (owner, header, ciphertext
@@ -354,7 +356,7 @@ mod tests {
         let req = RangeReq { start: 4096, len: 9000 };
         let plan = plan_range(&index, cs, &req).unwrap();
         let mut fetches = 0u32;
-        let got = assemble_range(&index, &mut cache, &dec, &id, &plan, &req, |i| {
+        let got = assemble_range(&index, &mut cache, Ns::Frag, &dec, &id, &plan, &req, |i| {
             fetches += 1;
             Ok(ct[i as usize].clone())
         })
@@ -364,7 +366,7 @@ mod tests {
 
         // Second identical request is a cache hit: no fetch, same bytes.
         let mut fetches2 = 0u32;
-        let got2 = assemble_range(&index, &mut cache, &dec, &id, &plan, &req, |_i| {
+        let got2 = assemble_range(&index, &mut cache, Ns::Frag, &dec, &id, &plan, &req, |_i| {
             fetches2 += 1;
             Ok(Vec::new())
         })

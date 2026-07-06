@@ -26,6 +26,7 @@ pub mod index;
 pub mod jobs;
 pub mod keystore;
 pub mod layout;
+pub mod media_cache;
 pub mod ram;
 pub mod recipients;
 pub mod recovery_pin;

@@ -132,14 +132,15 @@ impl Default for BundleJobs {
 }
 
 /// One live video-player session (Phase 7, Gate 4). Holds the in-TCB
-/// [`ContentDecryptor`] (the content subkey — NEVER crosses the Tauri seam), the
-/// authenticated fragment index (seek map), and the bounded on-disk **ciphertext**
-/// [`FragmentCache`]. Dropping the job (on `cancel_video`) drops the decryptor,
-/// which zeroizes the subkey. Non-`Clone` by construction (the decryptor is).
+/// [`ContentDecryptor`] (the content subkey — NEVER crosses the Tauri seam) and the
+/// authenticated fragment index (seek map). The ciphertext fragment cache is now
+/// the app-global shared [`crate::media_cache::MediaCache`] (external to the job),
+/// so it persists across `cancel_video`. Dropping the job (on `cancel_video`) drops
+/// the decryptor, which zeroizes the subkey. Non-`Clone` by construction (the
+/// decryptor is).
 pub struct VideoJob {
     pub decryptor: maxsecu_client_core::ContentDecryptor,
     pub index: Vec<crate::video::FragmentEntry>,
-    pub cache: crate::fragment_cache::FragmentCache,
     pub file_id_hex: String,
     pub version: u64,
     /// Plaintext content chunk size (bytes) — the byte↔chunk unit for range serving.

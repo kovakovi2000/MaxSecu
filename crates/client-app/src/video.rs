@@ -1,11 +1,11 @@
 //! Sandboxed-video client orchestration (Phase 7, Gate 4): the **fragment index**
 //! (seek map) + the **decrypt-while-play feeder** that drives one CMAF fragment at
-//! a time from the on-disk ciphertext [`FragmentCache`](crate::fragment_cache) and
+//! a time from the ciphertext [`BlobCache`](crate::blob_cache) and
 //! the in-TCB [`ContentDecryptor`](maxsecu_client_core::ContentDecryptor) to a
 //! decoder sink.
 //!
 //! # Security model (the dedicated review checks these)
-//! * **Only ciphertext is cached.** The blob handed to [`FragmentCache::put`] is
+//! * **Only ciphertext is cached.** The blob handed to [`BlobCache::put`] is
 //!   the *length-prefixed framing of the fetched ciphertext chunks* — never the
 //!   decrypted plaintext. The decrypt happens AFTER the cache write, into a
 //!   `Zeroizing` buffer that never touches the cache or disk.
@@ -31,8 +31,8 @@ use serde_json::Value;
 
 use maxsecu_client_core::ContentDecryptor;
 
+use crate::blob_cache::{BlobCache, Ns};
 use crate::error::UiError;
-use crate::fragment_cache::FragmentCache;
 
 /// One CMAF fragment's seek + storage mapping: presentation time `pts_ms` and the
 /// half-open absolute `content`-chunk range `[chunk_start, chunk_start + chunk_len)`
@@ -171,7 +171,8 @@ pub fn chunks_for_fragment(index: &[FragmentEntry], seq: u32) -> Option<(u64, u6
 /// error, or an AEAD failure all return an `Err` with no plaintext released.
 pub fn feed_fragment<F, S>(
     index: &[FragmentEntry],
-    cache: &mut FragmentCache,
+    cache: &mut BlobCache,
+    ns: Ns,
     decryptor: &ContentDecryptor,
     file_id_hex: &str,
     seq: u32,
@@ -195,7 +196,7 @@ where
     // whose chunk count does not match this fragment, is treated as a miss
     // (fail-closed) — never a panic.
     let cached: Option<Vec<Vec<u8>>> = cache
-        .get(file_id_hex, seq)
+        .get(ns, file_id_hex, seq)
         .and_then(|blob| deframe_chunks(&blob))
         .filter(|chunks| chunks.len() as u64 == chunk_len);
 
@@ -210,7 +211,7 @@ where
                 chunks.push(fetch_chunk(i)?);
             }
             let blob = frame_chunks(&chunks);
-            let _ = cache.put(file_id_hex, seq, &blob);
+            let _ = cache.put(ns, file_id_hex, seq, &blob);
             chunks
         }
     };
@@ -450,7 +451,7 @@ mod tests {
         assert_eq!(deframe_chunks(&impossible), None);
     }
 
-    // ---- the feeder over a REAL ContentDecryptor + REAL FragmentCache ----
+    // ---- the feeder over a REAL ContentDecryptor + REAL BlobCache ----
 
     /// Build a multi-chunk video-shaped upload, returning the bundle + the whole
     /// content plaintext (content spans several 4 KiB chunks).
@@ -559,7 +560,7 @@ mod tests {
         let id_hex = file_id_hex();
 
         let dir = tmp_dir("feed");
-        let mut cache = FragmentCache::open(&dir, 1 << 20).unwrap();
+        let mut cache = BlobCache::open(&dir, 1 << 20).unwrap();
 
         // Fragment 0 = content chunks [0,2) = plaintext bytes [0, 2*4096).
         let mut fetch_calls = 0u32;
@@ -567,6 +568,7 @@ mod tests {
         feed_fragment(
             &index,
             &mut cache,
+            Ns::Frag,
             &dec,
             &id_hex,
             0,
@@ -584,7 +586,7 @@ mod tests {
         assert_eq!(got, content[0..2 * 4096], "decoded plaintext matches");
 
         // The cache now holds CIPHERTEXT, not the plaintext we just decoded.
-        let blob = cache.get(&id_hex, 0).expect("cached after miss");
+        let blob = cache.get(Ns::Frag, &id_hex, 0).expect("cached after miss");
         assert_ne!(blob, got, "cache blob is not the decoded plaintext");
         assert!(
             !blob.windows(got.len()).any(|w| w == got.as_slice()),
@@ -599,6 +601,7 @@ mod tests {
         feed_fragment(
             &index,
             &mut cache,
+            Ns::Frag,
             &dec,
             &id_hex,
             0,
@@ -624,13 +627,14 @@ mod tests {
         let index = two_fragment_index(chunks.len() as u64);
         let id_hex = file_id_hex();
         let dir = tmp_dir("whole");
-        let mut cache = FragmentCache::open(&dir, 1 << 20).unwrap();
+        let mut cache = BlobCache::open(&dir, 1 << 20).unwrap();
 
         let mut joined: Vec<u8> = Vec::new();
         for seq in 0..2u32 {
             feed_fragment(
                 &index,
                 &mut cache,
+                Ns::Frag,
                 &dec,
                 &id_hex,
                 seq,
@@ -653,17 +657,18 @@ mod tests {
         let index = two_fragment_index(chunks.len() as u64);
         let id_hex = file_id_hex();
         let dir = tmp_dir("corrupt");
-        let mut cache = FragmentCache::open(&dir, 1 << 20).unwrap();
+        let mut cache = BlobCache::open(&dir, 1 << 20).unwrap();
 
         // Pre-seed a GARBAGE (undeframeable) blob under fragment 0's key.
         cache
-            .put(&id_hex, 0, b"\xff\xff\xff\xff not a frame")
+            .put(Ns::Frag, &id_hex, 0, b"\xff\xff\xff\xff not a frame")
             .unwrap();
 
         let mut fetch_calls = 0u32;
         feed_fragment(
             &index,
             &mut cache,
+            Ns::Frag,
             &dec,
             &id_hex,
             0,
@@ -677,7 +682,7 @@ mod tests {
         assert_eq!(fetch_calls, 2, "corrupt cache blob forced a refetch");
         // The cache was repaired with valid ciphertext framing.
         assert_eq!(
-            deframe_chunks(&cache.get(&id_hex, 0).unwrap()).unwrap(),
+            deframe_chunks(&cache.get(Ns::Frag, &id_hex, 0).unwrap()).unwrap(),
             chunks[0..2].to_vec()
         );
     }
@@ -689,10 +694,11 @@ mod tests {
         let dec = open_content_decryptor(&ctx(&owner), &header).expect("decryptor");
         let index = two_fragment_index(chunks.len() as u64);
         let dir = tmp_dir("unknown");
-        let mut cache = FragmentCache::open(&dir, 1 << 20).unwrap();
+        let mut cache = BlobCache::open(&dir, 1 << 20).unwrap();
         let err = feed_fragment(
             &index,
             &mut cache,
+            Ns::Frag,
             &dec,
             &file_id_hex(),
             99,
@@ -710,11 +716,12 @@ mod tests {
         let dec = open_content_decryptor(&ctx(&owner), &header).expect("decryptor");
         let index = two_fragment_index(chunks.len() as u64);
         let dir = tmp_dir("fetcherr");
-        let mut cache = FragmentCache::open(&dir, 1 << 20).unwrap();
+        let mut cache = BlobCache::open(&dir, 1 << 20).unwrap();
         let mut sink_calls = 0u32;
         let err = feed_fragment(
             &index,
             &mut cache,
+            Ns::Frag,
             &dec,
             &file_id_hex(),
             0,
@@ -737,11 +744,12 @@ mod tests {
         let dec = open_content_decryptor(&ctx(&owner), &header).expect("decryptor");
         let index = two_fragment_index(chunks.len() as u64);
         let dir = tmp_dir("tamper");
-        let mut cache = FragmentCache::open(&dir, 1 << 20).unwrap();
+        let mut cache = BlobCache::open(&dir, 1 << 20).unwrap();
         let mut sink_calls = 0u32;
         let err = feed_fragment(
             &index,
             &mut cache,
+            Ns::Frag,
             &dec,
             &file_id_hex(),
             0,
@@ -762,7 +770,7 @@ mod tests {
     /// to the cache — `cache.put` happens BEFORE the AEAD check — so a naive retry
     /// that just re-supplies genuine bytes to `feed_fragment` would read the
     /// poisoned cache entry back as a "hit" and fail again FOREVER. Evicting the
-    /// entry first (`FragmentCache::evict`, what `serve_range` does before its
+    /// entry first (`BlobCache::evict`, what `serve_range` does before its
     /// forced-proxy retry) breaks that trap: the next `feed_fragment` call is a
     /// genuine miss, re-fetches (here: the caller now supplies genuine bytes,
     /// standing in for the forced-proxy refetch), and succeeds.
@@ -776,13 +784,14 @@ mod tests {
         let index = two_fragment_index(chunks.len() as u64);
         let id_hex = file_id_hex();
         let dir = tmp_dir("poison-then-evict");
-        let mut cache = FragmentCache::open(&dir, 1 << 20).unwrap();
+        let mut cache = BlobCache::open(&dir, 1 << 20).unwrap();
 
         // First feed: tampered bytes. Fails AEAD, but the cache was already
         // written with the tampered blob (the trap this test pins).
         let err = feed_fragment(
             &index,
             &mut cache,
+            Ns::Frag,
             &dec,
             &id_hex,
             0,
@@ -791,7 +800,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "video_failed");
-        assert!(cache.contains(&id_hex, 0), "the failed attempt still poisoned the cache");
+        assert!(cache.contains(Ns::Frag, &id_hex, 0), "the failed attempt still poisoned the cache");
 
         // Without eviction, a retry with GENUINE bytes still fails — the poisoned
         // cache is read back as a "hit" and the genuine bytes never get used.
@@ -799,6 +808,7 @@ mod tests {
         let still_fails = feed_fragment(
             &index,
             &mut cache,
+            Ns::Frag,
             &dec,
             &id_hex,
             0,
@@ -813,13 +823,14 @@ mod tests {
 
         // Evict (what serve_range's Phase D does before its forced-proxy retry),
         // then retry with genuine bytes: now a real miss, refetches, and succeeds.
-        cache.evict(&id_hex, 0);
-        assert!(!cache.contains(&id_hex, 0));
+        cache.evict(Ns::Frag, &id_hex, 0);
+        assert!(!cache.contains(Ns::Frag, &id_hex, 0));
         let mut fetch_calls2 = 0u32;
         let mut got: Vec<u8> = Vec::new();
         feed_fragment(
             &index,
             &mut cache,
+            Ns::Frag,
             &dec,
             &id_hex,
             0,

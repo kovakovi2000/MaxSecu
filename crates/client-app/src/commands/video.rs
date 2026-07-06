@@ -47,6 +47,7 @@ use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::Manifest;
 use maxsecu_encoding::types::StreamType;
 
+use crate::blob_cache::{BlobCache, Ns};
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
 use crate::commands::feed::{hex, hex16, now_ms};
@@ -54,9 +55,9 @@ use crate::config::{load_directory_pub, RouteMode, SettingsConfig};
 use crate::directory::{resolve_and_verify_author_logged, resolve_my_user_id, VerifiedAuthor};
 use crate::download::{build_stream_header, parse_file_view};
 use crate::error::UiError;
-use crate::fragment_cache::FragmentCache;
 use crate::http_client::get_json;
 use crate::jobs::{AuthedChannel, UploadJobs, VideoJob, VideoJobs};
+use crate::media_cache::MediaCache;
 use crate::state::{PlayerPhase, EVT_PLAYER};
 use crate::video::{chunks_for_fragment, FragmentEntry};
 
@@ -134,12 +135,13 @@ fn open_video_job_core(
 /// bytes); re-derived here because 4.2b's `deframe_chunks` is private and must not
 /// be touched.
 fn cached_fragment_valid(
-    cache: &mut FragmentCache,
+    cache: &mut BlobCache,
+    ns: Ns,
     file_id_hex: &str,
     seq: u32,
     chunk_len: u64,
 ) -> bool {
-    match cache.get(file_id_hex, seq) {
+    match cache.get(ns, file_id_hex, seq) {
         Some(blob) => deframe_count(&blob).is_some_and(|n| n as u64 == chunk_len),
         None => false,
     }
@@ -471,13 +473,11 @@ async fn open_video_inner(
     let trusted_total =
         trusted_total_len(decryptor.content_chunk_count(), chunk_size, content_stream.total_bytes);
 
-    // Register the session first (so the fragment cache exists); probe the total
-    // plaintext length by decrypting ONLY the last fragment once, but ONLY when the
-    // server length was unusable (`settings`/`route_mode` were loaded above and are
-    // reused for every network fetch in the session).
-    let cap = settings.performance.media_cache_cap_mb as u64 * 1024 * 1024;
-    let location = settings.performance.cache_location;
-    let cache = FragmentCache::open_located(&dir.0, cap, location).map_err(|_| player_err())?;
+    // Register the session; probe the total plaintext length by decrypting ONLY the
+    // last fragment once, but ONLY when the server length was unusable (`route_mode`
+    // was loaded above and is reused for every network fetch in the session). The
+    // ciphertext fragment cache is the app-global shared `MediaCache` (built at
+    // startup, Task 7) — no per-job cache is created here.
 
     // Move the open-time authed connection into a persistent channel for all range
     // fetches in this session (probe_total_len + every serve_range). After this point
@@ -491,7 +491,6 @@ async fn open_video_inner(
         VideoJob {
             decryptor,
             index,
-            cache,
             file_id_hex: file_id_hex.clone(),
             version,
             chunk_size,
@@ -533,41 +532,41 @@ pub async fn cancel_video(
     Ok(())
 }
 
-/// Live in-RAM fragment-cache footprint, for the header RAM-cache gauge.
+/// Live in-RAM media-cache footprint, for the header RAM-cache gauge.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct CacheStats {
-    /// Sum, across all OPEN video sessions, of the ciphertext bytes each session's
-    /// fragment cache is holding **in RAM** (0 for a session using the on-disk
-    /// backend — see [`crate::fragment_cache::FragmentCache::memory_bytes`]). This is
-    /// exactly the "rolling memory frame" the cache occupies; it is capped per
-    /// session at `media_cache_cap_mb` and LRU-evicts, so it can never grow unbounded.
+    /// The ciphertext bytes the app-global shared media cache is holding **in RAM**
+    /// (0 when it uses the on-disk backend — see [`BlobCache::memory_bytes`]). This
+    /// is exactly the "rolling memory frame" the cache occupies; it is capped at
+    /// `media_cache_cap_mb` and LRU-evicts, so it can never grow unbounded.
     pub used_bytes: u64,
 }
 
-/// `cache_stats` — reconcile every open session's fragment cache to the **live** cap
-/// `cap_bytes` (the value the header gauge divides by), then report the summed in-RAM
-/// fill. The cap is otherwise frozen when a session opens, so lowering the setting
-/// mid-playback would leave an already-open cache holding up to its larger open-time
-/// cap while the gauge divides by the new, smaller cap — reading over 100%. Applying
-/// `set_cap` here (the gauge polls this ~every 1.5 s) evicts each open cache down to
-/// the current cap and updates its budget, so subsequent range fetches honor it too.
-/// Passing the SAME `cap_bytes` the gauge uses as the denominator keeps each open
-/// cache within it — so the normal single-playback case can never read over 100%.
-/// (The viewer drops a session on teardown via `cancel_video`, so concurrent sessions
-/// are unusual; N truly-simultaneous plays could sum to N×cap.) Cheap: a brief lock +
-/// LRU trims, no network I/O.
+/// `cache_stats` — reconcile the app-global shared media cache to the **live** cap
+/// `cap_bytes` (the value the header gauge divides by), then report its in-RAM fill.
+/// The cap is otherwise frozen when the cache opens, so lowering the setting
+/// mid-playback would leave the cache holding up to its larger open-time cap while
+/// the gauge divides by the new, smaller cap — reading over 100%. Applying `set_cap`
+/// here (the gauge polls this ~every 1.5 s) evicts the cache down to the current cap
+/// and updates its budget, so subsequent range fetches honor it too. Because there
+/// is now ONE shared cache (not one per session), the gauge can never read over 100%
+/// from summed per-session caches — the >100% bug this rework fixes. Cheap: a brief
+/// lock + LRU trims, no network I/O.
+///
+/// Task 7 makes this dual-mode (media + thumb, disk-mode denominator); today it
+/// reports the single shared media cache's in-RAM fill reconciled to the live cap.
+/// (`set_cap` unconditionally imposes a cap even in Disk mode; harmless while the
+/// default is Memory and the video path is not wired until Task 7.)
 #[tauri::command]
 pub async fn cache_stats(
     cap_bytes: u64,
-    jobs: State<'_, VideoJobs>,
+    media: State<'_, MediaCache>,
 ) -> Result<CacheStats, UiError> {
-    let mut guard = jobs.0.lock().await;
-    let mut used_bytes = 0u64;
-    for j in guard.values_mut() {
-        j.cache.set_cap(cap_bytes); // reconcile to the live cap (LRU-evicts down)
-        used_bytes += j.cache.memory_bytes();
-    }
-    Ok(CacheStats { used_bytes })
+    let mut cache = media.0.lock().await;
+    cache.set_cap(cap_bytes); // reconcile to the live cap (LRU-evicts down)
+    Ok(CacheStats {
+        used_bytes: cache.memory_bytes(),
+    })
 }
 
 // ===========================================================================
@@ -606,28 +605,41 @@ fn map_fetch_err(e: UiError) -> UiError {
 ///
 /// Public: the stream:// protocol core (carries no secret across the seam — only sliced
 /// plaintext the protocol already exposes).
+///
+/// The fragment cache is the app-global shared [`MediaCache`]; every phase that
+/// touches it locks `media` NESTED inside the `jobs` lock (lock order
+/// **VideoJobs → MediaCache**, never the reverse — that would deadlock). The
+/// `job` borrow is now immutable (the cache is external), so `cancel_video` can
+/// drop the session between phases while its cached fragments persist in the
+/// shared cache.
 pub async fn serve_range(
     jobs: &VideoJobs,
+    media: &MediaCache,
     file_id_hex: &str,
     first: u64,
     last_inclusive: Option<u64>,
 ) -> Result<RangeResponse, UiError> {
     use crate::stream::{assemble_range, plan_range, resolve_range};
 
-    // Phase A — resolve the request + plan the fragment span + fetch list, under the lock.
-    // Also clone the channel Arc (a cheap ref-count bump) before dropping the guard.
+    // Phase A — resolve the request + plan the fragment span + fetch list, under the
+    // jobs lock; check the shared cache under the media lock (nested, VideoJobs →
+    // MediaCache). Also clone the channel Arc (a cheap ref-count bump) before
+    // dropping the guards.
     let (req, plan, total_len, version, fetch_indices, channel, route_mode) = {
-        let mut guard = jobs.0.lock().await;
-        let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
+        let guard = jobs.0.lock().await;
+        let job = guard.get(file_id_hex).ok_or_else(player_err)?;
         let req = resolve_range(first, last_inclusive, job.total_len, MAX_RANGE_BODY)
             .ok_or_else(|| UiError::new("range_not_satisfiable", "range"))?;
         let plan = plan_range(&job.index, job.chunk_size, &req)?;
         let mut fetch_indices: Vec<u64> = Vec::new();
-        for seq in plan.f0..=plan.f1 {
-            let (cs, cl) = chunks_for_fragment(&job.index, seq).ok_or_else(player_err)?;
-            if !cached_fragment_valid(&mut job.cache, &job.file_id_hex, seq, cl) {
-                let end = cs.checked_add(cl).ok_or_else(player_err)?;
-                fetch_indices.extend(cs..end);
+        {
+            let mut cache = media.0.lock().await; // VideoJobs -> MediaCache
+            for seq in plan.f0..=plan.f1 {
+                let (cs, cl) = chunks_for_fragment(&job.index, seq).ok_or_else(player_err)?;
+                if !cached_fragment_valid(&mut cache, Ns::Frag, &job.file_id_hex, seq, cl) {
+                    let end = cs.checked_add(cl).ok_or_else(player_err)?;
+                    fetch_indices.extend(cs..end);
+                }
             }
         }
         let channel = job.channel.clone().ok_or_else(player_err)?;
@@ -667,19 +679,25 @@ pub async fn serve_range(
         }
     }
 
-    // Phase C — assemble + slice under the lock (sync decrypt in the TCB). `work`
-    // is a throwaway clone so `prefetched` survives intact for a Phase-D retry
-    // (`assemble_range`'s fetch closure destructively removes from whatever map
-    // it is given).
+    // Phase C — assemble + slice under jobs → media (sync decrypt in the TCB).
+    // `work` is a throwaway clone so `prefetched` survives intact for a Phase-D
+    // retry (`assemble_range`'s fetch closure destructively removes from whatever
+    // map it is given). `job` is an immutable borrow (the cache is external now).
     let attempt = {
-        let mut guard = jobs.0.lock().await;
-        let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
+        let guard = jobs.0.lock().await;
+        let job = guard.get(file_id_hex).ok_or_else(player_err)?;
+        let mut cache = media.0.lock().await; // VideoJobs -> MediaCache
         let mut work = prefetched.clone();
-        // Split borrows: index/decryptor are read-only, cache is &mut.
-        let VideoJob { index, cache, decryptor, file_id_hex: fid, .. } = &mut *job;
-        assemble_range(index, cache, decryptor, fid, &plan, &req, |i| {
-            work.remove(&i).ok_or_else(player_err)
-        })
+        assemble_range(
+            &job.index,
+            &mut cache,
+            Ns::Frag,
+            &job.decryptor,
+            &job.file_id_hex,
+            &plan,
+            &req,
+            |i| work.remove(&i).ok_or_else(player_err),
+        )
     };
 
     let body = match attempt {
@@ -705,21 +723,28 @@ pub async fn serve_range(
                     prefetched.insert(*i, bytes);
                 }
             }
-            // ...evict every fragment in the plan span first: `feed_fragment` writes
-            // a fragment's ciphertext to the on-disk cache BEFORE the AEAD check
-            // that just failed, so the failed attempt may have poisoned the cache
-            // with the tampered bytes — without evicting, the retry would read
-            // those same bad bytes back as a cache "hit" and never see the fresh
-            // (now-proxied) ones.
-            let mut guard = jobs.0.lock().await;
-            let job = guard.get_mut(file_id_hex).ok_or_else(player_err)?;
+            // ...evict every fragment in the plan span first (under jobs → media):
+            // `feed_fragment` writes a fragment's ciphertext to the cache BEFORE the
+            // AEAD check that just failed, so the failed attempt may have poisoned
+            // the cache with the tampered bytes — without evicting, the retry would
+            // read those same bad bytes back as a cache "hit" and never see the
+            // fresh (now-proxied) ones.
+            let guard = jobs.0.lock().await;
+            let job = guard.get(file_id_hex).ok_or_else(player_err)?;
+            let mut cache = media.0.lock().await; // VideoJobs -> MediaCache
             for seq in plan.f0..=plan.f1 {
-                job.cache.evict(&job.file_id_hex, seq);
+                cache.evict(Ns::Frag, &job.file_id_hex, seq);
             }
-            let VideoJob { index, cache, decryptor, file_id_hex: fid, .. } = &mut *job;
-            assemble_range(index, cache, decryptor, fid, &plan, &req, |i| {
-                prefetched.remove(&i).ok_or_else(player_err)
-            })?
+            assemble_range(
+                &job.index,
+                &mut cache,
+                Ns::Frag,
+                &job.decryptor,
+                &job.file_id_hex,
+                &plan,
+                &req,
+                |i| prefetched.remove(&i).ok_or_else(player_err),
+            )?
         }
         Err(e) => return Err(e),
     };
@@ -805,6 +830,7 @@ async fn stream_media_inner(
             let session = app.state::<Session>();
             let connect_lock = app.state::<ConnectLock>();
             let jobs = app.state::<VideoJobs>();
+            let media = app.state::<MediaCache>();
 
             // The session must already be open (open_video registered it).
             {
@@ -820,7 +846,7 @@ async fn stream_media_inner(
             // First attempt over the session's persistent authed channel (no reauth
             // needed for normal operation — overlapping requests serialize via the
             // channel Mutex).
-            match serve_range(&jobs, &file_id_hex, first, last_inclusive).await {
+            match serve_range(&jobs, &media, &file_id_hex, first, last_inclusive).await {
                 Ok(r) => Ok(r),
                 Err(e) if e.code == "channel_dead" => {
                     // The persistent connection dropped. Reconnect ONCE (needs app
@@ -837,7 +863,7 @@ async fn stream_media_inner(
                         let mut c = chan.lock().await;
                         *c = AuthedChannel { sender, host, token };
                     }
-                    serve_range(&jobs, &file_id_hex, first, last_inclusive)
+                    serve_range(&jobs, &media, &file_id_hex, first, last_inclusive)
                         .await
                         .map_err(|e| if e.code == "range_not_satisfiable" { 416 } else { 500 })
                 }
@@ -999,9 +1025,12 @@ mod tests {
         }
     }
 
-    /// Build a real, registered `VideoJob` over staged encrypted content + a fresh
-    /// on-disk cache — the same TCB path `open_video` takes, minus the network.
-    fn build_job(tag: &str) -> (VideoJob, Vec<Vec<u8>>) {
+    /// Build a real, registered `VideoJob` over staged encrypted content — the same
+    /// TCB path `open_video` takes, minus the network. The fragment cache is now the
+    /// app-global shared cache (external to the job), so this also returns a fresh
+    /// standalone `BlobCache` (`Ns::Frag`) that the range-serving tests thread in
+    /// where `serve_range` would supply the shared `MediaCache`.
+    fn build_job(tag: &str) -> (VideoJob, BlobCache, Vec<Vec<u8>>) {
         let (owner, bundle, _content) = build_video();
         let (header, chunks) = split(&bundle);
         let author = author_of(&owner);
@@ -1009,12 +1038,11 @@ mod tests {
             open_video_job_core(&owner, FILE_ID.0, &author, OWNER_ID.0, &header).expect("core");
         assert_eq!(index.len(), 2, "two-fragment index parsed");
         let dir = tmp_dir(tag);
-        let cache = FragmentCache::open(&dir, 1 << 20).unwrap();
+        let cache = BlobCache::open(&dir, 1 << 20).unwrap();
         let version = decryptor.version();
         let job = VideoJob {
             decryptor,
             index,
-            cache,
             file_id_hex: file_id_hex(),
             version,
             chunk_size: 4096,
@@ -1022,7 +1050,7 @@ mod tests {
             channel: None, // unit tests never serve ranges
             route_mode: RouteMode::PreferServer,
         };
-        (job, chunks)
+        (job, cache, chunks)
     }
 
     // ---- the synchronous TCB core: D5 author gates playback ----
@@ -1070,10 +1098,11 @@ mod tests {
     /// range-serving feeder) rather than the retired decode-path `decrypt_window`.
     #[test]
     fn cached_fragment_valid_mirrors_the_feeder_hit_condition() {
-        let (mut job, chunks) = build_job("m2");
+        let (job, mut cache, chunks) = build_job("m2");
         // No blob yet → not a valid hit.
         assert!(!cached_fragment_valid(
-            &mut job.cache,
+            &mut cache,
+            Ns::Frag,
             &job.file_id_hex,
             1,
             3
@@ -1081,7 +1110,8 @@ mod tests {
         // Feed fragment 1 directly to populate the cache with valid ciphertext framing.
         feed_fragment(
             &job.index,
-            &mut job.cache,
+            &mut cache,
+            Ns::Frag,
             &job.decryptor,
             &job.file_id_hex,
             1,
@@ -1091,24 +1121,27 @@ mod tests {
         .expect("feeds");
         // Now a valid hit at the feeder's exact chunk_len (3).
         assert!(cached_fragment_valid(
-            &mut job.cache,
+            &mut cache,
+            Ns::Frag,
             &job.file_id_hex,
             1,
             3
         ));
         // Wrong expected chunk_len → not a hit (count mismatch, like the feeder).
         assert!(!cached_fragment_valid(
-            &mut job.cache,
+            &mut cache,
+            Ns::Frag,
             &job.file_id_hex,
             1,
             2
         ));
         // A corrupt blob under another seq → not a hit (refetch, not fatal).
-        job.cache
-            .put(&job.file_id_hex, 0, b"\xff\xff\xff\xff not a frame")
+        cache
+            .put(Ns::Frag, &job.file_id_hex, 0, b"\xff\xff\xff\xff not a frame")
             .unwrap();
         assert!(!cached_fragment_valid(
-            &mut job.cache,
+            &mut cache,
+            Ns::Frag,
             &job.file_id_hex,
             0,
             2
@@ -1119,7 +1152,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_drops_the_job_and_its_decryptor() {
-        let (job, _chunks) = build_job("cancel");
+        let (job, _cache, _chunks) = build_job("cancel");
         let jobs = VideoJobs::new();
         jobs.0.lock().await.insert(file_id_hex(), job);
         assert!(jobs.0.lock().await.contains_key(&file_id_hex()));
