@@ -442,27 +442,33 @@ pub async fn decrypt_card(
     let mine = my_id == author.user_id;
 
     // For a bundle card, compute the order-private member tally (VID/IMG/TXT/FILE)
-    // from the VERIFIED signed member list. Best-effort: if the member list can't
-    // be opened, the card still renders (with a bundle badge) at zero counts —
-    // a member-list failure must NOT fail the whole card. Non-bundle cards stay
-    // at the default zeros. This extra fetch only happens for bundles (small list)
-    // and its result is cached below.
-    let member_counts = if manifest.file_type == FileType::Bundle {
-        match crate::commands::bundle::open_bundle_members(
+    // from the VERIFIED signed member list — REUSING THIS CALL'S already-warm
+    // pooled channel (`chan`) via `open_bundle_members_on`, NOT a fresh `reauth`.
+    // That keeps the nested member fetch off the single global `ConnectLock`, so a
+    // concurrent feed decode no longer loses the lock and silently falls back to
+    // zero counts. Best-effort: on any failure the card still renders (bundle
+    // badge, zero counts) but we record `member_ok = false` and DON'T cache it
+    // below, so a transient failure self-heals on reload instead of sticking as a
+    // cached blank. Non-bundle cards stay at the default zeros (and cache).
+    let (member_counts, member_ok) = if manifest.file_type == FileType::Bundle {
+        match crate::commands::bundle::open_bundle_members_on(
+            &mut chan.sender,
+            &host,
+            &token,
             &req.file_id,
             &dir,
             &session,
-            &connect_lock,
         )
         .await
         {
-            Ok((body, _version, _mine)) => {
-                histogram(&body.members.iter().map(|m| m.file_type).collect::<Vec<_>>())
-            }
-            Err(_) => crate::dto::MemberCounts::default(),
+            Ok((body, _version, _mine)) => (
+                histogram(&body.members.iter().map(|m| m.file_type).collect::<Vec<_>>()),
+                true,
+            ),
+            Err(_) => (crate::dto::MemberCounts::default(), false),
         }
     } else {
-        crate::dto::MemberCounts::default()
+        (crate::dto::MemberCounts::default(), true)
     };
 
     let card = crate::dto::CardDto {
@@ -495,24 +501,30 @@ pub async fn decrypt_card(
         }
     }
 
-    thumb
-        .put_card(
-            CacheKey {
-                file_id,
-                version: opened.version,
-            },
-            CachedMeta {
-                file_type: card.file_type.clone(),
-                title: card.title.clone(),
-                tags: card.tags.clone(),
-                thumbnail_b64: card.thumbnail_b64.clone(),
-                author_fp: card.author_fp.clone(),
-                recovery_ok: card.recovery_ok,
-                mine: card.mine,
-                member_counts: card.member_counts.clone(),
-            },
-        )
-        .await;
+    // Skip caching a bundle card whose member tally failed to load (`member_ok`
+    // is false only for a bundle whose `open_bundle_members_on` errored): caching
+    // it would make the empty summary sticky. Everything else (all non-bundles,
+    // and bundles with a good tally) caches normally.
+    if member_ok {
+        thumb
+            .put_card(
+                CacheKey {
+                    file_id,
+                    version: opened.version,
+                },
+                CachedMeta {
+                    file_type: card.file_type.clone(),
+                    title: card.title.clone(),
+                    tags: card.tags.clone(),
+                    thumbnail_b64: card.thumbnail_b64.clone(),
+                    author_fp: card.author_fp.clone(),
+                    recovery_ok: card.recovery_ok,
+                    mine: card.mine,
+                    member_counts: card.member_counts.clone(),
+                },
+            )
+            .await;
+    }
     Ok(card)
 }
 

@@ -62,6 +62,30 @@ pub(crate) async fn open_bundle_members(
     session: &State<'_, Session>,
     connect_lock: &State<'_, ConnectLock>,
 ) -> Result<(BundleBody, u64, bool), UiError> {
+    // Standalone entry (e.g. the `open_bundle` command): mint a channel-bound
+    // authed connection via the ConnectLock, then run the shared verify on it.
+    let server = server_of(&dir.0)?;
+    let (mut sender, host, token) = reauth(&dir.0, &server, session, connect_lock).await?;
+    open_bundle_members_on(&mut sender, &host, &token, req_file_id, dir, session).await
+}
+
+/// Verify + decrypt a bundle over an ALREADY-authed channel `(sender, host,
+/// token)`, returning its signed member list + verified version. Split out of
+/// [`open_bundle_members`] so a caller that already holds a warm authed channel
+/// — notably `decrypt_card`, which fans out CONCURRENTLY across the feed — can
+/// reuse that channel INSTEAD of taking the single global `ConnectLock`. That
+/// removes the nested-reauth lock contention that previously made a bundle
+/// card's member fetch lose the lock under a concurrent feed load and silently
+/// fall back to zero counts (a sticky, cached blank). The standalone entry above
+/// preserves the exact old behaviour for the `open_bundle` command.
+pub(crate) async fn open_bundle_members_on(
+    sender: &mut hyper::client::conn::http1::SendRequest<http_body_util::Full<hyper::body::Bytes>>,
+    host: &str,
+    token: &str,
+    req_file_id: &str,
+    dir: &State<'_, AppDir>,
+    session: &State<'_, Session>,
+) -> Result<(BundleBody, u64, bool), UiError> {
     // Validate the REQUESTED id up front: `run_open` binds the served record to
     // it, and it rejects a malformed id before it is interpolated into the URL.
     let file_id = hex16(req_file_id)?;
@@ -76,14 +100,11 @@ pub(crate) async fn open_bundle_members(
     }
     .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
 
-    let server = server_of(&dir.0)?;
-    let (mut sender, host, token) = reauth(&dir.0, &server, session, connect_lock).await?;
-
     let (status, view_json) = get_json(
-        &mut sender,
+        &mut *sender,
         &format!("/v1/files/{req_file_id}?version=latest"),
-        Some(&token),
-        &host,
+        Some(token),
+        host,
     )
     .await?;
     if status != hyper::StatusCode::OK {
@@ -100,8 +121,8 @@ pub(crate) async fn open_bundle_members(
         return Err(UiError::new("bad_request", "Not a bundle."));
     }
     let (author, author_binding) = crate::directory::resolve_and_verify_author_logged(
-        &mut sender,
-        &host,
+        &mut *sender,
+        host,
         &hex(&manifest.author_id.0),
         &verifier,
         &mut trust,
@@ -113,8 +134,8 @@ pub(crate) async fn open_bundle_members(
     crate::commands::feed::enforce_author_transparency(&dir.0, session.inner(), author_binding)
         .await?;
     let my_id = crate::directory::resolve_my_user_id(
-        &mut sender,
-        &host,
+        &mut *sender,
+        host,
         &username,
         &verifier,
         &mut trust,
@@ -126,9 +147,9 @@ pub(crate) async fn open_bundle_members(
     let direct_http = crate::direct_link::shared_direct_http();
 
     let (bundle, used_direct) = build_download_bundle(
-        &mut sender,
-        &host,
-        &token,
+        &mut *sender,
+        host,
+        token,
         req_file_id,
         &view,
         route_mode,
@@ -153,9 +174,9 @@ pub(crate) async fn open_bundle_members(
         Ok(o) => o,
         Err(e) if used_direct => {
             let (bundle, _) = build_download_bundle(
-                &mut sender,
-                &host,
-                &token,
+                &mut *sender,
+                host,
+                token,
                 req_file_id,
                 &view,
                 crate::config::RouteMode::PreferServer,
