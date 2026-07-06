@@ -505,3 +505,57 @@ active nav state, moves focus to `#main`, and toggles the ⚡ button's visibilit
 - [ ] Theme/a11y still driven by the `data-*` attributes + `settingsStore` (§6)
 - [ ] No keys/tokens/ciphertext handled in the UI (§5.3)
 ```
+
+---
+
+## 9. Multi-frontend architecture (the drop-in contract)
+
+The client hosts **three switchable frontends** over ONE shared component tree and
+backend. A frontend is a named visual skin with three parts:
+
+- **Registry entry** `{ id, label }` in `src/core/frontends.ts` (`FRONTENDS`).
+- **A complete stylesheet** it owns: `styles.<id>.css`, loaded via a single
+  `<link id="frontend-css">` in `index.html`. Exactly one is active at a time.
+- **An optional decoration module** `src/frontends/<id>/deco.ts` implementing
+  `DecoModule` (below), bundled into `main.js`.
+
+Registered ids: `default` (→ `styles.css`, today's design, verbatim),
+`pizza` (→ `styles.pizza.css`, this brief), `slot3` (→ `styles.slot3.css`, empty).
+
+Switching (`src/core/frontends.ts::applyFrontend`) rewrites the `<link>` href, sets
+`data-frontend="<id>"` on `<html>`, unmounts the old deco module, mounts the new one,
+and persists the id in `localStorage["maxsecu.frontend"]`. An inline bootstrap in
+`index.html` applies the persisted frontend before first paint (no flash).
+
+### The `DecoModule` interface
+
+    export interface DecoModule {
+      // Idempotent. Called once on apply AND after every route render. Query your slot
+      // (e.g. document.querySelector('[data-deco-slot="login"]')) and inject decoration
+      // only if you have not already (guard by a data-attr/class you own). Safe no-op if
+      // the slot is absent on the current screen.
+      mount(doc: Document): void;
+      // Remove every node your mount() injected (called when switching away).
+      unmount(doc: Document): void;
+    }
+
+### Decoration slots (stable mount points in the shared components)
+
+- `data-deco-slot="login"` — on the `<main>` of connect / register / recovery-login.
+- `data-deco-slot="app-bg"` — a body-level full-page layer in `app-shell`.
+- `data-deco-slot="header"` — inside the app header.
+
+Default/`slot3` leave these empty. Your `pizza` deco fills them. Slots are inert when
+empty — do NOT change component markup, layout, or spacing; only add children to slots.
+
+### What the pizza design delivers (drops into the `pizza` slot)
+
+1. `styles.pizza.css` — a COMPLETE standalone stylesheet (replaces the stub, which is
+   just `@import url("styles.css");`). **Preserve every spacing/layout/type token and
+   the component structure** from `styles.css` — change only colour, texture, imagery,
+   borders, shadows, and decorative styling. The spacing of elements must stay identical.
+2. `src/frontends/pizza/deco.ts` — the real `DecoModule` (replaces the no-op stub),
+   placing `assets/pizza.png` into `data-deco-slot="login"` and any cheese-drip layers.
+
+Do NOT touch `src/core/rpc.ts`, `types.ts`, command/event names, argument shapes, the
+serial queue (§4), or the security/a11y invariants (§5). This is look-and-feel only.
