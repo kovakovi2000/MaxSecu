@@ -103,3 +103,13 @@ test("Privacy copy is expanded and accurate", () => {
     assert.match(src, phrase, `Privacy copy must mention ${phrase}`);
   }
 });
+
+test("Appearance offers a Frontend selector wired to get/setFrontend", () => {
+  assert.match(src, /<select name="frontend">/, "Frontend <select> missing");
+  for (const id of ["default", "pizza", "slot3"]) {
+    assert.match(src, new RegExp(`<option value="${id}"`), `frontend option ${id} missing`);
+  }
+  assert.match(src, /getFrontend\(\)/, "load path must read getFrontend()");
+  assert.match(src, /setFrontend\(/, "change path must call setFrontend()");
+  assert.doesNotMatch(src, /<select name="theme">/, "old theme select must be removed");
+});

@@ -1,5 +1,6 @@
 import { call } from "../core/rpc.ts";
-import { settingsStore, updateSettings, loadAndApplySettings, getThemePreset, setThemePreset } from "../core/settings.ts";
+import { settingsStore, updateSettings, loadAndApplySettings } from "../core/settings.ts";
+import { getFrontend, setFrontend } from "../core/frontends.ts";
 import type { Settings, RamLimits } from "../core/types.ts";
 
 // Settings (spec §5/§7): appearance / accessibility / performance / behavior /
@@ -30,13 +31,13 @@ export class SettingsScreen extends HTMLElement {
           <div class="settings-column settings-column-left">
             <fieldset class="settings-card appearance-card">
               <legend>Appearance</legend>
-              <label>Theme
-                <select name="theme">
-                  <option value="tech">Tech (default)</option>
-                  <option value="cheese">Cheese</option>
-                  <option value="pottery">Pottery</option>
+              <label>Frontend
+                <select name="frontend">
+                  <option value="default">Default</option>
+                  <option value="pizza">Cheese Pizza</option>
+                  <option value="slot3">Custom (empty slot)</option>
                 </select></label>
-              <p class="hint">Theme presets are placeholders for upcoming visual passes.</p>
+              <p class="hint">Switches the whole visual frontend (its own stylesheet &amp; decoration). Applies immediately.</p>
             </fieldset>
 
             <fieldset class="settings-card a11y-card">
@@ -195,10 +196,10 @@ export class SettingsScreen extends HTMLElement {
       const v = Number(this.input(name).value);
       return Number.isFinite(v) ? v : fallback;
     };
-    setThemePreset(this.sel("theme").value);
+    setFrontend(this.sel("frontend").value);
     const patch: Partial<Settings> = {
-      // Backend settings keep the existing dark appearance contract; the new visual
-      // theme presets are frontend-only placeholders applied via data-theme.
+      // Backend appearance stays the existing dark contract. The visual frontend is
+      // UI-local (localStorage) and applied via setFrontend(), independent of this save.
       appearance: { theme: "dark" },
       a11y: {
         reduced_motion: this.input("reduced_motion").checked,
@@ -229,7 +230,7 @@ export class SettingsScreen extends HTMLElement {
 
   private writeControls(s: Settings): void {
     void s;
-    this.sel("theme").value = getThemePreset();
+    this.sel("frontend").value = getFrontend();
     this.input("reduced_motion").checked = s.a11y.reduced_motion;
     this.input("high_contrast").checked = s.a11y.high_contrast;
     this.sel("text_size").value = s.a11y.text_size;

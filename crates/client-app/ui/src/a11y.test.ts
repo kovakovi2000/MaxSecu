@@ -191,10 +191,10 @@ test("screens use a live region for feedback", () => {
     assert.match(up, /status\.textContent\s*=/, "status updates via textContent");
   });
 
-  test("settings screen exposes a labelled Theme + RAM control", () => {
+  test("settings screen exposes a labelled Frontend + RAM control", () => {
     const set = readFileSync("src/components/settings-screen.ts", "utf8");
-    assert.match(set, /Theme/, "Theme control present");
-    assert.match(set, /aria-label|<label|name="theme"/, "controls labelled");
+    assert.match(set, /Frontend/, "Frontend control present");
+    assert.match(set, /aria-label|<label|name="frontend"/, "controls labelled");
     // The RAM cache cap uses a range slider (built via DOM API or literal HTML).
     assert.match(set, /type="range"|\.type\s*=\s*"range"/, "RAM cap uses a range slider");
   });

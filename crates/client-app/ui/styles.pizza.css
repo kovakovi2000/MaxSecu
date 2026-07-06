@@ -1,0 +1,5 @@
+/* Cheese-Pizza frontend stylesheet — STUB.
+   Until the external cheese-pizza design lands (see PIZZA-BRIEF.md) this simply
+   renders like Default. The external design REPLACES this file with a complete
+   standalone stylesheet (dropping the @import). */
+@import url("styles.css");

@@ -18,6 +18,7 @@ import "./toast-host.ts";
 import "./trust-alarm.ts";
 import "./skeleton-card.ts";
 import { loadAndApplySettings, bindDocumentToSettings } from "../core/settings.ts";
+import { refreshFrontendDeco } from "../core/frontends.ts";
 import { activeTasks } from "../core/tasks.ts";
 import { subscribeBusy, isBusy } from "../core/busy.ts";
 import type { StatusPill } from "./status-pill.ts";
@@ -37,6 +38,7 @@ export class AppShell extends HTMLElement {
       (n) => `<a href="#/${n.route}" data-route="${n.route}">${n.label}</a>`,
     ).join("");
     this.innerHTML = `
+      <div data-deco-slot="app-bg" aria-hidden="true"></div>
       <header role="banner" class="app-header">
         <div class="app-brand" aria-label="MaxSecu">
           <span class="app-brand-mark" aria-hidden="true">◆</span>
@@ -44,6 +46,7 @@ export class AppShell extends HTMLElement {
         </div>
         <nav role="navigation" aria-label="Primary" class="nav-rail">${links}</nav>
         <div class="header-actions">
+          <span data-deco-slot="header" aria-hidden="true"></span>
           <ram-gauge id="ram"></ram-gauge>
         </div>
       </header>
@@ -158,6 +161,7 @@ export class AppShell extends HTMLElement {
       }
       const main = outlet.querySelector<HTMLElement>("#main");
       main?.focus();
+      refreshFrontendDeco();
     });
 
     // Startup precedence (spec §0-D7): on a fresh launch route to the recovery
