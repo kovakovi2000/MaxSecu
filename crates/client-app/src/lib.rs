@@ -12,7 +12,15 @@ pub mod download;
 pub mod dto;
 pub mod error;
 pub mod ffmpeg_bin;
-pub mod fragment_cache;
+pub mod blob_cache;
+/// Back-compat shim (removed in Task 4/5 of the RAM-cache-model rework): the old
+/// `fragment_cache` module path still resolves, re-exporting the thin
+/// `FragmentCache` wrapper now living in [`blob_cache`]. Lets the existing
+/// `commands/video.rs` / `stream.rs` / `jobs.rs` / `video.rs` call sites keep
+/// their `crate::fragment_cache::FragmentCache` imports until they migrate.
+pub mod fragment_cache {
+    pub use crate::blob_cache::FragmentCache;
+}
 pub mod http_client;
 pub mod index;
 pub mod jobs;
