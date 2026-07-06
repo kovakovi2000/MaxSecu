@@ -100,6 +100,8 @@ pub enum BundleStagePhase {
 ///     ffmpeg reports the source duration),
 ///   - `{"phase":"remuxing"}`,
 ///   - `{"phase":"finalizing"}`,
+///   - `{"phase":"sealing","percent":<0..=100|null>}` (the post-transcode
+///     "Preparing preview" encrypt/digest pass — see below),
 ///   - `{"phase":"cancelled"}` (benign terminal after a cancel),
 ///   - `{"phase":"failed","code":"<code>"}` (sanitized terminal).
 /// * Cancel: the `cancel_video_prepare` command (no args) cancels the in-flight
@@ -118,6 +120,11 @@ pub enum PreparePhase {
     Remuxing,
     /// Deriving thumbnail/preview + validating the fragment index (final local step).
     Finalizing,
+    /// The post-transcode "Preparing preview" pass: the prepared fMP4 is streamed
+    /// through AES-GCM to compute the manifest digest before it can be previewed
+    /// (O(whole file), so it is the slow tail after a fast transcode). `percent` is
+    /// `None` until the first chunk is sealed, then `0..=100`.
+    Sealing { percent: Option<u8> },
     /// Benign terminal: the user (or app shutdown) cancelled the transcode.
     Cancelled,
     /// Sanitized terminal failure (no decode oracle) — carries a stable code.
@@ -270,6 +277,10 @@ mod prepare_phase_tests {
             serde_json::to_string(&PreparePhase::Finalizing).unwrap(),
             "{\"phase\":\"finalizing\"}"
         );
+        let s = serde_json::to_string(&PreparePhase::Sealing { percent: Some(70) }).unwrap();
+        assert!(s.contains("\"phase\":\"sealing\"") && s.contains("\"percent\":70"), "got {s}");
+        let s = serde_json::to_string(&PreparePhase::Sealing { percent: None }).unwrap();
+        assert!(s.contains("\"phase\":\"sealing\"") && s.contains("\"percent\":null"), "got {s}");
         assert_eq!(
             serde_json::to_string(&PreparePhase::Cancelled).unwrap(),
             "{\"phase\":\"cancelled\"}"

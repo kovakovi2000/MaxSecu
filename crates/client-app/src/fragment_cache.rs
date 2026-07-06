@@ -192,9 +192,31 @@ impl FragmentCache {
         Some(bytes)
     }
 
-    /// Total tracked ciphertext bytes currently on disk.
+    /// Total tracked ciphertext bytes currently held (on disk or in RAM).
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
+    }
+
+    /// Update the byte budget to `new_cap`, immediately LRU-evicting down to it. The
+    /// cap is otherwise fixed when the cache is opened; this lets a **live** lowering
+    /// of the RAM-cache setting shrink an already-open session's cache (the case the
+    /// header gauge surfaces — otherwise the gauge divides the live cap into a cache
+    /// still holding up to its larger open-time cap, reading over 100%). Raising the
+    /// cap just permits more before the next eviction. Idempotent when unchanged.
+    pub fn set_cap(&mut self, new_cap: u64) {
+        self.cap_bytes = new_cap;
+        while self.total_bytes > self.cap_bytes && self.evict_one() {}
+    }
+
+    /// Bytes this cache is holding **in RAM** — i.e. `total_bytes` for the `Memory`
+    /// backend, and `0` for the `Disk` backend (whose blobs live on the filesystem,
+    /// not in the process's rolling memory frame). Drives the header RAM-cache gauge,
+    /// which reports only the in-RAM footprint against the configured cap.
+    pub fn memory_bytes(&self) -> u64 {
+        match &self.backend {
+            Backend::Memory { .. } => self.total_bytes,
+            Backend::Disk { .. } => 0,
+        }
     }
 
     /// Whether `(file_id_hex, seq)` is currently tracked.
@@ -472,6 +494,50 @@ mod tests {
         c.put("aa", 3, &blob(3)).unwrap();
         assert_eq!(c.total_bytes(), 30);
         assert_eq!(c.get("aa", 1), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_bytes_counts_ram_backend_only() {
+        // Memory backend: memory_bytes tracks the in-RAM fill and drops on evict.
+        let dir = tmp_dir("mem-bytes");
+        let mut mem =
+            FragmentCache::open_located(&dir, 1024, crate::config::FragmentCacheLocation::Memory)
+                .unwrap();
+        assert_eq!(mem.memory_bytes(), 0);
+        mem.put("aa", 0, &[0u8; 100]).unwrap();
+        assert_eq!(mem.memory_bytes(), 100);
+        assert_eq!(mem.memory_bytes(), mem.total_bytes());
+        mem.evict("aa", 0);
+        assert_eq!(mem.memory_bytes(), 0);
+        // Disk backend: bytes are on the filesystem, so the RAM figure stays 0 even
+        // though total_bytes counts them.
+        let mut disk = FragmentCache::open(&dir, 1024).unwrap();
+        disk.put("bb", 0, &[0u8; 100]).unwrap();
+        assert_eq!(disk.total_bytes(), 100);
+        assert_eq!(disk.memory_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_cap_lowering_evicts_down_to_the_new_budget() {
+        let dir = tmp_dir("setcap");
+        let mut c = FragmentCache::open(&dir, 100).unwrap();
+        for s in 0..10u32 {
+            c.put("aa", s, &[0u8; 10]).unwrap(); // 10 × 10B = 100B, at cap
+        }
+        assert_eq!(c.total_bytes(), 100);
+        // Lower the cap below the current fill → evicts LRU down to ≤ new cap.
+        c.set_cap(45);
+        assert!(c.total_bytes() <= 45, "got {}", c.total_bytes());
+        // The most-recently-used survive; the oldest were evicted.
+        assert!(c.contains("aa", 9));
+        assert!(!c.contains("aa", 0));
+        // Raising the cap keeps everything; a further put now fits.
+        c.set_cap(1000);
+        assert!(c.total_bytes() <= 45);
+        c.put("aa", 100, &[0u8; 500]).unwrap();
+        assert!(c.contains("aa", 100));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

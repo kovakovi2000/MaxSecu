@@ -202,6 +202,9 @@ export type PreparePhase =
   | { phase: "transcoding"; percent: number | null }
   | { phase: "remuxing" }
   | { phase: "finalizing" }
+  // The post-transcode "Preparing preview" encrypt/digest pass (streams the whole
+  // prepared file through AES-GCM). `percent` is null until the first chunk seals.
+  | { phase: "sealing"; percent: number | null }
   | { phase: "cancelled" }
   | { phase: "failed"; code: string };
 
@@ -243,3 +246,9 @@ export interface RamLimits { default_mb: number; min_mb: number; max_mb: number 
 // Live process + budget memory figures from the `memory_stats` command.
 // `used_bytes` is null when the OS process-RSS query is unavailable (fail-soft).
 export interface MemoryStats { used_bytes: number | null; budget_bytes: number }
+
+// Live in-RAM fragment-cache footprint from the `cache_stats` command: the bytes
+// the fragment cache is holding in RAM right now (0 when nothing is playing or the
+// Disk backend is selected), summed across open video sessions. The header gauge
+// shows this against the configured `ram_cache_cap_mb`.
+export interface CacheStats { used_bytes: number }

@@ -570,6 +570,9 @@ export class BundleComposer extends HTMLElement {
             detail = ` (transcoding ${p.percent == null ? "…" : p.percent + "%"})`;
           } else if (p.phase === "remuxing") {
             detail = " (finishing video…)";
+          } else if (p.phase === "sealing") {
+            // Post-transcode encrypt/digest pass — the slow tail after a fast transcode.
+            detail = ` (encrypting ${p.percent == null ? "…" : p.percent + "%"})`;
           } else {
             detail = "";
           }

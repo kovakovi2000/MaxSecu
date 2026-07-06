@@ -467,6 +467,19 @@ async fn stage_item(
         opt_streams.as_ref().map(|s| s.content.len() as u64).unwrap_or(0)
     };
 
+    // Post-transcode "Preparing preview" feedback. The transcode phases stop the
+    // instant ffmpeg exits, but staging still streams the WHOLE file through AES-GCM
+    // to compute the manifest digest (O(file)) plus a directory round-trip — the
+    // slow, previously-silent tail after a fast transcode. Emit `Sealing` so that
+    // tail shows live progress instead of a frozen "Finalizing…". Best-effort: a
+    // dropped event never fails staging.
+    let emit_prepare = |p: PreparePhase| {
+        let _ = app.emit(EVT_VIDEO_PREPARE, p);
+    };
+    if opt_video.is_some() || opt_generic.is_some() {
+        emit_prepare(PreparePhase::Sealing { percent: None });
+    }
+
     // 2) Resolve recipients under the pinned D5 (unauth directory GETs). The
     //    security-critical recovery-pin trust-alarm A (spec §3/§7) lives in the shared
     //    `resolve_recipients` helper (also used by the bundle file in
@@ -505,6 +518,7 @@ async fn stage_item(
             &req.title,
             dir.0.join("staging"),
             &mut dir_cleanup.0,
+            &emit_prepare,
         )
         .await?;
 
@@ -542,6 +556,7 @@ async fn stage_item(
             &req.title,
             dir.0.join("staging"),
             &mut dir_cleanup.0,
+            &emit_prepare,
         )
         .await?;
 
@@ -832,6 +847,9 @@ async fn stage_streaming_content(
     title: &str,
     staging_root: std::path::PathBuf,
     dir_cleanup_slot: &mut Option<std::path::PathBuf>,
+    // `Send + Sync` so this async fn's future (part of a Tauri command chain) stays
+    // `Send`: `on_phase` is live across the `session` lock `.await` below.
+    on_phase: &(dyn Fn(PreparePhase) + Send + Sync),
 ) -> Result<(StagingRecord, std::path::PathBuf), UiError> {
     let now = crypto.created_at;
     let file_id = crypto.file_id;
@@ -868,8 +886,21 @@ async fn stage_streaming_content(
     let mut in_file = std::fs::File::open(input_path)
         .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
     let plaintext_total = in_file.metadata().map(|m| m.len()).unwrap_or(0);
+    // Estimated chunk count for the "Preparing preview" progress %: the seal callback
+    // fires per chunk with its index, and the total is ceil(size / chunk). Emit a
+    // `Sealing { percent }` only when the whole-percent changes (throttles a large
+    // file's per-chunk callbacks down to ≤100 events). `on_phase` is best-effort.
+    let est_chunks = plaintext_total.div_ceil(CHUNK_SIZE as u64).max(1);
+    let mut last_pct: i32 = -1;
     let (count, digest) = sealer
-        .seal_from_reader(&mut in_file, |_, _| Ok(()))
+        .seal_from_reader(&mut in_file, |idx, _ct| {
+            let pct = (((idx + 1) as u128 * 100) / est_chunks as u128).min(100) as u8;
+            if pct as i32 != last_pct {
+                last_pct = pct as i32;
+                on_phase(PreparePhase::Sealing { percent: Some(pct) });
+            }
+            Ok(())
+        })
         .map_err(|_| UiError::new("encrypt_failed", "Could not prepare the upload."))?;
     drop(in_file); // close before rename/copy
 

@@ -325,6 +325,16 @@ export class UploadScreen extends HTMLElement {
           status.textContent = "Finalizing…";
           progress.removeAttribute("value");
           break;
+        case "sealing":
+          // Post-transcode "Preparing preview" encrypt/digest pass over the whole file.
+          if (p.percent == null) {
+            status.textContent = "Preparing preview…";
+            progress.removeAttribute("value"); // indeterminate
+          } else {
+            status.textContent = `Preparing preview… ${p.percent}%`;
+            progress.value = p.percent;
+          }
+          break;
         case "cancelled":
           cancelledPhase = true; // benign terminal; teardown happens below
           break;

@@ -97,6 +97,7 @@ fn main() {
             maxsecu_client_app::ram::memory_stats,
             maxsecu_client_app::commands::video::open_video,
             maxsecu_client_app::commands::video::cancel_video,
+            maxsecu_client_app::commands::video::cache_stats,
         ])
         .register_asynchronous_uri_scheme_protocol("stream", |ctx, request, responder| {
             let app = ctx.app_handle().clone();

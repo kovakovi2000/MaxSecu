@@ -533,6 +533,43 @@ pub async fn cancel_video(
     Ok(())
 }
 
+/// Live in-RAM fragment-cache footprint, for the header RAM-cache gauge.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct CacheStats {
+    /// Sum, across all OPEN video sessions, of the ciphertext bytes each session's
+    /// fragment cache is holding **in RAM** (0 for a session using the on-disk
+    /// backend — see [`crate::fragment_cache::FragmentCache::memory_bytes`]). This is
+    /// exactly the "rolling memory frame" the cache occupies; it is capped per
+    /// session at `ram_cache_cap_mb` and LRU-evicts, so it can never grow unbounded.
+    pub used_bytes: u64,
+}
+
+/// `cache_stats` — reconcile every open session's fragment cache to the **live** cap
+/// `cap_bytes` (the value the header gauge divides by), then report the summed in-RAM
+/// fill. The cap is otherwise frozen when a session opens, so lowering the setting
+/// mid-playback would leave an already-open cache holding up to its larger open-time
+/// cap while the gauge divides by the new, smaller cap — reading over 100%. Applying
+/// `set_cap` here (the gauge polls this ~every 1.5 s) evicts each open cache down to
+/// the current cap and updates its budget, so subsequent range fetches honor it too.
+/// Passing the SAME `cap_bytes` the gauge uses as the denominator keeps each open
+/// cache within it — so the normal single-playback case can never read over 100%.
+/// (The viewer drops a session on teardown via `cancel_video`, so concurrent sessions
+/// are unusual; N truly-simultaneous plays could sum to N×cap.) Cheap: a brief lock +
+/// LRU trims, no network I/O.
+#[tauri::command]
+pub async fn cache_stats(
+    cap_bytes: u64,
+    jobs: State<'_, VideoJobs>,
+) -> Result<CacheStats, UiError> {
+    let mut guard = jobs.0.lock().await;
+    let mut used_bytes = 0u64;
+    for j in guard.values_mut() {
+        j.cache.set_cap(cap_bytes); // reconcile to the live cap (LRU-evicts down)
+        used_bytes += j.cache.memory_bytes();
+    }
+    Ok(CacheStats { used_bytes })
+}
+
 // ===========================================================================
 // stream:// range protocol (Task 5). Serves per-range-decrypted plaintext bytes
 // to a native <video> element via a Tauri async URI-scheme protocol. The content
