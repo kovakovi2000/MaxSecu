@@ -1,3 +1,5 @@
-/* Third frontend slot — intentionally empty; falls back to the Default look until a
-   future design round fills it. Replace with a complete standalone stylesheet then. */
+/* Marauder's Map frontend stylesheet — STUB.
+   Until the external Harry Potter / Marauder's Map design lands (see
+   MARAUDERS-MAP-BRIEF.md) this simply renders like Default. The external design
+   REPLACES this file with a complete standalone stylesheet (dropping the @import). */
 @import url("styles.css");

@@ -5,6 +5,7 @@
 // UI-local (localStorage), exactly like the retired theme presets. DOM/storage access
 // is guarded so this module imports cleanly under node:test.
 import { pizzaDeco } from "../frontends/pizza/deco.ts";
+import { slot3Deco } from "../frontends/slot3/deco.ts";
 
 export type FrontendId = "default" | "pizza" | "slot3";
 
@@ -20,7 +21,7 @@ export interface DecoModule {
 export const FRONTENDS: ReadonlyArray<{ id: FrontendId; label: string }> = [
   { id: "default", label: "Default" },
   { id: "pizza", label: "Cheese Pizza" },
-  { id: "slot3", label: "Custom (empty slot)" },
+  { id: "slot3", label: "Marauder's Map" },
 ];
 
 const FRONTEND_KEY = "maxsecu.frontend";
@@ -33,6 +34,7 @@ const STYLESHEETS: Record<FrontendId, string> = {
 
 const DECO: Partial<Record<FrontendId, DecoModule>> = {
   pizza: pizzaDeco,
+  slot3: slot3Deco,
 };
 
 let activeDeco: DecoModule | null = null;

@@ -520,7 +520,11 @@ backend. A frontend is a named visual skin with three parts:
   `DecoModule` (below), bundled into `main.js`.
 
 Registered ids: `default` (→ `styles.css`, today's design, verbatim),
-`pizza` (→ `styles.pizza.css`, this brief), `slot3` (→ `styles.slot3.css`, empty).
+`pizza` (→ `styles.pizza.css`, the cheese-pizza skin), `slot3` (→ `styles.slot3.css` +
+`src/frontends/slot3/deco.ts`, the **Marauder's Map** skin — see `MARAUDERS-MAP-BRIEF.md`).
+Both `pizza` and `slot3` are wired in the scaffold with a real deco module, so an
+externally-authored skin's two files (`styles.<id>.css` + `src/frontends/<id>/deco.ts`)
+drop straight in.
 
 Switching (`src/core/frontends.ts::applyFrontend`) rewrites the `<link>` href, sets
 `data-frontend="<id>"` on `<html>`, unmounts the old deco module, mounts the new one,

@@ -35,7 +35,7 @@ export class SettingsScreen extends HTMLElement {
                 <select name="frontend">
                   <option value="default">Default</option>
                   <option value="pizza">Cheese Pizza</option>
-                  <option value="slot3">Custom (empty slot)</option>
+                  <option value="slot3">Marauder's Map</option>
                 </select></label>
               <p class="hint">Switches the whole visual frontend (its own stylesheet &amp; decoration). Applies immediately.</p>
             </fieldset>
