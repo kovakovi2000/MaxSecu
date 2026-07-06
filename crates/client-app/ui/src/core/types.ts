@@ -237,7 +237,7 @@ export interface Settings {
     decode_threads: number;
     // Where both caches live. "Memory" (default) keeps ciphertext in RAM only;
     // "Disk" spills ciphertext to a temp dir (no cap, wiped on start + exit).
-    // Mirrors Rust `CacheLocation` (serde bare string "Disk"/"Memory").
+    // Mirrors Rust `FragmentCacheLocation` (serde bare string "Disk"/"Memory").
     cache_location: "Disk" | "Memory";
   };
   connection: { route_mode: RouteMode };
