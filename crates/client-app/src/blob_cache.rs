@@ -2,10 +2,12 @@
 //! generalized into a small set of logical namespaces (video fragments, whole
 //! content, feed-card meta). Jumping **back** to an already-watched part of a
 //! video must re-fetch nothing: the cache re-reads the stored **ciphertext**
-//! (which the TCB then re-decrypts + re-decodes). The blobs live under
-//! `<dir>/cache/frag/` as files keyed by `(Ns, file_id_hex, seq)`, optionally
-//! capped by a byte budget with least-recently-used eviction (`Memory` enforces
-//! the cap; a `None` cap — the `Disk` app default — is unlimited).
+//! (which the TCB then re-decrypts + re-decodes). The blobs live under a
+//! caller-named `<dir>/cache/<subdir>/` (so several app-global caches can coexist
+//! under one `app_dir` — e.g. `cache/media/` and `cache/thumb/`) as files keyed
+//! by `(Ns, id_hex, sub)`, optionally capped by a byte budget with
+//! least-recently-used eviction (`Memory` enforces the cap; a `None` cap — the
+//! `Disk` app default — is unlimited).
 //!
 //! # Security invariant — CIPHERTEXT ONLY, never plaintext
 //! This cache sits on the data-at-rest boundary. It stores **exactly the opaque
@@ -20,13 +22,13 @@
 //! replace / clear wipes them even though they are already only ciphertext.
 //!
 //! # No path traversal
-//! The on-disk filename is `<ns>_<file_id_hex>_<seq>.blob`. `file_id_hex` is
-//! validated to be hex-only (so it cannot contain `/`, `\`, `.`, or `:`), the
-//! namespace tag is a fixed path-safe string, and `seq` is a `u32` rendered as
-//! decimal digits — so a hostile key can never escape `cache/frag/`.
+//! The on-disk filename is `<ns>_<id_hex>_<sub>.blob`. `id_hex` is validated to
+//! be hex-only (so it cannot contain `/`, `\`, `.`, or `:`), the namespace tag is
+//! a fixed path-safe string, and `sub` is a `u32` rendered as decimal digits — so
+//! a hostile key can never escape the cache's own `cache/<subdir>/` directory.
 //!
 //! # Windows search indexing
-//! On Windows the `cache/frag/` directory is marked
+//! On Windows the cache directory is marked
 //! `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED` so the at-rest ciphertext is not
 //! search-indexed. Because this crate `forbid`s `unsafe_code`, the raw Win32
 //! `SetFileAttributesW` FFI (which needs `unsafe`) is unavailable here; the
@@ -59,7 +61,7 @@ impl Ns {
     }
 }
 
-/// The composite index/backend key: `(namespace, file_id_hex, sub)`.
+/// The composite index/backend key: `(namespace, id_hex, sub)`.
 type Key = (Ns, String, u32);
 
 /// One tracked blob: its byte size and a monotonic last-used stamp driving LRU
@@ -77,10 +79,10 @@ struct Entry {
 /// invariant holds identically for each.
 #[derive(Debug)]
 enum Backend {
-    /// On disk under `<app_dir>/cache/frag/`, one `<ns>_<key>_<seq>.blob` file
-    /// per entry (today's behavior).
+    /// On disk under `<app_dir>/cache/<subdir>/`, one `<ns>_<id_hex>_<sub>.blob`
+    /// file per entry. The concrete directory is fixed at open time (`root`).
     Disk { root: PathBuf },
-    /// In-process: `(Ns, file_id_hex, seq)` -> ciphertext, never touching disk.
+    /// In-process: `(Ns, id_hex, sub)` -> ciphertext, never touching disk.
     /// The value is `Zeroizing` so it is wiped on drop/eviction/clear.
     Memory {
         blobs: BTreeMap<Key, Zeroizing<Vec<u8>>>,
@@ -102,35 +104,44 @@ pub struct BlobCache {
     total_bytes: u64,
     /// Monotonic clock for LRU; bumped on every `put` and successful `get`.
     tick: u64,
-    /// `(Ns, file_id_hex, seq)` -> tracked blob.
+    /// `(Ns, id_hex, sub)` -> tracked blob.
     index: BTreeMap<Key, Entry>,
 }
 
 impl BlobCache {
     /// Open (and create) a **disk** cache under `<app_dir>/cache/frag`, capped at
     /// `cap_bytes`. This is the capped-disk convenience constructor used by tests
-    /// and legacy callers; the app opens uncapped disk via
-    /// [`open_located`](Self::open_located) with a `None` cap.
+    /// and legacy callers (fixed to the `"frag"` subdir); the app opens its
+    /// several named caches via [`open_located`](Self::open_located) with an
+    /// explicit `subdir` and (for RAM caches) a `None` cap.
     ///
     /// The directory is created idempotently and, on Windows, marked
     /// not-content-indexed (best-effort). Any ciphertext left by a prior run is
     /// dropped so the byte budget is accounted exactly (the cache is rebuilt on
     /// demand).
     pub fn open(app_dir: &Path, cap_bytes: u64) -> io::Result<Self> {
-        Self::open_disk(app_dir, Some(cap_bytes))
+        Self::open_disk(app_dir, Some(cap_bytes), "frag")
     }
 
-    /// Open the cache with the configured backend and an optional cap. `Disk`
-    /// creates/prepares `<app_dir>/cache/frag`; `Memory` holds ciphertext
-    /// in-process and never touches disk. `cap` = `None` means unlimited (no
+    /// Open the cache with the configured backend, an optional cap, and (for
+    /// `Disk`) a named on-disk subdirectory. `Disk` creates/prepares
+    /// `<app_dir>/cache/<subdir>`; `Memory` holds ciphertext in-process, never
+    /// touches disk, and **ignores `subdir`**. `cap` = `None` means unlimited (no
     /// capacity eviction), `Some(c)` enforces the LRU budget on both backends.
+    ///
+    /// The `subdir` lets several app-global Disk caches coexist under one
+    /// `app_dir` (e.g. Media `"media"` + Thumbnails `"thumb"`). Because a Disk
+    /// open **wipes its own subdir** (see [`open_disk`](Self::open_disk)), two
+    /// Disk caches sharing one `app_dir` MUST use distinct subdirs, or the second
+    /// open would erase the first's ciphertext.
     pub fn open_located(
         app_dir: &Path,
         cap: Option<u64>,
         location: FragmentCacheLocation,
+        subdir: &str,
     ) -> io::Result<Self> {
         match location {
-            FragmentCacheLocation::Disk => Self::open_disk(app_dir, cap),
+            FragmentCacheLocation::Disk => Self::open_disk(app_dir, cap, subdir),
             FragmentCacheLocation::Memory => Ok(Self {
                 backend: Backend::Memory {
                     blobs: BTreeMap::new(),
@@ -143,10 +154,12 @@ impl BlobCache {
         }
     }
 
-    /// Shared disk-backend setup: create+clean `<app_dir>/cache/frag`, mark it
-    /// not-content-indexed, and return a fresh (empty-accounting) cache.
-    fn open_disk(app_dir: &Path, cap: Option<u64>) -> io::Result<Self> {
-        let root = app_dir.join("cache").join("frag");
+    /// Shared disk-backend setup: create+clean `<app_dir>/cache/<subdir>`, mark it
+    /// not-content-indexed, and return a fresh (empty-accounting) cache. This
+    /// **wipes the subdir on open**, so each Disk cache under a shared `app_dir`
+    /// must own a distinct `subdir`.
+    fn open_disk(app_dir: &Path, cap: Option<u64>, subdir: &str) -> io::Result<Self> {
+        let root = app_dir.join("cache").join(subdir);
         std::fs::create_dir_all(&root)?;
         if let Ok(rd) = std::fs::read_dir(&root) {
             for ent in rd.flatten() {
@@ -163,20 +176,14 @@ impl BlobCache {
         })
     }
 
-    /// Store `ciphertext` (opaque bytes) under `(ns, file_id_hex, sub)`, evicting
+    /// Store `ciphertext` (opaque bytes) under `(ns, id_hex, sub)`, evicting
     /// least-recently-used entries first so any cap is honored. Re-`put`ting an
     /// existing key replaces it. With a `Some` cap, a blob larger than the whole
     /// cap is **un-cacheable** and silently skipped (the caller still holds the
     /// bytes; a later `get` is simply a miss) — this keeps the cap strictly
     /// honored. With a `None` (unlimited) cap nothing is ever evicted or skipped.
-    pub fn put(
-        &mut self,
-        ns: Ns,
-        file_id_hex: &str,
-        sub: u32,
-        ciphertext: &[u8],
-    ) -> io::Result<()> {
-        let id = validated_key(file_id_hex)?;
+    pub fn put(&mut self, ns: Ns, id_hex: &str, sub: u32, ciphertext: &[u8]) -> io::Result<()> {
+        let id = validated_key(id_hex)?;
         let map_key: Key = (ns, id, sub);
         let size = ciphertext.len() as u64;
 
@@ -214,11 +221,11 @@ impl BlobCache {
         Ok(())
     }
 
-    /// Return the cached ciphertext for `(ns, file_id_hex, sub)`, refreshing its
-    /// LRU position. A miss — including a corrupt/missing backing file — returns
+    /// Return the cached ciphertext for `(ns, id_hex, sub)`, refreshing its LRU
+    /// position. A miss — including a corrupt/missing backing file — returns
     /// `None`; a stale index entry is dropped (fail-closed).
-    pub fn get(&mut self, ns: Ns, file_id_hex: &str, sub: u32) -> Option<Vec<u8>> {
-        let id = validated_key(file_id_hex).ok()?;
+    pub fn get(&mut self, ns: Ns, id_hex: &str, sub: u32) -> Option<Vec<u8>> {
+        let id = validated_key(id_hex).ok()?;
         let map_key: Key = (ns, id, sub);
         // Only tracked keys can hit (guards both backends against stray reads).
         self.index.get(&map_key)?;
@@ -279,23 +286,23 @@ impl BlobCache {
         while self.total_bytes > new_cap && self.evict_one() {}
     }
 
-    /// Whether `(ns, file_id_hex, sub)` is currently tracked.
-    pub fn contains(&self, ns: Ns, file_id_hex: &str, sub: u32) -> bool {
-        match validated_key(file_id_hex) {
+    /// Whether `(ns, id_hex, sub)` is currently tracked.
+    pub fn contains(&self, ns: Ns, id_hex: &str, sub: u32) -> bool {
+        match validated_key(id_hex) {
             Ok(id) => self.index.contains_key(&(ns, id, sub)),
             Err(_) => false,
         }
     }
 
-    /// Explicitly drop `(ns, file_id_hex, sub)` if present (no-op otherwise, never
-    /// an error). Used by the direct-link download route: `feed_fragment` writes a
+    /// Explicitly drop `(ns, id_hex, sub)` if present (no-op otherwise, never an
+    /// error). Used by the direct-link download route: `feed_fragment` writes a
     /// fragment's ciphertext to the cache BEFORE the AEAD check that would catch a
     /// tampered direct-sourced chunk, so a caller that retries a failed range via
     /// the server proxy must evict the (possibly poisoned) cache entry first —
     /// otherwise the retry would read the same bad bytes back as a cache "hit"
     /// and never actually re-fetch.
-    pub fn evict(&mut self, ns: Ns, file_id_hex: &str, sub: u32) {
-        if let Ok(id) = validated_key(file_id_hex) {
+    pub fn evict(&mut self, ns: Ns, id_hex: &str, sub: u32) {
+        if let Ok(id) = validated_key(id_hex) {
             self.remove_entry(&(ns, id, sub));
         }
     }
@@ -367,6 +374,7 @@ impl FragmentCache {
             app_dir,
             Some(cap_bytes),
             location,
+            "frag",
         )?))
     }
 
@@ -399,24 +407,24 @@ impl FragmentCache {
     }
 }
 
-/// Validate `file_id_hex` is non-empty, hex-only, and bounded in length, then
-/// return it **lowercased** as the canonical key component. Rejecting anything
-/// non-hex is what guarantees the derived filename cannot traverse out of
-/// `cache/frag/`.
+/// Validate `id_hex` is non-empty, hex-only, and bounded in length, then return
+/// it **lowercased** as the canonical key component. Rejecting anything non-hex
+/// is what guarantees the derived filename cannot traverse out of the cache's
+/// `cache/<subdir>/` directory.
 ///
 /// The lowercase normalization keeps the in-memory index namespace and the
 /// on-disk filename namespace in agreement: on case-insensitive NTFS,
 /// `frag_AA_0.blob` and `frag_aa_0.blob` are the *same* file, so case-distinct
-/// `String` keys for the same seq would otherwise clobber each other's blob while
-/// `total_bytes` double-counted. Canonicalizing both sides to lowercase makes
-/// that impossible. (The Task-4.2 feeder already passes canonical lowercase
+/// `String` keys for the same `sub` would otherwise clobber each other's blob
+/// while `total_bytes` double-counted. Canonicalizing both sides to lowercase
+/// makes that impossible. (The Task-4.2 feeder already passes canonical lowercase
 /// `hex16`; this just makes it airtight.)
-fn validated_key(file_id_hex: &str) -> io::Result<String> {
-    let ok = !file_id_hex.is_empty()
-        && file_id_hex.len() <= 64
-        && file_id_hex.bytes().all(|b| b.is_ascii_hexdigit());
+fn validated_key(id_hex: &str) -> io::Result<String> {
+    let ok = !id_hex.is_empty()
+        && id_hex.len() <= 64
+        && id_hex.bytes().all(|b| b.is_ascii_hexdigit());
     if ok {
-        Ok(file_id_hex.to_ascii_lowercase())
+        Ok(id_hex.to_ascii_lowercase())
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -428,8 +436,8 @@ fn validated_key(file_id_hex: &str) -> io::Result<String> {
 /// Deterministic, path-safe filename for a validated key: `<ns>_<id>_<sub>.blob`.
 /// The `ns` tag is a fixed path-safe string and `sub` is decimal digits, so only
 /// the (already hex-validated) `id` component could carry hostile characters.
-fn blob_filename(ns: Ns, file_id_hex: &str, sub: u32) -> String {
-    format!("{}_{}_{}.blob", ns.tag(), file_id_hex, sub)
+fn blob_filename(ns: Ns, id_hex: &str, sub: u32) -> String {
+    format!("{}_{}_{}.blob", ns.tag(), id_hex, sub)
 }
 
 /// Best-effort `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED` on the cache dir so the
@@ -624,8 +632,13 @@ mod tests {
     fn memory_backend_roundtrips_and_writes_nothing_to_disk() {
         let dir = tmp_dir("mem");
         let mut c =
-            BlobCache::open_located(&dir, Some(1024), crate::config::FragmentCacheLocation::Memory)
-                .unwrap();
+            BlobCache::open_located(
+                &dir,
+                Some(1024),
+                crate::config::FragmentCacheLocation::Memory,
+                "frag",
+            )
+            .unwrap();
         let ct = b"\x00opaque\xff".to_vec();
         c.put(Ns::Frag, "aa", 0, &ct).unwrap();
         assert_eq!(c.get(Ns::Frag, "aa", 0).as_deref(), Some(ct.as_slice()));
@@ -641,8 +654,13 @@ mod tests {
     fn memory_backend_evicts_lru_like_disk() {
         let dir = tmp_dir("mem-lru");
         let mut c =
-            BlobCache::open_located(&dir, Some(30), crate::config::FragmentCacheLocation::Memory)
-                .unwrap();
+            BlobCache::open_located(
+                &dir,
+                Some(30),
+                crate::config::FragmentCacheLocation::Memory,
+                "frag",
+            )
+            .unwrap();
         let blob = |b: u8| vec![b; 10];
         c.put(Ns::Frag, "aa", 0, &blob(0)).unwrap();
         c.put(Ns::Frag, "aa", 1, &blob(1)).unwrap();
@@ -659,8 +677,13 @@ mod tests {
         // Memory backend: memory_bytes tracks the in-RAM fill and drops on evict.
         let dir = tmp_dir("mem-bytes");
         let mut mem =
-            BlobCache::open_located(&dir, Some(1024), crate::config::FragmentCacheLocation::Memory)
-                .unwrap();
+            BlobCache::open_located(
+                &dir,
+                Some(1024),
+                crate::config::FragmentCacheLocation::Memory,
+                "frag",
+            )
+            .unwrap();
         assert_eq!(mem.memory_bytes(), 0);
         mem.put(Ns::Frag, "aa", 0, &[0u8; 100]).unwrap();
         assert_eq!(mem.memory_bytes(), 100);
@@ -716,7 +739,8 @@ mod tests {
     fn namespaces_do_not_collide() {
         let dir = tmp_dir("ns");
         let mut c =
-            BlobCache::open_located(&dir, Some(1 << 20), FragmentCacheLocation::Memory).unwrap();
+            BlobCache::open_located(&dir, Some(1 << 20), FragmentCacheLocation::Memory, "frag")
+                .unwrap();
         c.put(Ns::Frag, "aa", 0, b"frag-bytes").unwrap();
         c.put(Ns::Content, "aa", 0, b"content-bytes").unwrap();
         assert_eq!(
@@ -733,7 +757,8 @@ mod tests {
     fn disk_backend_is_uncapped() {
         let dir = tmp_dir("uncap");
         // cap None on disk: three 10-byte blobs under a would-be 20-byte cap all survive.
-        let mut c = BlobCache::open_located(&dir, None, FragmentCacheLocation::Disk).unwrap();
+        let mut c =
+            BlobCache::open_located(&dir, None, FragmentCacheLocation::Disk, "frag").unwrap();
         for s in 0..3u32 {
             c.put(Ns::Frag, "aa", s, &[0u8; 10]).unwrap();
         }
@@ -752,11 +777,20 @@ mod tests {
             } else {
                 None
             };
-            let mut c = BlobCache::open_located(&dir, cap, loc).unwrap();
+            let mut c = BlobCache::open_located(&dir, cap, loc, "frag").unwrap();
             c.put(Ns::Card, "aa", 0, b"x").unwrap();
+            // For Disk, the backing file exists before the clear...
+            let blob_path = dir.join("cache").join("frag").join("card_aa_0.blob");
+            if loc == FragmentCacheLocation::Disk {
+                assert!(blob_path.is_file());
+            }
             c.clear_and_zeroize();
             assert_eq!(c.total_bytes(), 0);
             assert!(c.get(Ns::Card, "aa", 0).is_none());
+            // ...and is actually removed from disk (not just dropped from the index).
+            if loc == FragmentCacheLocation::Disk {
+                assert!(!blob_path.is_file(), "Disk clear must delete the backing file");
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
