@@ -1642,6 +1642,15 @@ app-shell:not([data-app-chrome]) .header-actions {
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
   align-items: stretch;
 }
+/* Bundle gallery view (Issue 2): render bundle members on the SAME tile grid the
+   feed uses, so <media-card>s look identical in both places. Without this rule
+   the cards fall back to block flow (one per line). */
+.bundle-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  gap: clamp(0.9rem, 2vw, 1.25rem);
+  align-items: stretch;
+}
 media-card,
 media-card article.media-card-shell {
   min-width: 0;

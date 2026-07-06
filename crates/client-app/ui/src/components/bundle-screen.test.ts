@@ -148,3 +148,16 @@ test("a superseded scheduled render is dropped via the generation guard", () => 
 test("disconnect clears the pending re-render timer", () => {
   assert.match(src, /disconnectedCallback\(\)\s*\{[\s\S]*clearTimeout/, "must clear the timer on disconnect");
 });
+
+// --- Issue 2: the bundle gallery reuses the feed's tile grid ------------------
+const css = readFileSync("styles.css", "utf8");
+
+test(".bundle-gallery is a tile grid matching the feed #grid", () => {
+  // The gallery must lay <media-card>s out on the SAME auto-fit tile grid the
+  // feed uses (repeat(auto-fit, minmax(min(100%, 280px), 1fr))), not block flow.
+  assert.match(
+    css,
+    /\.bundle-gallery\s*\{[\s\S]*?display:\s*grid[\s\S]*?repeat\(auto-fit,\s*minmax\(min\(100%,\s*280px\),\s*1fr\)\)/,
+    ".bundle-gallery must define the feed's auto-fit tile grid",
+  );
+});
