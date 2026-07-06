@@ -3789,12 +3789,17 @@ body,
 app-shell,
 #outlet {
   min-height: 0 !important;
+  margin-block-end: 0 !important;
   margin-bottom: 0 !important;
+  padding-block-end: 0 !important;
   padding-bottom: 0 !important;
 }
 
 body {
   min-height: 100vh !important;
+  margin: 0 !important;
+  margin-bottom: 0 !important;
+  padding-bottom: 0 !important;
 }
 
 app-shell {
@@ -3889,7 +3894,6 @@ media-card article.media-card-shell {
   overflow: visible !important;
   border-radius: 15px !important;
   background:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath fill='%23b96a2b' d='M11 9c10.5-5.2 28.7-4.8 42.4 2.1 2.8 1.4 3.7 5 1.8 7.5l-4 5.2C40.4 18 25.2 15.3 9.1 17.5l-1.5-2.7C6.4 12.7 7.6 10.7 11 9Z'/%3E%3Cpath fill='%23ffd45f' d='M9.1 17.5c16.1-2.2 31.3.5 42.1 6.3L27.7 58.6c-1.5 2.2-4.9 1.5-5.4-1.1L9.1 17.5Z'/%3E%3Cpath fill='none' stroke='%23fff0a8' stroke-width='3.5' stroke-linecap='round' d='M9.1 17.5c16.1-2.2 31.3.5 42.1 6.3'/%3E%3Ccircle fill='%23c73422' cx='27' cy='26' r='4.4'/%3E%3Ccircle fill='%23c73422' cx='39' cy='35' r='3.9'/%3E%3Cpath fill='%2376ad4a' d='M23 41c4.6-2.7 7.5-1.6 8.9 2.9-4.2 2.9-7.1 1.7-8.9-2.9Z'/%3E%3Cpath fill='none' stroke='%23fff3a7' stroke-width='3' stroke-linecap='round' d='M18.6 31c2.2 1.4 3.2 3.8 2.7 6.8-.4 2.5.5 4 2.3 4.5'/%3E%3C/svg%3E") center / 38px 38px no-repeat,
     radial-gradient(circle at 72% 26%, rgba(255, 224, 121, 0.34) 0 0.35rem, transparent 0.38rem),
     linear-gradient(145deg, rgba(95, 39, 16, 0.92), rgba(38, 15, 7, 0.98)) !important;
   border: 1px solid rgba(255, 211, 89, 0.52) !important;
@@ -3903,8 +3907,38 @@ media-card article.media-card-shell {
   display: none !important;
 }
 
-.app-header .app-brand .app-brand-mark > * {
+.app-header .app-brand .app-brand-mark .default-brand-glyph {
   display: none !important;
+}
+
+.app-header .app-brand .app-brand-mark .pizza-brand-slice {
+  display: block !important;
+  width: 38px !important;
+  height: 38px !important;
+  min-width: 38px !important;
+  min-height: 38px !important;
+  color: initial !important;
+  font-size: initial !important;
+  line-height: normal !important;
+  transform: rotate(-8deg) translateY(1px) !important;
+  filter: drop-shadow(0 0.18rem 0.18rem rgba(50, 19, 6, 0.35));
+}
+
+.app-header .app-brand .app-brand-mark .pizza-brand-crust { fill: #b96a2b; }
+.app-header .app-brand .app-brand-mark .pizza-brand-cheese { fill: #ffd45f; }
+.app-header .app-brand .app-brand-mark .pizza-brand-edge {
+  fill: none;
+  stroke: #fff0a8;
+  stroke-width: 3.5;
+  stroke-linecap: round;
+}
+.app-header .app-brand .app-brand-mark .pizza-brand-pepperoni { fill: #c73422; }
+.app-header .app-brand .app-brand-mark .pizza-brand-basil { fill: #76ad4a; }
+.app-header .app-brand .app-brand-mark .pizza-brand-melt {
+  fill: none;
+  stroke: #fff3a7;
+  stroke-width: 3;
+  stroke-linecap: round;
 }
 
 @media (max-width: 520px) {
@@ -3913,6 +3947,12 @@ media-card article.media-card-shell {
     height: 42px !important;
     min-width: 42px !important;
     min-height: 42px !important;
-    background-size: 38px 38px, auto, auto !important;
+  }
+
+  .app-header .app-brand .app-brand-mark .pizza-brand-slice {
+    width: 38px !important;
+    height: 38px !important;
+    min-width: 38px !important;
+    min-height: 38px !important;
   }
 }
