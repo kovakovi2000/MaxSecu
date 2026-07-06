@@ -160,10 +160,12 @@ fn main() {
     //   the managed state is still alive (a managed-state drop is NOT guaranteed on
     //   shutdown). In Memory mode this zeroizes the in-RAM ciphertext; in Disk mode it
     //   deletes the `cache/media/*` + `cache/thumb/*` backing files. Zeroizing the
-    //   ephemeral `SessionSeal` key last makes any paged/hibernated sealed blob
-    //   unrecoverable even if a copy escaped to swap. The cache wipes use the
-    //   `try_lock`-based blocking variants so this SYNC callback can never panic on a
-    //   missing runtime context nor block shutdown.
+    //   ephemeral `SessionSeal` key's in-RAM copy last means sealed blobs paged out
+    //   earlier become undecryptable once the live key is gone — with the accepted
+    //   residual that a key copy already written to swap BEFORE this wipe (the key is
+    //   not `mlock`'d) is outside our control. The cache wipes use the `try_lock`-based
+    //   sync variants so this SYNC callback can never panic on a missing runtime
+    //   context nor block shutdown.
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } => {
             if let Some(prepare_cancel) =
@@ -178,17 +180,17 @@ fn main() {
             if let Some(media) =
                 app_handle.try_state::<maxsecu_client_app::media_cache::MediaCache>()
             {
-                media.clear_and_zeroize_blocking(); // Memory → wipe RAM; Disk → delete cache/media/*
+                media.clear_and_zeroize_sync(); // Memory → wipe RAM; Disk → delete cache/media/*
             }
             if let Some(thumb) =
                 app_handle.try_state::<maxsecu_client_app::thumb_cache::ThumbCache>()
             {
-                thumb.clear_and_zeroize_blocking(); // Memory → wipe; Disk → delete cache/thumb/*
+                thumb.clear_and_zeroize_sync(); // Memory → wipe; Disk → delete cache/thumb/*
             }
             if let Some(seal) = app_handle
                 .try_state::<std::sync::Arc<maxsecu_client_app::session_seal::SessionSeal>>()
             {
-                seal.zeroize(); // wipe the ephemeral key → any paged/hibernated sealed blob is unrecoverable
+                seal.zeroize(); // wipe the key's in-RAM copy (swap copy from before this is the accepted residual)
             }
         }
         _ => {}

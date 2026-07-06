@@ -40,13 +40,19 @@ pub async fn set_settings(
     // Apply the location toggle AND the caps live to BOTH caches (D5a): a Disk/Memory
     // switch rebuilds the cache under its subdir; in Memory mode a lowered cap evicts
     // now; a Disk cache stays uncapped. Both caches share the one `cache_location`.
+    // Apply `thumb` (the smaller cache) FIRST: if the second apply then hits an
+    // io::Error we bail, and the only inconsistency is a transient backend
+    // disagreement between the two caches (e.g. thumb flipped, media not) that a
+    // restart resolves — no rollback is warranted (a mid-rebuild I/O failure is rare
+    // and self-heals). `cache_stats` derives `disk_mode` from media, so ordering
+    // thumb-first keeps the governing cache's state consistent with what it reports.
     let loc = norm.performance.cache_location;
-    media
-        .apply_location_and_cap(&dir.0, loc, norm.performance.media_cache_cap_mb)
-        .await
-        .map_err(|_| UiError::new("settings_failed", "Could not apply the cache setting."))?;
     thumb
         .apply_location_and_cap(&dir.0, loc, norm.performance.thumb_cache_cap_mb)
+        .await
+        .map_err(|_| UiError::new("settings_failed", "Could not apply the cache setting."))?;
+    media
+        .apply_location_and_cap(&dir.0, loc, norm.performance.media_cache_cap_mb)
         .await
         .map_err(|_| UiError::new("settings_failed", "Could not apply the cache setting."))?;
     Ok(norm)

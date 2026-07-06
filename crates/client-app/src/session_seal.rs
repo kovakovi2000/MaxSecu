@@ -57,10 +57,15 @@ impl SessionSeal {
         open(&**guard, nonce, &[], ct).ok().map(Zeroizing::new)
     }
 
-    /// Explicitly wipe the key in place (overwrite with zeros). Called by the Exit
-    /// hook (Task 7) via `&self` while the managed `Arc<SessionSeal>` is still
-    /// alive — after this any paged/hibernated sealed blob is unrecoverable, and
-    /// subsequent `open`s of pre-zeroize blobs fail closed.
+    /// Explicitly wipe the key's in-RAM copy in place (overwrite with zeros).
+    /// Called by the Exit hook (Task 7) via `&self` while the managed
+    /// `Arc<SessionSeal>` is still alive. This wipes the live copy so a later
+    /// page-out cannot expose it, and once the live key is gone any sealed blob
+    /// that was paged/hibernated earlier becomes undecryptable — but a copy of the
+    /// key already written to swap BEFORE this wipe is outside our control (the key
+    /// is not `mlock`'d, out of scope). The 32-byte key already-in-swap and the
+    /// transient on-screen/plaintext frame are the accepted residual (matches the
+    /// security sign-off). Subsequent `open`s of pre-zeroize blobs fail closed.
     pub fn zeroize(&self) {
         let mut guard = self.key.lock().unwrap_or_else(|e| e.into_inner());
         (**guard).zeroize();

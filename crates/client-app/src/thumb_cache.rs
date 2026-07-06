@@ -207,11 +207,15 @@ impl ThumbCache {
         self.cache.lock().await.clear_and_zeroize();
     }
 
-    /// Exit-path (SYNC `RunEvent::Exit`) variant of [`clear_and_zeroize`](Self::clear_and_zeroize):
-    /// `try_lock` (NOT `blocking_lock`) so it can never panic on the missing runtime
-    /// context nor block shutdown — at shutdown nothing else holds the lock; a
-    /// contended miss is a best-effort skip (RAM is reclaimed as the process dies).
-    pub fn clear_and_zeroize_blocking(&self) {
+    /// Sync-context (SYNC `RunEvent::Exit`) variant of
+    /// [`clear_and_zeroize`](Self::clear_and_zeroize): `try_lock` (NOT
+    /// `blocking_lock`) so it can never panic on the missing runtime context nor
+    /// block shutdown — at shutdown nothing else holds the lock, so it succeeds. A
+    /// contended miss (essentially never real at Exit) is a best-effort skip: in
+    /// Memory mode the dying process reclaims the RAM; in Disk mode it leaves only
+    /// ciphertext under `cache/thumb/*`, which the next Disk-mode open wipes+recreates
+    /// and which a fresh per-process seal makes undecryptable anyway (not plaintext).
+    pub fn clear_and_zeroize_sync(&self) {
         if let Ok(mut c) = self.cache.try_lock() {
             c.clear_and_zeroize();
         }
@@ -431,12 +435,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_and_zeroize_blocking_empties() {
-        let dir = tmp_dir("clr-block");
+    async fn clear_and_zeroize_sync_empties() {
+        let dir = tmp_dir("clr-sync");
         let tc = mem_cache(&dir, 64);
         tc.put_card(key(1, 0), meta("t")).await;
         assert!(tc.get_card(key(1, 0), "x").await.is_some());
-        tc.clear_and_zeroize_blocking();
+        tc.clear_and_zeroize_sync();
         assert!(tc.get_card(key(1, 0), "x").await.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

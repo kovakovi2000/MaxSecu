@@ -119,12 +119,16 @@ impl MediaCache {
         Ok(())
     }
 
-    /// Wipe + zeroize the cache from the SYNC `RunEvent::Exit` callback (D6). Uses
-    /// `try_lock` (NOT `blocking_lock`): at shutdown nothing else holds the lock so
-    /// it succeeds, and it can never panic on the missing runtime context nor block
-    /// the shutdown — a contended miss is a best-effort skip (the process is dying
-    /// and its RAM is reclaimed regardless).
-    pub fn clear_and_zeroize_blocking(&self) {
+    /// Sync-context (SYNC `RunEvent::Exit` callback) variant of the async
+    /// [`BlobCache::clear_and_zeroize`] wipe (D6). Uses `try_lock` (NOT
+    /// `blocking_lock`), so it never blocks and can never panic on the missing
+    /// runtime context: at shutdown nothing else holds the lock, so it succeeds. A
+    /// contended miss (essentially never real at Exit) is a best-effort skip — in
+    /// Memory mode the dying process reclaims the RAM regardless; in Disk mode a
+    /// skipped wipe leaves only ciphertext under `cache/media/*`, which the next
+    /// Disk-mode open wipes+recreates and which a fresh per-process seal makes
+    /// undecryptable anyway (never plaintext-at-rest).
+    pub fn clear_and_zeroize_sync(&self) {
         if let Ok(mut c) = self.0.try_lock() {
             c.clear_and_zeroize();
         }
@@ -355,12 +359,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_and_zeroize_blocking_empties() {
-        let dir = tmp_dir("clr-block");
+    async fn clear_and_zeroize_sync_empties() {
+        let dir = tmp_dir("clr-sync");
         let media = MediaCache::open(&dir, 1, FragmentCacheLocation::Memory).unwrap();
         media.0.lock().await.put(Ns::Frag, "aa", 0, b"x").unwrap();
         assert_eq!(media.0.lock().await.total_bytes(), 1);
-        media.clear_and_zeroize_blocking();
+        media.clear_and_zeroize_sync();
         assert_eq!(media.0.lock().await.total_bytes(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
