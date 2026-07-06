@@ -68,7 +68,7 @@ base64 = "0.22"
 # Physical-RAM read for the in-memory decrypted-content cache sizing (the cap is
 # bounded to total-RAM − 6 GB). The ONLY new dependency in the UI-overhaul work;
 # flagged for `cargo deny`/`cargo audit`. Pure-Rust on Windows (no new C).
-sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
 # Native OS "open file" dialog for the upload Browse… button. Used only by the
 # `pick_file` command; returns a path the UI drops into the file-path field — no
 # bytes cross the dialog. default-features off keeps it lean (the Win32 file-dialog

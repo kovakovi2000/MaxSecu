@@ -7,6 +7,7 @@ pub mod config;
 pub mod contacts;
 pub mod directory;
 pub mod direct_link;
+pub mod disk_free;
 pub mod download;
 pub mod dto;
 pub mod error;
