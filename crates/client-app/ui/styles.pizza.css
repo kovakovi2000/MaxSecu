@@ -3987,3 +3987,89 @@ connect-screen #main.connect-main,
   stroke-width: 3;
   stroke-linecap: round;
 }
+
+
+/* ---------- Pizza v5 feedback pass: remove pseudo-element bottom band + force real slice ---------- */
+/* The reported bottom dead-space highlights only when DevTools targets pseudo-elements.
+   Disable the global body texture pseudo-layers in the pizza frontend so they cannot
+   create or visually mark an extra page-end band. Component cheese lips remain intact. */
+body::before,
+body::after {
+  content: none !important;
+  display: none !important;
+}
+
+#outlet::before,
+#outlet::after,
+app-shell::before,
+app-shell::after,
+main::before,
+main::after,
+connect-screen #main.connect-main::before,
+connect-screen #main.connect-main::after,
+.auth-main::before,
+.auth-main::after {
+  content: none !important;
+  display: none !important;
+}
+
+html,
+body,
+app-shell,
+#outlet {
+  min-height: 0 !important;
+}
+
+body {
+  min-height: 100vh !important;
+}
+
+app-shell {
+  min-height: 100dvh !important;
+  padding-bottom: 0 !important;
+}
+
+#outlet {
+  display: flow-root;
+  padding-bottom: 0 !important;
+  margin-bottom: 0 !important;
+}
+
+#outlet > :last-child,
+#outlet > :last-child #main,
+#outlet > main:last-child {
+  margin-bottom: 0 !important;
+  padding-bottom: 0 !important;
+}
+
+#main {
+  padding-bottom: 0 !important;
+}
+
+/* Hard-target the visible top-left brand mark. Do not rely on emoji pseudo-content or
+   an inline-hidden SVG: show the actual inline slice at a guaranteed 38px size. */
+.app-header .app-brand .app-brand-mark {
+  width: 42px !important;
+  height: 42px !important;
+  min-width: 42px !important;
+  max-width: 42px !important;
+  min-height: 42px !important;
+  padding: 0 !important;
+  display: inline-grid !important;
+  place-items: center !important;
+  overflow: visible !important;
+}
+
+.app-header .app-brand .app-brand-mark .default-brand-glyph {
+  display: none !important;
+}
+
+.app-header .app-brand .app-brand-mark .pizza-brand-slice {
+  display: block !important;
+  width: 38px !important;
+  min-width: 38px !important;
+  height: 38px !important;
+  min-height: 38px !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+}
