@@ -123,3 +123,28 @@ test("bundle-screen persists the mode via the bundle-view helper", () => {
   assert.match(src, /readBundleViewMode/);
   assert.match(src, /writeBundleViewMode/);
 });
+
+// --- Issue 1 (frontend): render-generation guard + debounced view switch -----
+// Rapid Gallery⇄Stacked toggling must not fan out overlapping member loads that
+// race the connect lock. setMode debounces the expensive re-render and tags each
+// scheduled render with a generation token so a superseded one is dropped;
+// re-render tears down prior children (replaceChildren) so their in-flight loads
+// are abandoned. disconnect clears any pending timer.
+
+test("bundle-screen carries a render-generation token", () => {
+  assert.match(src, /renderGen/, "must track a render generation");
+});
+
+test("setMode debounces the re-render with a timer", () => {
+  assert.match(src, /setTimeout\(/, "setMode must schedule the re-render on a timer");
+  assert.match(src, /clearTimeout\(/, "a pending re-render timer must be cancellable");
+});
+
+test("a superseded scheduled render is dropped via the generation guard", () => {
+  // The scheduled callback bails when its captured generation is stale.
+  assert.match(src, /!==\s*this\.renderGen/, "scheduled render must guard on a stale generation");
+});
+
+test("disconnect clears the pending re-render timer", () => {
+  assert.match(src, /disconnectedCallback\(\)\s*\{[\s\S]*clearTimeout/, "must clear the timer on disconnect");
+});

@@ -32,9 +32,20 @@ import type { ShareDialog } from "./share-dialog.ts";
 // (member cards, status text) is built via createElement/textContent — never
 // interpolated into innerHTML (the a11y lint flags any `${` in an innerHTML
 // template that isn't the esc() helper).
+// Debounce window for the Gallery⇄Stacked re-render. Long enough to collapse a
+// burst of toggles, short enough to feel immediate.
+const MODE_DEBOUNCE_MS = 150;
+
 export class BundleScreen extends HTMLElement {
   private view: BundleView | null = null;
   private mode: BundleViewMode = readBundleViewMode();
+  // Render-generation guard (Issue 1): a monotonically increasing token. A
+  // debounced setMode schedules a re-render tagged with the current generation;
+  // if a newer toggle bumps the generation first, the stale scheduled render is
+  // dropped. This shrinks the window in which rapid toggles fan out overlapping
+  // member loads that would contend the connect lock.
+  private renderGen = 0;
+  private modeTimer: ReturnType<typeof setTimeout> | null = null;
 
   connectedCallback() {
     const params = new URLSearchParams(location.hash.split("?")[1] ?? "");
@@ -124,13 +135,30 @@ export class BundleScreen extends HTMLElement {
   }
 
   // Switch view mode: persist the choice and re-render the already-fetched
-  // members (no re-fetch — mode is a pure presentation concern).
+  // members (no re-fetch — mode is a pure presentation concern). The toggle's
+  // visual state flips immediately for feedback; the expensive member re-render
+  // is debounced and generation-guarded so a burst of toggles collapses to the
+  // final mode and never leaves a superseded render running.
   private setMode(mode: BundleViewMode) {
     if (mode === this.mode) return;
     this.mode = mode;
     writeBundleViewMode(mode);
     this.syncToggle();
-    this.render();
+    const gen = ++this.renderGen;
+    if (this.modeTimer !== null) clearTimeout(this.modeTimer);
+    this.modeTimer = setTimeout(() => {
+      this.modeTimer = null;
+      if (gen !== this.renderGen) return; // superseded by a newer toggle
+      this.render();
+    }, MODE_DEBOUNCE_MS);
+  }
+
+  disconnectedCallback() {
+    // Drop any pending debounced re-render so it can't fire into a torn-down view.
+    if (this.modeTimer !== null) {
+      clearTimeout(this.modeTimer);
+      this.modeTimer = null;
+    }
   }
 
   private syncToggle() {
@@ -221,6 +249,8 @@ export class BundleScreen extends HTMLElement {
   }
 
   private render() {
+    // Any direct render (e.g. the initial load) supersedes a pending debounced one.
+    this.renderGen++;
     const container = this.querySelector("#bd-members") as HTMLElement;
     container.replaceChildren();
     if (!this.view) return;
