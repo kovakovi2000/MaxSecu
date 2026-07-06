@@ -3913,3 +3913,77 @@ media-card article.media-card-shell {
   background: linear-gradient(90deg, rgba(255, 238, 166, 0), rgba(255, 204, 73, 0.78), rgba(255, 238, 166, 0));
   pointer-events: none;
 }
+
+/* ---------- Pizza v4 feedback pass: no page-bottom dead space + real header slice ---------- */
+/* Remove the extra empty band that the original tech layout kept under each routed page.
+   Bottom-docked status/upload controls are fixed overlays, so the pizza skin should not
+   reserve a large visual spacer at the page end. */
+main,
+connect-screen #main.connect-main,
+.auth-main {
+  padding-bottom: 0 !important;
+}
+
+#outlet > main:last-child,
+#outlet > *:last-child main:last-child {
+  margin-bottom: 0 !important;
+}
+
+/* The pizza frontend now uses a real inline SVG slice instead of trying to draw over
+   the old diamond with pseudo-content. */
+.app-brand-mark {
+  position: relative;
+  width: 42px !important;
+  height: 42px !important;
+  min-width: 42px !important;
+  padding: 0 !important;
+  border-radius: 14px !important;
+  display: inline-grid !important;
+  place-items: center !important;
+  color: transparent !important;
+  font-size: 0 !important;
+  line-height: 1 !important;
+  overflow: visible !important;
+  transform: none !important;
+  background:
+    radial-gradient(circle at 58% 28%, rgba(185, 45, 26, 0.24) 0 0.2rem, transparent 0.23rem),
+    linear-gradient(145deg, rgba(95, 39, 16, 0.9), rgba(38, 15, 7, 0.96)) !important;
+  border: 1px solid rgba(255, 211, 89, 0.5);
+  box-shadow: 0 0.45rem 1.2rem rgba(234, 116, 35, 0.22), inset 0 1px 0 rgba(255, 244, 184, 0.24) !important;
+}
+
+.app-brand-mark::before,
+.app-brand-mark::after {
+  content: none !important;
+  display: none !important;
+}
+
+.app-brand-mark .default-brand-glyph {
+  display: none !important;
+}
+
+.app-brand-mark .pizza-brand-slice {
+  display: block !important;
+  width: 38px !important;
+  height: 38px !important;
+  overflow: visible;
+  transform: rotate(-12deg) translateY(-1px);
+  filter: drop-shadow(0 0.22rem 0.18rem rgba(42, 12, 3, 0.35));
+}
+
+.pizza-brand-crust { fill: #b96a2b; }
+.pizza-brand-cheese { fill: #ffd45f; }
+.pizza-brand-edge {
+  fill: none;
+  stroke: #fff0a8;
+  stroke-width: 3.5;
+  stroke-linecap: round;
+}
+.pizza-brand-pepperoni { fill: #c73422; }
+.pizza-brand-basil { fill: #76ad4a; }
+.pizza-brand-melt {
+  fill: none;
+  stroke: #fff3a7;
+  stroke-width: 3;
+  stroke-linecap: round;
+}
