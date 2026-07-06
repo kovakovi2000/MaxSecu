@@ -2,32 +2,56 @@ import { call } from "../core/rpc.ts";
 import { settingsStore } from "../core/settings.ts";
 import type { CacheStats } from "../core/types.ts";
 import { ramGaugeModel } from "../core/gauge.ts";
-import type { GaugeModel } from "../core/gauge.ts";
 
-// Standalone RAM-cache rainbow gauge for the shell header. A horizontal bar whose
-// fill grows left→right proportional to the in-RAM fragment cache's actual fill ÷
-// the RAM cache cap the user set. The numerator is the live cache footprint polled
-// from the `cache_stats` backend command every 1500 ms (0 when nothing is playing
-// or the Disk backend is selected — the cache is per-play and LRU-evicts at the
-// cap, so it visibly fills and drops during playback and can never exceed 100%);
-// the denominator is the live settings cap, so changing the cap on the Settings
-// screen moves the bar immediately.
-// `role="meter"` with aria-valuemin/max/now + aria-label (non-colour-only).
+// Standalone cache gauges for the shell header: TWO stacked rainbow bars — one for
+// the app-global Media cache (video fragments + full content), one for the
+// Thumbnails cache (feed-card meta). Each row = a caption + the accessible meter
+// bar (aria-*) + a read-out + its own Clear button. The live footprint is polled
+// from the `cache_stats` backend command every 1500 ms, passing BOTH caps.
+//
+// In Memory mode each bar's denominator is its configured cap (fill can never
+// exceed 100%). In Disk mode the on-disk size is measured against the startup
+// free-space estimate (the % may exceed 100 while the bar stays clamped; the
+// caller appends a " (disk)" suffix). Changing a cap on the Settings screen moves
+// the matching bar immediately (the store subscription recomputes).
+//
+// Each bar is `role="meter"` with aria-valuemin/max/now + aria-label
+// (non-colour-only). Clearing a cache only forces a re-fetch — no user data is
+// lost — so the Clear buttons are confirm-free.
+
+interface RowSpec {
+  key: "media" | "thumb";
+  caption: string;
+  clearCmd: string;
+  clearAria: string;
+}
+
+const ROWS: RowSpec[] = [
+  { key: "media", caption: "Media", clearCmd: "clear_media_cache", clearAria: "Clear media cache" },
+  { key: "thumb", caption: "Thumbnails", clearCmd: "clear_thumb_cache", clearAria: "Clear thumbnails cache" },
+];
+
 export class RamGauge extends HTMLElement {
   private _pollId: number | null = null;
-  private _lastGauge: GaugeModel | null = null;
-  private _lastUsed: number | null = null; // in-RAM cache bytes from cache_stats
+  private _stats: CacheStats | null = null;
   private _unsubSettings: (() => void) | null = null;
 
   connectedCallback() {
-    // Bar + a visible read-out: "<used> / <total> MB (<pct>%)". The bar is the
-    // accessible meter (aria-*); the text is aria-hidden to avoid double SR output.
     this.innerHTML = `
-      <div class="ram-gauge-wrap" hidden>
-        <div class="ram-gauge" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="RAM cache usage unavailable"><div class="ram-gauge-fill"></div></div>
-        <span class="ram-gauge-text" aria-hidden="true"></span>
+      <div class="ram-gauge-rows">
+        ${ROWS.map((r) => `
+          <div class="ram-gauge-row" data-cache="${r.key}" hidden>
+            <span class="ram-gauge-cap">${r.caption}</span>
+            <div class="ram-gauge" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="${r.caption} cache usage unavailable"><div class="ram-gauge-fill"></div></div>
+            <span class="ram-gauge-text" aria-hidden="true"></span>
+            <button type="button" class="cache-clear" data-clear="${r.key}" aria-label="${r.clearAria}">Clear</button>
+          </div>`).join("")}
       </div>`;
-    // Recompute whenever the cap changes (denominator is the cache cap).
+    for (const r of ROWS) {
+      const btn = this.querySelector<HTMLButtonElement>(`.cache-clear[data-clear="${r.key}"]`);
+      btn?.addEventListener("click", () => { void this._clear(r.clearCmd); });
+    }
+    // Recompute whenever a cap changes (the caps are the Memory-mode denominators).
     this._unsubSettings = settingsStore.subscribe(() => this._recompute());
     // Start polling (immediately + every 1500 ms).
     void this._poll();
@@ -47,43 +71,67 @@ export class RamGauge extends HTMLElement {
 
   private async _poll(): Promise<void> {
     try {
-      // Pass the CURRENT cap so the backend reconciles open caches to the same value
-      // the gauge divides by (lowering the cap mid-playback then evicts down to it).
-      const capBytes = settingsStore.get().performance.ram_cache_cap_mb * 1024 * 1024;
-      const stats = await call<CacheStats>("cache_stats", { capBytes });
-      this._lastUsed = stats.used_bytes;
+      // Pass BOTH current caps so the backend reconciles each open cache to the
+      // same value the matching gauge divides by (Tauri maps the camelCase arg
+      // names to `media_cap_bytes` / `thumb_cap_bytes`).
+      const perf = settingsStore.get().performance;
+      const mediaCapBytes = perf.media_cache_cap_mb * 1024 * 1024;
+      const thumbCapBytes = perf.thumb_cache_cap_mb * 1024 * 1024;
+      this._stats = await call<CacheStats>("cache_stats", { mediaCapBytes, thumbCapBytes });
     } catch {
-      // fail-soft: keep the previous value (or null on first poll failure)
+      // fail-soft: keep the previous stats (or null on first poll failure)
     }
     this._recompute();
   }
 
-  // Rebuild the gauge model from the last-seen in-RAM cache fill and the CURRENT
-  // cache cap, then paint. Denominator = ram_cache_cap_mb (the cache budget).
-  private _recompute(): void {
-    const capMb = settingsStore.get().performance.ram_cache_cap_mb;
-    const g = ramGaugeModel(this._lastUsed, capMb * 1024 * 1024);
-    // Prefix the read-out/label so it reads as the cache gauge, not whole-app RAM.
-    this._lastGauge = g.hidden ? g : { ...g, label: `Cache ${g.label}` };
-    this._paint();
+  private async _clear(cmd: string): Promise<void> {
+    try {
+      await call<void>(cmd);
+    } catch {
+      // fail-soft: a clear failure just leaves the cache as-is
+    }
+    // Immediately re-poll so the just-cleared bar drops to 0.
+    await this._poll();
   }
 
-  private _paint(): void {
-    const wrap = this.querySelector<HTMLElement>(".ram-gauge-wrap");
-    const bar = this.querySelector<HTMLElement>(".ram-gauge");
-    if (!wrap || !bar) return;
-    const g = this._lastGauge;
-    if (!g || g.hidden) {
-      wrap.hidden = true;
+  private _recompute(): void {
+    const perf = settingsStore.get().performance;
+    const stats = this._stats;
+    this._paintRow("media", stats ? stats.media_used : null, perf.media_cache_cap_mb, "Media", stats);
+    this._paintRow("thumb", stats ? stats.thumb_used : null, perf.thumb_cache_cap_mb, "Thumbnails", stats);
+  }
+
+  private _paintRow(
+    key: "media" | "thumb",
+    used: number | null,
+    capMb: number,
+    caption: string,
+    stats: CacheStats | null,
+  ): void {
+    const row = this.querySelector<HTMLElement>(`.ram-gauge-row[data-cache="${key}"]`);
+    if (!row) return;
+    const disk = !!stats && stats.disk_mode;
+    let g = disk
+      ? ramGaugeModel(used, stats!.disk_free_estimate, { disk: true })
+      : ramGaugeModel(used, capMb * 1024 * 1024);
+    if (disk && !g.hidden) g = { ...g, label: `${g.label} (disk)` };
+    if (g.hidden) {
+      row.hidden = true;
       return;
     }
-    wrap.hidden = false;
-    wrap.title = g.label;
-    bar.setAttribute("aria-valuenow", String(g.pct));
-    bar.setAttribute("aria-label", g.label);
-    const fill = bar.querySelector<HTMLElement>(".ram-gauge-fill");
-    if (fill) fill.style.width = `${g.fillFraction * 100}%`;
-    const text = this.querySelector<HTMLElement>(".ram-gauge-text");
+    row.hidden = false;
+    const full = `${caption} ${g.label}`;
+    row.title = full;
+    const bar = row.querySelector<HTMLElement>(".ram-gauge");
+    if (bar) {
+      // Keep aria-valuenow within [0,100] (the meter's declared range) via the
+      // clamped fill, even when the Disk-mode label reports > 100%.
+      bar.setAttribute("aria-valuenow", String(Math.round(g.fillFraction * 100)));
+      bar.setAttribute("aria-label", full);
+      const fill = bar.querySelector<HTMLElement>(".ram-gauge-fill");
+      if (fill) fill.style.width = `${g.fillFraction * 100}%`;
+    }
+    const text = row.querySelector<HTMLElement>(".ram-gauge-text");
     if (text) text.textContent = g.label;
   }
 }

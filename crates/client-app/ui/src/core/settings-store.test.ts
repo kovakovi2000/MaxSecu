@@ -7,7 +7,7 @@ function base(): Settings {
   return {
     a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
     behavior: { confirm_destructive: false },
-    performance: { ram_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4, fragment_cache_location: "Disk" },
+    performance: { media_cache_cap_mb: 1024, thumb_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4, cache_location: "Memory" },
     connection: { route_mode: "prefer-server" },
     appearance: { theme: "dark" },
   };

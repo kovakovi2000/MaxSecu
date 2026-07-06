@@ -227,14 +227,18 @@ export interface Settings {
   // (Rust PerformanceSettings), clamped 1..=logical-CPUs. All three round-trip
   // through get_settings/set_settings; the backend re-clamps on save.
   performance: {
-    ram_cache_cap_mb: number;
+    // Two app-global ciphertext-in-RAM cache caps (MB). Media = video fragments +
+    // full-content bytes; Thumbnails = feed-card meta/thumbnails. Each is the
+    // denominator of its header gauge in Memory mode.
+    media_cache_cap_mb: number;
+    thumb_cache_cap_mb: number;
     feed_concurrency: number;
     transcode_threads: number;
     decode_threads: number;
-    // Where stream fragments are cached during playback. "Disk" (default) spills
-    // ciphertext fragments to a temp dir; "Memory" keeps them in RAM only.
-    // Mirrors Rust `FragmentCacheLocation` (serde bare string "Disk"/"Memory").
-    fragment_cache_location: "Disk" | "Memory";
+    // Where both caches live. "Memory" (default) keeps ciphertext in RAM only;
+    // "Disk" spills ciphertext to a temp dir (no cap, wiped on start + exit).
+    // Mirrors Rust `CacheLocation` (serde bare string "Disk"/"Memory").
+    cache_location: "Disk" | "Memory";
   };
   connection: { route_mode: RouteMode };
   appearance: { theme: "dark" | "light" };
@@ -247,8 +251,15 @@ export interface RamLimits { default_mb: number; min_mb: number; max_mb: number 
 // `used_bytes` is null when the OS process-RSS query is unavailable (fail-soft).
 export interface MemoryStats { used_bytes: number | null; budget_bytes: number }
 
-// Live in-RAM fragment-cache footprint from the `cache_stats` command: the bytes
-// the fragment cache is holding in RAM right now (0 when nothing is playing or the
-// Disk backend is selected), summed across open video sessions. The header gauge
-// shows this against the configured `ram_cache_cap_mb`.
-export interface CacheStats { used_bytes: number }
+// Dual-mode cache footprint from the `cache_stats` command (takes the two live
+// caps: `{ mediaCapBytes, thumbCapBytes }`). `media_used`/`thumb_used` are the
+// bytes each app-global cache holds right now. In Memory mode (`disk_mode` false)
+// the header gauges divide each by its configured cap; in Disk mode (`disk_mode`
+// true) they divide the on-disk size by `disk_free_estimate` (the startup
+// free-space probe, 0 in RAM mode or when the probe failed → raw-size fallback).
+export interface CacheStats {
+  media_used: number;
+  thumb_used: number;
+  disk_mode: boolean;
+  disk_free_estimate: number;
+}

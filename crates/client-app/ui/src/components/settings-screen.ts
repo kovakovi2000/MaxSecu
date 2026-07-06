@@ -11,7 +11,7 @@ import type { Settings, RamLimits } from "../core/types.ts";
 const DEFAULTS: Settings = {
   a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
   behavior: { confirm_destructive: false },
-  performance: { ram_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4, fragment_cache_location: "Disk" },
+  performance: { media_cache_cap_mb: 1024, thumb_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4, cache_location: "Memory" },
   connection: { route_mode: "prefer-server" },
   appearance: { theme: "dark" },
 };
@@ -50,9 +50,11 @@ export class SettingsScreen extends HTMLElement {
 
           <fieldset>
             <legend>Performance</legend>
-            <label>RAM cache cap (MB)
-              <input type="range" name="ram_range" step="1" />
-              <input type="number" name="ram_cache_cap_mb" step="1" /></label>
+            <label>Media cache (MB)
+              <input type="range" name="media_range" step="1" />
+              <input type="number" name="media_cache_cap_mb" step="1" /></label>
+            <label>Thumbnails cache (MB)
+              <input type="number" name="thumb_cache_cap_mb" step="1" /></label>
             <p id="ram-hint" class="hint"></p>
             <label>Feed concurrency (cards decoded in parallel)
               <input type="number" name="feed_concurrency" min="1" max="8" step="1" /></label>
@@ -61,12 +63,12 @@ export class SettingsScreen extends HTMLElement {
             <label>Decode threads
               <input type="number" name="decode_threads" min="1" step="1" /></label>
             <p id="cores-hint" class="hint"></p>
-            <label>Fragment cache
-              <select name="fragment_cache_location">
-                <option value="Disk">Disk</option>
+            <label>Cache location
+              <select name="cache_location">
                 <option value="Memory">Memory (RAM only)</option>
+                <option value="Disk">Disk</option>
               </select></label>
-            <p class="hint">Memory keeps stream fragments in RAM only — nothing written to disk.</p>
+            <p class="hint">Memory keeps cached ciphertext in RAM only, bounded by the caps above. Disk spills ciphertext to a temp dir (no cap) and is wiped on start and exit.</p>
           </fieldset>
 
           <fieldset>
@@ -133,12 +135,16 @@ export class SettingsScreen extends HTMLElement {
 
   private async init() {
     try { this.limits = await call<RamLimits>("ram_limits"); } catch { /* keep defaults */ }
-    const range = this.input("ram_range");
-    const num = this.input("ram_cache_cap_mb");
-    range.min = String(this.limits.min_mb); range.max = String(this.limits.max_mb);
-    num.min = String(this.limits.min_mb); num.max = String(this.limits.max_mb);
+    // Both cap inputs (and the media slider) share the same ram_limits bounds.
+    const range = this.input("media_range");
+    const media = this.input("media_cache_cap_mb");
+    const thumb = this.input("thumb_cache_cap_mb");
+    for (const el of [range, media, thumb]) {
+      el.min = String(this.limits.min_mb);
+      el.max = String(this.limits.max_mb);
+    }
     (this.querySelector("#ram-hint") as HTMLElement).textContent =
-      `Allowed ${this.limits.min_mb}–${this.limits.max_mb} MB (cap = total RAM − 6 GB).`;
+      `Each cache: ${this.limits.min_mb}–${this.limits.max_mb} MB (cap = total RAM − 6 GB).`;
     // Bound the thread budgets to the machine's logical-CPU count. The backend
     // re-clamps 1..=cores on save, so this is a convenience bound, not the SoT.
     let cores = 4;
@@ -161,12 +167,12 @@ export class SettingsScreen extends HTMLElement {
   private async onPrefChange(e: Event) {
     const status = this.querySelector("#set-status")!;
     const target = e.target as HTMLElement;
-    if (target?.getAttribute("name") === "ram_range") {
-      this.input("ram_cache_cap_mb").value = this.input("ram_range").value;
-    } else if (target?.getAttribute("name") === "ram_cache_cap_mb") {
-      this.input("ram_range").value = this.input("ram_cache_cap_mb").value;
+    // Keep the media slider and its number input mirrored.
+    if (target?.getAttribute("name") === "media_range") {
+      this.input("media_cache_cap_mb").value = this.input("media_range").value;
+    } else if (target?.getAttribute("name") === "media_cache_cap_mb") {
+      this.input("media_range").value = this.input("media_cache_cap_mb").value;
     }
-    const ram = Number(this.input("ram_cache_cap_mb").value);
     const text = this.sel("text_size").value;
     const cur = settingsStore.get().performance;
     const numOr = (name: string, fallback: number) => {
@@ -181,14 +187,15 @@ export class SettingsScreen extends HTMLElement {
         text_size: text === "large" || text === "larger" ? text : "normal",
       },
       performance: {
-        ram_cache_cap_mb: Number.isFinite(ram) ? ram : DEFAULTS.performance.ram_cache_cap_mb,
-        // The three knobs round-trip through their inputs (the backend re-clamps
-        // feed 1..=8, threads 1..=cores). Fall back to the current stored value,
-        // then the default, if an input is empty/non-numeric.
+        // The two caps + three knobs round-trip through their inputs (the backend
+        // clamps caps to ram_limits, feed 1..=8, threads 1..=cores). Fall back to
+        // the current stored value, then the default, if empty/non-numeric.
+        media_cache_cap_mb: numOr("media_cache_cap_mb", cur.media_cache_cap_mb ?? DEFAULTS.performance.media_cache_cap_mb),
+        thumb_cache_cap_mb: numOr("thumb_cache_cap_mb", cur.thumb_cache_cap_mb ?? DEFAULTS.performance.thumb_cache_cap_mb),
         feed_concurrency: numOr("feed_concurrency", cur.feed_concurrency ?? DEFAULTS.performance.feed_concurrency),
         transcode_threads: numOr("transcode_threads", cur.transcode_threads ?? DEFAULTS.performance.transcode_threads),
         decode_threads: numOr("decode_threads", cur.decode_threads ?? DEFAULTS.performance.decode_threads),
-        fragment_cache_location: this.sel("fragment_cache_location").value === "Memory" ? "Memory" : "Disk",
+        cache_location: this.sel("cache_location").value === "Disk" ? "Disk" : "Memory",
       },
       behavior: { confirm_destructive: this.input("confirm_destructive").checked },
       connection: { route_mode: this.sel("route_mode").value as Settings["connection"]["route_mode"] },
@@ -206,12 +213,13 @@ export class SettingsScreen extends HTMLElement {
     this.input("reduced_motion").checked = s.a11y.reduced_motion;
     this.input("high_contrast").checked = s.a11y.high_contrast;
     this.sel("text_size").value = s.a11y.text_size;
-    this.input("ram_cache_cap_mb").value = String(s.performance.ram_cache_cap_mb);
-    this.input("ram_range").value = String(s.performance.ram_cache_cap_mb);
+    this.input("media_cache_cap_mb").value = String(s.performance.media_cache_cap_mb);
+    this.input("media_range").value = String(s.performance.media_cache_cap_mb);
+    this.input("thumb_cache_cap_mb").value = String(s.performance.thumb_cache_cap_mb);
     this.input("feed_concurrency").value = String(s.performance.feed_concurrency);
     this.input("transcode_threads").value = String(s.performance.transcode_threads);
     this.input("decode_threads").value = String(s.performance.decode_threads);
-    this.sel("fragment_cache_location").value = s.performance.fragment_cache_location ?? "Disk";
+    this.sel("cache_location").value = s.performance.cache_location ?? "Memory";
     this.input("confirm_destructive").checked = s.behavior.confirm_destructive;
     this.sel("route_mode").value = s.connection.route_mode;
   }

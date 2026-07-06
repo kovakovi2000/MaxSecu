@@ -276,7 +276,7 @@ app-shell { display: block; min-height: 100vh; }
   background: color-mix(in srgb, var(--mx-surface-2) 72%, transparent);
 }
 .tray-stack { grid-area: tray; justify-self: end; display: grid; gap: 0.6rem; }
-.ram-gauge-wrap[hidden] { display: none !important; }
+.ram-gauge-row[hidden] { display: none !important; }
 #outlet { position: relative; z-index: 1; }
 
 /* ---------- Routed screens ---------- */
@@ -596,10 +596,41 @@ settings-screen main > fieldset { max-width: 760px; }
    the fill REVEALS successive colours (red at empty → violet at full) rather than
    compressing the whole spectrum into the filled portion. Static fill, no shimmer
    (respects reduced-motion). */
-.ram-gauge-wrap {
+.ram-gauge-rows {
+  display: grid;
+  gap: 0.3rem;
+}
+.ram-gauge-row {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
+}
+.ram-gauge-cap {
+  font-family: var(--mx-font-tech);
+  font-size: var(--mx-fs-1);
+  opacity: 0.8;
+  min-width: 5.5rem;
+  white-space: nowrap;
+}
+/* Compact, theme-consistent per-cache Clear button (overrides the big gradient
+   default button so it fits the header). */
+.cache-clear {
+  min-height: 1.6rem;
+  padding: 0.15rem 0.55rem;
+  font-size: var(--mx-fs-1);
+  font-weight: 700;
+  color: inherit;
+  background: color-mix(in srgb, var(--mx-surface-2) 90%, transparent);
+  border: 1px solid var(--mx-border);
+  border-radius: var(--mx-radius-sm);
+  box-shadow: none;
+}
+.cache-clear:hover {
+  border-color: color-mix(in srgb, var(--mx-accent-1) 60%, var(--mx-border));
+}
+.cache-clear:focus-visible {
+  outline: 3px solid var(--mx-accent-1);
+  outline-offset: 2px;
 }
 .ram-gauge-text {
   font-size: var(--mx-fs-1);

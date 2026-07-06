@@ -48,3 +48,35 @@ test("label formatting: full budget", () => {
   assert.equal(m.pct, 100);
   assert.equal(m.fillFraction, 1);
 });
+
+// --- Disk mode --------------------------------------------------------------
+
+test("disk mode: used exceeds free → pct > 100 but fillFraction clamped to 1", () => {
+  const m = ramGaugeModel(3 * GiB, 2 * GiB, { disk: true });
+  assert.equal(m.hidden, false);
+  assert.equal(m.pct, 150, "% is uncapped in disk mode");
+  assert.ok(m.pct > 100);
+  assert.equal(m.fillFraction, 1, "bar never overflows its track");
+  assert.equal(m.label, "3072 / 2048 MB (150%)");
+});
+
+test("disk mode: normal fill under free space", () => {
+  const m = ramGaugeModel(512 * MiB, 1024 * MiB, { disk: true });
+  assert.equal(m.hidden, false);
+  assert.equal(m.pct, 50);
+  assert.equal(m.fillFraction, 0.5);
+  assert.equal(m.label, "512 / 1024 MB (50%)");
+});
+
+test("disk mode: unknown free space (probe failed) → raw size, not hidden", () => {
+  const m = ramGaugeModel(700 * MiB, 0, { disk: true });
+  assert.equal(m.hidden, false, "raw-size fallback is shown, not hidden");
+  assert.equal(m.label, "700 MB");
+  assert.equal(m.pct, 0);
+  assert.equal(m.fillFraction, 0);
+});
+
+test("disk mode: still hidden when used is null", () => {
+  const m = ramGaugeModel(null, 0, { disk: true });
+  assert.equal(m.hidden, true);
+});
