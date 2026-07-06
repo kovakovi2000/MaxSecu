@@ -1,0 +1,3 @@
+/* Third frontend slot — intentionally empty; falls back to the Default look until a
+   future design round fills it. Replace with a complete standalone stylesheet then. */
+@import url("styles.css");
