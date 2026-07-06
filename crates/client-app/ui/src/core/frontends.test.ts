@@ -25,3 +25,17 @@ test("FRONTENDS lists exactly the three ids in order", () => {
   assert.deepEqual(FRONTENDS.map((f) => f.id), ["default", "pizza", "slot3"]);
   for (const f of FRONTENDS) assert.ok(f.label.length > 0);
 });
+
+import { readFileSync } from "node:fs";
+
+const html = readFileSync("index.html", "utf8");
+
+test("index.html has a swappable #frontend-css stylesheet link defaulting to styles.css", () => {
+  assert.match(html, /<link[^>]*id="frontend-css"[^>]*href="styles\.css"|<link[^>]*href="styles\.css"[^>]*id="frontend-css"/);
+});
+
+test("index.html defaults data-frontend and boots the persisted frontend pre-paint", () => {
+  assert.match(html, /data-frontend="default"/);
+  assert.match(html, /maxsecu\.frontend/);
+  assert.doesNotMatch(html, /data-theme="tech"/);
+});
