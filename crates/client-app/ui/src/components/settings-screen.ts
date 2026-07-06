@@ -26,7 +26,7 @@ export class SettingsScreen extends HTMLElement {
         <h1 id="set-h">Settings</h1>
         <p id="set-status" role="status" aria-live="polite"></p>
 
-        <form id="set-form">
+        <div id="set-form">
           <fieldset>
             <legend>Appearance</legend>
             <label>Theme
@@ -86,36 +86,39 @@ export class SettingsScreen extends HTMLElement {
               </select></label>
             <p class="hint">Prefer server proxies all media through the server. Prefer Dropbox downloads offloaded media directly from cloud storage when available (still verified locally). Tor only routes everything over Tor and fails closed.</p>
           </fieldset>
-        </form>
 
-        <fieldset>
-          <legend>Account</legend>
-          <p id="acct-status" role="status" aria-live="polite"></p>
-          <form id="pw-form">
-            <label>Current password
-              <input type="password" name="oldpw" autocomplete="current-password" /></label>
-            <label>New password
-              <input type="password" name="newpw" autocomplete="new-password" /></label>
-            <button type="submit">Change password</button>
-          </form>
-          <form id="exp-form">
-            <p id="exp-warn" role="note">Back up the keystore file securely — it is only as safe as your password.</p>
-            <label>Export keystore to path
-              <input type="text" name="dest" autocomplete="off" /></label>
-            <button type="submit">Export keystore</button>
-          </form>
-        </fieldset>
+          <fieldset>
+            <legend>Account</legend>
+            <p id="acct-status" role="status" aria-live="polite"></p>
+            <form id="pw-form">
+              <label>Current password
+                <input type="password" name="oldpw" autocomplete="current-password" /></label>
+              <label>New password
+                <input type="password" name="newpw" autocomplete="new-password" /></label>
+              <button type="submit">Change password</button>
+            </form>
+            <form id="exp-form">
+              <p id="exp-warn" role="note">Back up the keystore file securely — it is only as safe as your password.</p>
+              <label>Export keystore to path
+                <input type="text" name="dest" autocomplete="off" /></label>
+              <button type="submit">Export keystore</button>
+            </form>
+          </fieldset>
 
-        <fieldset>
-          <legend>Privacy</legend>
-          <p>MaxSecu stores and encrypts your content locally before it ever leaves this
-            device. Settings are kept on this device only; no analytics or telemetry are
-            collected.</p>
-        </fieldset>
+          <fieldset class="privacy">
+            <legend>Privacy</legend>
+            <p>Your content is encrypted on this device with keys only you hold before
+              it ever leaves — the server stores and serves only ciphertext and can
+              never read your posts. Cached ciphertext is wiped and your keys are
+              zeroized from memory when the app closes. Settings stay on this device;
+              no analytics or telemetry are collected. You can optionally route all
+              traffic over Tor from the Connection settings above.</p>
+          </fieldset>
+        </div>
       </main>`;
     (this.querySelector("#main") as HTMLElement).focus();
 
-    const prefForm = this.querySelector("#set-form") as HTMLFormElement;
+    const prefForm = this.querySelector("#set-form") as HTMLElement;
     prefForm.addEventListener("change", (e) => this.onPrefChange(e));
 
     (this.querySelector("#pw-form") as HTMLFormElement)

@@ -585,7 +585,11 @@ settings-screen #set-form {
   backdrop-filter: none;
 }
 settings-screen #set-form fieldset { margin: 0; }
-settings-screen main > fieldset { max-width: 760px; }
+/* Grid groups align to the top so a short group (e.g. Behavior) doesn't stretch
+   to match a tall neighbour (Performance). Issue 4. */
+settings-screen #set-form > fieldset { align-self: start; }
+/* Privacy spans the full width beneath the two columns. */
+settings-screen #set-form > fieldset.privacy { grid-column: 1 / -1; }
 #ram-hint, #exp-warn { margin-top: 0.5rem; font-size: var(--mx-fs-1); }
 
 /* ---------- RAM gauge + upload tray + toasts ---------- */

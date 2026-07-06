@@ -62,3 +62,46 @@ test("all three knobs are written back in the save patch", () => {
     assert.match(src, new RegExp(`${name}:`), `save patch must include ${name}`);
   }
 });
+
+// --- Issue 4: unified single-grid Settings layout ----------------------------
+// The prefs container is a <div> grid (not a <form> — no submit is used, and it
+// must legally contain Account's own <form>s). Account and Privacy live INSIDE
+// the grid; Privacy spans both columns; the Privacy copy is expanded + accurate.
+const setCss = readFileSync("styles.css", "utf8");
+
+test('prefs container is a <div id="set-form"> grid, not a <form>', () => {
+  assert.match(src, /<div id="set-form">/, "set-form must be a <div>");
+  assert.doesNotMatch(src, /<form id="set-form">/, "set-form must NOT be a <form>");
+});
+
+test("Account and Privacy fieldsets live inside the set-form grid", () => {
+  // Both legends appear before the set-form div closes (i.e. nested in it).
+  assert.match(
+    src,
+    /<div id="set-form">[\s\S]*<legend>Account<\/legend>[\s\S]*<legend>Privacy<\/legend>[\s\S]*<\/div>/,
+    "Account + Privacy must be inside the #set-form grid",
+  );
+});
+
+test("Privacy fieldset is tagged for full-width and spans both columns", () => {
+  assert.match(src, /<fieldset class="privacy">/, "Privacy fieldset needs the .privacy class");
+  assert.match(
+    setCss,
+    /\.privacy\s*\{[\s\S]*?grid-column:\s*1\s*\/\s*-1/,
+    ".privacy must span both grid columns",
+  );
+});
+
+test("grid groups align to the top (no stretched short groups)", () => {
+  assert.match(
+    setCss,
+    /settings-screen #set-form > fieldset\s*\{[\s\S]*?align-self:\s*start/,
+    "grid group fieldsets must align-self: start",
+  );
+});
+
+test("Privacy copy is expanded and accurate", () => {
+  for (const phrase of [/ciphertext/i, /zeroiz/i, /telemetry/i, /\bTor\b/, /on this device/i]) {
+    assert.match(src, phrase, `Privacy copy must mention ${phrase}`);
+  }
+});
