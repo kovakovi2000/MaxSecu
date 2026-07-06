@@ -26,6 +26,10 @@ impl SessionSeal {
 
     /// `random 12-byte nonce ‖ AES-256-GCM(key, nonce, aad=[], pt)`. A fresh
     /// random nonce per call means the same plaintext seals to different bytes.
+    ///
+    /// The 96-bit random nonce is safe for the expected ≪2^32 seals per process
+    /// key (birthday bound; the bounded ephemeral caches never approach it). A
+    /// future reader reusing this helper at much higher volume must reconsider.
     pub fn seal(&self, pt: &[u8]) -> Vec<u8> {
         let nonce = random_array::<12>();
         let mut out = nonce.to_vec();
@@ -77,5 +81,18 @@ mod tests {
     fn truncated_blob_is_none() {
         let s = SessionSeal::generate();
         assert!(s.open(&[0u8; 4]).is_none()); // shorter than nonce
+    }
+    #[test]
+    fn empty_plaintext_round_trips() {
+        let s = SessionSeal::generate();
+        let blob = s.seal(b"");
+        assert_eq!(&*s.open(&blob).unwrap(), b""); // zero-length seals/opens cleanly
+    }
+    #[test]
+    fn exactly_nonce_len_blob_is_none() {
+        let s = SessionSeal::generate();
+        // 12 bytes passes the `< 12` guard but leaves no room for a GCM tag,
+        // so the split path must still fail closed — not only the length guard.
+        assert!(s.open(&[0u8; 12]).is_none());
     }
 }
