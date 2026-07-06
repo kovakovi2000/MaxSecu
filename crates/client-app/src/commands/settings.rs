@@ -31,13 +31,22 @@ pub async fn get_settings(dir: State<'_, AppDir>) -> Result<SettingsConfig, UiEr
 pub async fn set_settings(
     settings: SettingsConfig,
     dir: State<'_, AppDir>,
-    cache: State<'_, crate::content_cache::ContentCache>,
+    media: State<'_, crate::media_cache::MediaCache>,
+    thumb: State<'_, crate::thumb_cache::ThumbCache>,
 ) -> Result<SettingsConfig, UiError> {
     let norm = settings.normalized();
     norm.save(&dir.0)
         .map_err(|_| UiError::new("settings_failed", "Could not save settings."))?;
-    // Apply the (normalized) RAM-cache cap live: a smaller cap evicts now.
-    cache.set_cap(norm.performance.media_cache_cap_mb as usize * 1024 * 1024);
+    // Apply BOTH (normalized) RAM-cache caps live: a smaller cap evicts now.
+    // TODO(Task 7): gate on Memory mode (a Disk cache is uncapped `None`).
+    media
+        .0
+        .lock()
+        .await
+        .set_cap(norm.performance.media_cache_cap_mb as u64 * 1024 * 1024);
+    thumb.set_cap_mb(norm.performance.thumb_cache_cap_mb).await;
+    // TODO(Task 7): rebuild both caches on cache_location change (until then a
+    // location change takes effect on the next app restart).
     Ok(norm)
 }
 

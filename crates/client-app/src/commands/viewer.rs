@@ -91,6 +91,38 @@ mod tests {
         let err = shape_content(FileType::Blog, &[stream(StreamType::Metadata, b"x")]).unwrap_err();
         assert_eq!(err.code, "verify_failed");
     }
+
+    fn cached_meta(file_type: &str) -> crate::thumb_cache::CachedMeta {
+        crate::thumb_cache::CachedMeta {
+            file_type: file_type.into(),
+            title: "hi".into(),
+            tags: vec!["a".into()],
+            thumbnail_b64: None,
+            author_fp: "abcd".into(),
+            recovery_ok: true,
+            mine: false,
+            member_counts: crate::dto::MemberCounts::default(),
+        }
+    }
+
+    #[test]
+    fn shape_opened_dto_image_re_encodes_base64() {
+        let png = vec![0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
+        let dto = shape_opened_dto(&cached_meta("image"), &"07".repeat(16), 2, &png);
+        assert_eq!(dto.image_png_b64.unwrap(), B64.encode(&png));
+        assert!(dto.blog_text.is_none());
+        assert_eq!(dto.version, 2);
+        assert!(dto.can_share);
+        assert!(!dto.mine);
+    }
+
+    #[test]
+    fn shape_opened_dto_blog_is_text_verbatim() {
+        let dto = shape_opened_dto(&cached_meta("blog"), "x", 1, b"hello world");
+        assert_eq!(dto.blog_text.unwrap(), "hello world");
+        assert!(dto.image_png_b64.is_none());
+        assert_eq!(dto.title, "hi");
+    }
 }
 
 use tauri::{Emitter, State};
@@ -120,12 +152,15 @@ pub async fn open_content(
     dir: State<'_, AppDir>,
     session: State<'_, Session>,
     connect_lock: State<'_, ConnectLock>,
-    cache: State<'_, crate::content_cache::ContentCache>,
+    thumb: State<'_, crate::thumb_cache::ThumbCache>,
+    media: State<'_, crate::media_cache::MediaCache>,
+    seal: State<'_, std::sync::Arc<crate::session_seal::SessionSeal>>,
 ) -> Result<OpenedContentDto, UiError> {
     let emit = |p: FetchPhase| {
         let _ = app.emit(EVT_FETCH, p);
     };
-    let out = open_content_inner(&req, &dir, &session, &connect_lock, &cache, &emit).await;
+    let out =
+        open_content_inner(&req, &dir, &session, &connect_lock, &thumb, &media, &seal, &emit).await;
     if let Err(e) = &out {
         emit(FetchPhase::Failed {
             file_id: req.file_id.clone(),
@@ -140,16 +175,20 @@ async fn open_content_inner(
     dir: &State<'_, AppDir>,
     session: &State<'_, Session>,
     connect_lock: &State<'_, ConnectLock>,
-    cache: &State<'_, crate::content_cache::ContentCache>,
+    thumb: &State<'_, crate::thumb_cache::ThumbCache>,
+    media: &State<'_, crate::media_cache::MediaCache>,
+    seal: &State<'_, std::sync::Arc<crate::session_seal::SessionSeal>>,
     emit: &impl Fn(FetchPhase),
 ) -> Result<OpenedContentDto, UiError> {
     // Validate the REQUESTED id up front: this is the id the served record must
     // bind to (see `run_open`), and it also rejects a malformed id before it is
     // interpolated into the request URL.
     let file_id = hex16(&req.file_id)?;
-    use crate::content_cache::{CacheKey, CachedMeta};
+    use crate::thumb_cache::{CacheKey, CachedMeta};
     if let Some(v) = req.version {
-        if let Some(dto) = cache.get_content(CacheKey { file_id, version: v }, &req.file_id) {
+        if let Some(dto) =
+            content_hit(thumb, media, seal, CacheKey { file_id, version: v }, &req.file_id).await
+        {
             emit(FetchPhase::Ready {
                 file_id: req.file_id.clone(),
             });
@@ -190,8 +229,14 @@ async fn open_content_inner(
         // NB: keyed on the UNVERIFIED envelope `view.version`; if it diverges from the
         // signed manifest version this is a benign cache miss (the put keys on the
         // verified `opened.version`).
-        if let Some(dto) =
-            cache.get_content(CacheKey { file_id, version: view.version }, &req.file_id)
+        if let Some(dto) = content_hit(
+            thumb,
+            media,
+            seal,
+            CacheKey { file_id, version: view.version },
+            &req.file_id,
+        )
+        .await
         {
             emit(FetchPhase::Ready {
                 file_id: req.file_id.clone(),
@@ -401,24 +446,31 @@ async fn open_content_inner(
     });
 
     if let Some(content) = cache_content {
-        cache.put_content(
-            CacheKey {
-                file_id,
-                version: opened.version,
-            },
-            CachedMeta {
-                file_type: file_type_name(manifest.file_type),
-                title: title.clone(),
-                tags: tags.clone(),
-                thumbnail_b64: None,
-                author_fp: hex(&author.fingerprint[..8]),
-                recovery_ok: opened.recovery_grant_ok,
-                mine: my_id == author.user_id,
-                // Viewer opens image/blog content, never a bundle → no member tally.
-                member_counts: crate::dto::MemberCounts::default(),
-            },
-            content,
-        );
+        let key = CacheKey {
+            file_id,
+            version: opened.version,
+        };
+        // Split the old single enriched entry across the two sealed stores: the
+        // card meta (thumbnail_b64: None — ThumbCache's enrichment carries forward
+        // the feed thumbnail) into ThumbCache Ns::Card, the display-final payload
+        // into MediaCache Ns::Content. Both sealed under the shared SessionSeal.
+        thumb
+            .put_card(
+                key,
+                CachedMeta {
+                    file_type: file_type_name(manifest.file_type),
+                    title: title.clone(),
+                    tags: tags.clone(),
+                    thumbnail_b64: None,
+                    author_fp: hex(&author.fingerprint[..8]),
+                    recovery_ok: opened.recovery_grant_ok,
+                    mine: my_id == author.user_id,
+                    // Viewer opens image/blog content, never a bundle → no member tally.
+                    member_counts: crate::dto::MemberCounts::default(),
+                },
+            )
+            .await;
+        media.put_content(seal, key, &content).await;
     }
 
     Ok(OpenedContentDto {
@@ -469,4 +521,55 @@ pub(crate) fn run_open(
     let ctx = crate::directory::build_verify_ctx(file_id, author, my_id, identity);
     verify_and_open(&ctx, bundle)
         .map_err(|_| UiError::new("verify_failed", "This item failed verification."))
+}
+
+/// A two-store content cache hit: the card meta (ThumbCache `Ns::Card`) AND the
+/// full display-final payload (MediaCache `Ns::Content`) must BOTH be resident for
+/// a hit — a card-only entry (meta but no cached content) returns `None` so the
+/// caller fetches the content, exactly like the old single-store `get_content`. The
+/// shaped DTO is byte-identical to a fresh decrypt+shape (see `shape_opened_dto`).
+async fn content_hit(
+    thumb: &crate::thumb_cache::ThumbCache,
+    media: &crate::media_cache::MediaCache,
+    seal: &crate::session_seal::SessionSeal,
+    key: crate::thumb_cache::CacheKey,
+    file_id_hex: &str,
+) -> Option<OpenedContentDto> {
+    let meta = thumb.get_meta(key).await?;
+    let bytes = media.get_content(seal, key).await?;
+    Some(shape_opened_dto(&meta, file_id_hex, key.version, &bytes))
+}
+
+/// Shape cached meta + display-final content bytes into an `OpenedContentDto`,
+/// ported from the old `ContentCache::get_content`: an IMAGE re-encodes the raw
+/// canonical-PNG bytes to base64 into `image_png_b64`; anything else (blog) returns
+/// its already-sanitized UTF-8 verbatim via `from_utf8_lossy`. `can_share` is
+/// always `true` (a cache hit only exists because this wrap-holder opened it once).
+fn shape_opened_dto(
+    meta: &crate::thumb_cache::CachedMeta,
+    file_id_hex: &str,
+    version: u64,
+    bytes: &[u8],
+) -> OpenedContentDto {
+    let (image_png_b64, blog_text) = if meta.file_type == "image" {
+        (Some(B64.encode(bytes)), None)
+    } else {
+        (None, Some(String::from_utf8_lossy(bytes).into_owned()))
+    };
+    OpenedContentDto {
+        file_id: file_id_hex.to_owned(),
+        file_type: meta.file_type.clone(),
+        version,
+        title: meta.title.clone(),
+        tags: meta.tags.clone(),
+        image_png_b64,
+        blog_text,
+        author_fp: meta.author_fp.clone(),
+        recovery_ok: meta.recovery_ok,
+        // A cache hit only exists because THIS wrap-holder already opened the item
+        // successfully once — same D-OQ3 semantics as a fresh open (any wrap-holder).
+        can_share: true,
+        // Ownership was recorded at put time (bundles Task 6.2).
+        mine: meta.mine,
+    }
 }

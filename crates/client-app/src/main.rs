@@ -4,7 +4,6 @@
 
 use maxsecu_client_app::commands::auth::{AppDir, ConnectLock, Session};
 use maxsecu_client_app::config::SettingsConfig;
-use maxsecu_client_app::content_cache::ContentCache;
 use tauri::Manager;
 
 fn main() {
@@ -25,7 +24,9 @@ fn main() {
     // is not; `normalized()` here also bounds that first-run default to the
     // (total − 6 GB) ceiling so a small-RAM machine can't start over-cap. MiB → bytes.
     let normalized = SettingsConfig::load(&app_dir).normalized();
-    let cap_bytes = normalized.performance.media_cache_cap_mb as usize * 1024 * 1024;
+    let media_cap_mb = normalized.performance.media_cache_cap_mb;
+    let thumb_cap_mb = normalized.performance.thumb_cache_cap_mb;
+    let location = normalized.performance.cache_location;
     // Live-channel cap for the authed connection pool = the persisted feed
     // concurrency (already clamped to 1..=8 by `normalized`). Feed-card decodes
     // borrow up to this many concurrent authed channels; the UI never drives more
@@ -38,6 +39,22 @@ fn main() {
     // helpers on the TorOnly path.
     maxsecu_client_app::tor::init(app_dir.join("config"));
 
+    // Process-global ephemeral seal shared by both ciphertext-in-RAM caches: the
+    // Media cache's `Content` payloads and the Thumbnails cache's `Card` meta are
+    // sealed under it, so any OS page-out spills only ciphertext. Opened ONCE at
+    // startup (Disk mode surfaces a clean fatal-init error rather than a panic).
+    let seal = std::sync::Arc::new(maxsecu_client_app::session_seal::SessionSeal::generate());
+    let media_cache =
+        maxsecu_client_app::media_cache::MediaCache::open(&app_dir, media_cap_mb, location)
+            .expect("open media cache");
+    let thumb_cache = maxsecu_client_app::thumb_cache::ThumbCache::new(
+        &app_dir,
+        thumb_cap_mb,
+        location,
+        seal.clone(),
+    )
+    .expect("open thumb cache");
+
     let app = tauri::Builder::default()
         .manage(AppDir(app_dir))
         .manage(Session::new())
@@ -48,7 +65,9 @@ fn main() {
         .manage(maxsecu_client_app::jobs::VideoJobs::new())
         .manage(maxsecu_client_app::jobs::VideoPrepareCancel::default())
         .manage(maxsecu_client_app::state::H264EncoderCache::default())
-        .manage(ContentCache::new(cap_bytes))
+        .manage(seal.clone())
+        .manage(media_cache)
+        .manage(thumb_cache)
         .manage(maxsecu_client_app::directory::DirectoryCache::new())
         .manage(maxsecu_client_app::commands::pool::AppPool::new(pool_cap))
         .invoke_handler(tauri::generate_handler![
@@ -126,8 +145,9 @@ fn main() {
     //   `stage_upload` transcode's cancel token so its confined ffmpeg / re-mux child
     //   is terminated (via the watchdog's cancel poll) before the process exits — no
     //   orphaned confined child, prompt shutdown. Best-effort (no-op if none running).
-    // * `Exit` (unchanged): zeroize the decrypted-content cache so no plaintext
-    //   survives the process (spec §6 — zeroized on app close, in addition to on-evict).
+    // * `Exit`: TODO(Task 7) zeroize MediaCache + ThumbCache + SessionSeal on Exit
+    //   (D6). Until then the process dying wipes RAM anyway (the sealed caches are
+    //   in-RAM ciphertext + a `Zeroizing` seal key), so no plaintext survives.
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } => {
             if let Some(prepare_cancel) =
@@ -136,11 +156,6 @@ fn main() {
                 if let Some(flag) = prepare_cancel.0.lock().unwrap().as_ref() {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-            }
-        }
-        tauri::RunEvent::Exit => {
-            if let Some(cache) = app_handle.try_state::<ContentCache>() {
-                cache.clear_and_zeroize();
             }
         }
         _ => {}

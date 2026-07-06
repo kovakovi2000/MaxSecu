@@ -12,7 +12,8 @@ use tauri::State;
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
 use crate::commands::feed::{hex, hex16};
-use crate::content_cache::ContentCache;
+use crate::media_cache::MediaCache;
+use crate::thumb_cache::ThumbCache;
 use crate::dto::DeleteRequest;
 use crate::error::UiError;
 use crate::http_client::delete_req;
@@ -39,7 +40,8 @@ pub async fn delete_content(
     dir: State<'_, AppDir>,
     session: State<'_, Session>,
     connect_lock: State<'_, ConnectLock>,
-    cache: State<'_, ContentCache>,
+    thumb: State<'_, ThumbCache>,
+    media: State<'_, MediaCache>,
 ) -> Result<(), UiError> {
     // Validate the REQUESTED id BEFORE any network: a malformed id short-circuits
     // here (and is never interpolated into the request URL).
@@ -61,8 +63,11 @@ pub async fn delete_content(
     // Deleted server-side (204). Drop the local content-cache entries for this id
     // (any version). The server already cascaded bundle members, but the client
     // only knows the bundle id here — invalidating it is enough for the immediate
-    // view; the feed refresh (Task 6.2) drops the members from the listing.
-    cache.invalidate_file(file_id);
+    // view; the feed refresh (Task 6.2) drops the members from the listing. Both
+    // sealed caches are cleared: card meta (ThumbCache) and any full content +
+    // video fragments (MediaCache) for the id.
+    thumb.invalidate_file(file_id).await;
+    media.invalidate_file(file_id).await;
     Ok(())
 }
 

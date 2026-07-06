@@ -307,6 +307,25 @@ impl BlobCache {
         }
     }
 
+    /// Drop EVERY entry keyed `(ns, <id_hex>, *)` — all `sub`s (versions/seqs) of
+    /// one id in one namespace — adjusting `total_bytes` per removed entry. Used to
+    /// invalidate all versions of a file (post/bundle deletion) across the `Content`
+    /// / `Card` namespaces without knowing each stored `sub`. `id_hex` is normalized
+    /// to lowercase exactly like the key validation, so it matches the canonical
+    /// lowercase keys held in the index; a malformed/unmatched id is simply a no-op.
+    pub fn evict_prefix(&mut self, ns: Ns, id_hex: &str) {
+        let id = id_hex.to_ascii_lowercase();
+        let victims: Vec<Key> = self
+            .index
+            .keys()
+            .filter(|(k_ns, k_id, _)| *k_ns == ns && *k_id == id)
+            .cloned()
+            .collect();
+        for k in victims {
+            self.remove_entry(&k);
+        }
+    }
+
     /// Drop every entry: `Memory` wipes the (`Zeroizing`) blobs; `Disk` removes
     /// the backing files. Resets the byte accounting to zero. Used on app close
     /// and by the explicit per-cache "Clear" control.
@@ -347,63 +366,6 @@ impl BlobCache {
             }
             self.total_bytes = self.total_bytes.saturating_sub(e.size_bytes);
         }
-    }
-}
-
-/// Back-compat shim (removed in Task 4/5): the old `FragmentCache` name with its
-/// 2-component (no-namespace) API, forwarding every call to a wrapped
-/// [`BlobCache`] with a hard-coded [`Ns::Frag`]. This keeps the existing
-/// `commands/video.rs` / `stream.rs` / `jobs.rs` / `video.rs` call sites
-/// compiling unchanged until the RAM-cache-model migration moves them onto the
-/// namespaced API. It preserves the pre-rework semantics exactly: both backends
-/// are opened with a `Some` cap (disk was capped before this rework).
-#[derive(Debug)]
-pub struct FragmentCache(BlobCache);
-
-impl FragmentCache {
-    pub fn open(app_dir: &Path, cap_bytes: u64) -> io::Result<Self> {
-        Ok(Self(BlobCache::open(app_dir, cap_bytes)?))
-    }
-
-    pub fn open_located(
-        app_dir: &Path,
-        cap_bytes: u64,
-        location: FragmentCacheLocation,
-    ) -> io::Result<Self> {
-        Ok(Self(BlobCache::open_located(
-            app_dir,
-            Some(cap_bytes),
-            location,
-            "frag",
-        )?))
-    }
-
-    pub fn put(&mut self, file_id_hex: &str, seq: u32, ciphertext: &[u8]) -> io::Result<()> {
-        self.0.put(Ns::Frag, file_id_hex, seq, ciphertext)
-    }
-
-    pub fn get(&mut self, file_id_hex: &str, seq: u32) -> Option<Vec<u8>> {
-        self.0.get(Ns::Frag, file_id_hex, seq)
-    }
-
-    pub fn total_bytes(&self) -> u64 {
-        self.0.total_bytes()
-    }
-
-    pub fn memory_bytes(&self) -> u64 {
-        self.0.memory_bytes()
-    }
-
-    pub fn set_cap(&mut self, new_cap: u64) {
-        self.0.set_cap(new_cap)
-    }
-
-    pub fn contains(&self, file_id_hex: &str, seq: u32) -> bool {
-        self.0.contains(Ns::Frag, file_id_hex, seq)
-    }
-
-    pub fn evict(&mut self, file_id_hex: &str, seq: u32) {
-        self.0.evict(Ns::Frag, file_id_hex, seq)
     }
 }
 
@@ -629,6 +591,34 @@ mod tests {
     }
 
     #[test]
+    fn evict_prefix_removes_all_subs_of_an_id() {
+        let dir = tmp_dir("evict-prefix");
+        let mut c = BlobCache::open(&dir, 1 << 20).unwrap();
+        // Several subs under one id, plus another id (same ns) and a same-id-other-ns.
+        c.put(Ns::Content, "aa", 0, b"a0").unwrap();
+        c.put(Ns::Content, "aa", 1, b"a1").unwrap();
+        c.put(Ns::Content, "aa", 5, b"a5").unwrap();
+        c.put(Ns::Content, "bb", 0, b"b0").unwrap();
+        c.put(Ns::Frag, "aa", 0, b"af").unwrap(); // same id, DIFFERENT namespace
+        assert_eq!(c.total_bytes(), 2 * 5); // five 2-byte blobs
+        c.evict_prefix(Ns::Content, "aa");
+        // Every sub of (Content, aa) is gone…
+        assert!(!c.contains(Ns::Content, "aa", 0));
+        assert!(!c.contains(Ns::Content, "aa", 1));
+        assert!(!c.contains(Ns::Content, "aa", 5));
+        // …the other id in the same ns survives…
+        assert!(c.contains(Ns::Content, "bb", 0));
+        // …and the same id under a different ns is untouched.
+        assert!(c.contains(Ns::Frag, "aa", 0));
+        // Byte accounting reflects exactly the two survivors (2 + 2).
+        assert_eq!(c.total_bytes(), 4);
+        // An id with no entries is a clean no-op.
+        c.evict_prefix(Ns::Content, "cc");
+        assert_eq!(c.total_bytes(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn memory_backend_roundtrips_and_writes_nothing_to_disk() {
         let dir = tmp_dir("mem");
         let mut c =
@@ -793,32 +783,5 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
-    }
-
-    /// The back-compat `FragmentCache` shim (removed in Task 4/5) forwards its
-    /// 2-arg API onto the namespaced `BlobCache` with `Ns::Frag`, preserving the
-    /// pre-rework disk-capped semantics.
-    #[test]
-    fn fragment_cache_shim_roundtrips_and_caps() {
-        let dir = tmp_dir("shim");
-        let mut c = FragmentCache::open(&dir, 20).unwrap();
-        c.put("aa", 0, &[0u8; 10]).unwrap();
-        c.put("aa", 1, &[0u8; 10]).unwrap();
-        assert_eq!(c.get("aa", 0).as_deref(), Some([0u8; 10].as_slice()));
-        assert!(c.contains("aa", 1));
-        assert_eq!(c.total_bytes(), 20);
-        assert_eq!(c.memory_bytes(), 0);
-        // The shim writes under the frag namespace filename.
-        assert!(dir
-            .join("cache")
-            .join("frag")
-            .join("frag_aa_0.blob")
-            .is_file());
-        // Capped: a third blob over the 20B cap evicts the LRU.
-        c.put("aa", 2, &[0u8; 10]).unwrap();
-        assert_eq!(c.total_bytes(), 20);
-        c.evict("aa", 2);
-        assert!(!c.contains("aa", 2));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

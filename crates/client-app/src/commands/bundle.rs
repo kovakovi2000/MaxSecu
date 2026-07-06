@@ -53,8 +53,8 @@ use crate::http_client::get_json;
 /// `enforce_author_transparency`, `resolve_my_user_id`, `build_download_bundle`,
 /// `viewer::run_open` — including the direct-link retry-once-forced-proxy
 /// fallback. The bundle is bound to the REQUESTED `req_file_id` inside `run_open`
-/// (via `build_verify_ctx`). Intentionally UNCACHED: the `ContentCache` stores
-/// `OpenedContentDto` (image/blog bytes), not a `BundleBody`, so every open does a
+/// (via `build_verify_ctx`). Intentionally UNCACHED: the content caches store
+/// image/blog payloads + card meta, not a `BundleBody`, so every open does a
 /// fresh verify — bundles are small (an ordered id list) so this is cheap.
 pub(crate) async fn open_bundle_members(
     req_file_id: &str,
