@@ -309,12 +309,9 @@ pub struct PerformanceSettings {
     /// Clamped into the same RAM bounds (independent value).
     pub thumb_cache_cap_mb: u32,
     /// Feed cards fetched/decoded in parallel. Default 4; clamped 1..=8.
-    /// `#[serde(default)]` lets an older `settings.json` without this key load with the default.
-    #[serde(default = "default_feed_concurrency")]
     pub feed_concurrency: u8,
     /// Worker-thread budget for the confined author-side transcode. Default =
     /// available parallelism (logical CPUs); clamped 1..=available.
-    #[serde(default = "default_cpu_threads")]
     pub transcode_threads: u16,
     /// Worker-thread budget for the confined decode path. Default =
     /// available parallelism (logical CPUs); clamped 1..=available.
@@ -327,11 +324,9 @@ pub struct PerformanceSettings {
     /// for when a confined decode path returns (e.g. a preview/thumbnail decode) or
     /// for parallel per-chunk work; wiring it would pass it as a launch ARG to that
     /// worker (never an env var), consistent with the ffmpeg `-threads` path.
-    #[serde(default = "default_cpu_threads")]
     pub decode_threads: u16,
-    /// Shared cache-backend location (Media + Thumbnails). `#[serde(default)]` keeps
-    /// older settings.json loading; default is now `Memory` (ciphertext-in-RAM).
-    #[serde(default)]
+    /// Shared cache-backend location (Media + Thumbnails). Default is `Memory`
+    /// (ciphertext-in-RAM); `Disk` is the opt-in ciphertext-on-disk mode.
     pub cache_location: FragmentCacheLocation,
 }
 impl Default for PerformanceSettings {
@@ -690,11 +685,14 @@ mod tests {
     }
 
     #[test]
-    fn default_location_is_memory() {
-        assert_eq!(
-            PerformanceSettings::default().cache_location,
-            FragmentCacheLocation::Memory
-        );
+    fn legacy_ram_cache_cap_never_reserializes() {
+        // The headline guarantee: reading a legacy blob migrates the value, but the
+        // dead legacy key is gone from the model, so a save can never write it back.
+        let p: PerformanceSettings =
+            serde_json::from_str(r#"{"ram_cache_cap_mb":512}"#).unwrap();
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("ram_cache_cap_mb"), "legacy key re-serialized: {json}");
+        assert!(json.contains("media_cache_cap_mb"), "missing media cap: {json}");
     }
 
     #[test]
