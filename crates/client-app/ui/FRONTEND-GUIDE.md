@@ -390,7 +390,7 @@ Theme and accessibility preferences are driven by **attributes on `<html>`**, se
 
 | Attribute | Values | Meaning |
 |---|---|---|
-| `data-theme` | `tech` (default) \| `cheese` \| `pottery` | frontend visual theme preset. `tech` is baked into `index.html` to avoid a flash. |
+| `data-frontend` | `default` \| `pizza` \| `slot3` | the active **frontend** (its own stylesheet + decoration). Set by `applyFrontend()` (called from `applySettings()`); `default` is baked into `index.html`, and the persisted choice is re-applied pre-paint by `boot.js`. See §11. |
 | `data-reduced-motion` | present/absent | when present, motion/animation must be zeroed. `styles.css` also honors `@media (prefers-reduced-motion)`. |
 | `data-high-contrast` | present/absent | high‑contrast adjustments |
 | `data-text-size` | `normal` \| `large` \| `larger` | scales the **root font size** so the whole UI scales (use `rem`). |
@@ -524,8 +524,10 @@ Registered ids: `default` (→ `styles.css`, today's design, verbatim),
 
 Switching (`src/core/frontends.ts::applyFrontend`) rewrites the `<link>` href, sets
 `data-frontend="<id>"` on `<html>`, unmounts the old deco module, mounts the new one,
-and persists the id in `localStorage["maxsecu.frontend"]`. An inline bootstrap in
-`index.html` applies the persisted frontend before first paint (no flash).
+and persists the id in `localStorage["maxsecu.frontend"]`. An external same-origin
+`boot.js`, loaded from `index.html`, re-applies the persisted frontend before first
+paint (no flash). It must be an external file, not inline JS: the app CSP
+(`default-src 'self'`, no `script-src`) blocks inline `<script>`.
 
 ### The `DecoModule` interface
 
