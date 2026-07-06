@@ -57,6 +57,33 @@ impl ConnectLock {
     pub fn new() -> Self {
         Self(Mutex::new(()))
     }
+
+    /// Acquire the connect lock for a `reauth`, tolerating a brief collision with a
+    /// concurrent SIBLING reauth. `connect` holds this lock across its whole
+    /// (possibly slow) run via `try_lock`; a per-call `reauth` that overlaps another
+    /// reauth for a few milliseconds must not instantly fail with "busy". Wait up to
+    /// a small budget (`RETRIES × STEP`) for the lock, then fail honestly if it is
+    /// still held.
+    ///
+    /// Discipline preserved: only ONE reauth ever holds this guard at a time, so the
+    /// transient `Identity` take/restore in `reauth` can never overlap another's —
+    /// collisions just queue briefly instead of erroring.
+    pub(crate) async fn acquire_reauth(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, UiError> {
+        const RETRIES: u32 = 5;
+        const STEP: std::time::Duration = std::time::Duration::from_millis(50);
+        for _ in 0..RETRIES {
+            if let Ok(guard) = self.0.try_lock() {
+                return Ok(guard);
+            }
+            tokio::time::sleep(STEP).await;
+        }
+        // Final attempt so a lock freed exactly on the last tick still succeeds.
+        self.0
+            .try_lock()
+            .map_err(|_| UiError::new("busy", "A connection attempt is already in progress."))
+    }
 }
 
 impl Default for ConnectLock {
@@ -89,4 +116,61 @@ pub async fn logout(session: tauri::State<'_, Session>) -> Result<(), UiError> {
     s.server_id.clear();
     s.username = None;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Two concurrent reauths must NOT spuriously fail with "busy": the second
+    // briefly waits for the (short) first to release, then succeeds. Mutual
+    // exclusion is preserved — the in-flight counter never exceeds 1, which is
+    // exactly the guarantee that the identity-take window can never overlap.
+    #[tokio::test]
+    async fn concurrent_reauth_lock_serializes_without_spurious_busy() {
+        let lock = Arc::new(ConnectLock::new());
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        async fn hold(lock: Arc<ConnectLock>, inflight: Arc<AtomicUsize>, peak: Arc<AtomicUsize>) {
+            let g = lock
+                .acquire_reauth()
+                .await
+                .expect("a sibling reauth must not spuriously return busy");
+            let n = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(n, Ordering::SeqCst);
+            // Hold well under the wait budget so the sibling can acquire in time.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            drop(g);
+        }
+
+        let a = tokio::spawn(hold(lock.clone(), inflight.clone(), peak.clone()));
+        let b = tokio::spawn(hold(lock.clone(), inflight.clone(), peak.clone()));
+        a.await.unwrap();
+        b.await.unwrap();
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "two reauths must never hold the connect lock at the same time"
+        );
+    }
+
+    // If the lock is genuinely held past the wait budget (e.g. a slow real
+    // `connect` holding it for a Tor bootstrap), a reauth fails HONESTLY with the
+    // stable `busy` code rather than hanging forever.
+    #[tokio::test]
+    async fn reauth_lock_fails_closed_when_held_past_budget() {
+        let lock = ConnectLock::new();
+        let _held = lock.0.lock().await; // hold for the whole test
+        let err = lock
+            .acquire_reauth()
+            .await
+            .expect_err("a lock held past the budget must fail closed");
+        assert_eq!(err.code, "busy");
+    }
 }

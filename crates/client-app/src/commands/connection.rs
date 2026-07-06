@@ -227,10 +227,11 @@ pub(crate) async fn reauth(
     ),
     UiError,
 > {
-    let _guard = connect_lock
-        .0
-        .try_lock()
-        .map_err(|_| UiError::new("busy", "A connection attempt is already in progress."))?;
+    // Tolerate a transient overlap with a sibling reauth (bounded wait+retry)
+    // instead of instantly erroring "busy" — rapid view-switches that fan out
+    // several reauth-bound calls should queue briefly, not fail. Still fails
+    // closed if a real `connect` holds the lock past the budget.
+    let _guard = connect_lock.acquire_reauth().await?;
     let username = {
         let s = session.0.lock().await;
         s.username
