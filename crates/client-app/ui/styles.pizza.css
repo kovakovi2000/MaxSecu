@@ -3811,3 +3811,105 @@ media-card article.media-card-shell > .media-card-link:focus-visible {
 media-card article.media-card-shell > .card-download {
   z-index: 5 !important;
 }
+
+/* ---------- Pizza v3 feedback pass: compact spacing + proper brand slice ----------
+   Keeps the pizza skin decorative, but stops the theme from visually adding
+   large empty bands under every panel/card. */
+:root {
+  --mx-space-5: 1rem;
+  --mx-space-6: 1.15rem;
+  --mx-space-8: 1.55rem;
+  --mx-space-10: 1.9rem;
+}
+
+main {
+  padding-bottom: 2.25rem;
+}
+
+#grid,
+.bundle-stacked,
+.bc-preview,
+.bc-preview-grid,
+.bc-members,
+.upload-grid,
+settings-screen #set-form {
+  gap: clamp(0.65rem, 1.35vw, 1rem);
+}
+
+.bundle-head,
+.composer,
+.upload-composer,
+settings-screen #set-form > fieldset.settings-card,
+settings-screen #set-form > fieldset.privacy,
+.settings-cache-panel,
+media-card article.media-card-shell,
+.tray-row,
+.toast,
+trust-alarm {
+  margin-bottom: 0;
+  box-shadow: inset 0 1px 0 rgba(255, 238, 172, 0.12), 0 10px 24px rgba(43, 13, 3, 0.28);
+}
+
+.bundle-head,
+.composer,
+settings-screen #set-form > fieldset.settings-card,
+settings-screen #set-form > fieldset.privacy {
+  padding: clamp(0.85rem, 1.7vw, 1.15rem);
+}
+
+/* Smaller contained cheese lip: decorative only, not a thick visual spacer. */
+:is(form, fieldset, section[aria-labelledby], #up-preview, #vw-body, #vw-meta, main > dl, #pq-list, #controls,
+.connect-hero, .connect-card, .auth-copy, .auth-card, media-card article.media-card-shell,
+.bundle-head, .composer, .settings-card, .share-panel, .confirm-panel, .tray-row)::before {
+  height: 0.72rem;
+  opacity: 0.74;
+  background:
+    radial-gradient(ellipse at 10% 0, #ffe686 0 0.52rem, transparent 0.58rem),
+    radial-gradient(ellipse at 31% 0, #ffc44c 0 0.34rem, transparent 0.4rem),
+    radial-gradient(ellipse at 58% 0, #ffe089 0 0.45rem, transparent 0.51rem),
+    radial-gradient(ellipse at 84% 0, #ffbb3c 0 0.3rem, transparent 0.36rem),
+    linear-gradient(180deg, rgba(255, 204, 73, 0.72), rgba(255, 174, 49, 0.08) 72%, transparent);
+}
+
+media-card article.media-card-shell {
+  min-height: 16.25rem;
+  gap: 0.58rem;
+  padding: 0.72rem;
+}
+
+/* Replace the old abstract diamond with an actual pizza-slice icon. */
+.app-brand-mark {
+  width: 42px;
+  height: 42px;
+  min-width: 42px;
+  border-radius: 14px;
+  display: inline-grid;
+  place-items: center;
+  color: transparent;
+  font-size: 0;
+  background:
+    radial-gradient(circle at 58% 28%, rgba(185, 45, 26, 0.32) 0 0.2rem, transparent 0.23rem),
+    linear-gradient(145deg, rgba(95, 39, 16, 0.88), rgba(38, 15, 7, 0.94));
+  border: 1px solid rgba(255, 211, 89, 0.46);
+  box-shadow: 0 0.45rem 1.2rem rgba(234, 116, 35, 0.22), inset 0 1px 0 rgba(255, 244, 184, 0.24);
+  transform: none;
+  overflow: visible;
+}
+.app-brand-mark::before {
+  content: "🍕";
+  font-size: 38px;
+  line-height: 1;
+  transform: rotate(-13deg) translateY(-1px);
+  filter: drop-shadow(0 0.22rem 0.18rem rgba(42, 12, 3, 0.34));
+}
+.app-brand-mark::after {
+  content: "";
+  position: absolute;
+  left: 11px;
+  right: 9px;
+  bottom: 5px;
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(255, 238, 166, 0), rgba(255, 204, 73, 0.78), rgba(255, 238, 166, 0));
+  pointer-events: none;
+}
