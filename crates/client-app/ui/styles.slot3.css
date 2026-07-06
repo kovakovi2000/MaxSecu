@@ -3706,3 +3706,236 @@ settings-screen #set-form .settings-column > fieldset.privacy {
   .map-header-deco { display: none; }
   .map-compass-bg { opacity: 0.12; }
 }
+
+/* ---------- Slot3 refinement: dimmer parchment, no tech-blue hover, cleaner login ---------- */
+:root {
+  --mx-parchment-0: #ead6a8;
+  --mx-parchment-1: #d7b77a;
+  --mx-parchment-2: #bd8848;
+  --mx-parchment-3: #8f5f2a;
+  --mx-surface-1: rgba(224, 196, 139, 0.94);
+  --mx-surface-2: rgba(207, 166, 91, 0.92);
+  --mx-surface-3: rgba(181, 129, 59, 0.88);
+  --mx-surface-solid: #dec38b;
+  --mx-muted: #563518;
+  --mx-faint: #765225;
+  --mx-border: rgba(67, 38, 15, 0.34);
+  --mx-border-strong: rgba(51, 29, 12, 0.58);
+  --mx-glow: 0 0 0 1px rgba(70, 38, 15, 0.22), 0 14px 26px rgba(58, 32, 12, 0.20);
+  --mx-elev-1: 0 9px 18px rgba(56, 31, 12, 0.22), 0 2px 0 rgba(80, 44, 18, 0.12);
+  --mx-elev-2: 0 21px 46px rgba(55, 31, 13, 0.32), 0 2px 0 rgba(80, 44, 18, 0.14);
+  --mx-panel-bg:
+    radial-gradient(circle at 13% 18%, rgba(91, 51, 19, 0.11), transparent 9rem),
+    linear-gradient(135deg, rgba(242, 221, 171, 0.38), transparent 42%, rgba(118, 70, 25, 0.12)),
+    var(--mx-surface-1);
+  --mx-card-bg:
+    radial-gradient(circle at 9% 14%, rgba(91, 51, 19, 0.10), transparent 7rem),
+    linear-gradient(150deg, rgba(240, 218, 164, 0.34), transparent 34%, rgba(104, 58, 21, 0.14)),
+    var(--mx-surface-2);
+}
+
+html,
+body {
+  background: #96642e;
+}
+
+body {
+  background:
+    radial-gradient(circle at 12% 0%, rgba(224, 194, 125, 0.42), transparent 24rem),
+    radial-gradient(circle at 92% 14%, rgba(92, 50, 20, 0.24), transparent 29rem),
+    radial-gradient(circle at 48% 120%, rgba(47, 27, 12, 0.34), transparent 37rem),
+    linear-gradient(135deg, #d2ad73 0%, #bd8848 45%, #8f5e29 100%);
+}
+
+body::before { opacity: 0.34; }
+body::after { opacity: 0.13; }
+
+.app-header,
+form,
+fieldset,
+section[aria-labelledby],
+#up-preview,
+#vw-body,
+#vw-meta,
+main > dl,
+#pq-list,
+#controls,
+.confirm-host .confirm-panel,
+.share-dialog,
+.upload-tray,
+.share-tray,
+.media-card-shell,
+.skeleton-card,
+.settings-card,
+.settings-screen fieldset,
+.bundle-head,
+.bc-actionbar,
+.bundle-item,
+.bundle-stack-item,
+.viewer-frame,
+.auth-card,
+.auth-copy,
+.connect-card,
+.connect-hero {
+  background:
+    radial-gradient(circle at 9% 12%, rgba(82, 46, 18, 0.12), transparent 7rem),
+    radial-gradient(circle at 88% 78%, rgba(86, 49, 19, 0.10), transparent 9rem),
+    linear-gradient(135deg, rgba(235, 212, 158, 0.42), transparent 42%, rgba(88, 50, 19, 0.10)),
+    var(--mx-surface-1) !important;
+}
+
+/* Remove the leftover sci-fi orb and its ring animation from the login scene. */
+.connect-visual,
+.connect-visual .scan-orb,
+.scan-orb,
+.orbit-ring,
+.signal-bars {
+  display: none !important;
+}
+
+.connect-hero {
+  justify-content: center !important;
+  gap: clamp(0.85rem, 2vw, 1.15rem);
+}
+
+.map-login-deco {
+  overflow: visible;
+  background:
+    radial-gradient(circle at 11% 18%, rgba(83, 47, 18, 0.14), transparent 6rem),
+    linear-gradient(135deg, rgba(231, 207, 151, 0.52), rgba(169, 106, 44, 0.19));
+}
+
+.map-spell-text {
+  display: block;
+  max-width: min(100%, 22rem);
+  padding-right: 3.25rem;
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-size: clamp(1.18rem, 3vw, 2rem);
+  line-height: 1.16;
+}
+
+.map-spell-sub {
+  max-width: 32rem;
+  padding-right: 3.25rem;
+}
+
+@media (max-width: 560px) {
+  .map-spell-text,
+  .map-spell-sub { padding-right: 0; }
+  .map-login-deco::after,
+  .map-login-prints { display: none; }
+}
+
+/* Hard override all remaining inherited tech/cyan hover treatments in slot3. */
+button,
+.button,
+.buttonish,
+.confirm-host button,
+.share-actions button,
+.media-actions button,
+.bc-actionbar button,
+.connect-submit,
+#rg-submit,
+#rl-request,
+#rl-answer,
+main > a:first-child,
+.bundle-mode,
+.bc-preview-toggle button,
+.up-mode-btn {
+  background:
+    linear-gradient(135deg, #6b2119, #8f551e 62%, #432511) !important;
+  border-color: rgba(55, 31, 12, 0.62) !important;
+  box-shadow: inset 0 1px 0 rgba(238, 215, 162, 0.24), 0 8px 16px rgba(57, 31, 12, 0.24) !important;
+}
+
+button.secondary,
+button.ghost,
+.media-actions button,
+.share-actions button:not(.primary),
+.bc-actionbar button:not(.primary),
+main > a:first-child,
+.bundle-mode,
+.bc-preview-toggle button,
+.up-mode-btn {
+  color: var(--mx-ink) !important;
+  background:
+    linear-gradient(135deg, rgba(231, 208, 155, 0.34), rgba(164, 105, 45, 0.24)),
+    var(--mx-surface-2) !important;
+}
+
+button:hover:not(:disabled),
+button:focus-visible:not(:disabled),
+.button:hover:not(:disabled),
+.buttonish:hover:not(:disabled),
+main > a:first-child:hover,
+.confirm-host button:hover:not(:disabled),
+.share-actions button:hover:not(:disabled),
+.media-actions button:hover:not(:disabled),
+.bc-actionbar button:hover:not(:disabled),
+.bundle-mode:hover:not(:disabled),
+.bc-preview-toggle button:hover:not(:disabled),
+.up-mode-btn:hover:not(:disabled) {
+  filter: sepia(0.18) saturate(0.94) brightness(0.98) !important;
+  box-shadow: inset 0 1px 0 rgba(238, 215, 162, 0.22), 0 10px 18px rgba(55, 31, 12, 0.30) !important;
+  border-color: rgba(55, 31, 12, 0.74) !important;
+}
+
+button::before,
+button::after,
+.buttonish::before,
+.buttonish::after,
+.nav-rail a::before,
+.nav-rail a::after,
+main > a:first-child::before,
+main > a:first-child::after {
+  background: none !important;
+  box-shadow: none !important;
+}
+
+.nav-rail a:hover,
+.nav-rail a:focus-visible {
+  color: var(--mx-ink) !important;
+  background: rgba(94, 54, 21, 0.13) !important;
+  border-color: rgba(67, 38, 15, 0.42) !important;
+  box-shadow: none !important;
+}
+
+.nav-rail a.active,
+.nav-rail a[aria-current],
+.bundle-mode[aria-pressed="true"],
+.bc-preview-toggle button[aria-pressed="true"],
+.up-mode-btn.active,
+.up-mode-btn[aria-pressed="true"] {
+  color: #f1dfb0 !important;
+  background: linear-gradient(135deg, #5f1f19, #87501c) !important;
+  border-color: rgba(49, 27, 11, 0.62) !important;
+  box-shadow: 0 0 0 1px rgba(232, 204, 137, 0.15), 0 8px 16px rgba(55, 31, 12, 0.24) !important;
+}
+
+select:hover,
+input:hover,
+textarea:hover,
+select:focus,
+input:focus,
+textarea:focus,
+.cache-clear:hover,
+media-card article:hover,
+media-card article.media-card-shell:hover,
+.media-card-shell:hover,
+.bundle-cell:hover,
+.bc-cell:hover,
+.gallery-card:hover {
+  border-color: rgba(67, 38, 15, 0.50) !important;
+  box-shadow: var(--mx-elev-2), var(--mx-inset) !important;
+}
+
+state-badge[data-state="decrypting"],
+state-badge[data-state="fetching"],
+progress-meter,
+.toast-info,
+share-dialog .sd-note {
+  color: var(--mx-info) !important;
+  border-color: rgba(70, 43, 25, 0.42) !important;
+}
