@@ -2,7 +2,6 @@ import type { TranscodeOptions } from "./transcode-opts.ts";
 
 export interface ConnState { state: string }
 export interface AuthStateMsg { state: string }
-export interface MintedKeyResponse { registration_key: string }
 
 // --- Trusted-server recovery login (spec §6) DTO mirrors ---
 // No key material ever crosses the seam: only an opaque status + the public
@@ -241,7 +240,7 @@ export interface Settings {
     cache_location: "Disk" | "Memory";
   };
   connection: { route_mode: RouteMode };
-  appearance: { theme: "dark" | "light" };
+  appearance: { theme: "dark" };
 }
 
 // The RAM-cache slider/number bounds from the `ram_limits` command (Task 1).

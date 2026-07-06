@@ -72,19 +72,28 @@ export class BundleComposer extends HTMLElement {
   connectedCallback() {
     this.innerHTML = `
       <section id="bc-region" class="composer" tabindex="-1" aria-labelledby="bc-h">
-        <h2 id="bc-h">New bundle</h2>
-        <label>Bundle title <input id="bc-title" type="text" autocomplete="off" /></label>
-        <label>Tags (comma-separated) <input id="bc-tags" type="text" autocomplete="off" /></label>
-        <div class="bc-add" role="group" aria-label="Add bundle items">
-          <button id="bc-add-media" type="button">Add media…</button>
-          <button id="bc-add-text" type="button">Add text</button>
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">bundle composer</p>
+            <h2 id="bc-h">New bundle</h2>
+          </div>
+          <div class="bc-add" role="group" aria-label="Add bundle items">
+            <button id="bc-add-media" type="button">Add media…</button>
+            <button id="bc-add-text" type="button" class="secondary">Add text</button>
+          </div>
+        </div>
+        <div class="bc-meta">
+          <label>Bundle title <input id="bc-title" type="text" autocomplete="off" /></label>
+          <label>Tags (comma-separated) <input id="bc-tags" type="text" autocomplete="off" /></label>
         </div>
         <ol id="bc-members" class="bc-members"></ol>
-        <div class="bc-preview-toggle" role="group" aria-label="Preview mode">
-          <button id="bc-prev-gallery" type="button">Preview gallery</button>
-          <button id="bc-prev-stacked" type="button">Preview stacked</button>
+        <div class="bc-actionbar">
+          <div class="bc-preview-toggle" role="group" aria-label="Preview mode">
+            <button id="bc-prev-gallery" type="button" class="secondary">Preview gallery</button>
+            <button id="bc-prev-stacked" type="button" class="secondary">Preview stacked</button>
+          </div>
+          <button id="bc-post" type="button" class="bc-post">Post bundle</button>
         </div>
-        <button id="bc-post" type="button" class="bc-post">Post bundle</button>
         <p id="bc-status" role="status" aria-live="polite"></p>
         <div id="bc-preview" class="bc-preview"></div>
       </section>`;

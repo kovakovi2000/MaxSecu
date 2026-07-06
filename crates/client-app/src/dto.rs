@@ -45,14 +45,6 @@ pub struct RegisteredDto {
     pub user_id: String,
 }
 
-/// The outcome of `mint_registration_key`: the freshly minted single-use
-/// registration key, returned to the admin ONCE (the server keeps only its
-/// sha256). The admin hands this to the enrollee to type into the enrollment
-/// panel. No other key material crosses the seam.
-#[derive(Debug, Clone, Serialize)]
-pub struct MintedKeyResponse {
-    pub registration_key: String,
-}
 
 /// Feed type filter (D35). `All` omits the server `type` param.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]

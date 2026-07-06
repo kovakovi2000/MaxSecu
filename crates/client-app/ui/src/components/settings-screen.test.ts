@@ -63,10 +63,10 @@ test("all three knobs are written back in the save patch", () => {
   }
 });
 
-// --- Issue 4: unified single-grid Settings layout ----------------------------
+// --- Issue 4: two independent Settings columns -------------------------------
 // The prefs container is a <div> grid (not a <form> — no submit is used, and it
-// must legally contain Account's own <form>s). Account and Privacy live INSIDE
-// the grid; Privacy spans both columns; the Privacy copy is expanded + accurate.
+// must legally contain Account's own <form>s). Cards are grouped into two
+// independent vertical stacks so uneven card heights do not create grid holes.
 const setCss = readFileSync("styles.css", "utf8");
 
 test('prefs container is a <div id="set-form"> grid, not a <form>', () => {
@@ -74,29 +74,27 @@ test('prefs container is a <div id="set-form"> grid, not a <form>', () => {
   assert.doesNotMatch(src, /<form id="set-form">/, "set-form must NOT be a <form>");
 });
 
-test("Account and Privacy fieldsets live inside the set-form grid", () => {
-  // Both legends appear before the set-form div closes (i.e. nested in it).
+test("settings cards are grouped into two independent columns", () => {
+  assert.match(src, /<div class="settings-column settings-column-left">/, "left settings column missing");
+  assert.match(src, /<div class="settings-column settings-column-right">/, "right settings column missing");
   assert.match(
     src,
-    /<div id="set-form">[\s\S]*<legend>Account<\/legend>[\s\S]*<legend>Privacy<\/legend>[\s\S]*<\/div>/,
-    "Account + Privacy must be inside the #set-form grid",
+    /settings-column settings-column-right[\s\S]*<legend>Connection<\/legend>/,
+    "Connection must live in the right settings column",
+  );
+  assert.match(
+    setCss,
+    /\.settings-column\s*\{[\s\S]*?display:\s*grid[\s\S]*?align-content:\s*start/,
+    "each settings column must be an independent vertical grid",
   );
 });
 
-test("Privacy fieldset is tagged for full-width and spans both columns", () => {
-  assert.match(src, /<fieldset class="privacy">/, "Privacy fieldset needs the .privacy class");
+test("Privacy fieldset is a normal right-column card without a decorative logo", () => {
+  assert.match(src, /<fieldset class="settings-card privacy">/, "Privacy fieldset needs card + privacy classes");
   assert.match(
     setCss,
-    /\.privacy\s*\{[\s\S]*?grid-column:\s*1\s*\/\s*-1/,
-    ".privacy must span both grid columns",
-  );
-});
-
-test("grid groups align to the top (no stretched short groups)", () => {
-  assert.match(
-    setCss,
-    /settings-screen #set-form > fieldset\s*\{[\s\S]*?align-self:\s*start/,
-    "grid group fieldsets must align-self: start",
+    /settings-screen #set-form \.privacy::after\s*\{[\s\S]*?content:\s*none/,
+    "Privacy logo pseudo-element must be disabled",
   );
 });
 

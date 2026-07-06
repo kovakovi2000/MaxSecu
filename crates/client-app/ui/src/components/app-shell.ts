@@ -46,16 +46,21 @@ export class AppShell extends HTMLElement {
         <div class="header-actions">
           <ram-gauge id="ram"></ram-gauge>
         </div>
-        <div class="status-strip" role="region" aria-label="Status">
-          <status-pill id="pill"></status-pill>
-          <span id="sync-ind" class="sync-ind" role="status" aria-live="polite">Zero-knowledge session</span>
-          <span id="tasks-ind" class="tasks-ind" role="status" aria-live="polite">No active tasks</span>
-        </div>
-        <div class="tray-stack">
-          <upload-tray></upload-tray>
-          <share-tray></share-tray>
-        </div>
       </header>
+      <div class="status-strip" role="region" aria-label="Status">
+        <status-pill id="pill"></status-pill>
+        <span id="sync-ind" class="sync-ind" role="status" aria-live="polite">Zero-knowledge session</span>
+        <span id="tasks-ind" class="tasks-ind" role="status" aria-live="polite">No active tasks</span>
+      </div>
+      <div class="tray-stack">
+        <upload-tray></upload-tray>
+        <share-tray></share-tray>
+      </div>
+      <div id="busy-overlay" class="busy-overlay" role="status" aria-live="polite" hidden>
+        <span class="busy-kicker">Active task</span>
+        <strong id="busy-title">Working…</strong>
+        <small>Keep this window open until it finishes.</small>
+      </div>
       <toast-host></toast-host>
       <trust-alarm></trust-alarm>
       <div id="outlet"></div>`;
@@ -66,6 +71,20 @@ export class AppShell extends HTMLElement {
     const outlet = this.querySelector("#outlet")!;
     const pill = this.querySelector("#pill") as StatusPill;
     const nav = this.querySelector(".nav-rail") as HTMLElement;
+    const header = this.querySelector(".app-header") as HTMLElement;
+    const busyOverlay = this.querySelector("#busy-overlay") as HTMLElement;
+    const busyTitle = this.querySelector("#busy-title") as HTMLElement;
+    const busyKicker = this.querySelector(".busy-kicker") as HTMLElement;
+
+    const syncHeaderHeight = () => {
+      this.style.setProperty("--mx-header-height", `${Math.ceil(header.getBoundingClientRect().height)}px`);
+    };
+    syncHeaderHeight();
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(syncHeaderHeight);
+      ro.observe(header);
+    }
+    window.addEventListener("resize", syncHeaderHeight);
 
     // Navigation guard: while a transcode/upload is in flight the nav rail is
     // disabled (visually + functionally) and closing the tab/window warns. The
@@ -75,11 +94,17 @@ export class AppShell extends HTMLElement {
     nav.addEventListener("click", (e) => {
       if (isBusy()) e.preventDefault();
     });
-    subscribeBusy((busy) => {
+    subscribeBusy((busy, reason) => {
       nav.querySelectorAll<HTMLAnchorElement>("a").forEach((a) => {
         a.toggleAttribute("aria-disabled", busy);
         a.classList.toggle("nav-disabled", busy);
       });
+      busyOverlay.hidden = !busy;
+      if (busy) {
+        const label = reason.toLowerCase().includes("upload") ? "Active upload" : "Active task";
+        busyKicker.textContent = label;
+        busyTitle.textContent = reason || "Working…";
+      }
       window.onbeforeunload = busy
         ? (e: BeforeUnloadEvent) => {
           e.preventDefault();

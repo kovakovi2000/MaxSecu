@@ -60,31 +60,29 @@
   --mx-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
-/* ---------- Tokens: light ---------- */
-:root[data-theme="light"] {
-  color-scheme: light;
-  --mx-base: #f3f7ff;
-  --mx-base-2: #eaf0fb;
-  --mx-surface-1: rgba(255, 255, 255, 0.9);
-  --mx-surface-2: rgba(247, 250, 255, 0.92);
-  --mx-surface-3: rgba(232, 239, 253, 0.92);
-  --mx-surface-solid: #ffffff;
-  --mx-text: #111827;
-  --mx-muted: #475569;
-  --mx-faint: #64748b;
-  --mx-border: rgba(78, 95, 130, 0.22);
-  --mx-border-strong: rgba(78, 95, 130, 0.34);
-  --mx-accent-solid: #155eef;
-  --mx-accent-1: #155eef;
-  --mx-accent-2: #6d28d9;
-  --mx-ok: #047857;
-  --mx-warn: #92400e;
-  --mx-err: #b42318;
-  --mx-info: #1d4ed8;
-  --mx-glow: 0 0 0 1px rgba(21, 94, 239, 0.2), 0 18px 42px rgba(37, 99, 235, 0.14);
-  --mx-elev-1: 0 10px 26px rgba(29, 41, 57, 0.08);
-  --mx-elev-2: 0 24px 70px rgba(29, 41, 57, 0.16);
-  --mx-inset: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+/* ---------- Theme presets ---------- */
+:root[data-theme="tech"] {
+  color-scheme: dark;
+}
+:root[data-theme="cheese"] {
+  color-scheme: dark;
+  --mx-accent-1: #ffd166;
+  --mx-accent-2: #f77f00;
+  --mx-accent-3: #ffe29a;
+  --mx-accent-solid: #f6b73c;
+  --mx-neon-cyan: #ffe29a;
+  --mx-neon-violet: #f77f00;
+  --mx-neon-lime: #fff1a8;
+}
+:root[data-theme="pottery"] {
+  color-scheme: dark;
+  --mx-accent-1: #d68c45;
+  --mx-accent-2: #9c6644;
+  --mx-accent-3: #e6ccb2;
+  --mx-accent-solid: #c07f4f;
+  --mx-neon-cyan: #e6ccb2;
+  --mx-neon-violet: #b07d62;
+  --mx-neon-lime: #ddbea9;
 }
 
 /* ---------- Accessibility state tokens ---------- */
@@ -128,7 +126,6 @@ body::before {
   mask-image: radial-gradient(circle at 50% 0%, black, transparent 78%);
 }
 a { color: #9ec5ff; text-underline-offset: 0.18em; }
-:root[data-theme="light"] a { color: #174ea6; }
 a:hover { color: var(--mx-text); }
 img, canvas { max-width: 100%; }
 [hidden] { display: none !important; }
@@ -158,9 +155,7 @@ app-shell { display: block; min-height: 100vh; }
   z-index: 20;
   display: grid;
   grid-template-columns: auto 1fr auto;
-  grid-template-areas:
-    "brand nav actions"
-    "status status tray";
+  grid-template-areas: "brand nav actions";
   align-items: center;
   gap: 0.75rem 1rem;
   padding: 0.9rem clamp(1rem, 3vw, 2rem);
@@ -840,9 +835,7 @@ video-player media-loading-indicator {
     grid-template-columns: 1fr auto;
     grid-template-areas:
       "brand actions"
-      "nav nav"
-      "status status"
-      "tray tray";
+      "nav nav";
   }
   .tray-stack { justify-self: stretch; }
   .upload-tray, .share-tray { max-width: none; width: 100%; }
@@ -943,7 +936,7 @@ a:hover { text-decoration: none; }
 .nav-rail a:hover::before,
 .nav-rail a:focus-visible::before { opacity: 1; }
 .nav-rail a.active, .nav-rail a[aria-current] {
-  color: #06101d;
+  color: var(--mx-on-bright);
   background: linear-gradient(135deg, var(--mx-neon-cyan), var(--mx-neon-lime));
   box-shadow: 0 0 0 1px rgba(24,242,255,0.45), 0 0 26px rgba(24,242,255,0.28);
 }
@@ -1973,4 +1966,952 @@ trust-alarm .danger {
   background: var(--mx-danger, #d33);
   border: 1px solid var(--mx-danger, #ff5a5a);
   border-radius: var(--mx-radius-sm);
+}
+
+/* ---------- Round 2 reconciliation pass: unified primitives for new surface ---------- */
+:root {
+  --mx-danger: var(--mx-err);
+  --mx-on-bright: #06101d;
+  --mx-on-danger: #ffffff;
+  --mx-shadow-ink: #000000;
+  --mx-panel-bg:
+    linear-gradient(135deg, rgba(24,242,255,0.055), transparent 30%, rgba(180,92,255,0.06)),
+    color-mix(in srgb, var(--mx-surface-1) 92%, transparent);
+  --mx-card-bg:
+    linear-gradient(150deg, rgba(24,242,255,0.075), transparent 34%, rgba(180,92,255,0.085)),
+    color-mix(in srgb, var(--mx-surface-2) 90%, transparent);
+  --mx-cut-radius: 1.35rem 0.65rem 1.35rem 0.65rem;
+}
+
+
+.screen-title,
+.section-head,
+.bundle-head,
+.bc-actionbar,
+.share-actions,
+.confirm-host .confirm-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--mx-space-4);
+  flex-wrap: wrap;
+}
+
+.screen-subtitle,
+.auth-copy p,
+.auth-note,
+.section-head p,
+.bc-empty,
+#bd-status,
+#bc-status,
+#rg-status,
+#rl-status {
+  color: var(--mx-muted);
+}
+
+.section-head h2,
+.auth-copy h1,
+.bundle-head h1,
+.settings-card legend {
+  margin-top: 0;
+}
+
+button.danger,
+.confirm-host .danger,
+trust-alarm .danger,
+#bd-delete,
+#vw-del-btn {
+  color: var(--mx-on-danger);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--mx-danger) 92%, var(--mx-shadow-ink)), color-mix(in srgb, var(--mx-danger) 62%, var(--mx-neon-violet)));
+  border-color: color-mix(in srgb, var(--mx-danger) 72%, var(--mx-border));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--mx-danger) 24%, transparent), 0 16px 38px color-mix(in srgb, var(--mx-danger) 18%, transparent);
+}
+
+button.danger:hover,
+.confirm-host .danger:hover,
+trust-alarm .danger:hover {
+  filter: brightness(1.08) saturate(1.08);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--mx-danger) 46%, transparent), 0 0 30px color-mix(in srgb, var(--mx-danger) 22%, transparent);
+}
+
+/* Auth siblings for register/recovery: same product language as connect, without duplicating its hero art. */
+.auth-main {
+  width: min(1100px, calc(100vw - 2rem));
+  min-height: calc(100vh - 9.5rem);
+  display: grid;
+  align-items: center;
+}
+.auth-stage {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  grid-template-columns: minmax(0, 0.95fr) minmax(320px, 0.78fr);
+  gap: clamp(1rem, 3vw, 2rem);
+  align-items: stretch;
+}
+.auth-stage::before {
+  content: "";
+  position: absolute;
+  inset: -1rem;
+  z-index: -1;
+  opacity: 0.26;
+  background:
+    radial-gradient(circle at 16% 22%, color-mix(in srgb, var(--mx-neon-cyan) 26%, transparent), transparent 22rem),
+    radial-gradient(circle at 82% 72%, color-mix(in srgb, var(--mx-neon-violet) 24%, transparent), transparent 24rem);
+  filter: blur(8px);
+}
+.auth-copy,
+.auth-card {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 25%, var(--mx-border));
+  border-radius: var(--mx-cut-radius);
+  background: var(--mx-panel-bg);
+  box-shadow: var(--mx-elev-2), var(--mx-inset);
+  backdrop-filter: blur(18px) saturate(1.12);
+  clip-path: var(--mx-panel-cut);
+}
+.auth-copy {
+  display: flex;
+  flex-direction: column;
+  justify-content: end;
+  min-height: 26rem;
+  padding: clamp(1.4rem, 4vw, 2.6rem);
+}
+.auth-copy::before,
+.auth-card::before,
+.composer::before,
+.settings-card::before,
+.bundle-head::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 3px;
+  background: linear-gradient(90deg, var(--mx-neon-cyan), var(--mx-neon-violet), var(--mx-neon-lime));
+  opacity: 0.9;
+}
+.auth-copy h1 {
+  max-width: 11ch;
+  font-size: clamp(2.4rem, 6vw, 4.8rem);
+  line-height: 0.92;
+  letter-spacing: -0.07em;
+}
+.auth-card {
+  align-self: center;
+  max-width: none;
+  padding: clamp(1.15rem, 3vw, 1.85rem);
+}
+.auth-note {
+  padding: 0.85rem;
+  border: 1px solid color-mix(in srgb, var(--mx-neon-lime) 28%, var(--mx-border));
+  border-radius: var(--mx-radius-sm);
+  background: color-mix(in srgb, var(--mx-neon-lime) 8%, transparent);
+  font-family: var(--mx-font-tech);
+  font-size: var(--mx-fs-1);
+  font-weight: 800;
+}
+
+/* Bundle screen: clear page scaffold + toolbar with consistent segmented controls. */
+.bundle-head {
+  position: relative;
+  margin-bottom: var(--mx-space-5);
+  padding: clamp(1rem, 2vw, 1.35rem);
+  border: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 24%, var(--mx-border));
+  border-radius: var(--mx-cut-radius);
+  background: var(--mx-panel-bg);
+  box-shadow: var(--mx-elev-1), var(--mx-inset);
+  overflow: hidden;
+}
+.bundle-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--mx-space-2);
+}
+.bundle-toggle,
+.bc-preview-toggle,
+.up-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.24rem;
+  border: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 22%, var(--mx-border));
+  border-radius: var(--mx-radius-sm);
+  background: color-mix(in srgb, var(--mx-surface-2) 76%, transparent);
+  box-shadow: var(--mx-inset);
+}
+.bundle-mode,
+.bc-preview-toggle button,
+.up-mode-btn {
+  min-height: 2.2rem;
+  padding: 0.45rem 0.72rem;
+  color: var(--mx-muted);
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+.bundle-mode[aria-pressed="true"],
+.bc-preview-toggle button[aria-pressed="true"],
+.up-mode-btn.active,
+.up-mode-btn[aria-pressed="true"] {
+  color: var(--mx-on-bright);
+  background: linear-gradient(135deg, var(--mx-neon-cyan), var(--mx-neon-lime));
+  border-color: color-mix(in srgb, var(--mx-neon-cyan) 48%, transparent);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--mx-neon-cyan) 18%, transparent);
+}
+.bundle-stacked {
+  display: grid;
+  gap: clamp(1rem, 2vw, 1.35rem);
+}
+.bundle-stacked > section,
+.viewer-embedded {
+  scroll-margin-top: 7rem;
+}
+.viewer-embedded {
+  box-shadow: var(--mx-elev-1), var(--mx-inset);
+}
+
+/* Bundle composer: card rows, action bar, and preview area share feed-card primitives. */
+.composer {
+  position: relative;
+  display: grid;
+  gap: var(--mx-space-4);
+  margin-top: var(--mx-space-5);
+  padding: clamp(1rem, 2vw, 1.35rem);
+  border: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 24%, var(--mx-border));
+  border-radius: var(--mx-cut-radius);
+  background: var(--mx-panel-bg);
+  box-shadow: var(--mx-elev-1), var(--mx-inset);
+  overflow: hidden;
+}
+.composer h2 { margin: 0; font-size: var(--mx-fs-4); letter-spacing: -0.055em; }
+.bc-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--mx-space-4);
+}
+.bc-meta label { margin: 0; }
+.bc-add,
+.bc-row-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mx-space-2);
+}
+.bc-members {
+  list-style: none;
+  display: grid;
+  gap: var(--mx-space-3);
+  margin: 0;
+  padding: 0;
+}
+.bc-row,
+.bc-empty,
+.bc-preview-item,
+.settings-cache-panel {
+  border: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 18%, var(--mx-border));
+  border-radius: var(--mx-radius);
+  background: var(--mx-card-bg);
+  box-shadow: var(--mx-inset);
+}
+.bc-row,
+.bc-empty { padding: var(--mx-space-4); }
+.bc-row {
+  display: grid;
+  gap: var(--mx-space-3);
+}
+.bc-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--mx-space-3);
+}
+.bc-kind {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.75rem;
+  padding: 0.18rem 0.62rem;
+  border: 1px solid color-mix(in srgb, var(--mx-neon-violet) 44%, var(--mx-border));
+  border-radius: 0.35rem 0.8rem 0.35rem 0.8rem;
+  background: color-mix(in srgb, var(--mx-neon-violet) 12%, transparent);
+  color: color-mix(in srgb, var(--mx-neon-violet) 78%, var(--mx-text));
+  font-family: var(--mx-font-tech);
+  font-size: 0.74rem;
+  font-weight: 950;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.bc-row-controls button {
+  min-width: 2.25rem;
+  min-height: 2.25rem;
+  padding: 0.25rem 0.55rem;
+}
+.bc-actionbar {
+  padding-top: var(--mx-space-2);
+  border-top: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 18%, var(--mx-border));
+}
+.bc-post { min-width: min(100%, 12rem); }
+.bc-preview {
+  display: grid;
+  gap: var(--mx-space-3);
+}
+.bc-preview:empty { display: none; }
+.bc-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
+  gap: var(--mx-space-3);
+}
+.bc-preview-item {
+  display: grid;
+  gap: var(--mx-space-2);
+  padding: var(--mx-space-3);
+  min-width: 0;
+}
+.bc-preview-item img {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+  border-radius: var(--mx-radius-sm);
+  border: 1px solid var(--mx-border);
+}
+
+/* Settings: consistent cards + the same clearable cache meters as the header. */
+settings-screen #set-form {
+  align-items: start;
+}
+settings-screen #set-form > fieldset.settings-card,
+settings-screen #set-form > fieldset.privacy {
+  position: relative;
+  overflow: hidden;
+  padding: clamp(1rem, 2vw, 1.35rem);
+  border-color: color-mix(in srgb, var(--mx-neon-cyan) 20%, var(--mx-border));
+  border-radius: var(--mx-cut-radius);
+  background: var(--mx-panel-bg);
+  box-shadow: var(--mx-elev-1), var(--mx-inset);
+}
+settings-screen #set-form > fieldset.performance-card,
+settings-screen #set-form > fieldset.account-card {
+  grid-row: span 2;
+}
+settings-screen #set-form > fieldset.privacy {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--mx-space-4);
+  align-items: start;
+}
+settings-screen #set-form > fieldset.privacy legend {
+  grid-column: 1 / -1;
+}
+settings-screen #set-form > fieldset.privacy::after {
+  content: "TCB";
+  display: inline-grid;
+  place-items: center;
+  width: 4.3rem;
+  aspect-ratio: 1;
+  border: 1px solid color-mix(in srgb, var(--mx-neon-lime) 40%, var(--mx-border));
+  border-radius: 50%;
+  color: color-mix(in srgb, var(--mx-neon-lime) 78%, var(--mx-text));
+  font-family: var(--mx-font-tech);
+  font-weight: 950;
+  box-shadow: 0 0 26px color-mix(in srgb, var(--mx-neon-lime) 18%, transparent);
+}
+.settings-cache-panel {
+  display: grid;
+  gap: var(--mx-space-3);
+  margin: var(--mx-space-4) 0;
+  padding: var(--mx-space-4);
+}
+.settings-cache-panel strong {
+  display: block;
+  margin-bottom: 0.2rem;
+  font-family: var(--mx-font-tech);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.settings-cache-panel .hint { margin: 0; }
+.settings-cache-panel .ram-gauge-rows {
+  gap: var(--mx-space-2);
+}
+.settings-cache-panel .ram-gauge-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(6rem, auto) minmax(8rem, 1fr) auto auto;
+  gap: var(--mx-space-2);
+}
+.settings-cache-panel .ram-gauge {
+  width: 100%;
+  min-width: 8rem;
+}
+.settings-cache-panel .ram-gauge-fill {
+  background-size: max(120px, 100%) 100%;
+}
+#pw-form,
+#exp-form {
+  margin-top: var(--mx-space-3);
+  padding: var(--mx-space-3);
+  border-radius: var(--mx-radius);
+  background: color-mix(in srgb, var(--mx-surface-2) 60%, transparent);
+}
+
+/* Upload flow: richer mode selector and video menu grouping. */
+.upload-main .screen-subtitle {
+  max-width: 68ch;
+  margin-top: -0.25rem;
+}
+.upload-main #up-form {
+  display: grid;
+  gap: var(--mx-space-3);
+}
+#file-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--mx-space-3);
+  align-items: end;
+}
+#file-row #up-detected {
+  grid-column: 1 / -1;
+  margin: -0.35rem 0 0;
+  color: color-mix(in srgb, var(--mx-neon-cyan) 70%, var(--mx-muted));
+  font-family: var(--mx-font-tech);
+  font-size: var(--mx-fs-1);
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.video-options {
+  display: grid;
+  gap: var(--mx-space-3);
+  padding: var(--mx-space-4);
+  border: 1px solid color-mix(in srgb, var(--mx-neon-violet) 24%, var(--mx-border));
+  border-radius: var(--mx-radius);
+  background: color-mix(in srgb, var(--mx-neon-violet) 8%, transparent);
+}
+.video-options[hidden] { display: none !important; }
+.custom-res {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--mx-space-3);
+}
+.custom-res[hidden] { display: none !important; }
+.up-prepare {
+  padding: var(--mx-space-3);
+  border: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 22%, var(--mx-border));
+  border-radius: var(--mx-radius);
+  background: var(--mx-card-bg);
+}
+
+/* Shared dialog/modal shell reconciliation. */
+share-dialog .share-overlay,
+.confirm-host .confirm-overlay,
+trust-alarm .trust-overlay {
+  backdrop-filter: blur(8px) saturate(1.08);
+}
+share-dialog .share-panel,
+.confirm-host .confirm-panel,
+trust-alarm .trust-panel {
+  border-radius: var(--mx-cut-radius);
+  background: var(--mx-panel-bg);
+}
+#sd-rows.sd-roster {
+  border-radius: var(--mx-radius);
+  background: color-mix(in srgb, var(--mx-surface-2) 48%, transparent);
+}
+.sd-roster .sd-row {
+  min-height: 3rem;
+  padding: 0.55rem 0.7rem;
+}
+.sd-row:has(input[type="checkbox"]:disabled) {
+  filter: grayscale(0.35);
+}
+
+/* Header trays / gauges: compact but aligned with card primitives. */
+.upload-tray,
+.share-tray,
+.toast {
+  border-radius: var(--mx-cut-radius);
+  background: var(--mx-panel-bg);
+}
+.ram-gauge {
+  border: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 18%, transparent);
+  background: color-mix(in srgb, var(--mx-surface-solid) 58%, transparent);
+}
+.ram-gauge-fill {
+  background: linear-gradient(90deg, var(--mx-neon-lime), var(--mx-neon-cyan), var(--mx-neon-violet));
+}
+
+@media (max-width: 860px) {
+  .auth-stage,
+  .bc-meta,
+  .custom-res,
+  #file-row,
+  .settings-cache-panel .ram-gauge-row {
+    grid-template-columns: 1fr;
+  }
+  .auth-copy { min-height: 17rem; }
+  .bundle-toolbar { justify-content: flex-start; }
+  settings-screen #set-form > fieldset.performance-card,
+  settings-screen #set-form > fieldset.account-card { grid-row: auto; }
+  settings-screen #set-form > fieldset.privacy { grid-template-columns: 1fr; }
+  settings-screen #set-form > fieldset.privacy::after { display: none; }
+}
+
+/* ---------- Round 3 targeted fixes from live UI feedback ---------- */
+
+/* Active upload/share trays float independently from the sticky header. Hidden
+   children still stay hidden; the stack only becomes visible when a tray has work. */
+app-shell[data-app-chrome] .tray-stack {
+  position: fixed;
+  right: var(--mx-space-4);
+  bottom: calc(var(--mx-space-4) + 7.3rem);
+  z-index: 76;
+  justify-self: auto;
+  width: min(420px, calc(100vw - 2rem));
+  pointer-events: none;
+}
+app-shell[data-app-chrome] .tray-stack > * { pointer-events: auto; }
+
+/* Bundle / viewer return links are now contextual: members opened from a bundle
+   return to the bundle, and items opened from My Content return there. */
+.back-link { white-space: nowrap; }
+
+/* Bundle header alignment: keep eyebrow, title, and count in one vertical stack. */
+.bundle-head .screen-title {
+  display: grid;
+  justify-content: start;
+  justify-items: start;
+  gap: 0.18rem;
+}
+.bundle-head .screen-title .eyebrow,
+.bundle-head .screen-title h1,
+.bundle-head .screen-title #bd-status { margin: 0; }
+.bundle-head { align-items: end; margin-bottom: var(--mx-space-4); }
+.bundle-toolbar { align-items: center; }
+
+/* Single post now uses the same composer shell/rhythm as New bundle. */
+.upload-composer { margin-top: var(--mx-space-5); }
+.upload-main #up-form {
+  max-width: none;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+.up-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--mx-space-3) var(--mx-space-4);
+}
+.up-meta > label,
+.up-meta #file-row,
+.up-meta #body-row,
+.up-meta .video-options { margin: 0; }
+.up-meta #file-row,
+.up-meta #body-row,
+.up-meta .video-options { grid-column: 1 / -1; }
+.up-actionbar { margin-top: var(--mx-space-2); }
+
+/* A staged single-post upload gets one fixed action button in the lower-right.
+   It disappears with #up-preview once the upload completes or is reset. */
+.up-confirm-float {
+  position: fixed;
+  right: var(--mx-space-4);
+  bottom: calc(var(--mx-space-4) + 3.75rem);
+  z-index: 78;
+  min-width: 9.5rem;
+  min-height: 3.1rem;
+  box-shadow: var(--mx-elev-2), 0 0 36px color-mix(in srgb, var(--mx-neon-cyan) 24%, transparent);
+}
+
+/* New bundle composer: tighter title/tags and much denser member cards. */
+.bc-meta {
+  grid-template-columns: minmax(0, 1.25fr) minmax(13rem, 0.75fr);
+  gap: var(--mx-space-3);
+  padding: var(--mx-space-3);
+  border: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 16%, var(--mx-border));
+  border-radius: var(--mx-radius);
+  background: color-mix(in srgb, var(--mx-surface-2) 42%, transparent);
+}
+.bc-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--mx-space-2) var(--mx-space-3);
+  padding: var(--mx-space-3);
+}
+.bc-row-head,
+.bc-title-label,
+.bc-body-label,
+.bc-src,
+.bc-vopts { grid-column: 1 / -1; }
+.bc-row-head { gap: var(--mx-space-2); }
+.bc-title-label { margin: 0; }
+.bc-title-label input { min-height: 2.35rem; }
+.bc-src {
+  margin: -0.2rem 0 0;
+  color: var(--mx-muted);
+  font-family: var(--mx-font-tech);
+  font-size: var(--mx-fs-1);
+  overflow-wrap: anywhere;
+}
+.bc-cover {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  width: fit-content;
+  margin: 0;
+  padding: 0.42rem 0.62rem;
+  border: 1px solid color-mix(in srgb, var(--mx-neon-violet) 28%, var(--mx-border));
+  border-radius: 0.45rem 0.9rem 0.45rem 0.9rem;
+  background: color-mix(in srgb, var(--mx-neon-violet) 9%, transparent);
+  color: color-mix(in srgb, var(--mx-neon-violet) 76%, var(--mx-text));
+  font-size: var(--mx-fs-1);
+  gap: 0.45rem;
+}
+.bc-vopts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--mx-space-2);
+  padding: var(--mx-space-3);
+  border: 1px solid color-mix(in srgb, var(--mx-neon-violet) 18%, var(--mx-border));
+  border-radius: var(--mx-radius-sm);
+  background: color-mix(in srgb, var(--mx-neon-violet) 7%, transparent);
+}
+.bc-vopts label { margin: 0; }
+.bc-body-label textarea { min-height: 6rem; }
+
+/* Bundle preview modes: gallery and stacked are now visibly different while both
+   use the same tile language as feed cards. */
+.bc-counts {
+  margin: 0;
+  color: var(--mx-muted);
+  font-family: var(--mx-font-tech);
+  font-size: var(--mx-fs-1);
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.bc-preview-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  gap: clamp(0.9rem, 2vw, 1.25rem);
+}
+.bc-preview-stack {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--mx-space-3);
+}
+.bc-cell {
+  position: relative;
+  display: grid;
+  gap: 0.72rem;
+  min-width: 0;
+  padding: 0.85rem;
+  overflow: hidden;
+  border: 1px solid var(--mx-border);
+  border-radius: 1.25rem 0.65rem 1.25rem 0.65rem;
+  background:
+    linear-gradient(150deg, rgba(24,242,255,0.10), transparent 28%, rgba(180,92,255,0.11)),
+    linear-gradient(180deg, color-mix(in srgb, var(--mx-surface-2) 94%, transparent), color-mix(in srgb, var(--mx-surface-1) 96%, transparent));
+  box-shadow: var(--mx-elev-1), var(--mx-inset);
+}
+.bc-cell::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--mx-neon-cyan), var(--mx-neon-violet), var(--mx-neon-lime), transparent);
+}
+.bc-cell img {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+  border: 1px solid color-mix(in srgb, var(--mx-neon-violet) 28%, var(--mx-border));
+  border-radius: 1rem 0.45rem 1rem 0.45rem;
+  background: var(--mx-surface-3);
+}
+.bc-cell-stack {
+  grid-template-columns: minmax(8rem, 13rem) minmax(0, 1fr);
+  align-items: center;
+}
+.bc-cell-stack img { width: 100%; }
+.bc-cell-title {
+  margin: 0;
+  font-family: var(--mx-font-display);
+  font-size: clamp(1.08rem, 1.8vw, 1.32rem);
+  font-weight: 850;
+  line-height: 1.18;
+}
+.bc-cell-type {
+  margin: 0;
+  color: color-mix(in srgb, var(--mx-neon-cyan) 76%, var(--mx-muted));
+  font-family: var(--mx-font-tech);
+  font-size: 0.76rem;
+  font-weight: 950;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+
+@media (max-width: 860px) {
+  app-shell[data-app-chrome] .status-strip,
+  app-shell[data-app-chrome] .tray-stack,
+  .up-confirm-float {
+    right: 0.75rem;
+  }
+  app-shell[data-app-chrome] .status-strip {
+    left: 0.75rem;
+    max-width: none;
+    overflow-x: auto;
+  }
+  .up-meta,
+  .bc-meta,
+  .bc-vopts,
+  .bc-cell-stack { grid-template-columns: 1fr; }
+  .up-confirm-float { bottom: calc(var(--mx-space-4) + 4.4rem); }
+}
+
+
+/* ---------- Round 4 targeted feedback fixes ---------- */
+/* Status and active-task overlays are no longer part of the sticky header. */
+.status-strip {
+  position: fixed;
+  right: var(--mx-space-4);
+  bottom: var(--mx-space-4);
+  z-index: 74;
+  display: flex;
+  align-items: center;
+  gap: var(--mx-space-2);
+  max-width: min(100vw - 2rem, 44rem);
+  padding: 0.58rem 1.45rem 0.58rem 0.72rem;
+  border: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 38%, var(--mx-border));
+  border-right: 0;
+  border-radius: 0.75rem 0.15rem 0.15rem 1rem;
+  background:
+    linear-gradient(110deg, rgba(24,242,255,0.11), rgba(180,92,255,0.08) 58%, rgba(167,255,63,0.08)),
+    color-mix(in srgb, var(--mx-surface-1) 94%, transparent);
+  box-shadow: var(--mx-elev-2), var(--mx-inset), 0 0 32px color-mix(in srgb, var(--mx-neon-cyan) 13%, transparent);
+  backdrop-filter: blur(18px) saturate(1.14);
+  clip-path: polygon(0 0, calc(100% - 1.25rem) 0, 100% 100%, 0 100%);
+}
+.status-strip > * {
+  min-height: 1.7rem;
+  padding: 0.16rem 0.52rem;
+  border-color: color-mix(in srgb, var(--mx-neon-cyan) 22%, var(--mx-border));
+  background: color-mix(in srgb, var(--mx-surface-2) 72%, transparent);
+}
+app-shell:not([data-app-chrome]) .status-strip,
+app-shell:not([data-app-chrome]) .tray-stack,
+app-shell:not([data-app-chrome]) .busy-overlay {
+  display: none !important;
+}
+
+.busy-overlay {
+  position: fixed;
+  right: var(--mx-space-4);
+  bottom: calc(var(--mx-space-4) + 4.2rem);
+  z-index: 79;
+  display: grid;
+  gap: 0.15rem;
+  width: min(330px, calc(100vw - 2rem));
+  padding: 0.8rem 1.25rem 0.82rem 0.9rem;
+  border: 1px solid color-mix(in srgb, var(--mx-neon-lime) 34%, var(--mx-border));
+  border-right: 0;
+  border-radius: 0.85rem 0.2rem 0.2rem 1.1rem;
+  background:
+    linear-gradient(120deg, rgba(167,255,63,0.13), rgba(24,242,255,0.10) 46%, rgba(180,92,255,0.09)),
+    color-mix(in srgb, var(--mx-surface-1) 95%, transparent);
+  box-shadow: var(--mx-elev-2), 0 0 36px color-mix(in srgb, var(--mx-neon-lime) 18%, transparent);
+  backdrop-filter: blur(18px) saturate(1.16);
+  clip-path: polygon(0 0, calc(100% - 1.25rem) 0, 100% 100%, 0 100%);
+}
+.busy-overlay[hidden] { display: none !important; }
+.busy-kicker {
+  color: color-mix(in srgb, var(--mx-neon-lime) 72%, var(--mx-muted));
+  font-family: var(--mx-font-tech);
+  font-size: 0.72rem;
+  font-weight: 950;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.busy-overlay strong {
+  font-size: 1rem;
+  line-height: 1.15;
+}
+.busy-overlay small {
+  color: var(--mx-muted);
+  font-family: var(--mx-font-tech);
+  font-size: 0.72rem;
+}
+
+/* Settings are two independent vertical stacks, avoiding CSS-grid row holes. */
+settings-screen #set-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--mx-space-4);
+  align-items: start;
+  max-width: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+.settings-column {
+  display: grid;
+  gap: var(--mx-space-3);
+  min-width: 0;
+  align-content: start;
+}
+settings-screen #set-form .settings-column > fieldset {
+  margin: 0;
+  align-self: start;
+}
+settings-screen #set-form .settings-column > fieldset.settings-card,
+settings-screen #set-form .settings-column > fieldset.privacy {
+  position: relative;
+  overflow: hidden;
+  padding: clamp(1rem, 2vw, 1.35rem);
+  border-color: color-mix(in srgb, var(--mx-neon-cyan) 20%, var(--mx-border));
+  border-radius: var(--mx-cut-radius);
+  background: var(--mx-panel-bg);
+  box-shadow: var(--mx-elev-1), var(--mx-inset);
+}
+settings-screen #set-form .privacy {
+  display: block;
+  grid-column: auto;
+}
+settings-screen #set-form .privacy::after {
+  content: none;
+  display: none;
+}
+settings-screen label { margin-block: 0.55rem; }
+.settings-cache-panel {
+  margin: var(--mx-space-2) 0 var(--mx-space-3);
+  gap: var(--mx-space-2);
+}
+#pw-form,
+#exp-form { margin-top: var(--mx-space-2); }
+
+/* Align the file path input and Browse button on a single clean baseline. */
+#file-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+}
+#file-row > label {
+  margin: 0;
+}
+#file-row > button {
+  align-self: end;
+  min-height: 2.65rem;
+  margin: 0;
+  white-space: nowrap;
+}
+
+@media (max-width: 860px) {
+  settings-screen #set-form { grid-template-columns: 1fr; }
+  .status-strip,
+  .busy-overlay,
+  app-shell[data-app-chrome] .tray-stack,
+  .up-confirm-float { right: 0.75rem; }
+  .status-strip {
+    left: 0.75rem;
+    max-width: none;
+    overflow-x: auto;
+  }
+  .busy-overlay {
+    left: 0.75rem;
+    width: auto;
+  }
+}
+
+/* ---------- Round 5 targeted placement/alignment fixes ---------- */
+/* Status lives as a bottom-left edge dock. It grows to the right with content. */
+app-shell[data-app-chrome] > .status-strip {
+  position: fixed !important;
+  left: 0 !important;
+  right: auto !important;
+  top: auto !important;
+  bottom: 0 !important;
+  z-index: 78;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--mx-space-2);
+  width: max-content;
+  min-width: max-content;
+  max-width: calc(100vw - 0.5rem);
+  overflow-x: auto;
+  white-space: nowrap;
+  padding: 0.58rem 1.55rem 0.58rem 0.7rem;
+  border: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 38%, var(--mx-border));
+  border-left: 0;
+  border-bottom: 0;
+  border-radius: 0 0.95rem 0 0;
+  clip-path: polygon(0 0, calc(100% - 1.35rem) 0, 100% 100%, 0 100%);
+}
+app-shell[data-app-chrome] > .status-strip > * {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* Busy/upload feedback is a top-right overlay, tucked below the sticky header. */
+app-shell[data-app-chrome] > .busy-overlay {
+  top: calc(var(--mx-header-height, 4.5rem) + var(--mx-space-3)) !important;
+  right: var(--mx-space-4) !important;
+  bottom: auto !important;
+  left: auto !important;
+  width: min(350px, calc(100vw - 2rem));
+}
+
+/* Keep cache readouts from moving the Clear buttons when values grow/change. */
+.header-actions ram-gauge .ram-gauge-row {
+  display: grid;
+  grid-template-columns: 5.75rem 120px 7.8rem 4.25rem;
+  align-items: center;
+  gap: 0.45rem;
+}
+.header-actions ram-gauge .ram-gauge-text,
+.settings-cache-panel .ram-gauge-text {
+  min-width: 0;
+  width: 100%;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+}
+.header-actions ram-gauge .cache-clear,
+.settings-cache-panel .cache-clear {
+  justify-self: end;
+  min-width: 4.25rem;
+}
+.settings-cache-panel .ram-gauge-row {
+  grid-template-columns: 6.75rem minmax(8rem, 1fr) 10rem 4.25rem;
+  align-items: center;
+}
+
+@media (max-width: 860px) {
+  app-shell[data-app-chrome] > .status-strip {
+    left: 0 !important;
+    right: auto !important;
+    max-width: calc(100vw - 0.25rem);
+  }
+  app-shell[data-app-chrome] > .busy-overlay {
+    top: calc(var(--mx-header-height, 6.8rem) + var(--mx-space-3)) !important;
+    right: 0.75rem !important;
+    left: auto !important;
+    width: min(350px, calc(100vw - 1.5rem));
+  }
+  .settings-cache-panel .ram-gauge-row,
+  .header-actions ram-gauge .ram-gauge-row {
+    grid-template-columns: 1fr;
+  }
+  .settings-cache-panel .ram-gauge-text,
+  .header-actions ram-gauge .ram-gauge-text {
+    text-align: left;
+  }
+  .settings-cache-panel .cache-clear,
+  .header-actions ram-gauge .cache-clear {
+    justify-self: start;
+  }
 }

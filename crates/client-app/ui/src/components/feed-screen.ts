@@ -149,6 +149,7 @@ export class FeedScreen extends HTMLElement {
       card.setAttribute("file-type", e.file_type);
       card.setAttribute("version", String(e.version));
       card.setAttribute("role", "listitem");
+      card.setAttribute("return-route", this.mineOnly ? "mine" : "feed");
       if (this.mineOnly) card.setAttribute("mine-only", "");
       grid.appendChild(card);
     }
@@ -167,6 +168,7 @@ export class FeedScreen extends HTMLElement {
         card.setAttribute("file-id", h.file_id);
         card.setAttribute("file-type", h.file_type);
         card.setAttribute("role", "listitem");
+        card.setAttribute("return-route", this.mineOnly ? "mine" : "feed");
         if (this.mineOnly) card.setAttribute("mine-only", "");
         grid.appendChild(card);
       }

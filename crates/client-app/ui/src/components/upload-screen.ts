@@ -48,14 +48,23 @@ export class UploadScreen extends HTMLElement {
 
   connectedCallback() {
     this.innerHTML = `
-      <main id="main" tabindex="-1" aria-labelledby="up-h">
+      <main id="main" class="upload-main" tabindex="-1" aria-labelledby="up-h">
+        <p class="eyebrow">content staging</p>
         <h1 id="up-h">Upload a post</h1>
+        <p class="screen-subtitle">Stage locally, preview the result, then confirm when the encrypted package is ready.</p>
         <div class="up-mode" role="group" aria-label="Post type">
           <button id="up-mode-single" type="button" class="up-mode-btn active" aria-pressed="true">Single post</button>
           <button id="up-mode-bundle" type="button" class="up-mode-btn" aria-pressed="false">New bundle</button>
         </div>
-        <div id="up-single">
+        <section id="up-single" class="composer upload-composer" aria-labelledby="up-single-h">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">single composer</p>
+              <h2 id="up-single-h">Single post</h2>
+            </div>
+          </div>
         <form id="up-form">
+          <div class="up-meta">
           <label>Post kind
             <select name="mode">
               <option value="file">File (auto-detected)</option>
@@ -69,7 +78,7 @@ export class UploadScreen extends HTMLElement {
           </div>
           <label id="body-row" hidden>Post body
             <textarea name="content" rows="6"></textarea></label>
-          <div id="video-row" hidden>
+          <div id="video-row" class="video-options" hidden>
             <label>Resolution
               <select name="resolution">
                 <option value="original">Original (keep source)</option>
@@ -80,7 +89,7 @@ export class UploadScreen extends HTMLElement {
                 <option value="480">480p (SD)</option>
                 <option value="custom">Custom…</option>
               </select></label>
-            <div id="custom-res" hidden>
+            <div id="custom-res" class="custom-res" hidden>
               <label>Custom width
                 <input name="cw" type="number" min="2" max="7680" step="2" autocomplete="off" /></label>
               <label>Custom height
@@ -92,11 +101,14 @@ export class UploadScreen extends HTMLElement {
           </div>
           <label>Title <input name="title" type="text" required autocomplete="off" /></label>
           <label>Tags (comma-separated) <input name="tags" type="text" autocomplete="off" /></label>
-          <button type="submit">Preview</button>
+          </div>
+          <div class="bc-actionbar up-actionbar">
+            <button type="submit">Preview</button>
+          </div>
         </form>
         <p id="up-status" role="status" aria-live="polite"></p>
         <div id="up-preview"></div>
-        </div>
+        </section>
         <div id="up-bundle" hidden></div>
       </main>`;
     (this.querySelector("#main") as HTMLElement).focus();
@@ -410,7 +422,9 @@ export class UploadScreen extends HTMLElement {
     wrap.appendChild(dl);
 
     const confirm = document.createElement("button");
-    confirm.textContent = "Confirm upload";
+    confirm.type = "button";
+    confirm.className = "up-confirm-float";
+    confirm.textContent = "Upload";
     confirm.addEventListener("click", () => this.onConfirm(p.job_id, confirm));
     wrap.appendChild(confirm);
   }

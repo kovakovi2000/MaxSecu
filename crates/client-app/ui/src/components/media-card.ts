@@ -43,7 +43,20 @@ export class MediaCard extends HTMLElement {
       const isBundle = card.file_type === "bundle";
       const isGeneric = card.file_type === "generic";
       // A bundle links to the bundle screen; every other kind opens the viewer.
-      const href = cardHref(card.file_type, id, version);
+      const returnRoute = this.getAttribute("return-route");
+      const returnBundle = this.getAttribute("return-bundle-id");
+      const href = cardHref(
+        card.file_type,
+        id,
+        version,
+        returnBundle
+          ? { bundleId: returnBundle }
+          : returnRoute === "mine"
+          ? { route: "mine" }
+          : returnRoute === "feed"
+          ? { route: "feed" }
+          : undefined,
+      );
 
       const link = document.createElement("a");
       link.className = "media-card-link";
@@ -59,10 +72,13 @@ export class MediaCard extends HTMLElement {
       const badge = document.createElement("state-badge");
       badge.setAttribute("state", "verified");
       badge.setAttribute("label", `Verified · ${card.author_fp}`);
-      const type = document.createElement("span");
-      type.className = "type-chip";
-      type.textContent = card.file_type;
-      top.append(badge, type);
+      top.appendChild(badge);
+      if (!isBundle) {
+        const type = document.createElement("span");
+        type.className = "type-chip";
+        type.textContent = card.file_type;
+        top.appendChild(type);
+      }
       if (isBundle) {
         // A purple chip marking this card as a grouped post (routes to #/bundle).
         const bundleBadge = document.createElement("span");

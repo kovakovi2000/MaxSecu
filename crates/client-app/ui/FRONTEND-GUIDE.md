@@ -61,7 +61,7 @@ you must preserve everything in §3, §5, and §6.
 ```
 ui/
 ├── index.html              # shell HTML: <app-shell>, skip link, base inline CSS, CSP-safe
-├── styles.css              # design system: tokens, theme, a11y, layout (215 lines)
+├── styles.css              # design system: tokens, theme, a11y, layout (~1980 lines)
 ├── package.json            # scripts + pinned dev deps
 ├── tsconfig.json
 └── src/
@@ -70,31 +70,48 @@ ui/
     │   ├── rpc.ts          # call() / on()  — the ONLY Tauri bridge wrapper (§3)
     │   ├── router.ts       # hash router (#/route?query) → Route enum
     │   ├── serial.ts       # single-flight queue for backend calls (§4) — CRITICAL
+    │   ├── busy.ts         # global "backend busy / nav-locked" flag (transcode/upload guard)
     │   ├── viewer-open.ts  # viewer open orchestration (see §7 cautionary tale)
+    │   ├── card-view.ts, card-retry.ts # media-card decode state + bounded retry
+    │   ├── pool.ts         # bounded worker pool for parallel feed card decode
+    │   ├── bundle-view.ts  # bundle Gallery/Stacked view-mode state (remember-last)
+    │   ├── composer.ts     # bundle composer model (add/reorder/remove items)
+    │   ├── download.ts, download-name.ts # download orchestration + safe filename derivation
+    │   ├── confirm.ts      # promise-based confirm-dialog primitive
+    │   ├── transcode-opts.ts # resolution/bitrate menu model (mirrors Rust TranscodeOptions)
+    │   ├── gauge.ts        # RAM/cache gauge math (used/total → %, colour band)
+    │   ├── format.ts       # byte/duration/number formatting helpers
+    │   ├── trust-alarm.ts  # directory trust-alarm (split-view / first-contact) banner state
     │   ├── settings.ts     # settingsStore + applySettings + load/update (§5 theming)
     │   ├── settings-store.ts # reactive store backing settings
     │   ├── store.ts        # tiny reactive store primitive
     │   ├── session.ts      # current-username singleton
     │   ├── toast.ts        # toast pub/sub (success/info/error)
     │   ├── tasks.ts        # active-tasks counter (binds upload + fetch events)
-    │   ├── types.ts        # TS mirrors of every backend DTO (KEEP IN SYNC — §3)
-    │   ├── player.ts       # video A/V sync + ring buffer (player chrome logic)
-    │   └── webgl-yuv.ts    # WebGL YUV(I420)→RGB shader for the video surface
+    │   └── types.ts        # TS mirrors of every backend DTO (KEEP IN SYNC — §3)
+    │   # NB: video is now native <video> — the old player.ts / webgl-yuv.ts
+    │   #     (WebGL YUV→RGB sandbox surface) were retired with the decode sandbox.
     └── components/         # Web Components (one custom element each)
         ├── app-shell.ts        # top-level shell: header, nav rail, router, outlet
         ├── status-pill.ts      # connection-state indicator
         ├── connect-screen.ts   # unlock keystore + connect
-        ├── register-screen.ts  # registration-key enrollment panel (spec §5)
+        ├── register-screen.ts  # registration-key enrollment panel
         ├── recovery-login-screen.ts # cold recovery challenge-response login
         ├── admin-screen.ts     # registration-key minting (admin only)
         ├── feed-screen.ts      # the feed / library grid (also #/mine variant)
-        ├── media-card.ts       # one feed item (self-decrypting card → "View")
-        ├── media-viewer.ts     # one opened post (image / blog text / video player)
-        ├── video-player.ts     # sandboxed-video playback chrome (WebGL canvas)
-        ├── upload-screen.ts    # compose + preview + confirm an upload
+        ├── media-card.ts       # one feed item (self-decrypting card → View/Download/Delete; bundle badge)
+        ├── media-viewer.ts     # one opened post (image / blog text / native video)
+        ├── video-player.ts     # native <video> playback chrome (Media Chrome controls)
+        ├── video-src.ts        # builds the stream:// source URL for the native player
+        ├── bundle-screen.ts    # opened bundle: Gallery ⇄ Stacked toggle + Download-all
+        ├── bundle-composer.ts  # compose a bundle (add/reorder/remove/preview/post)
+        ├── upload-screen.ts    # compose + preview + confirm an upload (image/blog/video)
         ├── upload-tray.ts      # persistent active-uploads tray (progress/retry)
-        ├── settings-screen.ts  # full settings (appearance, a11y, account, RAM)
-        ├── ram-gauge.ts        # header RAM-usage rainbow meter
+        ├── share-dialog.ts     # reshare modal: tickable contacts checklist + manual input
+        ├── share-tray.ts       # persistent active-reshare tray
+        ├── trust-alarm.ts      # directory trust-alarm banner (split-view / first-contact)
+        ├── settings-screen.ts  # full settings (appearance, a11y, account, privacy, RAM/cache, concurrency)
+        ├── ram-gauge.ts        # header RAM-usage meter
         ├── toast-host.ts       # renders toasts (assertive/polite live regions)
         ├── skeleton-card.ts    # shimmer placeholder while loading
         ├── state-badge.ts      # non-color-only status chip
@@ -121,42 +138,123 @@ export function on<T>(event: string, cb: (p: T) => void): Promise<() => void> {
 }
 ```
 
-**Tauri arg convention:** an argument object's keys are the command's Rust parameter
-names. Commands whose Rust signature is `(req: SomeRequest, …)` are invoked as
-`call("cmd", { req: { …fields… } })`. Commands with scalar params (e.g.
-`(file_id: String, pts_ms: u64)`) are invoked as `call("cmd", { file_id, pts_ms })`.
-All field names are **snake_case**; all enum string values are **kebab-case**.
+**Tauri arg convention (IMPORTANT — two different casings):**
+- **Top-level scalar params are camelCase in JS.** Tauri v2 auto-converts the JS key
+  to the snake_case Rust parameter, so a Rust signature `(file_id: String, pts_ms: u64)`
+  is invoked as `call("cmd", { fileId, ptsMs })` — **not** `{ file_id, pts_ms }` (that
+  silently fails to bind and the call rejects). Real examples: `open_video` → `{ fileId }`,
+  `cache_stats` → `{ mediaCapBytes, thumbCapBytes }`, `save_file` → `{ defaultName }`.
+- **Struct params keep snake_case fields.** A signature `(req: SomeRequest, …)` is invoked
+  as `call("cmd", { req: { …fields… } })`; the wrapper key (`req` / `settings`) is one word,
+  and the struct's fields are serde-serialized under their **snake_case** Rust names.
+- Enum string values are **kebab-case**.
+
+> In the tables below, scalar keys are written in snake_case for readability, but at the
+> call site a scalar key must be **camelCased** (per the first bullet). `req: {…}` field
+> names stay snake_case as shown.
 
 ### 3.1 Commands
+
+> This table is the authoritative **list** of commands (matches `main.rs`'s
+> `generate_handler!`). For the exact field shapes of every `req: …` payload and
+> return DTO, the **single source of truth is `src/core/types.ts`** (and, behind it,
+> each command's Rust signature). A UI rework does **not** change any of these.
+
+**Session / connection**
 
 | Command | Invoke args | Returns | Used by |
 |---|---|---|---|
 | `connect` | `{ req: { server, username, use_tor } }` | `{ server_id }` | connect-screen |
 | `unlock_keystore` | `{ password }` | `void` | connect-screen |
-| `logout` | `{}` | `void` | (header / settings) |
+| `logout` | `{}` | `void` | header / settings |
+| `startup_mode` | `{}` | `StartupMode` (`normal\|register\|recovery`) | app-shell boot |
+
+**Enrollment / recovery / admin**
+
+| Command | Invoke args | Returns | Used by |
+|---|---|---|---|
+| `register_with_key` | `{ req: RegisterRequest }` | `RegisteredDto` | register-screen |
+| `request_recovery_challenge` | `{ passphrase }` | `RecoveryChallengeDto` | recovery-login-screen |
+| `answer_recovery_challenge` | `{}` | `RecoveryLoginDto` | recovery-login-screen |
+| `mint_registration_key` | `{ destPath }` | `string` (saved path; the key is written to that file, never returned) | admin-screen |
+
+**Browse / view**
+
+| Command | Invoke args | Returns | Used by |
+|---|---|---|---|
 | `list_feed` | `{ req: { filter, sort, limit? } }` | `FeedEntry[]` | feed-screen |
 | `decrypt_card` | `{ req: { file_id, version? } }` | `Card` | media-card |
 | `open_content` | `{ req: { file_id, version? } }` | `OpenedContent` | media-viewer |
+| `open_bundle` | `{ req: { file_id, version? } }` | `BundleView` | bundle-screen |
 | `search_local` | `{ req: { query } }` | `SearchHit[]` | feed-screen |
-| `pick_file` | `{ extensions: string[] }` | `string \| null` (chosen path, or null if cancelled) | upload-screen (image **and** video file picks) |
-| `register_with_key` | `{ req: { username, passphrase } }` | `RegisteredDto` | register-screen |
-| `list_pending` | `{}` | `PendingUserDto[]` | admin-screen |
-| `issue_voucher` | `{}` | `{ code }` | admin-screen |
-| `request_approval` | `{ req: { user_id } }` | `CeremonyWorkItem` | admin-screen |
+
+**Download / delete / share**
+
+| Command | Invoke args | Returns | Used by |
+|---|---|---|---|
+| `download_content` | `{ req: DownloadRequest }` | `string` (saved path) | media-card / viewer / bundle |
+| `delete_content` | `{ req: DeleteRequest }` | `void` | media-card (owner-only) |
+| `reshare_file` | `{ req: ReshareRequest }` | `ReshareOutcomeDto[]` | share-dialog |
+| `reshare_bundle` | `{ req: ReshareRequest }` | `ReshareOutcomeDto[]` | share-dialog |
+| `resolve_recipient` | `{ req: ResolveRecipientRequest }` | `ResolvedRecipientDto` | share-dialog |
+| `list_file_recipients` | `{ file_id }` | `string[]` | share-dialog |
+| `list_contacts` | `{}` | `ContactDto[]` | share-dialog |
+
+**File pickers**
+
+| Command | Invoke args | Returns | Used by |
+|---|---|---|---|
+| `pick_file` | `{ extensions: string[] }` | `string \| null` | upload-screen (image **and** video picks) |
+| `pick_files` | `{ extensions: string[] }` | `string[]` | bundle-composer |
+| `save_file` | `{ default_name }` | `string \| null` | download flows |
+| `pick_folder` | `{}` | `string \| null` | dest picking |
+
+**Upload (single + bundle)**
+
+| Command | Invoke args | Returns | Used by |
+|---|---|---|---|
 | `stage_upload` | `{ req: StageUploadRequest }` | `UploadPreview` | upload-screen |
+| `stage_bundle` | `{ req: StageBundleRequest }` | `BundlePreview` | bundle-composer |
 | `confirm_upload` | `{ req: { job_id } }` | `void` (emits `upload-state`) | upload-screen |
+| `confirm_bundle` | `{ req: { job_id } }` | `string` (bundle id) | bundle-composer |
+| `retry_confirm` | `{ req: { job_id } }` | `void` | upload-tray |
 | `cancel_upload` | `{ req: { job_id } }` | `void` | upload-tray |
+| `cancel_bundle` | `{ req: { job_id } }` | `void` | bundle-composer |
+| `cancel_video_prepare` | `{ req: { job_id } }` | `void` | upload-screen |
+| `resume_upload` | `{ req: { job_id } }` | `void` | upload-tray |
 | `upload_jobs` | `{}` | `UploadJobView[]` | upload-tray |
+| `list_pending_uploads` | `{}` | `PendingUploadDto[]` | upload-tray |
+| `dismiss_pending_upload` | `{ req: { job_id } }` | `void` | upload-tray |
+
+**Settings / account**
+
+| Command | Invoke args | Returns | Used by |
+|---|---|---|---|
 | `get_settings` | `{}` | `Settings` | settings, boot |
-| `set_settings` | `{ settings: Settings }` | `Settings` (normalized) | settings/quick |
+| `set_settings` | `{ settings: Settings }` | `Settings` (normalized) | settings-screen |
 | `change_password` | `{ req: { old_password, new_password } }` | `void` | settings-screen |
 | `export_keystore` | `{ req: { dest_path } }` | `void` | settings-screen |
-| `ram_limits` | `{}` | `{ default_mb, min_mb, max_mb }` | settings/quick |
-| `open_video` | `{ file_id }` | `void` (streams via events) | video-player |
-| `video_seek` | `{ file_id, pts_ms }` | `void` | video-player |
-| `video_set_volume` | `{ file_id, gain }` | `void` | video-player |
+| `system_cores` | `{}` | `number` | settings-screen (concurrency) |
+
+**RAM / cache**
+
+| Command | Invoke args | Returns | Used by |
+|---|---|---|---|
+| `ram_limits` | `{}` | `{ default_mb, min_mb, max_mb }` | settings |
+| `memory_stats` | `{}` | `MemoryStats` | ram-gauge |
+| `cache_stats` | `{ media_cap_bytes, thumb_cap_bytes }` | `CacheStats` | settings (gauges) |
+| `clear_media_cache` | `{}` | `void` | settings |
+| `clear_thumb_cache` | `{}` | `void` | settings |
+
+**Video (native `<video>`)**
+
+| Command | Invoke args | Returns | Used by |
+|---|---|---|---|
+| `open_video` | `{ file_id }` | `void` (starts the stream; native element then seeks/plays) | video-player |
 | `cancel_video` | `{ file_id }` | `void` | video-player |
-| `preview_video` | `{ job_id }` | `void` (streams via events) | upload-screen |
+
+> Native `<video>` handles seek/volume/scrubbing itself, so the old
+> `video_seek` / `video_set_volume` / `preview_video` commands are **gone**.
 
 `StageUploadRequest = { kind: "image"|"blog"|"video", path?, content?, options?, title, tags? }`
 (image → `path`; blog → `content`; video → `path` (a REAL video file path) +
@@ -186,12 +284,16 @@ first. Subscribe and switch on it.
 |---|---|
 | `maxsecu://connection-state` | `{ state }` — `idle\|resolving\|tls-handshake\|channel-binding\|connected\|reconnecting\|disconnected\|degraded` |
 | `maxsecu://auth-state` | `{ state }` — `logged-out\|unlocking-keystore\|authenticating\|logged-in\|session-expired\|reauthenticating` |
-| `maxsecu://account-state` | `{ state }` — `unknown\|pending\|active` |
 | `maxsecu://fetch-state` | `{ phase, file_id, … }` — `fetching{fetched,total}\|verifying\|decrypting\|ready\|failed{code}` |
 | `maxsecu://upload-state` | `{ phase, job_id, … }` — `encrypting\|staging\|uploading{done,total}\|finalizing\|done{file_id}\|failed{code}` |
+| `maxsecu://bundle-stage` | `{ phase, … }` — per-member bundle staging progress |
+| `maxsecu://reshare-state` | `{ phase, … }` — per-recipient reshare progress |
 | `maxsecu://player-state` | `{ phase, … }` — `buffering\|playing\|gap{skipped}\|stalled\|error{code}\|codec-unavailable` |
-| `maxsecu://video-frame` | `I420FrameDto { width, height, pts_ms, y_b64, u_b64, v_b64 }` |
-| `maxsecu://video-audio` | `PcmDto { channels, sample_rate, pts_ms, samples_b64 }` |
+| `maxsecu://video-prepare` | `{ phase, … }` — local transcode/prepare progress before an upload |
+
+> Because video is now a **native `<video>`** element, the decoded-frame stream is
+> gone: the old `maxsecu://video-frame` / `maxsecu://video-audio` events (raw I420 /
+> PCM) and `maxsecu://account-state` are **retired**. Don't reintroduce listeners for them.
 
 These names are defined in the Rust source as constants (`EVT_*`). **Use the exact
 strings.** The full TS shapes live in `src/core/types.ts` — keep that file in sync if
@@ -288,7 +390,7 @@ Theme and accessibility preferences are driven by **attributes on `<html>`**, se
 
 | Attribute | Values | Meaning |
 |---|---|---|
-| `data-theme` | `dark` (default) \| `light` | color scheme. `dark` is baked into `index.html` to avoid a flash. |
+| `data-theme` | `tech` (default) \| `cheese` \| `pottery` | frontend visual theme preset. `tech` is baked into `index.html` to avoid a flash. |
 | `data-reduced-motion` | present/absent | when present, motion/animation must be zeroed. `styles.css` also honors `@media (prefers-reduced-motion)`. |
 | `data-high-contrast` | present/absent | high‑contrast adjustments |
 | `data-text-size` | `normal` \| `large` \| `larger` | scales the **root font size** so the whole UI scales (use `rem`). |
@@ -306,11 +408,13 @@ wholesale — just keep keying off the four `data-*` attributes above and keep u
 
 A couple of layout facts the current UI relies on (preserve the behavior, restyle
 freely):
-- The ⚡ quick‑settings button is **hidden on the Settings screen** (`r === "settings"`
-  toggles `[hidden]` on it). It exposes **Theme + RAM only**.
-- A persistent **upload tray** lives in the header (outside the routed outlet) so
-  upload progress survives navigation.
+- The header carries a standalone **`<ram-gauge>`** meter (the old ⚡ quick‑settings
+  popover was removed — full appearance/RAM controls now live only on the Settings screen).
+- A persistent **upload tray** *and* a **share tray** live in the header (outside the
+  routed outlet) so upload/reshare progress survives navigation.
 - There is a **status strip** with the connection pill + an active‑tasks count.
+- A **trust‑alarm** banner can appear (directory split‑view / first‑contact) — it must
+  read as a high‑priority, non‑color‑only alert.
 
 ---
 
@@ -376,8 +480,10 @@ server at **`localhost:8443`** (its TLS cert is for `localhost`, not `127.0.0.1`
 Hash‑based, parsed by `core/router.ts` (`#/route?query`; the query is preserved in
 `location.hash` for the screen to read, e.g. the viewer reads `?id=…&v=…`).
 
-`connect` · `feed` · `mine` (feed filtered to my uploads) · `bootstrap` · `pending` ·
-`admin` · `viewer` · `upload` · `settings`. Unknown → `connect`.
+`connect` · `feed` · `mine` (feed filtered to my uploads) · `register` · `recovery` ·
+`admin` · `viewer` · `bundle` · `upload` · `settings`. Unknown → `connect`.
+(The old `bootstrap` / `pending` routes were retired with the voucher/pending
+enrollment flow; enrollment is now `register` + admin `mint_registration_key`.)
 
 The shell (`app-shell.ts`) maps each route to a component in the `#outlet`, sets the
 active nav state, moves focus to `#main`, and toggles the ⚡ button's visibility.

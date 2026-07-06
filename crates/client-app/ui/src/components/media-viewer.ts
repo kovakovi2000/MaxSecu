@@ -74,7 +74,7 @@ export class MediaViewer extends HTMLElement {
     } else {
       this.innerHTML = `
         <main id="main" class="viewer-main" tabindex="-1" aria-labelledby="vw-h">
-          <a href="#/feed" class="back-link">← Back to feed</a>
+          <a id="vw-back" href="#/feed" class="back-link">← Back to feed</a>
           <section class="viewer-frame" aria-label="Opened post">
             <div class="viewer-head">
               <p class="eyebrow">decrypted payload</p>
@@ -88,6 +88,10 @@ export class MediaViewer extends HTMLElement {
           </section>
         </main>
         <share-dialog id="vw-share-dialog"></share-dialog>`;
+      const back = backTarget(new URLSearchParams(location.hash.split("?")[1] ?? ""));
+      const backLink = this.querySelector("#vw-back") as HTMLAnchorElement;
+      backLink.href = back.href;
+      backLink.textContent = back.label;
       (this.querySelector("#main") as HTMLElement).focus();
     }
 
@@ -261,6 +265,17 @@ export class MediaViewer extends HTMLElement {
       toast("error", viewerErr(x));
     }
   }
+}
+
+function backTarget(params: URLSearchParams): { href: string; label: string } {
+  const from = params.get("from");
+  if (from === "mine") return { href: "#/mine", label: "← Back to My Content" };
+  if (from === "bundle") {
+    const bundle = params.get("bundle") ?? "";
+    const href = bundle ? `#/bundle?id=${encodeURIComponent(bundle)}` : "#/feed";
+    return { href, label: "← Back to bundle" };
+  }
+  return { href: "#/feed", label: "← Back to feed" };
 }
 
 function readBlogText(c: OpenedContent): string | null {

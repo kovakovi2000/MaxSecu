@@ -21,6 +21,8 @@ const screens = [
   "src/components/upload-screen.ts",
   "src/components/settings-screen.ts",
   "src/components/admin-screen.ts",
+  "src/components/register-screen.ts",
+  "src/components/recovery-login-screen.ts",
 ];
 
 for (const f of screens) {

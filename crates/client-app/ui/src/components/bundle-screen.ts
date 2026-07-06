@@ -50,24 +50,33 @@ export class BundleScreen extends HTMLElement {
   connectedCallback() {
     const params = new URLSearchParams(location.hash.split("?")[1] ?? "");
     const id = params.get("id") ?? "";
+    const back = backTarget(params);
 
     this.innerHTML = `
-      <main id="main" tabindex="-1" aria-labelledby="bd-h">
-        <a href="#/feed" class="back-link">← Back to feed</a>
+      <main id="main" class="bundle-main" tabindex="-1" aria-labelledby="bd-h">
+        <a id="bd-back" href="#/feed" class="back-link">← Back to feed</a>
         <div class="bundle-head">
-          <h1 id="bd-h">Bundle</h1>
-          <p id="bd-status" role="status" aria-live="polite">Loading…</p>
-          <div class="bundle-toggle" role="group" aria-label="View mode">
-            <button id="bd-gallery" type="button" class="bundle-mode">Gallery</button>
-            <button id="bd-stacked" type="button" class="bundle-mode">Stacked</button>
+          <div class="screen-title">
+            <p class="eyebrow">bundle viewer</p>
+            <h1 id="bd-h">Bundle</h1>
+            <p id="bd-status" role="status" aria-live="polite">Loading…</p>
           </div>
-          <button id="bd-download-all" type="button" class="secondary" disabled>Download all</button>
-          <button id="bd-share" type="button" class="secondary" hidden>Share…</button>
-          <button id="bd-delete" type="button" class="danger" hidden>Delete bundle</button>
+          <div class="bundle-toolbar" aria-label="Bundle actions">
+            <div class="bundle-toggle" role="group" aria-label="View mode">
+              <button id="bd-gallery" type="button" class="bundle-mode">Gallery</button>
+              <button id="bd-stacked" type="button" class="bundle-mode">Stacked</button>
+            </div>
+            <button id="bd-download-all" type="button" class="secondary" disabled>Download all</button>
+            <button id="bd-share" type="button" class="secondary" hidden>Share…</button>
+            <button id="bd-delete" type="button" class="danger" hidden>Delete bundle</button>
+          </div>
         </div>
         <div id="bd-members"></div>
       </main>
       <share-dialog id="bd-share-dialog"></share-dialog>`;
+    const backLink = this.querySelector("#bd-back") as HTMLAnchorElement;
+    backLink.href = back.href;
+    backLink.textContent = back.label;
     (this.querySelector("#main") as HTMLElement).focus();
 
     this.syncToggle();
@@ -264,6 +273,7 @@ export class BundleScreen extends HTMLElement {
         card.setAttribute("file-id", m.file_id);
         card.setAttribute("file-type", m.file_type);
         card.setAttribute("role", "listitem");
+        if (this.view) card.setAttribute("return-bundle-id", this.view.file_id);
         container.appendChild(card);
       } else {
         // Stacked: each member is fully opened inline via an embedded
@@ -279,6 +289,12 @@ export class BundleScreen extends HTMLElement {
       }
     }
   }
+}
+
+function backTarget(params: URLSearchParams): { href: string; label: string } {
+  const from = params.get("from");
+  if (from === "mine") return { href: "#/mine", label: "← Back to My Content" };
+  return { href: "#/feed", label: "← Back to feed" };
 }
 
 function bundleErr(x: unknown): string {

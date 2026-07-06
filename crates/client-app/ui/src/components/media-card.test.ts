@@ -27,6 +27,15 @@ test("cardHref percent-encodes the id", () => {
   assert.equal(cardHref("image", "a b", 1), "#/viewer?id=a%20b&v=1");
 });
 
+test("cardHref carries contextual return targets", () => {
+  assert.equal(cardHref("image", "ab12", undefined, { route: "mine" }), "#/viewer?id=ab12&from=mine");
+  assert.equal(cardHref("bundle", "bd34", undefined, { route: "mine" }), "#/bundle?id=bd34&from=mine");
+  assert.equal(
+    cardHref("video", "m1", 2, { bundleId: "bundle 9" }),
+    "#/viewer?id=m1&v=2&from=bundle&bundle=bundle%209",
+  );
+});
+
 // --- countsLabel: the bundle member tally strip ----------------------------
 
 test("countsLabel omits zero categories", () => {

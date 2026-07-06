@@ -14,13 +14,16 @@ import type { RegisteredDto } from "../core/types.ts";
 export class RegisterScreen extends HTMLElement {
   connectedCallback() {
     this.innerHTML = `
-      <main id="main" tabindex="-1" aria-labelledby="rg-h" aria-describedby="rg-status">
-        <h1 id="rg-h">Create your account</h1>
-        <p>This device holds a single-use <strong>registration key</strong>. Choose a
-           username and a strong passphrase to protect your local keystore. Your
-           encryption keys are generated on this device and never leave it; the
-           registration key is used once and then destroyed.</p>
-        <form id="rg-f">
+      <main id="main" class="auth-main register-main" tabindex="-1" aria-labelledby="rg-h" aria-describedby="rg-status">
+        <section class="auth-stage" aria-label="Registration gate">
+          <div class="auth-copy">
+            <p class="eyebrow">one-time enrollment</p>
+            <h1 id="rg-h">Create your account</h1>
+            <p>This device holds a single-use <strong>registration key</strong>. Choose a
+              username and a strong passphrase to protect your local keystore.</p>
+            <p class="auth-note">Your encryption keys are generated on this device and never leave it; the registration key is used once and then destroyed.</p>
+          </div>
+        <form id="rg-f" class="auth-card">
           <label>Username
             <input name="username" required autocomplete="username" /></label>
           <label>Keystore passphrase
@@ -28,7 +31,8 @@ export class RegisterScreen extends HTMLElement {
           <button type="submit" id="rg-submit">Create account</button>
           <p id="rg-status" role="status" aria-live="polite">Enter a username and passphrase.</p>
           <p id="rg-err" role="alert"></p>
-        </form>`;
+        </form>
+        </section>`;
     (this.querySelector("#main") as HTMLElement).focus();
 
     const form = this.querySelector("#rg-f") as HTMLFormElement;

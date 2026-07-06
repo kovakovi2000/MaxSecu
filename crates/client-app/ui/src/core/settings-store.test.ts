@@ -24,8 +24,8 @@ test("patch merges a nested section and notifies", () => {
   const s = new SettingsStore(base());
   let seen: Settings | null = null;
   s.subscribe((v) => (seen = v));
-  s.patchLocal({ appearance: { theme: "light" } });
-  assert.equal(seen!.appearance.theme, "light");
+  s.patchLocal({ appearance: { theme: "dark" } });
+  assert.equal(seen!.appearance.theme, "dark");
   assert.equal(seen!.a11y.text_size, "normal", "other sections preserved");
 });
 
@@ -34,6 +34,6 @@ test("unsubscribe stops notifications", () => {
   let count = 0;
   const off = s.subscribe(() => count++);
   off();
-  s.patchLocal({ appearance: { theme: "light" } });
+  s.patchLocal({ appearance: { theme: "dark" } });
   assert.equal(count, 1, "only the immediate call fired");
 });

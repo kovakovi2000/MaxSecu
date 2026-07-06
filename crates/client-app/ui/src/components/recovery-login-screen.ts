@@ -13,12 +13,15 @@ import type { RecoveryChallengeDto, RecoveryLoginDto } from "../core/types.ts";
 export class RecoveryLoginScreen extends HTMLElement {
   connectedCallback() {
     this.innerHTML = `
-      <main id="main" tabindex="-1" aria-labelledby="rl-h" aria-describedby="rl-status">
-        <h1 id="rl-h">Recovery sign-in</h1>
-        <p>Sign in with the cold <strong>recovery key</strong> to establish an
-           admin server session. This grants admin actions only — it does
-           <strong>not</strong> unlock content decryption.</p>
-        <form id="rl-f">
+      <main id="main" class="auth-main recovery-main" tabindex="-1" aria-labelledby="rl-h" aria-describedby="rl-status">
+        <section class="auth-stage" aria-label="Recovery gate">
+          <div class="auth-copy">
+            <p class="eyebrow">cold-key recovery</p>
+            <h1 id="rl-h">Recovery sign-in</h1>
+            <p>Sign in with the cold <strong>recovery key</strong> to establish an admin server session.</p>
+            <p class="auth-note">This grants admin actions only — it does <strong>not</strong> unlock content decryption.</p>
+          </div>
+        <form id="rl-f" class="auth-card">
           <label>Recovery key passphrase
             <input name="passphrase" type="password" required autocomplete="off" /></label>
           <button type="submit" id="rl-request">Request Challenge</button>
@@ -26,6 +29,7 @@ export class RecoveryLoginScreen extends HTMLElement {
           <p id="rl-status" role="status" aria-live="polite">Awaiting the recovery passphrase.</p>
           <p id="rl-err" role="alert"></p>
         </form>
+        </section>
       </main>`;
     (this.querySelector("#main") as HTMLElement).focus();
 

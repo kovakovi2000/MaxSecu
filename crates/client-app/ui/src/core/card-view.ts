@@ -13,10 +13,22 @@ export interface MemberCounts {
 
 // The route a feed card links to. A bundle card opens the bundle screen
 // (#/bundle?id=…); every other kind opens the viewer (#/viewer?id=…[&v=…]).
-export function cardHref(file_type: string, id: string, version?: number): string {
-  const enc = encodeURIComponent(id);
-  if (file_type === "bundle") return `#/bundle?id=${enc}`;
-  return version !== undefined ? `#/viewer?id=${enc}&v=${version}` : `#/viewer?id=${enc}`;
+export interface CardReturnTarget {
+  route?: "feed" | "mine";
+  bundleId?: string;
+}
+
+export function cardHref(file_type: string, id: string, version?: number, from?: CardReturnTarget): string {
+  const parts = [`id=${encodeURIComponent(id)}`];
+  if (file_type !== "bundle" && version !== undefined) parts.push(`v=${encodeURIComponent(String(version))}`);
+  if (from?.bundleId) {
+    parts.push("from=bundle", `bundle=${encodeURIComponent(from.bundleId)}`);
+  } else if (from?.route === "mine") {
+    parts.push("from=mine");
+  } else if (from?.route === "feed") {
+    parts.push("from=feed");
+  }
+  return file_type === "bundle" ? `#/bundle?${parts.join("&")}` : `#/viewer?${parts.join("&")}`;
 }
 
 // A compact "VID 1 · IMG 4 · TXT 1 · FILE 0" strip for a bundle's member tally,
