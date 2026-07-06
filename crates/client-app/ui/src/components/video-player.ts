@@ -34,6 +34,11 @@ export class VideoPlayer extends HTMLElement {
   // True when the native <video> + Media Chrome path is active.
   private native = false;
 
+  // True when mounted inside an embedded (Stacked bundle-member) media-viewer.
+  // Embedded players must not steal focus — each member that loads would
+  // otherwise scroll-jump the page. Set from the `embedded` attribute on mount.
+  private embedded = false;
+
   // file-id may be supplied as a property (media-viewer sets it) or attribute.
   set fileId(v: string) {
     this._fileId = v;
@@ -89,7 +94,13 @@ export class VideoPlayer extends HTMLElement {
           </media-control-bar>
         </media-controller>
       </section>`;
-    (this.querySelector("#vp-region") as HTMLElement).focus();
+    // Routed viewer: move focus to the media region (WCAG 2.4.3). Embedded
+    // (Stacked bundle) instances must NOT — a loading member grabbing focus
+    // scroll-jumps the page.
+    this.embedded = this.hasAttribute("embedded");
+    if (!this.embedded) {
+      (this.querySelector("#vp-region") as HTMLElement).focus();
+    }
     const video = this.querySelector("video") as HTMLVideoElement;
     video.addEventListener("error", () => {
       const s = this.querySelector("#vp-status") as HTMLElement | null;

@@ -195,6 +195,8 @@ export class MediaViewer extends HTMLElement {
       const vp = document.createElement("video-player");
       vp.setAttribute("file-id", this.reqId);
       (vp as unknown as VideoPlayer).fileId = this.reqId;
+      // Embedded (Stacked bundle) viewers must not let their player steal focus.
+      if (this.embedded) vp.setAttribute("embedded", "");
       body.appendChild(vp);
     } else if (blogText !== null) {
       const article = document.createElement("article");
