@@ -29,13 +29,21 @@ test("FRONTENDS lists exactly the three ids in order", () => {
 import { readFileSync } from "node:fs";
 
 const html = readFileSync("index.html", "utf8");
+const boot = readFileSync("boot.js", "utf8");
 
 test("index.html has a swappable #frontend-css stylesheet link defaulting to styles.css", () => {
   assert.match(html, /<link[^>]*id="frontend-css"[^>]*href="styles\.css"|<link[^>]*href="styles\.css"[^>]*id="frontend-css"/);
 });
 
-test("index.html defaults data-frontend and boots the persisted frontend pre-paint", () => {
+test("index.html defaults data-frontend and loads the external boot script (CSP-safe, no inline JS)", () => {
   assert.match(html, /data-frontend="default"/);
-  assert.match(html, /maxsecu\.frontend/);
   assert.doesNotMatch(html, /data-theme="tech"/);
+  assert.match(html, /<script[^>]*src="boot\.js"/);
+  assert.doesNotMatch(html, /<script>[\s\S]*maxsecu\.frontend/); // no inline JS
+});
+
+test("boot.js applies the persisted frontend pre-paint, mirroring the stylesheet map", () => {
+  assert.match(boot, /maxsecu\.frontend/);
+  assert.match(boot, /styles\.pizza\.css/);
+  assert.match(boot, /styles\.slot3\.css/);
 });

@@ -5,21 +5,7 @@
     <title>MaxSecu</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link id="frontend-css" rel="stylesheet" href="styles.css" />
-    <script>
-      /* Apply the persisted frontend before first paint (no flash). Mirrors
-         STYLESHEETS in src/core/frontends.ts. */
-      (function () {
-        try {
-          var f = localStorage.getItem("maxsecu.frontend");
-          var map = { "default": "styles.css", "pizza": "styles.pizza.css", "slot3": "styles.slot3.css" };
-          if (f && map[f]) {
-            document.documentElement.setAttribute("data-frontend", f);
-            var l = document.getElementById("frontend-css");
-            if (l) l.setAttribute("href", map[f]);
-          }
-        } catch (e) { /* storage unavailable — keep default */ }
-      })();
-    </script>
+    <script src="boot.js"></script>
     <style>
       /* Minimal shell-critical CSS only. Full design lives in styles.css. */
       * { box-sizing: border-box; }
