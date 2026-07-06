@@ -508,7 +508,7 @@ active nav state, moves focus to `#main`, and toggles the ⚡ button's visibilit
 
 ---
 
-## 9. Multi-frontend architecture (the drop-in contract)
+## 11. Multi-frontend architecture (the drop-in contract)
 
 The client hosts **three switchable frontends** over ONE shared component tree and
 backend. A frontend is a named visual skin with three parts:

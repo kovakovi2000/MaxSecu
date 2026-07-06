@@ -2,7 +2,7 @@
 
 > **Paste-ready task for an external frontend run.** The *rules* live in
 > **`FRONTEND-GUIDE.md`** (same folder) — read it in full first. Its §3 (backend
-> contract), §4 (serial queue), §5 (security & a11y), §6 (theming), and the new §9
+> contract), §4 (serial queue), §5 (security & a11y), §6 (theming), and the new §11
 > (multi-frontend architecture / drop-in contract) are **binding**.
 
 ## Mission
@@ -12,7 +12,7 @@ skin for the existing MaxSecu client. You are **reskinning**, not rebuilding. Th
 its components, its layout, and the **spacing of every element must stay identical** —
 you change only colour, texture, imagery, borders, shadows, gradients, and decoration.
 
-## Deliverables (exactly two files — see FRONTEND-GUIDE §9)
+## Deliverables (exactly two files — see FRONTEND-GUIDE §11)
 
 1. **`styles.pizza.css`** — a COMPLETE standalone stylesheet. Start from a copy of
    `styles.css` and restyle it. Keep every `--mx-*` spacing/radius/type token and the
@@ -20,7 +20,7 @@ you change only colour, texture, imagery, borders, shadows, gradients, and decor
    pizza texture (golden crust, tomato-red accents, molten-cheese gradients, drip
    edges via pseudo-elements). Do not alter layout or spacing.
 2. **`src/frontends/pizza/deco.ts`** — implement `DecoModule` (`mount`/`unmount`,
-   idempotent; see §9). On the login screens, inject the supplied **`assets/pizza.png`**
+   idempotent; see §11). On the login screens, inject the supplied **`assets/pizza.png`**
    into `[data-deco-slot="login"]` as the hero image, plus optional cheese-drip layers
    into `[data-deco-slot="app-bg"]`. Remove all injected nodes in `unmount`.
 
