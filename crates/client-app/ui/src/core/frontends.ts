@@ -9,7 +9,11 @@ import { pizzaDeco } from "../frontends/pizza/deco.ts";
 export type FrontendId = "default" | "pizza" | "slot3";
 
 export interface DecoModule {
+  // Called once on apply AND again after every route render — MUST be idempotent
+  // (guard against injecting your decoration twice). Safe no-op if your slot is
+  // absent on the current screen.
   mount(doc: Document): void;
+  // Remove every node mount() injected. Called when switching away from this frontend.
   unmount(doc: Document): void;
 }
 
