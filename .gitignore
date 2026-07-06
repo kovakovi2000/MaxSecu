@@ -46,3 +46,12 @@ target-repro-b/
 # the build fails closed (or emits a labelled test pin under `--features
 # unpinned-dev`). See `crates/client-app/src/recovery_pin.rs`.
 /crates/client-app/recovery_pin.bin
+
+# Root-level demo/runtime artifacts written by running the portable server +
+# client (rerun-demo). These are per-run secrets and staging dirs — never source,
+# never committed. The recovery/enrollment blobs are live trust material.
+/recovery_key.blob
+/recovery_pin.bin
+/register.key
+/.server-fresh/
+/client/
