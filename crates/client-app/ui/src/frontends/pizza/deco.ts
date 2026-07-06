@@ -2,6 +2,38 @@ import type { DecoModule } from "../../core/frontends.ts";
 
 const DECORATION_ATTR = "data-pizza-deco";
 const ORIGINAL_TEXT_ATTR = "data-pizza-original-text";
+const ORIGINAL_BODY_MARGIN_BOTTOM_ATTR = "data-pizza-original-body-margin-bottom";
+const ORIGINAL_BODY_PADDING_BOTTOM_ATTR = "data-pizza-original-body-padding-bottom";
+
+function clearBodyEndGap(doc: Document): void {
+  const body = doc.body;
+  if (!body) return;
+  if (!body.hasAttribute(ORIGINAL_BODY_MARGIN_BOTTOM_ATTR)) {
+    body.setAttribute(ORIGINAL_BODY_MARGIN_BOTTOM_ATTR, body.style.getPropertyValue("margin-bottom"));
+  }
+  if (!body.hasAttribute(ORIGINAL_BODY_PADDING_BOTTOM_ATTR)) {
+    body.setAttribute(ORIGINAL_BODY_PADDING_BOTTOM_ATTR, body.style.getPropertyValue("padding-bottom"));
+  }
+  body.style.setProperty("margin-bottom", "0px", "important");
+  body.style.setProperty("padding-bottom", "0px", "important");
+}
+
+function restoreBodyEndGap(doc: Document): void {
+  const body = doc.body;
+  if (!body) return;
+  const originalMargin = body.getAttribute(ORIGINAL_BODY_MARGIN_BOTTOM_ATTR);
+  const originalPadding = body.getAttribute(ORIGINAL_BODY_PADDING_BOTTOM_ATTR);
+  if (originalMargin !== null) {
+    if (originalMargin) body.style.setProperty("margin-bottom", originalMargin);
+    else body.style.removeProperty("margin-bottom");
+    body.removeAttribute(ORIGINAL_BODY_MARGIN_BOTTOM_ATTR);
+  }
+  if (originalPadding !== null) {
+    if (originalPadding) body.style.setProperty("padding-bottom", originalPadding);
+    else body.style.removeProperty("padding-bottom");
+    body.removeAttribute(ORIGINAL_BODY_PADDING_BOTTOM_ATTR);
+  }
+}
 
 function hasDeco(host: Element, name: string): boolean {
   return host.querySelector(`[${DECORATION_ATTR}="${name}"]`) !== null;
@@ -140,12 +172,14 @@ function rewriteLoginCopy(doc: Document): void {
 
 export const pizzaDeco: DecoModule = {
   mount(doc: Document): void {
+    clearBodyEndGap(doc);
     addBackground(doc);
     addLoginHero(doc);
     rewriteLoginCopy(doc);
   },
   unmount(doc: Document): void {
     doc.querySelectorAll(`[${DECORATION_ATTR}]`).forEach((node) => node.remove());
+    restoreBodyEndGap(doc);
     restoreText(doc);
   },
 };
