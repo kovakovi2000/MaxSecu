@@ -60,31 +60,6 @@
   --mx-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
-/* ---------- Theme presets ---------- */
-:root[data-theme="tech"] {
-  color-scheme: dark;
-}
-:root[data-theme="cheese"] {
-  color-scheme: dark;
-  --mx-accent-1: #ffd166;
-  --mx-accent-2: #f77f00;
-  --mx-accent-3: #ffe29a;
-  --mx-accent-solid: #f6b73c;
-  --mx-neon-cyan: #ffe29a;
-  --mx-neon-violet: #f77f00;
-  --mx-neon-lime: #fff1a8;
-}
-:root[data-theme="pottery"] {
-  color-scheme: dark;
-  --mx-accent-1: #d68c45;
-  --mx-accent-2: #9c6644;
-  --mx-accent-3: #e6ccb2;
-  --mx-accent-solid: #c07f4f;
-  --mx-neon-cyan: #e6ccb2;
-  --mx-neon-violet: #b07d62;
-  --mx-neon-lime: #ddbea9;
-}
-
 /* ---------- Accessibility state tokens ---------- */
 :root[data-text-size="large"] { --mx-text-scale: 1.18; }
 :root[data-text-size="larger"] { --mx-text-scale: 1.34; }

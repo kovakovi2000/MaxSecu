@@ -198,8 +198,8 @@ export class SettingsScreen extends HTMLElement {
     };
     setFrontend(this.sel("frontend").value);
     const patch: Partial<Settings> = {
-      // Backend settings keep the existing dark appearance contract; the new visual
-      // theme presets are frontend-only placeholders applied via data-theme.
+      // Backend appearance stays the existing dark contract. The visual frontend is
+      // UI-local (localStorage) and applied via setFrontend(), independent of this save.
       appearance: { theme: "dark" },
       a11y: {
         reduced_motion: this.input("reduced_motion").checked,
