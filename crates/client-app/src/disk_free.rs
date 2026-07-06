@@ -3,6 +3,12 @@
 //! this. Best-effort: any failure yields `None` and the UI falls back to showing
 //! the raw on-disk size without a denominator.
 
+/// The startup disk-free estimate, stashed as Tauri managed state so the
+/// dual-mode `cache_stats` can hand it back as the Disk-mode gauge denominator
+/// without re-probing. `None` when the probe failed at startup (the UI then shows
+/// the raw on-disk size without a denominator).
+pub struct DiskFreeEstimate(pub Option<u64>);
+
 /// Best-effort free bytes on the volume holding `app_dir`, probed ONCE at startup.
 /// Returns `None` on any failure (never panics).
 pub fn free_bytes_for(app_dir: &std::path::Path) -> Option<u64> {

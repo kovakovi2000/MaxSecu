@@ -59,6 +59,7 @@ use crate::http_client::get_json;
 use crate::jobs::{AuthedChannel, UploadJobs, VideoJob, VideoJobs};
 use crate::media_cache::MediaCache;
 use crate::state::{PlayerPhase, EVT_PLAYER};
+use crate::thumb_cache::ThumbCache;
 use crate::video::{chunks_for_fragment, FragmentEntry};
 
 /// Cap on a single range response body (open-ended `bytes=N-` streams in pieces).
@@ -533,42 +534,65 @@ pub async fn cancel_video(
     Ok(())
 }
 
-/// Live in-RAM media-cache footprint, for the header RAM-cache gauge.
+/// Dual-mode gauge readout for BOTH app-global caches (Media + Thumbnails).
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct CacheStats {
-    /// The ciphertext bytes the app-global shared media cache is holding **in RAM**
-    /// (0 when it uses the on-disk backend — see [`BlobCache::memory_bytes`]). This
-    /// is exactly the "rolling memory frame" the cache occupies; it is capped at
-    /// `media_cache_cap_mb` and LRU-evicts, so it can never grow unbounded.
-    pub used_bytes: u64,
+    /// Media cache fill: in-RAM ciphertext bytes (Memory mode) or on-disk bytes
+    /// (Disk mode). Reconciled to the live cap in Memory mode so the gauge never
+    /// reads over 100%.
+    pub media_used: u64,
+    /// Thumbnails cache fill, same RAM/disk semantics as `media_used`.
+    pub thumb_used: u64,
+    /// `true` when both caches use the on-disk backend (they share one location),
+    /// so the UI divides the fill by `disk_free_estimate` instead of the RAM cap.
+    pub disk_mode: bool,
+    /// The startup free-space estimate for the Disk-mode gauge denominator; `0`
+    /// when unknown (probe failed) or in RAM mode.
+    pub disk_free_estimate: u64,
 }
 
-/// `cache_stats` — reconcile the app-global shared media cache to the **live** cap
-/// `cap_bytes` (the value the header gauge divides by), then report its in-RAM fill.
-/// The cap is otherwise frozen when the cache opens, so lowering the setting
-/// mid-playback would leave the cache holding up to its larger open-time cap while
-/// the gauge divides by the new, smaller cap — reading over 100%. Applying `set_cap`
-/// here (the gauge polls this ~every 1.5 s) evicts the cache down to the current cap
-/// and updates its budget, so subsequent range fetches honor it too. Because there
-/// is now ONE shared cache (not one per session), the gauge can never read over 100%
-/// from summed per-session caches — the >100% bug this rework fixes. Cheap: a brief
-/// lock + LRU trims, no network I/O.
-///
-/// Task 7 makes this dual-mode (media + thumb, disk-mode denominator); today it
-/// reports the single shared media cache's in-RAM fill reconciled to the live cap.
-/// (`set_cap` unconditionally imposes a cap even in Disk mode; harmless while the
-/// default is Memory and the video path is not wired until Task 7.)
+/// `cache_stats` — the header gauges' poll (~every 1.5 s). Reconciles EACH cache to
+/// its live cap in Memory mode (LRU-evicts down so a gauge dividing by the live cap
+/// can never read over 100% — the >100% bug this rework fixes) and reports both
+/// fills. Because both caches share the one location, the Media cache's `disk_mode`
+/// governs the denominator: RAM cap in Memory mode, the stashed startup disk-free
+/// estimate in Disk mode. Cheap: two brief locks + LRU trims, no network I/O.
 #[tauri::command]
 pub async fn cache_stats(
-    cap_bytes: u64,
+    media_cap_bytes: u64,
+    thumb_cap_bytes: u64,
     media: State<'_, MediaCache>,
+    thumb: State<'_, ThumbCache>,
+    disk_free: State<'_, crate::disk_free::DiskFreeEstimate>,
 ) -> Result<CacheStats, UiError> {
-    let mut cache = media.0.lock().await;
-    // TODO(Task 7): gate set_cap on Memory mode (Disk is uncapped, D5a)
-    cache.set_cap(cap_bytes); // reconcile to the live cap (LRU-evicts down)
+    let (media_used, disk_mode) = media.gauge_fill(media_cap_bytes).await;
+    let (thumb_used, _) = thumb.gauge_fill(thumb_cap_bytes).await;
+    let disk_free_estimate = if disk_mode {
+        disk_free.0.unwrap_or(0)
+    } else {
+        0
+    };
     Ok(CacheStats {
-        used_bytes: cache.memory_bytes(),
+        media_used,
+        thumb_used,
+        disk_mode,
+        disk_free_estimate,
     })
+}
+
+/// Clear + zeroize the Media cache (D8 case 3). No effect on any open VideoJob's
+/// decryptor — only cached bytes drop; an in-flight serve_range simply re-fetches.
+#[tauri::command]
+pub async fn clear_media_cache(media: State<'_, MediaCache>) -> Result<(), UiError> {
+    media.0.lock().await.clear_and_zeroize();
+    Ok(())
+}
+
+/// Clear + zeroize the Thumbnails cache.
+#[tauri::command]
+pub async fn clear_thumb_cache(thumb: State<'_, ThumbCache>) -> Result<(), UiError> {
+    thumb.clear_and_zeroize().await;
+    Ok(())
 }
 
 // ===========================================================================
@@ -1282,6 +1306,67 @@ mod tests {
             "first == total_len must be unsatisfiable (None/416)"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gauge readout (via `MediaCache::gauge_fill`, which `cache_stats` calls) can
+    /// never report over the live cap in Memory mode — it reconciles down first.
+    #[tokio::test]
+    async fn cache_stats_memory_never_over_cap() {
+        let dir = tmp_dir("stats-cap");
+        let media = MediaCache::open(&dir, 1, crate::config::FragmentCacheLocation::Memory).unwrap();
+        {
+            let mut c = media.0.lock().await;
+            for s in 0..8u32 {
+                c.put(Ns::Frag, "aa", s, &[0u8; 100 * 1024]).unwrap();
+            }
+        }
+        let cap = 200 * 1024;
+        let (used, disk_mode) = media.gauge_fill(cap).await;
+        assert!(!disk_mode);
+        assert!(used <= cap, "fill {used} must not exceed the live cap {cap}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `clear_media_cache` / `clear_thumb_cache` each zero ONLY their own target
+    /// (they are independent caches sharing only the process seal).
+    #[tokio::test]
+    async fn clear_one_cache_leaves_the_other_intact() {
+        let dir = tmp_dir("clear-indep");
+        let seal = std::sync::Arc::new(crate::session_seal::SessionSeal::generate());
+        let media = MediaCache::open(&dir, 1, crate::config::FragmentCacheLocation::Memory).unwrap();
+        let thumb = ThumbCache::new(&dir, 64, crate::config::FragmentCacheLocation::Memory, seal.clone()).unwrap();
+        let key = crate::thumb_cache::CacheKey {
+            file_id: [5u8; 16],
+            version: 1,
+        };
+        media.put_content(&seal, key, b"content-bytes").await;
+        thumb
+            .put_card(
+                key,
+                crate::thumb_cache::CachedMeta {
+                    file_type: "blog".into(),
+                    title: "t".into(),
+                    tags: vec![],
+                    thumbnail_b64: None,
+                    author_fp: "fp".into(),
+                    recovery_ok: true,
+                    mine: false,
+                    member_counts: crate::dto::MemberCounts::default(),
+                },
+            )
+            .await;
+        assert!(media.get_content(&seal, key).await.is_some());
+        assert!(thumb.get_meta(key).await.is_some());
+
+        // Clearing Media leaves Thumbnails intact…
+        media.0.lock().await.clear_and_zeroize();
+        assert!(media.get_content(&seal, key).await.is_none());
+        assert!(thumb.get_meta(key).await.is_some(), "thumb untouched by media clear");
+
+        // …and vice versa.
+        thumb.clear_and_zeroize().await;
+        assert!(thumb.get_meta(key).await.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -37,16 +37,18 @@ pub async fn set_settings(
     let norm = settings.normalized();
     norm.save(&dir.0)
         .map_err(|_| UiError::new("settings_failed", "Could not save settings."))?;
-    // Apply BOTH (normalized) RAM-cache caps live: a smaller cap evicts now.
-    // TODO(Task 7): gate on Memory mode (a Disk cache is uncapped `None`).
+    // Apply the location toggle AND the caps live to BOTH caches (D5a): a Disk/Memory
+    // switch rebuilds the cache under its subdir; in Memory mode a lowered cap evicts
+    // now; a Disk cache stays uncapped. Both caches share the one `cache_location`.
+    let loc = norm.performance.cache_location;
     media
-        .0
-        .lock()
+        .apply_location_and_cap(&dir.0, loc, norm.performance.media_cache_cap_mb)
         .await
-        .set_cap(norm.performance.media_cache_cap_mb as u64 * 1024 * 1024);
-    thumb.set_cap_mb(norm.performance.thumb_cache_cap_mb).await;
-    // TODO(Task 7): rebuild both caches on cache_location change (until then a
-    // location change takes effect on the next app restart).
+        .map_err(|_| UiError::new("settings_failed", "Could not apply the cache setting."))?;
+    thumb
+        .apply_location_and_cap(&dir.0, loc, norm.performance.thumb_cache_cap_mb)
+        .await
+        .map_err(|_| UiError::new("settings_failed", "Could not apply the cache setting."))?;
     Ok(norm)
 }
 

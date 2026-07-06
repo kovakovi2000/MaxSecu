@@ -75,6 +75,60 @@ impl MediaCache {
         cache.evict_prefix(Ns::Frag, &id_hex);
         cache.evict_prefix(Ns::Content, &id_hex);
     }
+
+    /// The header gauge's fill + denominator selector. In `Memory` mode, reconcile
+    /// the cache to the **live** `cap_bytes` (LRU-evicts down) so the gauge — which
+    /// divides by the live cap — can never read over 100%, then report the in-RAM
+    /// fill and `false` (RAM denominator). In `Disk` mode the cache is uncapped
+    /// (`None`), so NEVER `set_cap` (that would wrongly cap it); report the on-disk
+    /// fill and `true` (disk-free denominator).
+    pub async fn gauge_fill(&self, cap_bytes: u64) -> (u64, bool) {
+        let mut c = self.0.lock().await;
+        if c.is_disk() {
+            (c.disk_bytes(), true)
+        } else {
+            c.set_cap(cap_bytes);
+            (c.memory_bytes(), false)
+        }
+    }
+
+    /// Apply the Disk/Memory location toggle AND the live cap in one place (the
+    /// Task-5 TODOs). If the requested backend differs from the open one, REBUILD
+    /// the cache via [`BlobCache::open_located`] under `cache/media` (a Disk open
+    /// wipes+recreates the subdir; a Memory open starts empty) — this switches
+    /// backends live. If the backend is unchanged and Memory, apply the cap live
+    /// (`Disk` stays uncapped `None`, never `set_cap`).
+    pub async fn apply_location_and_cap(
+        &self,
+        app_dir: &std::path::Path,
+        loc: FragmentCacheLocation,
+        cap_mb: u32,
+    ) -> io::Result<()> {
+        let mut c = self.0.lock().await;
+        let want_disk = loc == FragmentCacheLocation::Disk;
+        if c.is_disk() != want_disk {
+            let cap = if want_disk {
+                None
+            } else {
+                Some(cap_mb as u64 * 1024 * 1024)
+            };
+            *c = BlobCache::open_located(app_dir, cap, loc, "media")?;
+        } else if !want_disk {
+            c.set_cap(cap_mb as u64 * 1024 * 1024);
+        }
+        Ok(())
+    }
+
+    /// Wipe + zeroize the cache from the SYNC `RunEvent::Exit` callback (D6). Uses
+    /// `try_lock` (NOT `blocking_lock`): at shutdown nothing else holds the lock so
+    /// it succeeds, and it can never panic on the missing runtime context nor block
+    /// the shutdown — a contended miss is a best-effort skip (the process is dying
+    /// and its RAM is reclaimed regardless).
+    pub fn clear_and_zeroize_blocking(&self) {
+        if let Ok(mut c) = self.0.try_lock() {
+            c.clear_and_zeroize();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +258,110 @@ mod tests {
         assert!(!media.0.lock().await.contains(Ns::Frag, &hex(&a.file_id), 0));
         // …the unrelated id survives.
         assert!(media.get_content(&seal, b).await.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn gauge_fill_memory_reconciles_to_lowered_cap() {
+        let dir = tmp_dir("gauge-mem");
+        // Open at 1 MB, fill with a handful of 100 KB frags.
+        let media = MediaCache::open(&dir, 1, FragmentCacheLocation::Memory).unwrap();
+        {
+            let mut c = media.0.lock().await;
+            for s in 0..8u32 {
+                c.put(Ns::Frag, "aa", s, &[0u8; 100 * 1024]).unwrap();
+            }
+            assert_eq!(c.total_bytes(), 8 * 100 * 1024);
+        }
+        // Reconcile to a 300 KB cap → LRU-evicts down to ≤ cap, reports RAM fill.
+        let (fill, disk_mode) = media.gauge_fill(300 * 1024).await;
+        assert!(!disk_mode, "Memory mode → RAM denominator");
+        assert!(fill <= 300 * 1024, "reconciled to the lowered cap, got {fill}");
+        assert_eq!(media.0.lock().await.memory_bytes(), fill);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn gauge_fill_disk_reports_disk_bytes_and_never_caps() {
+        let dir = tmp_dir("gauge-disk");
+        let media = MediaCache::open(&dir, 0, FragmentCacheLocation::Disk).unwrap();
+        {
+            let mut c = media.0.lock().await;
+            for s in 0..3u32 {
+                c.put(Ns::Frag, "aa", s, &[0u8; 10]).unwrap();
+            }
+        }
+        // A tiny would-be cap must NOT evict anything (Disk is uncapped).
+        let (fill, disk_mode) = media.gauge_fill(1).await;
+        assert!(disk_mode, "Disk mode → disk-free denominator");
+        assert_eq!(fill, 30, "disk_bytes reported, nothing evicted");
+        assert_eq!(media.0.lock().await.total_bytes(), 30);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn apply_location_memory_to_disk_rebuilds_and_flips() {
+        let dir = tmp_dir("loc-m2d");
+        let media = MediaCache::open(&dir, 1, FragmentCacheLocation::Memory).unwrap();
+        media.0.lock().await.put(Ns::Frag, "aa", 0, b"before").unwrap();
+        assert!(!media.0.lock().await.is_disk());
+        assert!(media.0.lock().await.contains(Ns::Frag, "aa", 0));
+        // Switch to Disk → rebuild wipes the prior blob and flips the backend.
+        media
+            .apply_location_and_cap(&dir, FragmentCacheLocation::Disk, 1)
+            .await
+            .unwrap();
+        assert!(media.0.lock().await.is_disk(), "backend flipped to Disk");
+        assert!(!media.0.lock().await.contains(Ns::Frag, "aa", 0), "prior blob gone");
+        // And a Disk cache is uncapped: a would-be-tiny cap does not evict.
+        let (fill, disk_mode) = media.gauge_fill(1).await;
+        assert!(disk_mode);
+        assert_eq!(fill, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn apply_location_disk_to_memory_rebuilds() {
+        let dir = tmp_dir("loc-d2m");
+        let media = MediaCache::open(&dir, 0, FragmentCacheLocation::Disk).unwrap();
+        media.0.lock().await.put(Ns::Frag, "aa", 0, b"onwire").unwrap();
+        assert!(media.0.lock().await.is_disk());
+        media
+            .apply_location_and_cap(&dir, FragmentCacheLocation::Memory, 1)
+            .await
+            .unwrap();
+        assert!(!media.0.lock().await.is_disk(), "backend flipped to Memory");
+        assert!(!media.0.lock().await.contains(Ns::Frag, "aa", 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn apply_location_same_memory_lowers_cap_and_evicts() {
+        let dir = tmp_dir("loc-cap");
+        let media = MediaCache::open(&dir, 1, FragmentCacheLocation::Memory).unwrap();
+        {
+            let mut c = media.0.lock().await;
+            for s in 0..8u32 {
+                c.put(Ns::Frag, "aa", s, &[0u8; 100 * 1024]).unwrap();
+            }
+        }
+        // Same backend (Memory), lower the cap → evicts live down to ≤ cap.
+        media
+            .apply_location_and_cap(&dir, FragmentCacheLocation::Memory, 0)
+            .await
+            .unwrap();
+        assert_eq!(media.0.lock().await.total_bytes(), 0, "cap 0 evicts all");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn clear_and_zeroize_blocking_empties() {
+        let dir = tmp_dir("clr-block");
+        let media = MediaCache::open(&dir, 1, FragmentCacheLocation::Memory).unwrap();
+        media.0.lock().await.put(Ns::Frag, "aa", 0, b"x").unwrap();
+        assert_eq!(media.0.lock().await.total_bytes(), 1);
+        media.clear_and_zeroize_blocking();
+        assert_eq!(media.0.lock().await.total_bytes(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

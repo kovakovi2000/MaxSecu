@@ -57,6 +57,12 @@ fn main() {
     )
     .expect("open thumb cache");
 
+    // Stash the Disk-mode gauge denominator: probe the free space on the volume
+    // holding `app_dir` ONCE now (while `app_dir` is still un-moved). `cache_stats`
+    // hands this back as the denominator in Disk mode; `None` → the UI shows the
+    // raw on-disk size without a denominator.
+    let disk_free_est = maxsecu_client_app::disk_free::free_bytes_for(&app_dir);
+
     let app = tauri::Builder::default()
         .manage(AppDir(app_dir))
         .manage(Session::new())
@@ -70,6 +76,7 @@ fn main() {
         .manage(seal.clone())
         .manage(media_cache)
         .manage(thumb_cache)
+        .manage(maxsecu_client_app::disk_free::DiskFreeEstimate(disk_free_est))
         .manage(maxsecu_client_app::directory::DirectoryCache::new())
         .manage(maxsecu_client_app::commands::pool::AppPool::new(pool_cap))
         .invoke_handler(tauri::generate_handler![
@@ -119,6 +126,8 @@ fn main() {
             maxsecu_client_app::commands::video::open_video,
             maxsecu_client_app::commands::video::cancel_video,
             maxsecu_client_app::commands::video::cache_stats,
+            maxsecu_client_app::commands::video::clear_media_cache,
+            maxsecu_client_app::commands::video::clear_thumb_cache,
         ])
         .register_asynchronous_uri_scheme_protocol("stream", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
@@ -147,9 +156,14 @@ fn main() {
     //   `stage_upload` transcode's cancel token so its confined ffmpeg / re-mux child
     //   is terminated (via the watchdog's cancel poll) before the process exits — no
     //   orphaned confined child, prompt shutdown. Best-effort (no-op if none running).
-    // * `Exit`: TODO(Task 7) zeroize MediaCache + ThumbCache + SessionSeal on Exit
-    //   (D6). Until then the process dying wipes RAM anyway (the sealed caches are
-    //   in-RAM ciphertext + a `Zeroizing` seal key), so no plaintext survives.
+    // * `Exit` (D6/D5a): explicitly wipe both app-global caches + the seal key while
+    //   the managed state is still alive (a managed-state drop is NOT guaranteed on
+    //   shutdown). In Memory mode this zeroizes the in-RAM ciphertext; in Disk mode it
+    //   deletes the `cache/media/*` + `cache/thumb/*` backing files. Zeroizing the
+    //   ephemeral `SessionSeal` key last makes any paged/hibernated sealed blob
+    //   unrecoverable even if a copy escaped to swap. The cache wipes use the
+    //   `try_lock`-based blocking variants so this SYNC callback can never panic on a
+    //   missing runtime context nor block shutdown.
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } => {
             if let Some(prepare_cancel) =
@@ -158,6 +172,23 @@ fn main() {
                 if let Some(flag) = prepare_cancel.0.lock().unwrap().as_ref() {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+            }
+        }
+        tauri::RunEvent::Exit => {
+            if let Some(media) =
+                app_handle.try_state::<maxsecu_client_app::media_cache::MediaCache>()
+            {
+                media.clear_and_zeroize_blocking(); // Memory → wipe RAM; Disk → delete cache/media/*
+            }
+            if let Some(thumb) =
+                app_handle.try_state::<maxsecu_client_app::thumb_cache::ThumbCache>()
+            {
+                thumb.clear_and_zeroize_blocking(); // Memory → wipe; Disk → delete cache/thumb/*
+            }
+            if let Some(seal) = app_handle
+                .try_state::<std::sync::Arc<maxsecu_client_app::session_seal::SessionSeal>>()
+            {
+                seal.zeroize(); // wipe the ephemeral key → any paged/hibernated sealed blob is unrecoverable
             }
         }
         _ => {}

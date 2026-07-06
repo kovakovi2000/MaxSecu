@@ -255,6 +255,14 @@ impl BlobCache {
         self.total_bytes
     }
 
+    /// Whether this cache is disk-backed (`Backend::Disk`). The app uses this to
+    /// gate cap-application (a `Disk` cache is uncapped `None`; `set_cap` would
+    /// wrongly turn it capped) and to pick the gauge denominator (disk-free vs the
+    /// RAM cap).
+    pub fn is_disk(&self) -> bool {
+        matches!(self.backend, Backend::Disk { .. })
+    }
+
     /// Bytes held in RAM (`Memory` backend) — `0` for `Disk` (whose blobs live on
     /// the filesystem, not in the process's rolling memory frame). Drives the
     /// header RAM-mode gauge, which reports only the in-RAM footprint against the
@@ -755,6 +763,17 @@ mod tests {
         assert_eq!(c.total_bytes(), 30);
         assert_eq!(c.disk_bytes(), 30);
         assert_eq!(c.memory_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_disk_reports_backend() {
+        let dir = tmp_dir("isdisk");
+        let mem =
+            BlobCache::open_located(&dir, Some(1024), FragmentCacheLocation::Memory, "frag").unwrap();
+        assert!(!mem.is_disk(), "Memory-opened cache is not disk-backed");
+        let disk = BlobCache::open_located(&dir, None, FragmentCacheLocation::Disk, "frag").unwrap();
+        assert!(disk.is_disk(), "Disk-opened cache is disk-backed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

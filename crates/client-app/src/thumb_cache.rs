@@ -148,20 +148,73 @@ impl ThumbCache {
             .evict_prefix(Ns::Card, &hex(&file_id));
     }
 
-    /// Live cap change (Settings). MiB → bytes; a smaller cap evicts now.
+    /// Live cap change (Settings). MiB → bytes; a smaller cap evicts now. Gated on
+    /// Memory mode: a `Disk` cache is uncapped (`None`), and a bare `set_cap` would
+    /// wrongly turn it capped, so it is a no-op there. (The live Settings path now
+    /// goes through [`apply_location_and_cap`](Self::apply_location_and_cap), which
+    /// also handles the location toggle; this stays for the unit tests + any direct
+    /// caller.)
     pub async fn set_cap_mb(&self, cap_mb: u32) {
-        // TODO(Task 7): gate on Memory mode (a Disk cache is uncapped `None`; a bare
-        // `set_cap` would wrongly turn it capped).
-        self.cache
-            .lock()
-            .await
-            .set_cap(cap_mb as u64 * 1024 * 1024);
+        let mut c = self.cache.lock().await;
+        if !c.is_disk() {
+            c.set_cap(cap_mb as u64 * 1024 * 1024);
+        }
+    }
+
+    /// The header gauge's fill + denominator selector (mirror of
+    /// [`MediaCache::gauge_fill`](crate::media_cache::MediaCache::gauge_fill)). In
+    /// `Memory` mode reconcile to the live `cap_bytes` and report the in-RAM fill
+    /// + `false`; in `Disk` mode report the on-disk fill + `true`, never capping.
+    pub async fn gauge_fill(&self, cap_bytes: u64) -> (u64, bool) {
+        let mut c = self.cache.lock().await;
+        if c.is_disk() {
+            (c.disk_bytes(), true)
+        } else {
+            c.set_cap(cap_bytes);
+            (c.memory_bytes(), false)
+        }
+    }
+
+    /// Apply the Disk/Memory location toggle AND the live cap for the Thumbnails
+    /// cache (mirror of
+    /// [`MediaCache::apply_location_and_cap`](crate::media_cache::MediaCache::apply_location_and_cap),
+    /// under the `cache/thumb` subdir). Rebuilds on a backend change (a Disk open
+    /// wipes+recreates the subdir); otherwise applies the cap live in Memory mode.
+    pub async fn apply_location_and_cap(
+        &self,
+        app_dir: &Path,
+        loc: FragmentCacheLocation,
+        cap_mb: u32,
+    ) -> io::Result<()> {
+        let mut c = self.cache.lock().await;
+        let want_disk = loc == FragmentCacheLocation::Disk;
+        if c.is_disk() != want_disk {
+            let cap = if want_disk {
+                None
+            } else {
+                Some(cap_mb as u64 * 1024 * 1024)
+            };
+            *c = BlobCache::open_located(app_dir, cap, loc, "thumb")?;
+        } else if !want_disk {
+            c.set_cap(cap_mb as u64 * 1024 * 1024);
+        }
+        Ok(())
     }
 
     /// Wipe everything (app close / explicit Clear). `Memory` zeroizes the sealed
     /// blobs; `Disk` removes the backing files.
     pub async fn clear_and_zeroize(&self) {
         self.cache.lock().await.clear_and_zeroize();
+    }
+
+    /// Exit-path (SYNC `RunEvent::Exit`) variant of [`clear_and_zeroize`](Self::clear_and_zeroize):
+    /// `try_lock` (NOT `blocking_lock`) so it can never panic on the missing runtime
+    /// context nor block shutdown — at shutdown nothing else holds the lock; a
+    /// contended miss is a best-effort skip (RAM is reclaimed as the process dies).
+    pub fn clear_and_zeroize_blocking(&self) {
+        if let Ok(mut c) = self.cache.try_lock() {
+            c.clear_and_zeroize();
+        }
     }
 }
 
@@ -202,6 +255,11 @@ mod tests {
     fn mem_cache(dir: &Path, cap_mb: u32) -> ThumbCache {
         let seal = Arc::new(SessionSeal::generate());
         ThumbCache::new(dir, cap_mb, FragmentCacheLocation::Memory, seal).unwrap()
+    }
+
+    fn disk_cache(dir: &Path) -> ThumbCache {
+        let seal = Arc::new(SessionSeal::generate());
+        ThumbCache::new(dir, 0, FragmentCacheLocation::Disk, seal).unwrap()
     }
 
     #[tokio::test]
@@ -311,6 +369,75 @@ mod tests {
             seal: Arc::new(SessionSeal::generate()),
         };
         assert!(stranger.get_meta(k).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn gauge_fill_memory_reconciles_and_disk_never_caps() {
+        // Memory: a lowered cap evicts and the fill is reported with RAM denominator.
+        let dir = tmp_dir("gauge-mem");
+        let tc = mem_cache(&dir, 64);
+        for v in 0..4u64 {
+            tc.put_card(key(1, v), meta("some-title")).await;
+        }
+        let (fill, disk_mode) = tc.gauge_fill(0).await; // 0-byte cap evicts everything
+        assert!(!disk_mode);
+        assert_eq!(fill, 0, "reconciled to the 0-byte cap");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Disk: never caps; reports the on-disk fill with the disk denominator.
+        let dir2 = tmp_dir("gauge-disk");
+        let tc2 = disk_cache(&dir2);
+        tc2.put_card(key(1, 0), meta("t")).await;
+        let before = tc2.cache.lock().await.total_bytes();
+        assert!(before > 0);
+        let (fill2, disk_mode2) = tc2.gauge_fill(1).await; // tiny would-be cap must not evict
+        assert!(disk_mode2);
+        assert_eq!(fill2, before, "disk fill unchanged (uncapped)");
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn apply_location_rebuilds_both_directions() {
+        let dir = tmp_dir("loc");
+        let tc = mem_cache(&dir, 64);
+        tc.put_card(key(1, 0), meta("t")).await;
+        assert!(!tc.cache.lock().await.is_disk());
+        // Memory → Disk rebuilds (prior blob gone, backend flips, uncapped).
+        tc.apply_location_and_cap(&dir, FragmentCacheLocation::Disk, 64)
+            .await
+            .unwrap();
+        assert!(tc.cache.lock().await.is_disk());
+        assert!(tc.get_card(key(1, 0), "x").await.is_none(), "rebuild wiped it");
+        // Disk → Memory rebuilds back.
+        tc.apply_location_and_cap(&dir, FragmentCacheLocation::Memory, 64)
+            .await
+            .unwrap();
+        assert!(!tc.cache.lock().await.is_disk());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn apply_location_same_memory_lowers_cap_evicts() {
+        let dir = tmp_dir("loc-cap");
+        let tc = mem_cache(&dir, 64);
+        tc.put_card(key(1, 0), meta("t")).await;
+        assert!(tc.get_card(key(1, 0), "x").await.is_some());
+        tc.apply_location_and_cap(&dir, FragmentCacheLocation::Memory, 0)
+            .await
+            .unwrap();
+        assert!(tc.get_card(key(1, 0), "x").await.is_none(), "cap 0 evicts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn clear_and_zeroize_blocking_empties() {
+        let dir = tmp_dir("clr-block");
+        let tc = mem_cache(&dir, 64);
+        tc.put_card(key(1, 0), meta("t")).await;
+        assert!(tc.get_card(key(1, 0), "x").await.is_some());
+        tc.clear_and_zeroize_blocking();
+        assert!(tc.get_card(key(1, 0), "x").await.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
