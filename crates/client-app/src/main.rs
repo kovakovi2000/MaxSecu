@@ -25,7 +25,7 @@ fn main() {
     // is not; `normalized()` here also bounds that first-run default to the
     // (total − 6 GB) ceiling so a small-RAM machine can't start over-cap. MiB → bytes.
     let normalized = SettingsConfig::load(&app_dir).normalized();
-    let cap_bytes = normalized.performance.ram_cache_cap_mb as usize * 1024 * 1024;
+    let cap_bytes = normalized.performance.media_cache_cap_mb as usize * 1024 * 1024;
     // Live-channel cap for the authed connection pool = the persisted feed
     // concurrency (already clamped to 1..=8 by `normalized`). Feed-card decodes
     // borrow up to this many concurrent authed channels; the UI never drives more

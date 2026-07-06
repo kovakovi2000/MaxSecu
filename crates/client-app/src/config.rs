@@ -241,19 +241,73 @@ pub struct BehaviorSettings {
     pub confirm_destructive: bool,
 }
 
-/// Where the ciphertext fragment cache lives. `Disk` (default) = today's
-/// `<dir>/cache/frag/*.frag`. `Memory` = an in-process ciphertext LRU that never
-/// touches disk (same byte budget). Both store ONLY ciphertext.
+/// Where the ciphertext caches live. `Memory` (default) = an in-process
+/// ciphertext LRU that never touches disk (same byte budget) — the ciphertext-in-RAM
+/// model. `Disk` = the opt-in ciphertext-on-disk mode (`<dir>/cache/frag/*.frag`).
+/// Both store ONLY ciphertext, and both caches (Media + Thumbnails) share this one
+/// location toggle.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FragmentCacheLocation {
-    #[default]
     Disk,
+    #[default]
     Memory,
 }
 
+/// The wire form of [`PerformanceSettings`]: reads BOTH the current keys and the
+/// legacy `ram_cache_cap_mb`, folding the legacy value into `media_cache_cap_mb`.
+/// A direct `serde_json::from_str::<PerformanceSettings>` routes through this via
+/// `#[serde(from = "PerformanceSettingsWire")]`, so the migration runs even when a
+/// caller bypasses `SettingsConfig::load`/`normalized`. The real struct carries NO
+/// `ram_cache_cap_mb` field, so the legacy key never re-serializes on save.
+#[derive(Deserialize)]
+struct PerformanceSettingsWire {
+    #[serde(default)]
+    media_cache_cap_mb: u32, // 0 when absent → migrate/default
+    #[serde(default)]
+    thumb_cache_cap_mb: u32, // 0 when absent → 256
+    #[serde(default = "default_feed_concurrency")]
+    feed_concurrency: u8,
+    #[serde(default = "default_cpu_threads")]
+    transcode_threads: u16,
+    #[serde(default = "default_cpu_threads")]
+    decode_threads: u16,
+    #[serde(default)]
+    cache_location: FragmentCacheLocation,
+    #[serde(default)]
+    ram_cache_cap_mb: Option<u32>, // legacy key, read-only
+}
+impl From<PerformanceSettingsWire> for PerformanceSettings {
+    fn from(w: PerformanceSettingsWire) -> Self {
+        let media_cache_cap_mb = if w.media_cache_cap_mb == 0 {
+            w.ram_cache_cap_mb.filter(|v| *v > 0).unwrap_or(default_media_cap())
+        } else {
+            w.media_cache_cap_mb
+        };
+        let thumb_cache_cap_mb = if w.thumb_cache_cap_mb == 0 {
+            default_thumb_cap()
+        } else {
+            w.thumb_cache_cap_mb
+        };
+        Self {
+            media_cache_cap_mb,
+            thumb_cache_cap_mb,
+            feed_concurrency: w.feed_concurrency,
+            transcode_threads: w.transcode_threads,
+            decode_threads: w.decode_threads,
+            cache_location: w.cache_location,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "PerformanceSettingsWire")]
 pub struct PerformanceSettings {
-    pub ram_cache_cap_mb: u32,
+    /// Byte budget (MiB) for the Media cache (video fragments + full-content).
+    /// Default 1024. Clamped into the live RAM bounds by `normalized_with_ram`.
+    pub media_cache_cap_mb: u32,
+    /// Byte budget (MiB) for the Thumbnails cache (card metadata). Default 256.
+    /// Clamped into the same RAM bounds (independent value).
+    pub thumb_cache_cap_mb: u32,
     /// Feed cards fetched/decoded in parallel. Default 4; clamped 1..=8.
     /// `#[serde(default)]` lets an older `settings.json` without this key load with the default.
     #[serde(default = "default_feed_concurrency")]
@@ -275,20 +329,28 @@ pub struct PerformanceSettings {
     /// worker (never an env var), consistent with the ffmpeg `-threads` path.
     #[serde(default = "default_cpu_threads")]
     pub decode_threads: u16,
-    /// Fragment-cache backend. `#[serde(default)]` keeps older settings.json loading.
+    /// Shared cache-backend location (Media + Thumbnails). `#[serde(default)]` keeps
+    /// older settings.json loading; default is now `Memory` (ciphertext-in-RAM).
     #[serde(default)]
-    pub fragment_cache_location: FragmentCacheLocation,
+    pub cache_location: FragmentCacheLocation,
 }
 impl Default for PerformanceSettings {
     fn default() -> Self {
         Self {
-            ram_cache_cap_mb: 1024,
+            media_cache_cap_mb: default_media_cap(),
+            thumb_cache_cap_mb: default_thumb_cap(),
             feed_concurrency: default_feed_concurrency(),
             transcode_threads: default_cpu_threads(),
             decode_threads: default_cpu_threads(),
-            fragment_cache_location: FragmentCacheLocation::default(),
+            cache_location: FragmentCacheLocation::default(),
         }
     }
+}
+fn default_media_cap() -> u32 {
+    1024
+}
+fn default_thumb_cap() -> u32 {
+    256
 }
 fn default_feed_concurrency() -> u8 {
     4
@@ -391,9 +453,13 @@ impl SettingsConfig {
     /// RAM cache cap into [min,max], constrain text_size + theme to known sets.
     pub fn normalized_with_ram(&self, limits: &crate::ram::RamLimits) -> SettingsConfig {
         let mut s = self.clone();
-        s.performance.ram_cache_cap_mb = s
+        s.performance.media_cache_cap_mb = s
             .performance
-            .ram_cache_cap_mb
+            .media_cache_cap_mb
+            .clamp(limits.min_mb, limits.max_mb);
+        s.performance.thumb_cache_cap_mb = s
+            .performance
+            .thumb_cache_cap_mb
             .clamp(limits.min_mb, limits.max_mb);
         let cores = default_cpu_threads();
         s.performance.feed_concurrency = s.performance.feed_concurrency.clamp(1, 8);
@@ -469,22 +535,22 @@ mod tests {
         let d = SettingsConfig::load(&dir);
         assert!(!d.a11y.reduced_motion && !d.a11y.high_contrast);
         assert_eq!(d.a11y.text_size, "normal");
-        assert_eq!(d.performance.ram_cache_cap_mb, 1024);
+        assert_eq!(d.performance.media_cache_cap_mb, 1024);
         // Round-trip.
         let mut s = SettingsConfig::default();
         s.a11y.reduced_motion = true;
         s.a11y.text_size = "large".into();
-        s.performance.ram_cache_cap_mb = 1024;
+        s.performance.media_cache_cap_mb = 1024;
         s.save(&dir).unwrap();
         assert_eq!(SettingsConfig::load(&dir), s);
         // Clamp: out-of-range cap and bad text_size are normalized.
         let mut bad = SettingsConfig::default();
-        bad.performance.ram_cache_cap_mb = 99_999_999;
+        bad.performance.media_cache_cap_mb = 99_999_999;
         bad.a11y.text_size = "huge".into();
         let limits = crate::ram::compute_ram_limits(crate::ram::system_total_mb_public());
         let norm = bad.normalized();
-        assert!(norm.performance.ram_cache_cap_mb <= limits.max_mb);
-        assert!(norm.performance.ram_cache_cap_mb >= limits.min_mb);
+        assert!(norm.performance.media_cache_cap_mb <= limits.max_mb);
+        assert!(norm.performance.media_cache_cap_mb >= limits.min_mb);
         assert_eq!(norm.a11y.text_size, "normal");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -533,14 +599,14 @@ mod tests {
         use crate::ram::compute_ram_limits;
         let limits = compute_ram_limits(16384); // min 64, max 10240
         let mut s = SettingsConfig::default();
-        s.performance.ram_cache_cap_mb = 99_999;
+        s.performance.media_cache_cap_mb = 99_999;
         assert_eq!(
-            s.normalized_with_ram(&limits).performance.ram_cache_cap_mb,
+            s.normalized_with_ram(&limits).performance.media_cache_cap_mb,
             10240
         );
-        s.performance.ram_cache_cap_mb = 1;
+        s.performance.media_cache_cap_mb = 1;
         assert_eq!(
-            s.normalized_with_ram(&limits).performance.ram_cache_cap_mb,
+            s.normalized_with_ram(&limits).performance.media_cache_cap_mb,
             64
         );
     }
@@ -601,14 +667,49 @@ mod tests {
     }
 
     #[test]
-    fn fragment_cache_location_defaults_to_disk_and_back_compat_loads() {
+    fn cache_location_defaults_to_memory_and_back_compat_loads() {
         assert_eq!(
-            PerformanceSettings::default().fragment_cache_location,
-            FragmentCacheLocation::Disk
+            PerformanceSettings::default().cache_location,
+            FragmentCacheLocation::Memory
         );
+        // A legacy file (only `ram_cache_cap_mb`, no `cache_location`) → default Memory,
+        // and the legacy cap migrates into `media_cache_cap_mb`.
         let json = r#"{"ram_cache_cap_mb":512}"#;
         let p: PerformanceSettings = serde_json::from_str(json).unwrap();
-        assert_eq!(p.fragment_cache_location, FragmentCacheLocation::Disk);
+        assert_eq!(p.cache_location, FragmentCacheLocation::Memory);
+        assert_eq!(p.media_cache_cap_mb, 512);
+    }
+
+    #[test]
+    fn migrates_legacy_ram_cache_cap_into_media() {
+        // Old settings.json with only ram_cache_cap_mb populates media_cache_cap_mb.
+        let json = r#"{"media_cache_cap_mb":0,"thumb_cache_cap_mb":0,"ram_cache_cap_mb":512}"#;
+        let p: PerformanceSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(p.media_cache_cap_mb, 512);
+        assert_eq!(p.thumb_cache_cap_mb, 256); // default when absent/zero
+    }
+
+    #[test]
+    fn default_location_is_memory() {
+        assert_eq!(
+            PerformanceSettings::default().cache_location,
+            FragmentCacheLocation::Memory
+        );
+    }
+
+    #[test]
+    fn both_caps_clamp_to_ram_bounds() {
+        let limits = crate::ram::RamLimits {
+            default_mb: 1024,
+            min_mb: 64,
+            max_mb: 2048,
+        };
+        let mut s = SettingsConfig::default();
+        s.performance.media_cache_cap_mb = 99_999;
+        s.performance.thumb_cache_cap_mb = 1;
+        let n = s.normalized_with_ram(&limits).performance;
+        assert!(n.media_cache_cap_mb <= 2048 && n.media_cache_cap_mb >= 64);
+        assert!(n.thumb_cache_cap_mb <= 2048 && n.thumb_cache_cap_mb >= 64);
     }
 
     fn n() -> u128 {

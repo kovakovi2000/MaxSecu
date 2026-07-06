@@ -475,8 +475,8 @@ async fn open_video_inner(
     // plaintext length by decrypting ONLY the last fragment once, but ONLY when the
     // server length was unusable (`settings`/`route_mode` were loaded above and are
     // reused for every network fetch in the session).
-    let cap = settings.performance.ram_cache_cap_mb as u64 * 1024 * 1024;
-    let location = settings.performance.fragment_cache_location;
+    let cap = settings.performance.media_cache_cap_mb as u64 * 1024 * 1024;
+    let location = settings.performance.cache_location;
     let cache = FragmentCache::open_located(&dir.0, cap, location).map_err(|_| player_err())?;
 
     // Move the open-time authed connection into a persistent channel for all range
@@ -540,7 +540,7 @@ pub struct CacheStats {
     /// fragment cache is holding **in RAM** (0 for a session using the on-disk
     /// backend — see [`crate::fragment_cache::FragmentCache::memory_bytes`]). This is
     /// exactly the "rolling memory frame" the cache occupies; it is capped per
-    /// session at `ram_cache_cap_mb` and LRU-evicts, so it can never grow unbounded.
+    /// session at `media_cache_cap_mb` and LRU-evicts, so it can never grow unbounded.
     pub used_bytes: u64,
 }
 

@@ -37,7 +37,7 @@ pub async fn set_settings(
     norm.save(&dir.0)
         .map_err(|_| UiError::new("settings_failed", "Could not save settings."))?;
     // Apply the (normalized) RAM-cache cap live: a smaller cap evicts now.
-    cache.set_cap(norm.performance.ram_cache_cap_mb as usize * 1024 * 1024);
+    cache.set_cap(norm.performance.media_cache_cap_mb as usize * 1024 * 1024);
     Ok(norm)
 }
 
