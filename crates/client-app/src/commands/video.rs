@@ -26,8 +26,8 @@
 //!   signed by the wrong key.
 //! * **Bounded ranges (decrypt-while-stream, NOT whole-file).** Each range request
 //!   decrypts only the fragments covering the requested byte span, capped at
-//!   [`MAX_RANGE_BODY`]; only ciphertext is cached on disk, plaintext is
-//!   transient.
+//!   [`MAX_RANGE_BODY`]; only ciphertext is cached (in RAM or on disk per the
+//!   cache-location setting — ciphertext-only either way), plaintext is transient.
 //! * **Reauth/serial discipline.** Each authed command mints a fresh channel+token
 //!   under the `ConnectLock` (the Phase-3 `reauth` pattern); the identity is
 //!   borrowed only under the session lock across the SYNCHRONOUS verify.
@@ -185,8 +185,9 @@ fn read_u32_le(blob: &[u8], pos: &mut usize) -> Option<u32> {
 ///
 /// Prefers the direct-link download route (`crate::direct_link`) under
 /// [`RouteMode::PreferDropbox`]; on ANY problem — link off/absent/mis-fetched, or
-/// (checked here, since this fetch bypasses the on-disk fragment cache entirely,
-/// so there is no poisoned-cache concern to clean up) an AEAD failure on the
+/// (checked here, since this fetch bypasses the fragment cache entirely — in RAM
+/// or on disk per the cache-location setting — so there is no poisoned-cache
+/// concern to clean up) an AEAD failure on the
 /// decrypt below — it falls back to the ordinary server-proxied GET and retries
 /// the decrypt exactly once. `route_mode == TorOnly` never attempts direct
 /// (`direct_link::direct_allowed`).
@@ -563,6 +564,7 @@ pub async fn cache_stats(
     media: State<'_, MediaCache>,
 ) -> Result<CacheStats, UiError> {
     let mut cache = media.0.lock().await;
+    // TODO(Task 7): gate set_cap on Memory mode (Disk is uncapped, D5a)
     cache.set_cap(cap_bytes); // reconcile to the live cap (LRU-evicts down)
     Ok(CacheStats {
         used_bytes: cache.memory_bytes(),
@@ -1164,6 +1166,46 @@ mod tests {
         assert!(
             !jobs.0.lock().await.contains_key(&file_id_hex()),
             "session gone after cancel"
+        );
+    }
+
+    /// The rework's core guarantee: the ciphertext cache is app-global and EXTERNAL
+    /// to the `VideoJob`, so dropping a job (exactly what `cancel_video` does —
+    /// remove it from `VideoJobs`) must NOT drop the cached fragment bytes. A later
+    /// re-open is then a cache HIT (no refetch). The standalone `BlobCache` here
+    /// stands in for the shared `MediaCache` the real `serve_range` threads in.
+    #[tokio::test]
+    async fn cancel_drops_job_but_shared_cache_persists() {
+        let (job, mut cache, _chunks) = build_job("persist");
+        let fid = job.file_id_hex.clone();
+        // Populate the shared cache with a fragment keyed by this job's file_id.
+        let blob = b"\x00opaque-ciphertext\xff".to_vec();
+        cache.put(Ns::Frag, &fid, 0, &blob).unwrap();
+        assert!(cache.contains(Ns::Frag, &fid, 0));
+
+        let jobs = VideoJobs::new();
+        jobs.0.lock().await.insert(fid.clone(), job);
+        assert!(jobs.0.lock().await.contains_key(&fid));
+
+        // Remove the job (the exact effect of `cancel_video`) — drops the decryptor,
+        // NOT the external cache.
+        let removed = jobs.0.lock().await.remove(&fid);
+        assert!(removed.is_some(), "job removed (decryptor dropped)");
+        assert!(
+            !jobs.0.lock().await.contains_key(&fid),
+            "session gone after cancel"
+        );
+
+        // The shared cache STILL holds the fragment — a re-open is a hit, not a
+        // refetch. This is the whole point of the rework.
+        assert!(
+            cache.contains(Ns::Frag, &fid, 0),
+            "cache bytes persist across cancel"
+        );
+        assert_eq!(
+            cache.get(Ns::Frag, &fid, 0).as_deref(),
+            Some(blob.as_slice()),
+            "the exact ciphertext survives the job drop"
         );
     }
 
