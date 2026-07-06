@@ -39,8 +39,10 @@ use maxsecu_ceremony_harness::Ceremony;
 use maxsecu_client_app::directory::{
     resolve_and_verify_author, resolve_my_user_id,
 };
+use maxsecu_client_app::blob_cache::Ns;
+use maxsecu_client_app::config::FragmentCacheLocation;
 use maxsecu_client_app::download::{build_stream_header, parse_file_view};
-use maxsecu_client_app::fragment_cache::FragmentCache;
+use maxsecu_client_app::media_cache::MediaCache;
 use maxsecu_client_app::upload::run_pipeline;
 use maxsecu_client_app::video::parse_fragment_index;
 use maxsecu_client_core::{
@@ -464,14 +466,18 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
     let decryptor = open_content_decryptor(&ctx, &header).expect("range test: content decryptor");
     let version = decryptor.version();
 
-    // (e) On-disk ciphertext fragment cache.
+    // (e) On-disk ciphertext fragment cache — now the app-global shared MediaCache
+    // (Ns::Frag holds the raw DEK-ciphertext fragments). Disk mode keeps the
+    // "ciphertext at rest on disk" semantics ASSERT 4 checks; the cap is ignored in
+    // Disk mode (uncapped), which is fine here.
     let cache_dir = std::env::temp_dir().join(format!(
         "mxrangecache_{}",
         hex(&maxsecu_crypto::random_array::<8>())
     ));
-    let cache = FragmentCache::open(&cache_dir, 8 * 1024 * 1024).unwrap();
+    let media = MediaCache::open(&cache_dir, 8, FragmentCacheLocation::Disk).unwrap();
 
-    // Register the VideoJob: decryptor, authenticated index, empty cache.
+    // Register the VideoJob: decryptor, authenticated index (the job no longer owns
+    // a cache — fragments live in the shared MediaCache passed to serve_range).
     // total_len = content_len: the last chunk has 1000 plaintext bytes (no padding),
     // so (41-1)*4096 + 1000 == content_len exactly.
     //
@@ -491,7 +497,6 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
         maxsecu_client_app::jobs::VideoJob {
             decryptor,
             index,
-            cache,
             file_id_hex: fid_hex.clone(),
             version,
             chunk_size: 4096u64,
@@ -511,6 +516,7 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
     loop {
         let r = maxsecu_client_app::commands::video::serve_range(
             &jobs,
+            &media,
             &fid_hex,
             off,
             Some(off + 50_000 - 1),
@@ -539,6 +545,7 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
     // ===================================================================
     let again = maxsecu_client_app::commands::video::serve_range(
         &jobs,
+        &media,
         &fid_hex,
         0,
         Some(9999),
@@ -557,12 +564,12 @@ async fn range_streaming_reassembles_plaintext_over_real_tls() {
     // ===================================================================
     let f0_bytes = 10 * CHUNK; // fragment 0 covers 10 chunks = 40960 B of plaintext
     let plaintext0 = &content[0..f0_bytes];
-    let cached0 = {
-        let mut g = jobs.0.lock().await;
-        let job = g.get_mut(&fid_hex).unwrap();
-        job.cache.get(&fid_hex, 0)
-    }
-    .expect("ASSERT 4: fragment 0 ciphertext is cached after the full forward pass");
+    let cached0 = media
+        .0
+        .lock()
+        .await
+        .get(Ns::Frag, &fid_hex, 0)
+        .expect("ASSERT 4: fragment 0 ciphertext is cached after the full forward pass");
     assert_ne!(
         cached0.as_slice(),
         plaintext0,

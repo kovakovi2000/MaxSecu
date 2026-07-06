@@ -14,6 +14,13 @@ use crate::config::FragmentCacheLocation;
 use crate::session_seal::SessionSeal;
 use crate::thumb_cache::CacheKey;
 
+/// The app-global Media cache: `Ns::Frag` (raw DEK-ciphertext video fragments,
+/// UNSEALED) + `Ns::Content` (SessionSeal-sealed image/blog payloads) under one
+/// budget. Because it holds raw unsealed frag ciphertext, MediaCache stores NO key
+/// material of its own — the seal is passed as a per-call PARAMETER to
+/// `put_content`/`get_content`. (Contrast [`ThumbCache`](crate::thumb_cache::ThumbCache),
+/// which seals everything it stores and so OWNS an `Arc<SessionSeal>` clone.) Both
+/// share the one process seal from `main.rs`.
 pub struct MediaCache(pub Arc<Mutex<BlobCache>>);
 
 impl MediaCache {

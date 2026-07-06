@@ -41,8 +41,10 @@ fn main() {
 
     // Process-global ephemeral seal shared by both ciphertext-in-RAM caches: the
     // Media cache's `Content` payloads and the Thumbnails cache's `Card` meta are
-    // sealed under it, so any OS page-out spills only ciphertext. Opened ONCE at
-    // startup (Disk mode surfaces a clean fatal-init error rather than a panic).
+    // sealed under it, so any OS page-out spills only ciphertext. Both caches are
+    // opened ONCE at startup; `open`/`new` return an `io::Result`, and a Disk-mode
+    // open failure (bad/unwritable dir) aborts startup here via `expect` (an
+    // honest fail-fast panic) rather than limping on with a broken cache.
     let seal = std::sync::Arc::new(maxsecu_client_app::session_seal::SessionSeal::generate());
     let media_cache =
         maxsecu_client_app::media_cache::MediaCache::open(&app_dir, media_cap_mb, location)

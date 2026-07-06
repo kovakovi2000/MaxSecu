@@ -42,6 +42,12 @@ pub struct CachedMeta {
 /// The Thumbnails cache: sealed card meta in a `BlobCache` under `Ns::Card`, own
 /// (256 MB default) budget. The `seal` is the process-global ephemeral key shared
 /// with the Media cache's `Content` payloads, so a page-out spills only ciphertext.
+///
+/// Seal-ownership asymmetry (by design): everything ThumbCache stores is sealed, so
+/// it OWNS an `Arc<SessionSeal>` clone. [`MediaCache`](crate::media_cache::MediaCache)
+/// instead takes the seal as a per-call PARAMETER and stores no key material — it
+/// also holds raw, UNSEALED `Ns::Frag` video ciphertext, so it stays key-less. Both
+/// ultimately share the one process seal generated in `main.rs`.
 pub struct ThumbCache {
     cache: Arc<Mutex<BlobCache>>,
     seal: Arc<SessionSeal>,
