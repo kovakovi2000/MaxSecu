@@ -1,6 +1,7 @@
 import { call } from "../core/rpc.ts";
 import { settingsStore, updateSettings, loadAndApplySettings } from "../core/settings.ts";
-import { getFrontend, setFrontend } from "../core/frontends.ts";
+import { getFrontend, applyFrontend, normalizeFrontend } from "../core/frontends.ts";
+import { DEFAULTS } from "../core/settings-store-instance.ts";
 import type { Settings, RamLimits } from "../core/types.ts";
 
 // Settings (spec §5/§7): appearance / accessibility / performance / behavior /
@@ -8,16 +9,8 @@ import type { Settings, RamLimits } from "../core/types.ts";
 // settings store (so the header RAM gauge + the shell theme stay in sync and apply
 // live); the RAM control is bounded to the live `ram_limits`. Account actions
 // are explicit submits. Accessible: focused landmark on mount, labelled controls
-// in fieldsets, role=status live regions.
-const DEFAULTS: Settings = {
-  a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
-  behavior: { confirm_destructive: false },
-  performance: { media_cache_cap_mb: 1024, thumb_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4, cache_location: "Memory" },
-  connection: { route_mode: "prefer-server" },
-  appearance: { theme: "dark", frontend: "default" },
-  ui: { bundle_view: "gallery" },
-  playback: { volume: 1.0, muted: false },
-};
+// in fieldsets, role=status live regions. DEFAULTS (fallback for empty/non-numeric
+// inputs) is the single shared default set from settings-store-instance.ts.
 
 export class SettingsScreen extends HTMLElement {
   private limits: RamLimits = { default_mb: 256, min_mb: 64, max_mb: 4096 };
@@ -198,12 +191,12 @@ export class SettingsScreen extends HTMLElement {
       const v = Number(this.input(name).value);
       return Number.isFinite(v) ? v : fallback;
     };
-    setFrontend(this.sel("frontend").value);
+    // Apply the chosen skin visually now (no persist here); the single patch below
+    // persists both frontend and the real theme, avoiding a double set_settings race.
+    const frontend = normalizeFrontend(this.sel("frontend").value);
+    applyFrontend(frontend);
     const patch: Partial<Settings> = {
-      // Backend appearance stays the existing dark contract. The visual frontend is
-      // persisted to settings.json by setFrontend() (called just above); mirror the
-      // current value here so this save patch does not clobber it.
-      appearance: { theme: "dark", frontend: getFrontend() },
+      appearance: { theme: settingsStore.get().appearance.theme, frontend },
       a11y: {
         reduced_motion: this.input("reduced_motion").checked,
         high_contrast: this.input("high_contrast").checked,

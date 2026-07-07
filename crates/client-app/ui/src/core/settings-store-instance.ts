@@ -6,7 +6,7 @@ import type { Settings } from "./types.ts";
 // store + updateSettings) can import it without forming an initialization cycle.
 // settings.ts re-exports it so existing `import { settingsStore } from "./settings.ts"`
 // call sites keep working.
-const DEFAULTS: Settings = {
+export const DEFAULTS: Settings = {
   a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
   behavior: { confirm_destructive: false },
   performance: { media_cache_cap_mb: 1024, thumb_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4, cache_location: "Memory" },

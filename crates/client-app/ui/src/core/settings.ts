@@ -13,9 +13,9 @@ import { settingsStore } from "./settings-store-instance.ts";
 
 // Apply settings live: active frontend + a11y data-attrs (styles.css keys on
 // them; reduced-motion ALSO respects the OS via a media query), and resize the
-// shared feed-decode pool from `feed_concurrency`. The active frontend is UI-local
-// (localStorage, via applyFrontend); the persisted backend appearance contract
-// remains the existing dark setting.
+// shared feed-decode pool from `feed_concurrency`. The active frontend is
+// persisted in settings.json (appearance.frontend); applyFrontend() re-asserts it
+// on the DOM from the shared store whenever settings apply.
 export function applySettings(s: Settings): void {
   const root = document.documentElement;
   applyFrontend();

@@ -127,11 +127,13 @@ export class VideoPlayer extends ElementBase {
     video.muted = pb.muted;
     let volTimer: ReturnType<typeof setTimeout> | undefined;
     video.addEventListener("volumechange", () => {
-      const volume = clampVolume(video.volume);
-      const muted = video.muted;
-      settingsStore.patchLocal({ playback: { volume, muted } });
+      // Debounce: persist (and patch the shared store) only after the drag settles,
+      // so scrubbing the volume doesn't re-run the settings subscriber every tick.
       if (volTimer) clearTimeout(volTimer);
       volTimer = setTimeout(() => {
+        const volume = clampVolume(video.volume);
+        const muted = video.muted;
+        settingsStore.patchLocal({ playback: { volume, muted } });
         void updateSettings({ playback: { volume, muted } }).catch(() => {});
       }, 400);
     });

@@ -24,7 +24,8 @@ import type { ShareDialog } from "./share-dialog.ts";
 //    <media-viewer file-id="…" embedded> per member (same content the routed
 //    viewer shows — image/blog/video). The bundle screen owns the single #main
 //    landmark; the embedded viewers emit none.
-// The chosen mode is remembered across opens (localStorage, default Gallery).
+// The chosen mode is remembered across opens (settings.json ui.bundle_view via
+// the shared settings store, default Gallery).
 // open_bundle is routed through the priority serial queue (the backend re-auths
 // per call and cannot run those concurrently with card/member decrypts).
 //
