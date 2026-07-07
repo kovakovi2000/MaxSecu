@@ -34,6 +34,13 @@ fn main() {
     // `feed_concurrency` in settings takes effect on the next app restart.
     let pool_cap = normalized.performance.feed_concurrency as usize;
 
+    // WebView2 user-data folder lives INSIDE the portable folder so localStorage,
+    // cache, cookies, and GPU cache never escape <app_dir>. Wiped on exit.
+    let webview_dir = app_dir.join("webview");
+    // The persisted skin, injected pre-paint via an initialization script so boot.js
+    // can apply it before first paint with no flash (settings.json is the source of truth).
+    let boot_frontend = normalized.appearance.frontend.clone();
+
     // Initialize the process-wide Tor state (arti state under <app-dir>/config/tor).
     // Lazily bootstrapped on the first TorOnly connect; read only by the connection
     // helpers on the TorOnly path.
@@ -79,6 +86,23 @@ fn main() {
         .manage(maxsecu_client_app::disk_free::DiskFreeEstimate(disk_free_est))
         .manage(maxsecu_client_app::directory::DirectoryCache::new())
         .manage(maxsecu_client_app::commands::pool::AppPool::new(pool_cap))
+        .setup(move |app| {
+            use tauri::{WebviewUrl, WebviewWindowBuilder};
+            // Set the injected global BEFORE any page script (incl. boot.js) runs.
+            let boot_script = format!(
+                "window.__MAXSECU_BOOT__ = {{ frontend: {} }};",
+                serde_json::to_string(&boot_frontend).unwrap_or_else(|_| "\"default\"".into())
+            );
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                .title("MaxSecu")
+                .inner_size(1100.0, 720.0)
+                .resizable(true)
+                .maximized(true)
+                .data_directory(webview_dir.clone())
+                .initialization_script(boot_script)
+                .build()?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
             maxsecu_client_app::commands::auth::unlock_keystore,
@@ -191,6 +215,11 @@ fn main() {
                 .try_state::<std::sync::Arc<maxsecu_client_app::session_seal::SessionSeal>>()
             {
                 seal.zeroize(); // wipe the key's in-RAM copy (swap copy from before this is the accepted residual)
+            }
+            // Wipe the WebView2 user-data folder so no browser artifacts persist
+            // between runs. Best-effort — never block or panic shutdown.
+            if let Some(dir) = app_handle.try_state::<AppDir>() {
+                let _ = std::fs::remove_dir_all(dir.0.join("webview"));
             }
         }
         _ => {}
