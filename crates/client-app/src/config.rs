@@ -396,16 +396,56 @@ pub struct ConnectionSettings {
 pub struct AppearanceSettings {
     /// "dark" (default) | "light". Applied via `<html data-theme>` in the UI.
     pub theme: String,
+    /// Active visual skin: "default" | "pizza" | "slot3". Non-secret UI pref;
+    /// the source of truth for the skin (was UI-local localStorage). Injected
+    /// pre-paint by `main.rs` via `window.__MAXSECU_BOOT__.frontend`.
+    #[serde(default = "default_frontend")]
+    pub frontend: String,
 }
 impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
             theme: "dark".into(),
+            frontend: default_frontend(),
+        }
+    }
+}
+fn default_frontend() -> String {
+    "default".into()
+}
+
+/// Non-secret UI-shape preferences that used to live in browser localStorage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiSettings {
+    /// Bundle view mode: "gallery" (default) | "stacked".
+    pub bundle_view: String,
+}
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            bundle_view: "gallery".into(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+/// Player playback preferences (non-secret).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlaybackSettings {
+    /// Player volume, 0.0..=1.0 (default 1.0).
+    pub volume: f32,
+    /// Player mute state (default false).
+    pub muted: bool,
+}
+impl Default for PlaybackSettings {
+    fn default() -> Self {
+        Self {
+            volume: 1.0,
+            muted: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SettingsConfig {
     #[serde(default)]
     pub a11y: A11ySettings,
@@ -417,6 +457,10 @@ pub struct SettingsConfig {
     pub connection: ConnectionSettings,
     #[serde(default)]
     pub appearance: AppearanceSettings,
+    #[serde(default)]
+    pub ui: UiSettings,
+    #[serde(default)]
+    pub playback: PlaybackSettings,
 }
 
 impl SettingsConfig {
@@ -466,6 +510,18 @@ impl SettingsConfig {
         if !matches!(s.appearance.theme.as_str(), "dark" | "light") {
             s.appearance.theme = "dark".into();
         }
+        if !matches!(s.appearance.frontend.as_str(), "default" | "pizza" | "slot3") {
+            s.appearance.frontend = "default".into();
+        }
+        if !matches!(s.ui.bundle_view.as_str(), "gallery" | "stacked") {
+            s.ui.bundle_view = "gallery".into();
+        }
+        // Clamp volume into [0,1]; a NaN (from a hand-edited file) resets to 1.0.
+        s.playback.volume = if s.playback.volume.is_nan() {
+            1.0
+        } else {
+            s.playback.volume.clamp(0.0, 1.0)
+        };
         // Route-mode ⇄ legacy `use_tor` reconciliation: migrate a legacy file that
         // set only `use_tor=true` (route_mode defaulted to PreferServer) into
         // TorOnly, then keep `use_tor` synced to route_mode so older readers stay
@@ -708,6 +764,60 @@ mod tests {
         let n = s.normalized_with_ram(&limits).performance;
         assert!(n.media_cache_cap_mb <= 2048 && n.media_cache_cap_mb >= 64);
         assert!(n.thumb_cache_cap_mb <= 2048 && n.thumb_cache_cap_mb >= 64);
+    }
+
+    #[test]
+    fn appearance_frontend_defaults_and_normalizes() {
+        let s = SettingsConfig::default();
+        assert_eq!(s.appearance.frontend, "default");
+        let mut bad = SettingsConfig::default();
+        bad.appearance.frontend = "bogus".into();
+        assert_eq!(bad.normalized().appearance.frontend, "default");
+        for id in ["default", "pizza", "slot3"] {
+            let mut ok = SettingsConfig::default();
+            ok.appearance.frontend = id.into();
+            assert_eq!(ok.normalized().appearance.frontend, id);
+        }
+    }
+
+    #[test]
+    fn ui_bundle_view_defaults_and_normalizes() {
+        let d = SettingsConfig::default();
+        assert_eq!(d.ui.bundle_view, "gallery");
+        let mut bad = SettingsConfig::default();
+        bad.ui.bundle_view = "weird".into();
+        assert_eq!(bad.normalized().ui.bundle_view, "gallery");
+        let mut ok = SettingsConfig::default();
+        ok.ui.bundle_view = "stacked".into();
+        assert_eq!(ok.normalized().ui.bundle_view, "stacked");
+    }
+
+    #[test]
+    fn playback_defaults_and_volume_clamps() {
+        let d = SettingsConfig::default();
+        assert_eq!(d.playback.volume, 1.0);
+        assert!(!d.playback.muted);
+        let mut hi = SettingsConfig::default();
+        hi.playback.volume = 5.0;
+        assert_eq!(hi.normalized().playback.volume, 1.0);
+        let mut lo = SettingsConfig::default();
+        lo.playback.volume = -3.0;
+        assert_eq!(lo.normalized().playback.volume, 0.0);
+        let mut nan = SettingsConfig::default();
+        nan.playback.volume = f32::NAN;
+        assert_eq!(nan.normalized().playback.volume, 1.0);
+    }
+
+    #[test]
+    fn old_settings_file_without_new_sections_still_loads() {
+        // A pre-migration file (no ui/playback/frontend) loads with defaults.
+        let json = r#"{"appearance":{"theme":"light"}}"#;
+        let s: SettingsConfig = serde_json::from_str(json).unwrap();
+        let n = s.normalized();
+        assert_eq!(n.appearance.theme, "light");
+        assert_eq!(n.appearance.frontend, "default");
+        assert_eq!(n.ui.bundle_view, "gallery");
+        assert_eq!(n.playback.volume, 1.0);
     }
 
     fn n() -> u128 {
