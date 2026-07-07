@@ -1,23 +1,15 @@
 import { call } from "./rpc.ts";
 import type { Settings } from "./types.ts";
-import { SettingsStore } from "./settings-store.ts";
 import { decodePool } from "./pool.ts";
 import { applyFrontend } from "./frontends.ts";
 
-const DEFAULTS: Settings = {
-  a11y: { reduced_motion: false, high_contrast: false, text_size: "normal" },
-  behavior: { confirm_destructive: false },
-  performance: { media_cache_cap_mb: 1024, thumb_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4, cache_location: "Memory" },
-  connection: { route_mode: "prefer-server" },
-  appearance: { theme: "dark", frontend: "default" },
-  ui: { bundle_view: "gallery" },
-  playback: { volume: 1.0, muted: false },
-};
-
 // The single shared settings store (spec §7). Settings screen, the header RAM
 // gauge, and the shell theme all read/write THIS instance, so they always agree
-// and apply live.
-export const settingsStore = new SettingsStore(DEFAULTS);
+// and apply live. The instance itself lives in the settings-store-instance.ts leaf
+// module so frontends.ts can import it without an import cycle; re-exported here so
+// existing `import { settingsStore } from "./settings.ts"` call sites keep working.
+export { settingsStore } from "./settings-store-instance.ts";
+import { settingsStore } from "./settings-store-instance.ts";
 
 // Apply settings live: active frontend + a11y data-attrs (styles.css keys on
 // them; reduced-motion ALSO respects the OS via a media query), and resize the
