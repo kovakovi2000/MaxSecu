@@ -2,6 +2,15 @@ import "media-chrome";
 import { call } from "../core/rpc.ts";
 import { streamSrc, previewSrc } from "./video-src.ts";
 import { serial } from "../core/serial.ts";
+import { settingsStore } from "../core/settings.ts";
+import { updateSettings } from "../core/settings.ts";
+
+// Pure: clamp a raw volume into [0,1] (NaN → 1). Mirrors the backend clamp so the
+// UI and settings.json agree.
+export function clampVolume(v: number): number {
+  if (Number.isNaN(v)) return 1;
+  return Math.min(1, Math.max(0, v));
+}
 
 // Sandboxed-video CHROME (Gate 5.3 / native-decode pivot). Pure UI, OUTSIDE the TCB.
 //
@@ -19,7 +28,16 @@ import { serial } from "../core/serial.ts";
 // The one authed command left (open_video) goes through the shared serial()
 // queue, like every other reauth-bound UI call. No keys cross this layer.
 
-export class VideoPlayer extends HTMLElement {
+// DOM-safe base: HTMLElement in the WebView (identical to `extends HTMLElement`),
+// a dummy stand-in under node:test (which has no DOM) so this module — and its
+// pure `clampVolume` export — can be imported without a ReferenceError. No
+// instance is ever constructed off-DOM, so the stand-in's members are never hit.
+const ElementBase: typeof HTMLElement =
+  typeof HTMLElement !== "undefined"
+    ? HTMLElement
+    : (class {} as unknown as typeof HTMLElement);
+
+export class VideoPlayer extends ElementBase {
   private _fileId = "";
   private reqId = "";
   private opened = false;
@@ -102,6 +120,21 @@ export class VideoPlayer extends HTMLElement {
       (this.querySelector("#vp-region") as HTMLElement).focus();
     }
     const video = this.querySelector("video") as HTMLVideoElement;
+    // Restore persisted volume/mute (settings.json is the source of truth). Applied
+    // after Media Chrome mounts so ours wins over its own localStorage copy.
+    const pb = settingsStore.get().playback;
+    video.volume = clampVolume(pb.volume);
+    video.muted = pb.muted;
+    let volTimer: ReturnType<typeof setTimeout> | undefined;
+    video.addEventListener("volumechange", () => {
+      const volume = clampVolume(video.volume);
+      const muted = video.muted;
+      settingsStore.patchLocal({ playback: { volume, muted } });
+      if (volTimer) clearTimeout(volTimer);
+      volTimer = setTimeout(() => {
+        void updateSettings({ playback: { volume, muted } }).catch(() => {});
+      }, 400);
+    });
     video.addEventListener("error", () => {
       const s = this.querySelector("#vp-status") as HTMLElement | null;
       if (s) {
@@ -147,4 +180,6 @@ function phaseCode(x: unknown): string {
   return "open_failed";
 }
 
-customElements.define("video-player", VideoPlayer);
+if (typeof customElements !== "undefined") {
+  customElements.define("video-player", VideoPlayer);
+}
