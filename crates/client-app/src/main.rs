@@ -22,18 +22,25 @@ fn main() {
     // Redirect the process temp dir INTO the portable folder BEFORE anything resolves
     // a temp path — critically before the WebView2 child spawns, since it inherits our
     // environment. This keeps WebView2's browser scratch (msedge_*, WebView2Downloads)
-    // AND our own transient scratch (the confined video-transcode job dirs) inside
-    // <app_dir>/webview/tmp, which the exit-wipe already removes. The confined ffmpeg
-    // job dir grants the AppContainer SID an ACE on its OWN per-job dir (SetNamedSecurityInfo)
-    // and reaches it via bypass-traverse, so relocating temp here does not affect
-    // confinement. Env is read lazily by `std::env::temp_dir()`, so setting it now
-    // takes effect for every later call. Best-effort: a create failure leaves the OS
-    // default in place rather than crashing startup.
+    // AND our own transient scratch (the confined video-transcode per-job dirs) inside
+    // <app_dir>/tmp, which the exit-wipe removes.
+    //
+    // The temp dir is a SIBLING of `webview/`, NOT nested inside it: WebView2
+    // ACL-locks its own user-data directory (`webview/`), and a confined-ffmpeg job
+    // dir created under that locked tree fails the AppContainer child's access
+    // ("That video could not be processed."). A plain `<app_dir>/tmp` has ordinary
+    // inherited ACLs — identical to the OS-temp location the confinement was proven
+    // against — so the per-job `grant_path_to_appcontainer` ACE + bypass-traverse work
+    // exactly as before and GPU-accelerated transcode is preserved.
+    //
+    // Env is read lazily by `std::env::temp_dir()`, so setting it now takes effect for
+    // every later call. Best-effort: a create failure leaves the OS default in place
+    // rather than crashing startup.
     let webview_dir = app_dir.join("webview");
-    let webview_tmp = webview_dir.join("tmp");
-    if std::fs::create_dir_all(&webview_tmp).is_ok() {
-        std::env::set_var("TEMP", &webview_tmp);
-        std::env::set_var("TMP", &webview_tmp);
+    let app_tmp = app_dir.join("tmp");
+    if std::fs::create_dir_all(&app_tmp).is_ok() {
+        std::env::set_var("TEMP", &app_tmp);
+        std::env::set_var("TMP", &app_tmp);
     }
 
     // Initial cache cap from persisted settings, clamped to the live RAM bounds.
@@ -124,11 +131,17 @@ fn main() {
             //     path that makes the runtime's identity broker (oneauth.dll) read the
             //     machine's Microsoft/OneDrive account store. We have no MS-account
             //     integration, so disabling it changes nothing we use.
+            //   * --disable-spell-checking: WebView2 spellchecks typed text (post
+            //     title/caption) via the Windows spellchecker, which LEARNS words into
+            //     the user's OS personal dictionary (%APPDATA%\Microsoft\Spelling\*) —
+            //     a trace outside the folder. We don't need spellcheck in a media
+            //     client, so turn it off entirely.
             const BROWSER_ARGS: &str = concat!(
                 "--disable-features=",
                 "msWebOOUI,msPdfOOUI,msSmartScreenProtection,",
                 "msImplicitSignin,msSingleSignOnOSForPrimaryAccountIsShared",
                 " --disable-gpu-shader-disk-cache",
+                " --disable-spell-checking",
                 " --autoplay-policy=no-user-gesture-required",
             );
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
@@ -255,10 +268,12 @@ fn main() {
             {
                 seal.zeroize(); // wipe the key's in-RAM copy (swap copy from before this is the accepted residual)
             }
-            // Wipe the WebView2 user-data folder so no browser artifacts persist
-            // between runs. Best-effort — never block or panic shutdown.
+            // Wipe the WebView2 user-data folder AND the in-folder temp dir so no
+            // browser artifacts or transient transcode scratch persist between runs.
+            // Best-effort — never block or panic shutdown.
             if let Some(dir) = app_handle.try_state::<AppDir>() {
                 let _ = std::fs::remove_dir_all(dir.0.join("webview"));
+                let _ = std::fs::remove_dir_all(dir.0.join("tmp"));
             }
         }
         _ => {}
