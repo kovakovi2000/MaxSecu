@@ -19,6 +19,23 @@ fn main() {
     // not crash startup.
     let _ = maxsecu_client_app::layout::ensure_portable_layout(&app_dir);
 
+    // Redirect the process temp dir INTO the portable folder BEFORE anything resolves
+    // a temp path — critically before the WebView2 child spawns, since it inherits our
+    // environment. This keeps WebView2's browser scratch (msedge_*, WebView2Downloads)
+    // AND our own transient scratch (the confined video-transcode job dirs) inside
+    // <app_dir>/webview/tmp, which the exit-wipe already removes. The confined ffmpeg
+    // job dir grants the AppContainer SID an ACE on its OWN per-job dir (SetNamedSecurityInfo)
+    // and reaches it via bypass-traverse, so relocating temp here does not affect
+    // confinement. Env is read lazily by `std::env::temp_dir()`, so setting it now
+    // takes effect for every later call. Best-effort: a create failure leaves the OS
+    // default in place rather than crashing startup.
+    let webview_dir = app_dir.join("webview");
+    let webview_tmp = webview_dir.join("tmp");
+    if std::fs::create_dir_all(&webview_tmp).is_ok() {
+        std::env::set_var("TEMP", &webview_tmp);
+        std::env::set_var("TMP", &webview_tmp);
+    }
+
     // Initial cache cap from persisted settings, clamped to the live RAM bounds.
     // `load` normalizes a present file, but the missing-file default (1 GiB)
     // is not; `normalized()` here also bounds that first-run default to the
@@ -34,9 +51,9 @@ fn main() {
     // `feed_concurrency` in settings takes effect on the next app restart.
     let pool_cap = normalized.performance.feed_concurrency as usize;
 
-    // WebView2 user-data folder lives INSIDE the portable folder so localStorage,
-    // cache, cookies, and GPU cache never escape <app_dir>. Wiped on exit.
-    let webview_dir = app_dir.join("webview");
+    // WebView2 user-data folder lives INSIDE the portable folder (`webview_dir`,
+    // defined above) so localStorage, cache, cookies, and GPU cache never escape
+    // <app_dir>. Wiped on exit.
     // The persisted skin, injected pre-paint via an initialization script so boot.js
     // can apply it before first paint with no flash (settings.json is the source of truth).
     let boot_frontend = normalized.appearance.frontend.clone();
@@ -93,12 +110,34 @@ fn main() {
                 "window.__MAXSECU_BOOT__ = {{ frontend: {} }};",
                 serde_json::to_string(&boot_frontend).unwrap_or_else(|_| "\"default\"".into())
             );
+            // WebView2/Chromium command-line args. Setting this REPLACES wry's
+            // defaults, so we re-list them first, then add our hardening:
+            //   * wry defaults (must keep): msWebOOUI/msPdfOOUI (out-of-proc UI off),
+            //     msSmartScreenProtection (no SmartScreen phone-home),
+            //     --autoplay-policy=no-user-gesture-required (autoplay defaults on in
+            //     wry, our media player relies on it).
+            //   * --disable-gpu-shader-disk-cache: stop the GPU driver writing its
+            //     shader cache OUTSIDE the folder, WITHOUT disabling GPU-accelerated
+            //     video decode (we do NOT pass --disable-gpu).
+            //   * msImplicitSignin + msSingleSignOnOSForPrimaryAccountIsShared:
+            //     best-effort suppression of Edge's implicit OS single-sign-on, the
+            //     path that makes the runtime's identity broker (oneauth.dll) read the
+            //     machine's Microsoft/OneDrive account store. We have no MS-account
+            //     integration, so disabling it changes nothing we use.
+            const BROWSER_ARGS: &str = concat!(
+                "--disable-features=",
+                "msWebOOUI,msPdfOOUI,msSmartScreenProtection,",
+                "msImplicitSignin,msSingleSignOnOSForPrimaryAccountIsShared",
+                " --disable-gpu-shader-disk-cache",
+                " --autoplay-policy=no-user-gesture-required",
+            );
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("MaxSecu")
                 .inner_size(1100.0, 720.0)
                 .resizable(true)
                 .maximized(true)
                 .data_directory(webview_dir.clone())
+                .additional_browser_args(BROWSER_ARGS)
                 .initialization_script(boot_script)
                 .build()?;
             Ok(())
