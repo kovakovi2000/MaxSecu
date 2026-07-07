@@ -240,7 +240,10 @@ export interface Settings {
     cache_location: "Disk" | "Memory";
   };
   connection: { route_mode: RouteMode };
-  appearance: { theme: "dark" };
+  appearance: { theme: "dark" | "light"; frontend: "default" | "pizza" | "slot3" };
+  // Non-secret UI-shape prefs migrated out of browser localStorage into settings.json.
+  ui: { bundle_view: "gallery" | "stacked" };
+  playback: { volume: number; muted: boolean };
 }
 
 // The RAM-cache slider/number bounds from the `ram_limits` command (Task 1).

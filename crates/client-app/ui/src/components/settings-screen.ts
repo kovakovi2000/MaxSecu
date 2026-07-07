@@ -14,7 +14,9 @@ const DEFAULTS: Settings = {
   behavior: { confirm_destructive: false },
   performance: { media_cache_cap_mb: 1024, thumb_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4, cache_location: "Memory" },
   connection: { route_mode: "prefer-server" },
-  appearance: { theme: "dark" },
+  appearance: { theme: "dark", frontend: "default" },
+  ui: { bundle_view: "gallery" },
+  playback: { volume: 1.0, muted: false },
 };
 
 export class SettingsScreen extends HTMLElement {
@@ -199,8 +201,9 @@ export class SettingsScreen extends HTMLElement {
     setFrontend(this.sel("frontend").value);
     const patch: Partial<Settings> = {
       // Backend appearance stays the existing dark contract. The visual frontend is
-      // UI-local (localStorage) and applied via setFrontend(), independent of this save.
-      appearance: { theme: "dark" },
+      // persisted to settings.json by setFrontend() (called just above); mirror the
+      // current value here so this save patch does not clobber it.
+      appearance: { theme: "dark", frontend: getFrontend() },
       a11y: {
         reduced_motion: this.input("reduced_motion").checked,
         high_contrast: this.input("high_contrast").checked,
