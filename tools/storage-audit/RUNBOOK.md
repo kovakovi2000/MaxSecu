@@ -8,7 +8,7 @@ Procmon.exe /AcceptEula /Quiet /Minimized /BackingFile capture.pml
 ```
 
 ## 2. Exercise EVERY persistence-relevant flow in the built client
-Launch `MaxSecuClient.exe` from its portable folder, then:
+Launch `MaxSecu.exe` from its portable folder, then:
 - register / first-run (if applicable), unlock/login
 - change the theme; change the skin; change the bundle view (gallery ↔ stacked)
 - play a video and change the volume + toggle mute
