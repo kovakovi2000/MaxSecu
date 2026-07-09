@@ -30,10 +30,10 @@ use crate::error::UiError;
 
 /// SHA-256 of the vendored static ffmpeg, pinned at build time.
 ///
-/// hex: `6ed7e5c931d3cbc72931ee7e97efc4b7d8a1287f03c60585fab81a6a293b2e0e`
+/// hex: `5899192cfbe74807e8e521e98b5e1dcb08ff7f188a7a3a527d2db7193b92c0f9`
 pub const FFMPEG_SHA256: [u8; 32] = [
-    0x6e, 0xd7, 0xe5, 0xc9, 0x31, 0xd3, 0xcb, 0xc7, 0x29, 0x31, 0xee, 0x7e, 0x97, 0xef, 0xc4, 0xb7,
-    0xd8, 0xa1, 0x28, 0x7f, 0x03, 0xc6, 0x05, 0x85, 0xfa, 0xb8, 0x1a, 0x6a, 0x29, 0x3b, 0x2e, 0x0e,
+    0x58, 0x99, 0x19, 0x2c, 0xfb, 0xe7, 0x48, 0x07, 0xe8, 0xe5, 0x21, 0xe9, 0x8b, 0x5e, 0x1d, 0xcb,
+    0x08, 0xff, 0x7f, 0x18, 0x8a, 0x7a, 0x3a, 0x52, 0x7d, 0x2d, 0xb7, 0x19, 0x3b, 0x92, 0xc0, 0xf9,
 ];
 
 /// The vendored static ffmpeg, baked into this binary. Present only when the
@@ -53,7 +53,7 @@ fn video_unavailable() -> UiError {
 
 /// First 8 lowercase hex chars (the first 4 bytes) of the pinned digest,
 /// derived from the constant so the on-disk filename can never drift from the
-/// pin. For the current pin this is `6ed7e5c9`.
+/// pin. For the current pin this is `5899192c`.
 #[cfg(feature = "embed-ffmpeg")]
 fn sha8() -> String {
     use std::fmt::Write as _;
@@ -179,7 +179,7 @@ mod tests {
     fn ensure_materializes_verified_exe() {
         let dir = fresh_dir("materialize");
         let path = ensure_ffmpeg(&dir).unwrap();
-        assert_eq!(path, dir.join("bin").join("ffmpeg-6ed7e5c9.exe"));
+        assert_eq!(path, dir.join("bin").join("ffmpeg-5899192c.exe"));
         assert!(path.exists());
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(maxsecu_crypto::sha256(&on_disk), FFMPEG_SHA256);

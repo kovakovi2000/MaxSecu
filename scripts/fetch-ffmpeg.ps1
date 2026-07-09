@@ -14,10 +14,12 @@
     hash, the download is skipped. On ANY hash mismatch the script FAILS LOUDLY (it
     never leaves an unpinned binary staged).
 
-    NOTE: BtbN's `latest` tag is a ROLLING release; a future download may not match the
-    pinned hash. That is intentional — a mismatch is a hard error, not a silent accept.
-    If upstream rolled, obtain the matching build or deliberately re-pin (update the SHA
-    here, in README.md, and in ffmpeg_bin.rs, and re-review).
+    NOTE: the URL below points at a DATED, IMMUTABLE BtbN autobuild release (not the
+    rolling `latest` tag), so its asset is frozen and the pinned SHA-256 stays valid.
+    BtbN does eventually prune very old autobuild releases; if the URL ever 404s,
+    re-pin to a newer dated release (update the URL + SHA here, in README.md, and in
+    ffmpeg_bin.rs, and re-review). A hash mismatch remains a hard error, never a silent
+    accept.
 
 .EXAMPLE
     pwsh scripts/fetch-ffmpeg.ps1
@@ -29,9 +31,9 @@ param()
 $ErrorActionPreference = 'Stop'
 
 # --- Pinned build (keep in sync with vendor/ffmpeg/README.md + ffmpeg_bin.rs) ---------
-$FFMPEG_URL    = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip'
-$FFMPEG_SHA256 = '6ed7e5c931d3cbc72931ee7e97efc4b7d8a1287f03c60585fab81a6a293b2e0e'
-$INNER_PATH    = 'ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe'  # path inside the zip
+$FFMPEG_URL    = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-09-14-21/ffmpeg-n7.1.5-1-g7d0e842004-win64-gpl-7.1.zip'
+$FFMPEG_SHA256 = '5899192cfbe74807e8e521e98b5e1dcb08ff7f188a7a3a527d2db7193b92c0f9'
+$INNER_PATH    = 'ffmpeg-n7.1.5-1-g7d0e842004-win64-gpl-7.1/bin/ffmpeg.exe'  # path inside the zip
 
 # --- Paths ---------------------------------------------------------------------------
 $repoRoot = Split-Path -Parent $PSScriptRoot

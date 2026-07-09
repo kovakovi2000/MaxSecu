@@ -18,12 +18,12 @@ this hash.
 | Field            | Value |
 |------------------|-------|
 | File             | `vendor/ffmpeg/ffmpeg.exe` |
-| **SHA-256**      | `6ed7e5c931d3cbc72931ee7e97efc4b7d8a1287f03c60585fab81a6a293b2e0e` |
-| Size             | 143314944 bytes (136.68 MiB) |
-| FFmpeg version   | `N-125365-g9a01c1cb6a-20260630` (git `9a01c1cb6a`, 2026-06-30) |
+| **SHA-256**      | `5899192cfbe74807e8e521e98b5e1dcb08ff7f188a7a3a527d2db7193b92c0f9` |
+| Size             | 138066432 bytes (131.67 MiB) |
+| FFmpeg version   | `n7.1.5-1-g7d0e842004` (7.1.5 release branch; ≤ 7.x) |
 | Source           | BtbN FFmpeg-Builds, GitHub releases |
-| Asset            | `ffmpeg-master-latest-win64-gpl.zip` → `bin/ffmpeg.exe` |
-| URL              | <https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip> |
+| Asset            | `ffmpeg-n7.1.5-1-g7d0e842004-win64-gpl-7.1.zip` → `bin/ffmpeg.exe` |
+| URL              | <https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-09-14-21/ffmpeg-n7.1.5-1-g7d0e842004-win64-gpl-7.1.zip> |
 | Build type       | **static, self-contained single .exe** (no bundled `*.dll`) |
 
 ### Build configuration (relevant flags)
@@ -58,10 +58,10 @@ explicit **Phase-B** residual (spec §12).
 pwsh scripts/fetch-ffmpeg.ps1   # downloads + SHA-256-verifies vendor/ffmpeg/ffmpeg.exe
 ```
 
-> NOTE: BtbN's `latest` tag is a **rolling** release — the asset behind that URL is
-> rebuilt periodically, so a future download may NOT match the pinned SHA-256. That is
-> intentional and safe: `fetch-ffmpeg.ps1` **fails loudly** on a hash mismatch rather
-> than silently embedding an unpinned binary. If upstream has rolled, obtain the build
-> matching the pinned hash (or deliberately re-pin: update the SHA-256 here, in
-> `scripts/fetch-ffmpeg.ps1`, and `FFMPEG_SHA256` in `crates/client-app/src/ffmpeg_bin.rs`,
-> and re-review).
+> NOTE: the URL above points at a **dated, immutable** BtbN autobuild release
+> (`autobuild-2026-07-09-14-21`), NOT the rolling `latest` tag — so the asset is frozen
+> and the pinned SHA-256 stays valid. `fetch-ffmpeg.ps1` still **fails loudly** on any
+> hash mismatch rather than silently embedding an unpinned binary. BtbN does eventually
+> prune very old autobuild releases; if the URL 404s, re-pin to a newer dated release
+> (update the URL + SHA-256 here, in `scripts/fetch-ffmpeg.ps1`, and `FFMPEG_SHA256` in
+> `crates/client-app/src/ffmpeg_bin.rs`, and re-review).
