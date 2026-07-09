@@ -52,6 +52,7 @@ $benignPatterns = @(
   '\\nvidia\b',                                  # per-user NVIDIA GPU shader cache dirs
   'nvidia corporation',                          # %ProgramData% / driver NVIDIA profile store
   '\\d3dscache\\',                               # OS DirectX pipeline/shader cache (GPU process; compiled shader blobs, no user data)
+  '\\explorer\\iconcache',                       # Windows shell icon cache — touched by the native file open/save dialog, global OS bookkeeping
   '\\microsoft\\oneauth\\',                      # Edge/WebView2 runtime identity broker
   '\\temp\\webview2downloads',                   # WebView2 runtime download temp
   '\\temp\\msedge_',                             # WebView2/Edge runtime temp

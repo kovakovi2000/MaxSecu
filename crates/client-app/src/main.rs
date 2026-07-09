@@ -141,11 +141,12 @@ fn main() {
             //     path that makes the runtime's identity broker (oneauth.dll) read the
             //     machine's Microsoft/OneDrive account store. We have no MS-account
             //     integration, so disabling it changes nothing we use.
-            //   * --disable-spell-checking: WebView2 spellchecks typed text (post
-            //     title/caption) via the Windows spellchecker, which LEARNS words into
-            //     the user's OS personal dictionary (%APPDATA%\Microsoft\Spelling\*) —
-            //     a trace outside the folder. We don't need spellcheck in a media
-            //     client, so turn it off entirely.
+            //   * --disable-spell-checking: belt-and-suspenders only. It disables
+            //     Chromium's own spellcheck but NOT the Windows OS spellchecker
+            //     (WinRT Globalization), which is what WebView2 uses on Windows and
+            //     which learns words into %APPDATA%\Microsoft\Spelling\*. The effective
+            //     fix for that out-of-folder trace is `spellcheck="false"` on the UI
+            //     root (index.html) — this flag is kept as a harmless secondary guard.
             const BROWSER_ARGS: &str = concat!(
                 "--disable-features=",
                 "msWebOOUI,msPdfOOUI,msSmartScreenProtection,",
