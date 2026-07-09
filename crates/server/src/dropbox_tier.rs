@@ -5,10 +5,17 @@
 //! Every byte handed to [`DropboxTier::put_chunk`] is already client-encrypted
 //! AEAD ciphertext (`server::blob` module doc) — this adapter passes it through
 //! **verbatim**, and stores/returns nothing else. No key, manifest field, title,
-//! or plaintext ever reaches this module, let alone Dropbox. The OAuth access
-//! token is read from **runtime config/env only** (never hardcoded, never
-//! committed) and is redacted from `Debug` + best-effort zeroized on drop
-//! ([`DropboxToken`]). [`DropboxTier::broker_direct_link`] mints only a
+//! or plaintext ever reaches this module, let alone Dropbox. Authentication uses
+//! the OAuth **refresh flow**: the server holds a long-lived app key/secret +
+//! refresh token (read from **runtime config/env only** — never hardcoded, never
+//! committed) and mints short-lived access tokens on demand at the token
+//! endpoint. The refresh token appears ONLY in the token-endpoint request body;
+//! a minted access token appears ONLY in the `Authorization: Bearer …` header of
+//! content/RPC requests. The app secret, refresh token, and cached access token
+//! all redact from `Debug` + best-effort zeroize on drop ([`DropboxToken`]).
+//! Access tokens are cached and auto-refreshed [`REFRESH_MARGIN`] before expiry,
+//! plus a reactive single retry on a `401` (early expiry / clock skew).
+//! [`DropboxTier::broker_direct_link`] mints only a
 //! Dropbox-scoped, short-lived read link (`get_temporary_link`) that carries no
 //! master credential, and returns `Ok(None)` for an absent chunk (no oracle).
 //! Every transport failure, non-2xx status, or malformed response maps to a
@@ -38,16 +45,18 @@
 //! `FsBlobStore::stream_dir`).
 //!
 //! # Running the live test
-//! `dropbox_live_round_trip` is `#[ignore]`d and gated on the `DROPBOX_TEST_TOKEN`
-//! env var — it never runs in CI. To run it manually against a real Dropbox
-//! account (an app-scoped OAuth2 access token with `files.content.write`,
-//! `files.content.read`, and `sharing.write` scopes):
+//! `dropbox_live_round_trip_refresh` is `#[ignore]`d and gated on the refresh
+//! credential set (`MAXSECU_DROPBOX_APP_KEY`, `MAXSECU_DROPBOX_APP_SECRET`,
+//! `MAXSECU_DROPBOX_REFRESH_TOKEN` — all non-empty) — it never runs in CI. To run
+//! it manually against a real Dropbox account (a scoped app authorized offline
+//! with `files.content.write`, `files.content.read`, and `sharing.write`):
 //! ```text
-//! DROPBOX_TEST_TOKEN=<your-token> \
-//!   cargo test -p maxsecu-server --lib -- --ignored dropbox_live_round_trip
+//! MAXSECU_DROPBOX_APP_KEY=… MAXSECU_DROPBOX_APP_SECRET=… MAXSECU_DROPBOX_REFRESH_TOKEN=… \
+//!   cargo test -p maxsecu-server --lib -- --ignored dropbox_live_round_trip_refresh
 //! ```
-//! It uploads a small random ciphertext-shaped blob under a fresh random test
-//! root, reads it back, brokers a temporary link, and deletes it.
+//! It forces a token refresh, uploads a small random ciphertext-shaped blob under
+//! a fresh random test root, reads it back, brokers a temporary link, and deletes
+//! it. An optional `MAXSECU_DROPBOX_ACCESS_TOKEN` warm-starts the cache.
 
 use crate::blob::{BlobError, DirectLink};
 use crate::tier::ColdTier;
@@ -85,6 +94,65 @@ impl Drop for DropboxToken {
     fn drop(&mut self) {
         self.0.zeroize();
     }
+}
+
+/// Refresh a cached access token this long before its stated expiry, so an
+/// in-flight request never races the boundary.
+const REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Upper bound on a cached token's lifetime. A real Dropbox access token is
+/// short-lived (~4 h); a token-endpoint response reporting anything beyond this
+/// is clamped down. This is a robustness guard: an absurd/oversized `expires_in`
+/// (e.g. `u64::MAX` from a buggy/hostile token endpoint) would otherwise overflow
+/// `Instant + Duration` and PANIC — clamping keeps `bearer()` fail-safe.
+const MAX_TOKEN_LIFETIME_SECS: u64 = 7 * 24 * 3600;
+
+/// A minted access token plus the monotonic instant it stops being valid.
+struct CachedToken {
+    access_token: DropboxToken,
+    expires_at: std::time::Instant,
+}
+
+/// The long-lived OAuth refresh credential set + the most recently minted access
+/// token. `app_key` is the public-ish HTTP Basic *username* on the token
+/// endpoint; `app_secret` and `refresh_token` are secrets (redact `Debug` +
+/// best-effort zeroize on drop, reusing [`DropboxToken`]). `cached` holds the
+/// current short-lived access token behind a `tokio::sync::Mutex` so refreshes
+/// are single-flight: concurrent callers block on the mutex, and the first
+/// refresh's result is reused by the rest.
+struct DropboxCreds {
+    app_key: String,
+    app_secret: DropboxToken,
+    refresh_token: DropboxToken,
+    cached: tokio::sync::Mutex<Option<CachedToken>>,
+}
+
+impl fmt::Debug for DropboxCreds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DropboxCreds")
+            .field("app_key", &self.app_key)
+            .field("app_secret", &self.app_secret) // DropboxToken's Debug redacts
+            .field("refresh_token", &self.refresh_token) // DropboxToken's Debug redacts
+            .field("cached", &"<redacted>") // never print the minted access token
+            .finish()
+    }
+}
+
+/// Percent-encode `s` for an `application/x-www-form-urlencoded` body value,
+/// escaping everything outside the RFC 3986 unreserved set. Tiny and inline —
+/// the crate has no percent-encoding dependency and the only value encoded here
+/// is the refresh token in the token-endpoint request body.
+fn percent_encode_form(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// HTTP method of a [`DropboxRequest`]. Only `POST` is ever issued — every
@@ -187,7 +255,7 @@ fn is_path_not_found(status: u16, body: &[u8]) -> bool {
 /// egress contract and path mapping.
 pub struct DropboxTier<H: DropboxHttp> {
     http: H,
-    token: DropboxToken,
+    creds: DropboxCreds,
     /// Dropbox app folder root, e.g. `/maxsecu` (no trailing slash).
     root: String,
     api_host: String,
@@ -200,45 +268,154 @@ impl<H: DropboxHttp> fmt::Debug for DropboxTier<H> {
             .field("root", &self.root)
             .field("api_host", &self.api_host)
             .field("content_host", &self.content_host)
-            .field("token", &self.token) // DropboxToken's own Debug redacts it
+            .field("creds", &self.creds) // DropboxCreds's own Debug redacts secrets
             .finish()
     }
 }
 
 impl<H: DropboxHttp> DropboxTier<H> {
     /// Build a tier over an explicit transport `http` (mocks in tests, or a
-    /// [`HyperDropboxHttp`] pointed at a non-default host for a loopback stub).
-    /// `token` is the caller-sourced runtime credential (env/config — never
-    /// hardcoded); `root` is the Dropbox app-folder root (e.g. `/maxsecu`).
-    fn with_http_and_hosts(
+    /// [`HyperDropboxHttp`] pointed at a non-default host for a loopback stub)
+    /// using the OAuth refresh credential set. `app_key`/`app_secret`/
+    /// `refresh_token` are the caller-sourced runtime credentials (env/config —
+    /// never hardcoded). `access_token: Some(_)` warm-starts the cache with an
+    /// already-stale expiry (`Instant::now()`), so the first `bearer()` call
+    /// mints a fresh token; `None` starts cold. `root` is the Dropbox app-folder
+    /// root (e.g. `/maxsecu`).
+    #[allow(clippy::too_many_arguments)]
+    fn with_refresh_http(
         http: H,
-        token: impl Into<String>,
-        root: impl Into<String>,
+        app_key: impl Into<String>,
+        app_secret: impl Into<String>,
+        refresh_token: impl Into<String>,
+        access_token: Option<String>,
         api_host: impl Into<String>,
         content_host: impl Into<String>,
+        root: impl Into<String>,
     ) -> Self {
         let root = root.into();
+        let cached = access_token.map(|t| CachedToken {
+            access_token: DropboxToken::new(t),
+            expires_at: std::time::Instant::now(),
+        });
         DropboxTier {
             http,
-            token: DropboxToken::new(token),
+            creds: DropboxCreds {
+                app_key: app_key.into(),
+                app_secret: DropboxToken::new(app_secret),
+                refresh_token: DropboxToken::new(refresh_token),
+                cached: tokio::sync::Mutex::new(cached),
+            },
             root: root.trim_end_matches('/').to_owned(),
             api_host: api_host.into(),
             content_host: content_host.into(),
         }
     }
 
-    fn auth_header(&self) -> (String, String) {
-        (
-            "authorization".to_owned(),
-            format!("Bearer {}", self.token.as_str()),
-        )
+    /// Build the token-endpoint request: `POST {api_host}/oauth2/token` with HTTP
+    /// Basic (`app_key:app_secret`) auth and a form-encoded refresh grant. The
+    /// refresh token appears ONLY here, in the request body.
+    fn build_refresh_request(&self) -> DropboxRequest {
+        use base64::Engine;
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!(
+            "{}:{}",
+            self.creds.app_key,
+            self.creds.app_secret.as_str()
+        ));
+        let body = format!(
+            "grant_type=refresh_token&refresh_token={}",
+            percent_encode_form(self.creds.refresh_token.as_str())
+        );
+        DropboxRequest {
+            method: DropboxMethod::Post,
+            url: format!("{}/oauth2/token", self.api_host),
+            headers: vec![
+                ("authorization".to_owned(), format!("Basic {basic}")),
+                (
+                    "content-type".to_owned(),
+                    "application/x-www-form-urlencoded".to_owned(),
+                ),
+            ],
+            body: body.into_bytes(),
+        }
     }
 
-    fn json_headers(&self) -> Vec<(String, String)> {
-        vec![
-            self.auth_header(),
-            ("content-type".to_owned(), "application/json".to_owned()),
-        ]
+    /// Return a valid `Bearer <access_token>` string, refreshing if needed.
+    ///
+    /// A cache hit (token exists and `now + REFRESH_MARGIN < expires_at`) returns
+    /// immediately WITHOUT touching the token endpoint. Otherwise a refresh runs
+    /// UNDER the `cached` lock (single-flight): concurrent callers block on the
+    /// mutex and — because the validity check runs again after the lock is
+    /// acquired — reuse the token the first refresh just minted instead of
+    /// refreshing again. The refresh request itself uses Basic auth, so it is NOT
+    /// routed through the 401-retry helper.
+    async fn bearer(&self) -> Result<String, BlobError> {
+        let mut guard = self.creds.cached.lock().await;
+        // Re-check validity now that we hold the lock (a concurrent caller may
+        // have just refreshed while we were blocked).
+        if let Some(cached) = guard.as_ref() {
+            if std::time::Instant::now() + REFRESH_MARGIN < cached.expires_at {
+                return Ok(format!("Bearer {}", cached.access_token.as_str()));
+            }
+        }
+        let resp = self.http.execute(self.build_refresh_request()).await?;
+        if resp.status / 100 != 2 {
+            return Err(BlobError::new(
+                "dropbox_oauth_refresh",
+                format!("dropbox http {}", resp.status),
+            ));
+        }
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
+            BlobError::new("dropbox_oauth_refresh", format!("malformed response: {e}"))
+        })?;
+        let access = v
+            .get("access_token")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| BlobError::new("dropbox_oauth_refresh", "missing access_token"))?;
+        let expires_in = v
+            .get("expires_in")
+            .and_then(|e| e.as_u64())
+            .ok_or_else(|| BlobError::new("dropbox_oauth_refresh", "missing expires_in"))?;
+        let token = DropboxToken::new(access);
+        let bearer = format!("Bearer {}", token.as_str());
+        // Clamp a bogus/oversized `expires_in` so `Instant + Duration` can never
+        // overflow (which panics); a genuine Dropbox token is ~4 h, far under the
+        // cap, so legitimate values are unaffected.
+        let lifetime = std::time::Duration::from_secs(expires_in.min(MAX_TOKEN_LIFETIME_SECS));
+        *guard = Some(CachedToken {
+            access_token: token,
+            expires_at: std::time::Instant::now() + lifetime,
+        });
+        Ok(bearer)
+    }
+
+    /// Replace any existing `authorization` header on `req` with `bearer`.
+    fn set_auth(req: &mut DropboxRequest, bearer: &str) {
+        req.headers.retain(|(k, _)| k != "authorization");
+        req.headers
+            .push(("authorization".to_owned(), bearer.to_owned()));
+    }
+
+    /// Execute a content/RPC `req` (built WITHOUT its `Authorization` header),
+    /// injecting a fresh bearer and absorbing early token expiry: on a `401` the
+    /// cache is invalidated, a fresh token minted, and the request retried
+    /// EXACTLY ONCE. A second `401` is returned as-is (bounded — never loops).
+    async fn execute_authed(&self, mut req: DropboxRequest) -> Result<DropboxResponse, BlobError> {
+        let bearer = self.bearer().await?;
+        Self::set_auth(&mut req, &bearer);
+        let resp = self.http.execute(req.clone()).await?;
+        if resp.status != 401 {
+            return Ok(resp);
+        }
+        // Reactive refresh: drop the stale cached token, force a fresh mint, and
+        // retry once.
+        {
+            let mut guard = self.creds.cached.lock().await;
+            *guard = None;
+        }
+        let bearer = self.bearer().await?;
+        Self::set_auth(&mut req, &bearer);
+        self.http.execute(req).await
     }
 
     async fn post_json(
@@ -250,10 +427,10 @@ impl<H: DropboxHttp> DropboxTier<H> {
         let req = DropboxRequest {
             method: DropboxMethod::Post,
             url: format!("{host}{path}"),
-            headers: self.json_headers(),
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
             body: body.to_string().into_bytes(),
         };
-        self.http.execute(req).await
+        self.execute_authed(req).await
     }
 
     /// `POST .../files/delete_v2 {"path"}` — idempotent, `path/not_found` is
@@ -286,7 +463,6 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
             method: DropboxMethod::Post,
             url: format!("{}/2/files/upload", self.content_host),
             headers: vec![
-                self.auth_header(),
                 ("dropbox-api-arg".to_owned(), arg),
                 (
                     "content-type".to_owned(),
@@ -295,7 +471,7 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
             ],
             body: bytes,
         };
-        let resp = self.http.execute(req).await?;
+        let resp = self.execute_authed(req).await?;
         if resp.status / 100 == 2 {
             Ok(())
         } else {
@@ -315,10 +491,10 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
         let req = DropboxRequest {
             method: DropboxMethod::Post,
             url: format!("{}/2/files/download", self.content_host),
-            headers: vec![self.auth_header(), ("dropbox-api-arg".to_owned(), arg)],
+            headers: vec![("dropbox-api-arg".to_owned(), arg)],
             body: Vec::new(),
         };
-        let resp = self.http.execute(req).await?;
+        let resp = self.execute_authed(req).await?;
         if resp.status == 200 {
             Ok(Some(resp.body))
         } else if is_path_not_found(resp.status, &resp.body) {
@@ -578,16 +754,30 @@ impl DropboxHttp for HyperDropboxHttp {
 }
 
 impl DropboxTier<HyperDropboxHttp> {
-    /// Build the REAL production adapter. `token` is the caller-sourced runtime
-    /// OAuth access token (env/config — NEVER hardcoded); `root` is the Dropbox
-    /// app-folder root (e.g. `/maxsecu`). Talks to the real Dropbox hosts.
-    pub fn new(token: impl Into<String>, root: impl Into<String>) -> Result<Self, BlobError> {
-        Ok(DropboxTier::with_http_and_hosts(
+    /// Build the REAL production adapter from the OAuth refresh credential set
+    /// (all caller-sourced runtime values — env/config, NEVER hardcoded). The
+    /// server mints short-lived access tokens itself from `app_key`/`app_secret`/
+    /// `refresh_token`, so the tier keeps working across access-token expiry with
+    /// no manual maintenance. `access_token: Some(_)` warm-starts the cache (it
+    /// is treated as already-stale and refreshed on first use — safe either way);
+    /// `root` is the Dropbox app-folder root (e.g. `/maxsecu`). Talks to the real
+    /// Dropbox hosts.
+    pub fn with_refresh(
+        app_key: impl Into<String>,
+        app_secret: impl Into<String>,
+        refresh_token: impl Into<String>,
+        access_token: Option<String>,
+        root: impl Into<String>,
+    ) -> Result<Self, BlobError> {
+        Ok(DropboxTier::with_refresh_http(
             HyperDropboxHttp::new()?,
-            token,
-            root,
+            app_key,
+            app_secret,
+            refresh_token,
+            access_token,
             DEFAULT_API_HOST,
             DEFAULT_CONTENT_HOST,
+            root,
         ))
     }
 }
@@ -652,16 +842,44 @@ mod tests {
     }
 
     const TOKEN: &str = "test-token-NOT-A-REAL-SECRET";
+    const APP_KEY: &str = "test-app-key";
+    const APP_SECRET: &str = "test-app-secret-NOT-A-REAL-SECRET";
+    const REFRESH_TOKEN: &str = "test-refresh-token-NOT-A-REAL-SECRET";
 
-    fn tier(responses: Vec<DropboxResponse>) -> (DropboxTier<MockDropboxHttp>, ()) {
-        let mock = MockDropboxHttp::new(responses);
-        let t = DropboxTier::with_http_and_hosts(
-            mock,
-            TOKEN,
-            "/maxsecu",
+    /// A `/oauth2/token` 2xx response minting `TOKEN` with a 4-hour lifetime
+    /// (comfortably beyond `REFRESH_MARGIN`, so the minted token counts as fresh).
+    fn refresh_ok() -> DropboxResponse {
+        json_resp(
+            200,
+            serde_json::json!({ "access_token": TOKEN, "expires_in": 14400 }),
+        )
+    }
+
+    /// Build a tier over a mock transport with a COLD cache — the first content
+    /// op triggers a refresh (so the caller must queue a `/oauth2/token` response
+    /// first).
+    fn tier_cold(responses: Vec<DropboxResponse>) -> DropboxTier<MockDropboxHttp> {
+        DropboxTier::with_refresh_http(
+            MockDropboxHttp::new(responses),
+            APP_KEY,
+            APP_SECRET,
+            REFRESH_TOKEN,
+            None,
             "https://api.dropboxapi.com",
             "https://content.dropboxapi.com",
-        );
+            "/maxsecu",
+        )
+    }
+
+    /// Build a tier whose cache is warm-started with a non-expired `TOKEN` (valid
+    /// 1 h), so content ops issue NO refresh — existing behavioral tests need only
+    /// queue their content responses and still see `Bearer {TOKEN}`.
+    fn tier(responses: Vec<DropboxResponse>) -> (DropboxTier<MockDropboxHttp>, ()) {
+        let t = tier_cold(responses);
+        *t.creds.cached.try_lock().unwrap() = Some(CachedToken {
+            access_token: DropboxToken::new(TOKEN),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        });
         (t, ())
     }
 
@@ -828,17 +1046,174 @@ mod tests {
         assert!(debug.contains("redacted"));
     }
 
-    /// Live, real-network round trip against actual Dropbox. `#[ignore]`d so it
-    /// never runs in CI; gated on `DROPBOX_TEST_TOKEN` so it never runs even
-    /// with `--ignored` unless the operator supplies a real token. See the
-    /// module doc for the exact command to run this manually.
+    /// Count how many recorded requests hit the token endpoint.
+    fn oauth_count(reqs: &[DropboxRequest]) -> usize {
+        reqs.iter()
+            .filter(|r| r.url.ends_with("/oauth2/token"))
+            .count()
+    }
+
     #[tokio::test]
-    #[ignore = "live network test against real Dropbox; requires DROPBOX_TEST_TOKEN"]
-    async fn dropbox_live_round_trip() {
-        let token = match std::env::var("DROPBOX_TEST_TOKEN") {
-            Ok(t) if !t.is_empty() => t,
+    async fn refresh_mints_and_caches_then_cache_hit() {
+        // Cold cache: first content op refreshes then uploads; the second op
+        // reuses the cached token (no second refresh).
+        let t = tier_cold(vec![
+            refresh_ok(),
+            resp(200, Vec::new()),
+            resp(200, Vec::new()),
+        ]);
+        t.put_chunk(REF, 0, vec![1, 2, 3]).await.unwrap();
+        t.put_chunk(REF, 1, vec![4, 5, 6]).await.unwrap();
+
+        let reqs = t.http.requests();
+        // Exactly one refresh total, and it came first.
+        assert_eq!(oauth_count(&reqs), 1);
+        let refresh = &reqs[0];
+        assert!(refresh.url.ends_with("/oauth2/token"));
+        assert!(refresh
+            .headers
+            .iter()
+            .any(|(k, v)| k == "authorization" && v.starts_with("Basic ")));
+        assert!(refresh
+            .headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v == "application/x-www-form-urlencoded"));
+        let body = String::from_utf8_lossy(&refresh.body);
+        assert!(body.contains("grant_type=refresh_token"));
+        assert!(body.contains("refresh_token="));
+        // The refresh token/secret never leak into the URL, and the content ops
+        // carry the minted bearer.
+        assert!(!refresh.url.contains(REFRESH_TOKEN));
+        for r in &reqs[1..] {
+            assert!(r
+                .headers
+                .iter()
+                .any(|(k, v)| k == "authorization" && v == &format!("Bearer {TOKEN}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_token_triggers_refresh() {
+        // Warm-start Some(_) seeds expiry = Instant::now() (already within
+        // REFRESH_MARGIN of "expired"), so the next op must refresh.
+        let t = DropboxTier::with_refresh_http(
+            MockDropboxHttp::new(vec![refresh_ok(), resp(200, Vec::new())]),
+            APP_KEY,
+            APP_SECRET,
+            REFRESH_TOKEN,
+            Some("stale-warm-start-token".to_owned()),
+            "https://api.dropboxapi.com",
+            "https://content.dropboxapi.com",
+            "/maxsecu",
+        );
+        t.put_chunk(REF, 0, vec![1]).await.unwrap();
+        let reqs = t.http.requests();
+        assert_eq!(oauth_count(&reqs), 1);
+        assert!(reqs[0].url.ends_with("/oauth2/token"));
+    }
+
+    #[tokio::test]
+    async fn content_401_invalidates_refreshes_and_retries_once() {
+        // refresh → content-401 → invalidate → refresh → content-200 (one retry).
+        let t = tier_cold(vec![
+            refresh_ok(),
+            resp(401, b"expired".to_vec()),
+            refresh_ok(),
+            resp(200, Vec::new()),
+        ]);
+        t.put_chunk(REF, 0, vec![1, 2, 3]).await.unwrap();
+
+        let reqs = t.http.requests();
+        // Two refreshes (initial + reactive) and the content upload appears twice
+        // (original + single retry) — bounded to one retry.
+        assert_eq!(oauth_count(&reqs), 2);
+        let uploads = reqs
+            .iter()
+            .filter(|r| r.url.ends_with("/2/files/upload"))
+            .count();
+        assert_eq!(uploads, 2);
+        assert_eq!(reqs.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn second_401_is_returned_not_retried() {
+        // refresh → content-401 → refresh → content-401 again: bounded, returns
+        // the 401 as an error rather than looping.
+        let t = tier_cold(vec![
+            refresh_ok(),
+            resp(401, b"expired".to_vec()),
+            refresh_ok(),
+            resp(401, b"still expired".to_vec()),
+        ]);
+        assert!(t.put_chunk(REF, 0, vec![1]).await.is_err());
+        let reqs = t.http.requests();
+        assert_eq!(oauth_count(&reqs), 2);
+        assert_eq!(reqs.len(), 4); // no third content attempt
+    }
+
+    #[tokio::test]
+    async fn oversized_expires_in_does_not_panic() {
+        // A token endpoint reporting an absurd `expires_in` must NOT overflow
+        // `Instant + Duration` (which would panic); it is clamped and the op
+        // completes normally.
+        let t = tier_cold(vec![
+            json_resp(
+                200,
+                serde_json::json!({ "access_token": TOKEN, "expires_in": u64::MAX }),
+            ),
+            resp(200, Vec::new()),
+        ]);
+        t.put_chunk(REF, 0, vec![1]).await.unwrap();
+        assert_eq!(oauth_count(&t.http.requests()), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_maps_to_blob_error() {
+        // Non-2xx at the token endpoint → the content op errors, no panic.
+        let t = tier_cold(vec![resp(400, b"invalid_grant".to_vec())]);
+        assert!(t.put_chunk(REF, 0, vec![1]).await.is_err());
+
+        // 200 with a malformed/missing-field body also fails closed.
+        let t2 = tier_cold(vec![json_resp(
+            200,
+            serde_json::json!({ "no_token": true }),
+        )]);
+        assert!(t2.get_chunk(REF, 0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn secrets_absent_from_debug() {
+        let (t, _) = tier(vec![]);
+        let debug = format!("{t:?}");
+        assert!(!debug.contains(APP_SECRET));
+        assert!(!debug.contains(REFRESH_TOKEN));
+        assert!(!debug.contains(TOKEN));
+        assert!(debug.contains("redacted"));
+        // App key is public-ish and may appear; the creds Debug also redacts.
+        let creds_debug = format!("{:?}", t.creds);
+        assert!(!creds_debug.contains(APP_SECRET));
+        assert!(!creds_debug.contains(REFRESH_TOKEN));
+        assert!(!creds_debug.contains(TOKEN));
+        assert!(creds_debug.contains("redacted"));
+    }
+
+    /// Live, real-network round trip against actual Dropbox using the OAuth
+    /// refresh flow. `#[ignore]`d so it never runs in CI; gated on the full
+    /// refresh credential set so it never runs even with `--ignored` unless the
+    /// operator supplies real creds. See the module doc for the exact command.
+    #[tokio::test]
+    #[ignore = "live network test against real Dropbox; requires MAXSECU_DROPBOX_APP_KEY/_APP_SECRET/_REFRESH_TOKEN"]
+    async fn dropbox_live_round_trip_refresh() {
+        let (app_key, app_secret, refresh_token) = match (
+            std::env::var("MAXSECU_DROPBOX_APP_KEY"),
+            std::env::var("MAXSECU_DROPBOX_APP_SECRET"),
+            std::env::var("MAXSECU_DROPBOX_REFRESH_TOKEN"),
+        ) {
+            (Ok(k), Ok(s), Ok(r)) if !k.is_empty() && !s.is_empty() && !r.is_empty() => (k, s, r),
             _ => {
-                eprintln!("skipping dropbox_live_round_trip: DROPBOX_TEST_TOKEN is not set");
+                eprintln!(
+                    "skipping dropbox_live_round_trip_refresh: MAXSECU_DROPBOX_APP_KEY/_APP_SECRET/_REFRESH_TOKEN not all set"
+                );
                 return;
             }
         };
@@ -848,7 +1223,16 @@ mod tests {
             hex.push_str(&format!("{b:02x}"));
         }
         let root = format!("/maxsecu-live-test-{hex}");
-        let tier = DropboxTier::new(token, root).expect("real transport init");
+        let tier = DropboxTier::with_refresh(
+            app_key,
+            app_secret,
+            refresh_token,
+            std::env::var("MAXSECU_DROPBOX_ACCESS_TOKEN").ok(),
+            root,
+        )
+        .expect("real transport init");
+        // Force a refresh before any content op.
+        tier.bearer().await.expect("refresh access token");
 
         let blob_ref = "livetest/1/1";
         let payload = maxsecu_crypto::random_array::<64>().to_vec();

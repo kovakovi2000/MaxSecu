@@ -14,13 +14,21 @@ pub enum Profile {
 /// Cold-tier backing for the write-back offload engine (`server::writeback_tier`).
 /// `Off` keeps today's behavior (a plain local `FsBlobStore`, no offload). `Fs`
 /// backs the cold tier with an on-disk `FsColdTier` (models Dropbox locally — the
-/// testable, no-credential path). `Dropbox` uses the real `DropboxTier` (OAuth
-/// token from the environment, NEVER logged).
+/// testable, no-credential path). `Dropbox` uses the real `DropboxTier` over an
+/// OAuth REFRESH flow: the app key/secret + a long-lived refresh token are read
+/// from the environment and auto-mint short-lived access tokens at runtime. All
+/// of these secrets come from the environment and are NEVER logged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColdTierCfg {
     Off,
     Fs(PathBuf),
-    Dropbox { token: String, root: String },
+    Dropbox {
+        app_key: String,
+        app_secret: String,
+        refresh_token: String,
+        access_token: Option<String>,
+        root: String,
+    },
 }
 
 /// Resolved launcher configuration.
@@ -106,15 +114,31 @@ impl LauncherConfig {
                     .unwrap_or_else(|| data_dir.join("cold"));
                 ColdTierCfg::Fs(dir)
             }
-            Some("dropbox") => match (env("MAXSECU_DROPBOX_TOKEN"), env("MAXSECU_DROPBOX_ROOT")) {
-                // Both the token and a root are required; missing either disables
-                // offload (never silently runs without a destination).
-                (Some(token), root) if !token.is_empty() => ColdTierCfg::Dropbox {
-                    token,
-                    root: root.unwrap_or_else(|| "/maxsecu".to_owned()),
-                },
-                _ => ColdTierCfg::Off,
-            },
+            Some("dropbox") => {
+                // OAuth refresh flow: the app key/secret + a refresh token are all
+                // required (each non-empty). Missing any one disables offload — we
+                // never silently run without full credentials. The static
+                // `MAXSECU_DROPBOX_TOKEN` path is gone (removed with the static mode).
+                let app_key = env("MAXSECU_DROPBOX_APP_KEY").filter(|s| !s.is_empty());
+                let app_secret = env("MAXSECU_DROPBOX_APP_SECRET").filter(|s| !s.is_empty());
+                let refresh_token = env("MAXSECU_DROPBOX_REFRESH_TOKEN").filter(|s| !s.is_empty());
+                match (app_key, app_secret, refresh_token) {
+                    (Some(app_key), Some(app_secret), Some(refresh_token)) => {
+                        ColdTierCfg::Dropbox {
+                            app_key,
+                            app_secret,
+                            refresh_token,
+                            // Optional pre-minted access token; empty is treated as absent.
+                            access_token: env("MAXSECU_DROPBOX_ACCESS_TOKEN")
+                                .filter(|s| !s.is_empty()),
+                            root: env("MAXSECU_DROPBOX_ROOT")
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| "/maxsecu".to_owned()),
+                        }
+                    }
+                    _ => ColdTierCfg::Off,
+                }
+            }
             _ => ColdTierCfg::Off,
         };
 
@@ -284,22 +308,74 @@ mod tests {
     }
 
     #[test]
-    fn cold_tier_dropbox_needs_a_nonempty_token() {
+    fn cold_tier_dropbox_needs_full_refresh_credentials() {
+        // Full set (all three required + optional access token + explicit root).
         let ok = LauncherConfig::from_parts(env(&[
             ("MAXSECU_COLD_TIER", "dropbox"),
-            ("MAXSECU_DROPBOX_TOKEN", "tok"),
+            ("MAXSECU_DROPBOX_APP_KEY", "key"),
+            ("MAXSECU_DROPBOX_APP_SECRET", "secret"),
+            ("MAXSECU_DROPBOX_REFRESH_TOKEN", "refresh"),
+            ("MAXSECU_DROPBOX_ACCESS_TOKEN", "access"),
             ("MAXSECU_DROPBOX_ROOT", "/mx"),
         ]));
         assert_eq!(
             ok.cold_tier,
             ColdTierCfg::Dropbox {
-                token: "tok".to_owned(),
-                root: "/mx".to_owned()
+                app_key: "key".to_owned(),
+                app_secret: "secret".to_owned(),
+                refresh_token: "refresh".to_owned(),
+                access_token: Some("access".to_owned()),
+                root: "/mx".to_owned(),
             }
         );
-        // Missing/empty token → fails closed to Off (never runs without a token).
-        let missing = LauncherConfig::from_parts(env(&[("MAXSECU_COLD_TIER", "dropbox")]));
-        assert_eq!(missing.cold_tier, ColdTierCfg::Off);
+
+        // Each of the three required vars is individually mandatory; missing any
+        // one fails closed to Off (never runs without full credentials).
+        let missing_app_key = LauncherConfig::from_parts(env(&[
+            ("MAXSECU_COLD_TIER", "dropbox"),
+            ("MAXSECU_DROPBOX_APP_SECRET", "secret"),
+            ("MAXSECU_DROPBOX_REFRESH_TOKEN", "refresh"),
+        ]));
+        assert_eq!(missing_app_key.cold_tier, ColdTierCfg::Off);
+        let missing_app_secret = LauncherConfig::from_parts(env(&[
+            ("MAXSECU_COLD_TIER", "dropbox"),
+            ("MAXSECU_DROPBOX_APP_KEY", "key"),
+            ("MAXSECU_DROPBOX_REFRESH_TOKEN", "refresh"),
+        ]));
+        assert_eq!(missing_app_secret.cold_tier, ColdTierCfg::Off);
+        let missing_refresh = LauncherConfig::from_parts(env(&[
+            ("MAXSECU_COLD_TIER", "dropbox"),
+            ("MAXSECU_DROPBOX_APP_KEY", "key"),
+            ("MAXSECU_DROPBOX_APP_SECRET", "secret"),
+        ]));
+        assert_eq!(missing_refresh.cold_tier, ColdTierCfg::Off);
+
+        // A present-but-empty required var also fails closed to Off.
+        let empty_required = LauncherConfig::from_parts(env(&[
+            ("MAXSECU_COLD_TIER", "dropbox"),
+            ("MAXSECU_DROPBOX_APP_KEY", "key"),
+            ("MAXSECU_DROPBOX_APP_SECRET", ""),
+            ("MAXSECU_DROPBOX_REFRESH_TOKEN", "refresh"),
+        ]));
+        assert_eq!(empty_required.cold_tier, ColdTierCfg::Off);
+
+        // Bare full required set: root defaults to `/maxsecu`, access token None.
+        let defaults = LauncherConfig::from_parts(env(&[
+            ("MAXSECU_COLD_TIER", "dropbox"),
+            ("MAXSECU_DROPBOX_APP_KEY", "key"),
+            ("MAXSECU_DROPBOX_APP_SECRET", "secret"),
+            ("MAXSECU_DROPBOX_REFRESH_TOKEN", "refresh"),
+        ]));
+        assert_eq!(
+            defaults.cold_tier,
+            ColdTierCfg::Dropbox {
+                app_key: "key".to_owned(),
+                app_secret: "secret".to_owned(),
+                refresh_token: "refresh".to_owned(),
+                access_token: None,
+                root: "/maxsecu".to_owned(),
+            }
+        );
     }
 
     #[test]

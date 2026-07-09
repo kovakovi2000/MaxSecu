@@ -36,9 +36,21 @@ fn build_blobs(cfg: &LauncherConfig, layout: &Layout) -> std::io::Result<Arc<dyn
     let cold: Arc<dyn ColdTier> = match &cfg.cold_tier {
         ColdTierCfg::Off => return Ok(local),
         ColdTierCfg::Fs(dir) => Arc::new(FsColdTier::new(dir.clone())),
-        ColdTierCfg::Dropbox { token, root } => Arc::new(
-            DropboxTier::new(token.clone(), root.clone())
-                .map_err(|e| std::io::Error::other(format!("dropbox tier init: {e}")))?,
+        ColdTierCfg::Dropbox {
+            app_key,
+            app_secret,
+            refresh_token,
+            access_token,
+            root,
+        } => Arc::new(
+            DropboxTier::with_refresh(
+                app_key.clone(),
+                app_secret.clone(),
+                refresh_token.clone(),
+                access_token.clone(),
+                root.clone(),
+            )
+            .map_err(|e| std::io::Error::other(format!("dropbox tier init: {e}")))?,
         ),
     };
     let tier = Arc::new(WriteBackTier::new(
