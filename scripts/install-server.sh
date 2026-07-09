@@ -18,6 +18,8 @@
 #                   omitted it is auto-detected (https://api.ipify.org) and echoed
 #                   for you to confirm.
 #   --port N        Listen port (default 8443).
+#   --dropbox       Force the Dropbox cold-tier prompt ON (needs a TTY to paste
+#                   the secrets). --no-dropbox forces it OFF (no prompt).
 #
 set -euo pipefail
 
@@ -34,6 +36,9 @@ Usage: install-server.sh [--public [IP]] [--port N]
                   puts the public IP in the TLS certificate. If you omit IP it is
                   auto-detected and shown for you to confirm.
   --port N        Listen port (default 8443).
+  --dropbox       Force the Dropbox cold-tier setup prompt ON. You must run in a
+                  terminal (TTY) so the App key/secret/refresh token can be typed.
+  --no-dropbox    Skip the Dropbox cold-tier prompt entirely.
   -h, --help      Show this help.
 EOF
 }
@@ -44,6 +49,8 @@ EOF
 PUBLIC=0
 PUBLIC_IP=""
 PORT=8443
+# Dropbox cold-tier: -1 = decide interactively (default), 1 = forced on, 0 = forced off.
+DROPBOX_FORCE=-1
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -74,6 +81,14 @@ while [ $# -gt 0 ]; do
 		fi
 		PORT="$2"
 		shift 2
+		;;
+	--dropbox)
+		DROPBOX_FORCE=1
+		shift
+		;;
+	--no-dropbox)
+		DROPBOX_FORCE=0
+		shift
 		;;
 	-h | --help)
 		usage
@@ -277,6 +292,106 @@ if [ "$PUBLIC" -eq 1 ]; then
 fi
 
 # --------------------------------------------------------------------------- #
+# 9b. Optional Dropbox cold-tier offload. Interactive; the credentials are read
+#     WITHOUT echo and written only to a root:root 0600 EnvironmentFile that the
+#     systemd unit loads. Answering No (or a non-TTY run) never touches an
+#     existing creds file, so re-runs preserve prior Dropbox setup.
+# --------------------------------------------------------------------------- #
+DROPBOX_ENV_PATH="/etc/maxsecu/dropbox.env"
+DROPBOX_ENABLED_THIS_RUN=0
+
+# Decide whether to run the Dropbox setup prompt.
+want_dropbox=0
+if [ "$DROPBOX_FORCE" -eq 0 ]; then
+	: # explicitly disabled with --no-dropbox
+elif [ "$DROPBOX_FORCE" -eq 1 ]; then
+	# --dropbox forces yes, but secrets can only be read from a real terminal.
+	if [ -t 0 ]; then
+		want_dropbox=1
+	else
+		echo "error: --dropbox needs an interactive terminal to read the secrets," >&2
+		echo "       but stdin is not a TTY. Re-run in a terminal, or set the" >&2
+		echo "       MAXSECU_DROPBOX_* credentials in $DROPBOX_ENV_PATH by hand." >&2
+		exit 2
+	fi
+elif [ -t 0 ]; then
+	# Default: interactive prompt, default No.
+	printf 'Enable Dropbox cold-tier offload? [y/N] '
+	read -r reply || reply=""
+	case "$reply" in
+	y | Y | yes | YES | Yes)
+		want_dropbox=1
+		;;
+	*) ;;
+	esac
+else
+	# No TTY and no forcing flag → auto-No so non-interactive --public never hangs.
+	echo "==> Non-interactive run (no TTY): skipping the Dropbox cold-tier prompt"
+	echo "    (re-run in a terminal, or pass --dropbox, to enable it)"
+fi
+
+if [ "$want_dropbox" -eq 1 ]; then
+	echo "==> Dropbox cold-tier setup — paste the values from your Dropbox App Console."
+	echo "    Secrets are NOT echoed; they are written only to $DROPBOX_ENV_PATH (root 0600)."
+
+	printf 'Dropbox App key: '
+	read -r DBX_APP_KEY || DBX_APP_KEY=""
+
+	printf 'Dropbox App secret: '
+	read -rs DBX_APP_SECRET || DBX_APP_SECRET=""
+	printf '\n'
+
+	printf 'Dropbox Refresh token: '
+	read -rs DBX_REFRESH_TOKEN || DBX_REFRESH_TOKEN=""
+	printf '\n'
+
+	printf 'Dropbox Access token (optional, press Enter to skip): '
+	read -rs DBX_ACCESS_TOKEN || DBX_ACCESS_TOKEN=""
+	printf '\n'
+
+	printf 'Dropbox root folder [/maxsecu]: '
+	read -r DBX_ROOT || DBX_ROOT=""
+	if [ -z "$DBX_ROOT" ]; then
+		DBX_ROOT="/maxsecu"
+	fi
+
+	if [ -z "$DBX_APP_KEY" ] || [ -z "$DBX_APP_SECRET" ] || [ -z "$DBX_REFRESH_TOKEN" ]; then
+		echo "warning: App key, App secret and Refresh token are all required." >&2
+		echo "         One or more was blank — leaving the Dropbox cold tier OFF." >&2
+		echo "         Nothing was written; re-run to try again." >&2
+	else
+		# Build the creds file in a private temp file (umask 077 so it is never
+		# world/group-readable, even briefly), then install it root:root 0600.
+		run_root "install -d -o root -g root -m 0700 /etc/maxsecu"
+		OLD_UMASK="$(umask)"
+		umask 077
+		DBX_TMP="$(mktemp)"
+		umask "$OLD_UMASK"
+		trap 'rm -f "$DBX_TMP"' EXIT
+		{
+			printf '%s\n' "MAXSECU_COLD_TIER=dropbox"
+			printf 'MAXSECU_DROPBOX_APP_KEY=%s\n' "$DBX_APP_KEY"
+			printf 'MAXSECU_DROPBOX_APP_SECRET=%s\n' "$DBX_APP_SECRET"
+			printf 'MAXSECU_DROPBOX_REFRESH_TOKEN=%s\n' "$DBX_REFRESH_TOKEN"
+			if [ -n "$DBX_ACCESS_TOKEN" ]; then
+				printf 'MAXSECU_DROPBOX_ACCESS_TOKEN=%s\n' "$DBX_ACCESS_TOKEN"
+			fi
+			printf 'MAXSECU_DROPBOX_ROOT=%s\n' "$DBX_ROOT"
+		} >"$DBX_TMP"
+
+		run_root "install -o root -g root -m 0600 '$DBX_TMP' '$DROPBOX_ENV_PATH'"
+		rm -f "$DBX_TMP"
+		trap - EXIT
+
+		# Drop the plaintext secrets from this shell's memory now that they are
+		# safely on disk (0600). Nothing was ever echoed to the terminal.
+		unset DBX_APP_SECRET DBX_REFRESH_TOKEN DBX_ACCESS_TOKEN
+		DROPBOX_ENABLED_THIS_RUN=1
+		echo "    Wrote $DROPBOX_ENV_PATH (root:root 0600)."
+	fi
+fi
+
+# --------------------------------------------------------------------------- #
 # 10. Write the systemd unit. It holds the DB password, so it is root:root 0600
 #     and the password is never printed to the terminal.
 # --------------------------------------------------------------------------- #
@@ -310,6 +425,9 @@ trap 'rm -f "$UNIT_TMP"' EXIT
 	fi
 	echo "Environment=MAXSECU_PORT=$PORT"
 	echo "Environment=MAXSECU_DATA_DIR=$DATA_DIR"
+	# Optional Dropbox cold-tier creds. Leading '-' => an absent file is ignored,
+	# so no-Dropbox installs and re-runs are unaffected and never clobbered.
+	echo "EnvironmentFile=-$DROPBOX_ENV_PATH"
 	echo ""
 	echo "[Install]"
 	echo "WantedBy=multi-user.target"
@@ -394,3 +512,12 @@ echo ""
 echo "        journalctl -u maxsecu-server -f"
 echo ""
 echo "============================================================"
+
+if [ "$DROPBOX_ENABLED_THIS_RUN" -eq 1 ]; then
+	echo ""
+	echo " Dropbox cold-tier offload: ENABLED (creds in $DROPBOX_ENV_PATH, root-only)."
+elif [ ! -e "$DROPBOX_ENV_PATH" ]; then
+	echo ""
+	echo " Dropbox cold-tier offload is OFF. Re-run this script (or pass --dropbox)"
+	echo " to enable it."
+fi
