@@ -79,6 +79,20 @@ Write-Host "Server port    : $Port"
 # ---------------------------------------------------------------------------
 Write-Section 'Checking build toolchains'
 
+# rustup installs cargo to %USERPROFILE%\.cargo\bin and normally adds it to the
+# user PATH — but a terminal opened before install (or a customized PATH) won't
+# see it, so `Get-Command cargo` reports Rust "missing" when it is in fact
+# installed. Recover that common case: if cargo isn't on PATH but exists at the
+# standard rustup location, prepend that dir to THIS session's PATH. This only
+# makes an already-installed toolchain visible — it never installs anything.
+if ($null -eq (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+    if (Test-Path (Join-Path $cargoBin 'cargo.exe')) {
+        $env:Path = "$cargoBin;$env:Path"
+        Write-Host "cargo not on PATH; using rustup install at $cargoBin" -ForegroundColor DarkYellow
+    }
+}
+
 $cargo = Get-Command cargo -ErrorAction SilentlyContinue
 $node  = Get-Command node  -ErrorAction SilentlyContinue
 $npm   = Get-Command npm   -ErrorAction SilentlyContinue
