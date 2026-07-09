@@ -18,8 +18,10 @@
 #                   omitted it is auto-detected (https://api.ipify.org) and echoed
 #                   for you to confirm.
 #   --port N        Listen port (default 8443).
-#   --dropbox       Force the Dropbox cold-tier prompt ON (needs a TTY to paste
-#                   the secrets). --no-dropbox forces it OFF (no prompt).
+#   --dropbox       Force the Dropbox cold-tier setup prompt ON (needs a TTY: you
+#                   paste the App key/secret + a browser authorization code, which
+#                   the installer exchanges for a refresh token). --no-dropbox
+#                   forces it OFF (no prompt).
 #
 set -euo pipefail
 
@@ -37,7 +39,9 @@ Usage: install-server.sh [--public [IP]] [--port N]
                   auto-detected and shown for you to confirm.
   --port N        Listen port (default 8443).
   --dropbox       Force the Dropbox cold-tier setup prompt ON. You must run in a
-                  terminal (TTY) so the App key/secret/refresh token can be typed.
+                  terminal (TTY): you paste the App key + secret and a one-time
+                  browser authorization code, and the installer exchanges it for a
+                  long-lived refresh token itself.
   --no-dropbox    Skip the Dropbox cold-tier prompt entirely.
   -h, --help      Show this help.
 EOF
@@ -331,8 +335,12 @@ else
 fi
 
 if [ "$want_dropbox" -eq 1 ]; then
-	echo "==> Dropbox cold-tier setup — paste the values from your Dropbox App Console."
+	echo "==> Dropbox cold-tier setup"
+	echo "    Paste your App key + App secret (Dropbox App Console), then authorize"
+	echo "    the app ONCE in your browser and paste the code back — this installer"
+	echo "    exchanges it for a long-lived refresh token for you (no manual curl)."
 	echo "    Secrets are NOT echoed; they are written only to $DROPBOX_ENV_PATH (root 0600)."
+	echo ""
 
 	printf 'Dropbox App key: '
 	read -r DBX_APP_KEY || DBX_APP_KEY=""
@@ -341,27 +349,75 @@ if [ "$want_dropbox" -eq 1 ]; then
 	read -rs DBX_APP_SECRET || DBX_APP_SECRET=""
 	printf '\n'
 
-	printf 'Dropbox Refresh token: '
-	read -rs DBX_REFRESH_TOKEN || DBX_REFRESH_TOKEN=""
-	printf '\n'
+	# Populated by the code→token exchange below; empty means "leave the tier off".
+	DBX_REFRESH_TOKEN=""
+	DBX_ACCESS_TOKEN=""
 
-	printf 'Dropbox Access token (optional, press Enter to skip): '
-	read -rs DBX_ACCESS_TOKEN || DBX_ACCESS_TOKEN=""
-	printf '\n'
+	if [ -z "$DBX_APP_KEY" ] || [ -z "$DBX_APP_SECRET" ]; then
+		echo "warning: App key and App secret are both required." >&2
+		echo "         One was blank — leaving the Dropbox cold tier OFF (nothing written)." >&2
+	else
+		# One-time offline authorization: the operator opens this URL in THEIR own
+		# browser (this box is headless), clicks Allow, and Dropbox shows a short
+		# single-use authorization code. `token_access_type=offline` is what makes
+		# Dropbox issue a long-lived refresh token at the exchange below.
+		echo ""
+		echo "    1. Open this URL in a browser and click \"Allow\":"
+		echo ""
+		echo "       https://www.dropbox.com/oauth2/authorize?client_id=${DBX_APP_KEY}&response_type=code&token_access_type=offline"
+		echo ""
+		echo "    2. Copy the authorization code Dropbox shows you and paste it here."
+		echo ""
+		printf 'Authorization code: '
+		read -r DBX_CODE || DBX_CODE=""
 
-	printf 'Dropbox root folder [/maxsecu]: '
-	read -r DBX_ROOT || DBX_ROOT=""
-	if [ -z "$DBX_ROOT" ]; then
-		DBX_ROOT="/maxsecu"
+		if [ -z "$DBX_CODE" ]; then
+			echo "warning: no authorization code entered — leaving the Dropbox cold tier OFF." >&2
+		else
+			echo "    Exchanging the code for a refresh token…"
+			# The App secret and code go through a private curl config file
+			# (umask 077) so neither ever appears in the process arg list (`ps`).
+			OLD_UMASK="$(umask)"
+			umask 077
+			DBX_CURL_CFG="$(mktemp)"
+			umask "$OLD_UMASK"
+			trap 'rm -f "$DBX_CURL_CFG"' EXIT
+			printf 'user = "%s:%s"\ndata = "grant_type=authorization_code"\ndata-urlencode = "code=%s"\n' \
+				"$DBX_APP_KEY" "$DBX_APP_SECRET" "$DBX_CODE" >"$DBX_CURL_CFG"
+			DBX_RESP="$(curl -sS -K "$DBX_CURL_CFG" https://api.dropboxapi.com/oauth2/token || true)"
+			rm -f "$DBX_CURL_CFG"
+			trap - EXIT
+			unset DBX_CODE
+
+			# Extract the tokens from Dropbox's compact single-line JSON (no jq
+			# dependency). A missing refresh_token means the exchange failed.
+			DBX_REFRESH_TOKEN="$(printf '%s' "$DBX_RESP" | sed -n 's/.*"refresh_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+			DBX_ACCESS_TOKEN="$(printf '%s' "$DBX_RESP" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+			if [ -z "$DBX_REFRESH_TOKEN" ]; then
+				DBX_ERR="$(printf '%s' "$DBX_RESP" | sed -n 's/.*"error_description"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+				if [ -z "$DBX_ERR" ]; then
+					DBX_ERR="$(printf '%s' "$DBX_RESP" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+				fi
+				echo "warning: Dropbox did not return a refresh token — leaving the cold tier OFF." >&2
+				if [ -n "$DBX_ERR" ]; then
+					echo "         Dropbox said: $DBX_ERR" >&2
+				fi
+				echo "         (The code is single-use and expires fast — re-run to try again.)" >&2
+			fi
+			unset DBX_RESP
+		fi
 	fi
 
-	if [ -z "$DBX_APP_KEY" ] || [ -z "$DBX_APP_SECRET" ] || [ -z "$DBX_REFRESH_TOKEN" ]; then
-		echo "warning: App key, App secret and Refresh token are all required." >&2
-		echo "         One or more was blank — leaving the Dropbox cold tier OFF." >&2
-		echo "         Nothing was written; re-run to try again." >&2
-	else
+	if [ -n "$DBX_REFRESH_TOKEN" ]; then
+		printf 'Dropbox root folder [/maxsecu]: '
+		read -r DBX_ROOT || DBX_ROOT=""
+		if [ -z "$DBX_ROOT" ]; then
+			DBX_ROOT="/maxsecu"
+		fi
+
 		# Build the creds file in a private temp file (umask 077 so it is never
 		# world/group-readable, even briefly), then install it root:root 0600.
+		# The access token from the exchange warm-starts the server's token cache.
 		run_root "install -d -o root -g root -m 0700 /etc/maxsecu"
 		OLD_UMASK="$(umask)"
 		umask 077
