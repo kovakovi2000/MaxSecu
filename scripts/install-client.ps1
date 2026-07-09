@@ -37,9 +37,16 @@ param(
     [string] $ServerAddr = '',
 
     # SSH port used ONLY for the scp cert fetch. Default 22; set this when the VPS
-    # runs sshd on a non-standard port (a common hardening — e.g. -SshPort 14369).
+    # runs sshd on a non-standard port (a common hardening — e.g. -SshPort 14269).
     # It does not affect the app connection, which always uses -ServerAddr:$Port.
-    [int] $SshPort = 22
+    [int] $SshPort = 22,
+
+    # Escape hatch: a local folder that already contains the two pins
+    # (server_cert.der + directory_pub.der). Use this when Windows OpenSSH scp
+    # can't authenticate — e.g. your key lives only in PuTTY's Pageant. Fetch the
+    # pins yourself with pscp/WinSCP (both use Pageant), then pass -PinsDir. When
+    # set, the scp step is skipped entirely (so -SshPort is not needed).
+    [string] $PinsDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -133,12 +140,7 @@ Write-Host "npm   : $($npm.Source)"
 # ---------------------------------------------------------------------------
 # 3. Download the two pinned certs from the VPS via scp
 # ---------------------------------------------------------------------------
-Write-Section 'Downloading pinned certs from the VPS (scp)'
-
-$scp = Get-Command scp -ErrorAction SilentlyContinue
-if ($null -eq $scp) {
-    Fail 'scp was not found. Enable the Windows OpenSSH Client (Settings > Apps > Optional features) and re-run.'
-}
+Write-Section 'Downloading pinned certs from the VPS'
 
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("maxsecu-install-" + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
@@ -146,21 +148,42 @@ New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 $CertTmp = Join-Path $TmpDir 'server_cert.der'
 $DirTmp  = Join-Path $TmpDir 'directory_pub.der'
 
-Write-Host "Fetching server_cert.der ... (ssh port $SshPort)"
-& scp -P $SshPort "${Vps}:maxsecu-server-data/client-pins/server_cert.der" $CertTmp
-if ($LASTEXITCODE -ne 0) {
-    Fail "scp of server_cert.der failed. Make sure the VPS is reachable on SSH port $SshPort (if sshd is not on 22, pass -SshPort <port>; if SSH is only reachable over a VPN, pass -Vps root@<vpn-ip> together with -ServerAddr <public-ip>), your SSH key/password works, and the server has completed its first run (the pins live at maxsecu-server-data/client-pins/ on the VPS)."
+if ($PinsDir -ne '') {
+    # Pins already fetched by the operator (see the -PinsDir help above). This
+    # avoids Windows OpenSSH scp entirely — handy when the key lives in Pageant.
+    $srcCert = Join-Path $PinsDir 'server_cert.der'
+    $srcDir  = Join-Path $PinsDir 'directory_pub.der'
+    if (-not (Test-Path $srcCert)) { Fail "server_cert.der not found in -PinsDir '$PinsDir'." }
+    if (-not (Test-Path $srcDir))  { Fail "directory_pub.der not found in -PinsDir '$PinsDir'." }
+    Copy-Item $srcCert $CertTmp -Force
+    Copy-Item $srcDir  $DirTmp  -Force
+    Write-Host "Using pins supplied in $PinsDir"
+} else {
+    $scp = Get-Command scp -ErrorAction SilentlyContinue
+    if ($null -eq $scp) {
+        Fail 'scp was not found. Enable the Windows OpenSSH Client (Settings > Apps > Optional features) and re-run, or fetch the two pins yourself and pass -PinsDir.'
+    }
+
+    # accept-new: trust the VPS host key on first connect instead of blocking on an
+    # interactive yes/no prompt, which a `-File` script cannot answer.
+    $sshOpts = @('-P', $SshPort, '-o', 'StrictHostKeyChecking=accept-new')
+
+    Write-Host "Fetching server_cert.der ... (ssh port $SshPort)"
+    & scp @sshOpts "${Vps}:maxsecu-server-data/client-pins/server_cert.der" $CertTmp
+    if ($LASTEXITCODE -ne 0) {
+        Fail "scp of server_cert.der failed. If your key lives in PuTTY/Pageant (Windows OpenSSH scp can't use it), fetch the two pins with pscp or WinSCP and re-run with -PinsDir <folder>. Otherwise check the VPS is reachable on SSH port $SshPort (custom port: -SshPort <port>; VPN-only: -Vps root@<vpn-ip> together with -ServerAddr <public-ip>), your key works, and the server finished its first run (pins live at maxsecu-server-data/client-pins/)."
+    }
+
+    Write-Host "Fetching directory_pub.der ..."
+    & scp @sshOpts "${Vps}:maxsecu-server-data/client-pins/directory_pub.der" $DirTmp
+    if ($LASTEXITCODE -ne 0) {
+        Fail "scp of directory_pub.der failed. Same checks as above (or fetch both pins yourself and use -PinsDir)."
+    }
 }
 
-Write-Host "Fetching directory_pub.der ..."
-& scp -P $SshPort "${Vps}:maxsecu-server-data/client-pins/directory_pub.der" $DirTmp
-if ($LASTEXITCODE -ne 0) {
-    Fail "scp of directory_pub.der failed. Same checks as above: server must have finished its first run so the pins exist."
-}
-
-if (-not (Test-Path $CertTmp)) { Fail "server_cert.der did not download to $CertTmp." }
-if (-not (Test-Path $DirTmp))  { Fail "directory_pub.der did not download to $DirTmp." }
-Write-Host "Pins downloaded to $TmpDir"
+if (-not (Test-Path $CertTmp)) { Fail "server_cert.der is missing at $CertTmp." }
+if (-not (Test-Path $DirTmp))  { Fail "directory_pub.der is missing at $DirTmp." }
+Write-Host "Pins ready in $TmpDir"
 
 # ---------------------------------------------------------------------------
 # 4. Create the recovery account + first key via maxsecu-setup
