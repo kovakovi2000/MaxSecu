@@ -34,7 +34,12 @@ param(
 
     [int] $Port = 8443,
 
-    [string] $ServerAddr = ''
+    [string] $ServerAddr = '',
+
+    # SSH port used ONLY for the scp cert fetch. Default 22; set this when the VPS
+    # runs sshd on a non-standard port (a common hardening — e.g. -SshPort 14369).
+    # It does not affect the app connection, which always uses -ServerAddr:$Port.
+    [int] $SshPort = 22
 )
 
 $ErrorActionPreference = 'Stop'
@@ -141,14 +146,14 @@ New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 $CertTmp = Join-Path $TmpDir 'server_cert.der'
 $DirTmp  = Join-Path $TmpDir 'directory_pub.der'
 
-Write-Host "Fetching server_cert.der ..."
-& scp "${Vps}:maxsecu-server-data/client-pins/server_cert.der" $CertTmp
+Write-Host "Fetching server_cert.der ... (ssh port $SshPort)"
+& scp -P $SshPort "${Vps}:maxsecu-server-data/client-pins/server_cert.der" $CertTmp
 if ($LASTEXITCODE -ne 0) {
-    Fail "scp of server_cert.der failed. Make sure the VPS is reachable, your SSH key/password works, and the server has completed its first run (the pins live at maxsecu-server-data/client-pins/ on the VPS)."
+    Fail "scp of server_cert.der failed. Make sure the VPS is reachable on SSH port $SshPort (if sshd is not on 22, pass -SshPort <port>; if SSH is only reachable over a VPN, pass -Vps root@<vpn-ip> together with -ServerAddr <public-ip>), your SSH key/password works, and the server has completed its first run (the pins live at maxsecu-server-data/client-pins/ on the VPS)."
 }
 
 Write-Host "Fetching directory_pub.der ..."
-& scp "${Vps}:maxsecu-server-data/client-pins/directory_pub.der" $DirTmp
+& scp -P $SshPort "${Vps}:maxsecu-server-data/client-pins/directory_pub.der" $DirTmp
 if ($LASTEXITCODE -ne 0) {
     Fail "scp of directory_pub.der failed. Same checks as above: server must have finished its first run so the pins exist."
 }
