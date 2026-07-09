@@ -194,49 +194,61 @@ $RecoveryBlob = Join-Path $Root 'recovery_key.blob'
 $RecoveryPin  = Join-Path $Root 'recovery_pin.bin'
 $RegisterKey  = Join-Path $Root 'register.key'
 
-# Prompt for the recovery passphrase without echoing it; hand it to the child
-# process only via the SETUP_RECOVERY_PW env var (never printed, never persisted).
-Write-Host 'Choose a RECOVERY passphrase. Write it down and keep it offline with'
-Write-Host 'recovery_key.blob -- together they are the ONLY way to recover the account.'
-$SecurePw = Read-Host -AsSecureString 'Recovery passphrase'
-$Bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePw)
-try {
-    $PlainPw = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($Bstr)
-} finally {
-    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Bstr)
-}
-if ([string]::IsNullOrEmpty($PlainPw)) {
-    Fail 'Recovery passphrase cannot be empty.'
-}
-
-$SetupExit = 0
-$env:SETUP_RECOVERY_PW = $PlainPw
-try {
-    & cargo run --release --manifest-path (Join-Path $Root 'tools\maxsecu-setup\Cargo.toml') -- `
-        --server "${ServerAddr}:${Port}" `
-        --host "$ServerAddr" `
-        --cert "$CertTmp" `
-        --out "$RecoveryBlob" `
-        --pin-out "$RecoveryPin" `
-        --first-key-out "$RegisterKey"
-    $SetupExit = $LASTEXITCODE
-} finally {
-    # Scrub the passphrase from the environment and local variable.
-    Remove-Item Env:\SETUP_RECOVERY_PW -ErrorAction SilentlyContinue
-    $PlainPw = $null
-}
-
-if ($SetupExit -eq 3) {
-    Write-Host ''
-    Write-Host 'NOTE: the server already has a recovery account (exit code 3).' -ForegroundColor Yellow
-    Write-Host '      Nothing was re-registered. Reusing the existing recovery_pin.bin if present.' -ForegroundColor Yellow
-    if (-not (Test-Path $RecoveryPin)) {
-        Fail "The server is already set up but no existing recovery_pin.bin was found at $RecoveryPin. You need the recovery_pin.bin from the original setup to build a working client."
-    }
-} elseif ($SetupExit -ne 0) {
-    Fail "maxsecu-setup failed (exit code $SetupExit). Check the server address ${ServerAddr}:${Port} and that the cert matches the running server."
+# RESUMABILITY: maxsecu-setup is once-only and produces three IRREPLACEABLE files
+# (its preflight refuses to overwrite them, and the server 409s a second register).
+# If a prior run already completed setup, those files are on disk — skip setup and
+# resume the build rather than fail. This lets you re-run after fixing a later step
+# (e.g. staging ffmpeg) without touching the recovery key / first registration key.
+if ((Test-Path $RecoveryBlob) -and (Test-Path $RecoveryPin) -and (Test-Path $RegisterKey)) {
+    Write-Host 'Recovery artifacts already present from a prior run — setup is complete; skipping maxsecu-setup.' -ForegroundColor Yellow
+    Write-Host "  $RecoveryBlob"
+    Write-Host "  $RecoveryPin"
+    Write-Host "  $RegisterKey"
 } else {
-    Write-Host 'Recovery account created.'
+    # Prompt for the recovery passphrase without echoing it; hand it to the child
+    # process only via the SETUP_RECOVERY_PW env var (never printed, never persisted).
+    Write-Host 'Choose a RECOVERY passphrase. Write it down and keep it offline with'
+    Write-Host 'recovery_key.blob -- together they are the ONLY way to recover the account.'
+    $SecurePw = Read-Host -AsSecureString 'Recovery passphrase'
+    $Bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePw)
+    try {
+        $PlainPw = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($Bstr)
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Bstr)
+    }
+    if ([string]::IsNullOrEmpty($PlainPw)) {
+        Fail 'Recovery passphrase cannot be empty.'
+    }
+
+    $SetupExit = 0
+    $env:SETUP_RECOVERY_PW = $PlainPw
+    try {
+        & cargo run --release --manifest-path (Join-Path $Root 'tools\maxsecu-setup\Cargo.toml') -- `
+            --server "${ServerAddr}:${Port}" `
+            --host "$ServerAddr" `
+            --cert "$CertTmp" `
+            --out "$RecoveryBlob" `
+            --pin-out "$RecoveryPin" `
+            --first-key-out "$RegisterKey"
+        $SetupExit = $LASTEXITCODE
+    } finally {
+        # Scrub the passphrase from the environment and local variable.
+        Remove-Item Env:\SETUP_RECOVERY_PW -ErrorAction SilentlyContinue
+        $PlainPw = $null
+    }
+
+    if ($SetupExit -eq 3) {
+        Write-Host ''
+        Write-Host 'NOTE: the server already has a recovery account (exit code 3).' -ForegroundColor Yellow
+        Write-Host '      Nothing was re-registered. Reusing the existing recovery_pin.bin if present.' -ForegroundColor Yellow
+        if (-not (Test-Path $RecoveryPin)) {
+            Fail "The server is already set up but no existing recovery_pin.bin was found at $RecoveryPin. You need the recovery_pin.bin from the original setup to build a working client."
+        }
+    } elseif ($SetupExit -ne 0) {
+        Fail "maxsecu-setup failed (exit code $SetupExit). Check the server address ${ServerAddr}:${Port} and that the cert matches the running server."
+    } else {
+        Write-Host 'Recovery account created.'
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -271,6 +283,25 @@ Write-Host 'UI built.'
 # 7. Build the client binary
 # ---------------------------------------------------------------------------
 Write-Section 'Building the client (cargo build --release)'
+
+# The client embeds a pinned static ffmpeg.exe via include_bytes! (author-side
+# video transcode). vendor\ffmpeg\ffmpeg.exe is gitignored, so a fresh checkout
+# lacks it and the build fails with a cryptic include_bytes error. Stage it first
+# with the pinned fetch script (idempotent: it skips the download if already staged
+# and matching the pinned SHA-256).
+$FfmpegExe = Join-Path $Root 'vendor\ffmpeg\ffmpeg.exe'
+if (-not (Test-Path $FfmpegExe)) {
+    Write-Host 'vendor\ffmpeg\ffmpeg.exe is missing — fetching the pinned build (scripts\fetch-ffmpeg.ps1) ...'
+    try {
+        & (Join-Path $Root 'scripts\fetch-ffmpeg.ps1')
+    } catch {
+        Write-Host "fetch-ffmpeg.ps1 failed: $_" -ForegroundColor Red
+        Fail 'Could not fetch the pinned ffmpeg. Run scripts\fetch-ffmpeg.ps1 manually; if it reports a SHA-256 mismatch, BtbN latest has rolled -- obtain the matching build or re-pin the SHA (scripts\fetch-ffmpeg.ps1, vendor\ffmpeg\README.md, crates\client-app\src\ffmpeg_bin.rs), then re-run.'
+    }
+    if (-not (Test-Path $FfmpegExe)) {
+        Fail "vendor\ffmpeg\ffmpeg.exe is still missing after scripts\fetch-ffmpeg.ps1."
+    }
+}
 
 & cargo build --release --manifest-path (Join-Path $Root 'crates\client-app\Cargo.toml') -p maxsecu-client-app
 if ($LASTEXITCODE -ne 0) {
