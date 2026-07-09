@@ -92,7 +92,7 @@ CREATE TABLE auth_nonces (                       -- single-use login challenges 
 
 CREATE TABLE sessions (                           -- channel-bound tokens (§9.2 / api.md §1.5)
   token_hash    BYTEA PRIMARY KEY CHECK (octet_length(token_hash) = 32),  -- store only a hash of the token
-  user_id       BYTEA NOT NULL REFERENCES users(user_id),
+  user_id       BYTEA NOT NULL,                                           -- principal: a users.user_id OR the reserved all-zero RECOVERY_ID (recovery admin session, spec §6/§9) which by design has NO users row — so NO FK to users here (sessions_user_idx below still serves lookups)
   tls_exporter  BYTEA NOT NULL CHECK (octet_length(tls_exporter) = 32),   -- bound connection's exporter; checked per request
   issued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at    TIMESTAMPTZ NOT NULL,

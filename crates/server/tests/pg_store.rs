@@ -492,6 +492,41 @@ async fn recovery_style_nonce_key_with_nul_round_trips_in_postgres() {
 }
 
 #[tokio::test]
+async fn recovery_principal_session_persists_without_a_users_row() {
+    // Regression: recovery/verify mints an admin session for the reserved
+    // RECOVERY_ID principal, which by design has NO users-table row (spec §6/§9).
+    // A `sessions.user_id REFERENCES users(user_id)` FK made insert_session 500 on
+    // recovery/verify over Postgres (invisible to the MemoryStore e2e). Without
+    // inserting any users row, the all-zero-principal session must persist and
+    // validate back as that principal.
+    let db = db_or_skip!();
+    let token: [u8; 32] = random_array();
+
+    db.store
+        .insert_session(
+            sha256(&token),
+            SessionRecord {
+                user_id: RECOVERY_ID.0,
+                tls_exporter: EXPORTER,
+                expires_at_ms: TS + 3_600_000,
+                revoked: false,
+            },
+        )
+        .await
+        .expect("recovery-principal session must persist with no users row");
+
+    let svc = AuthService::new(db.store.clone(), AuthConfig::default());
+    assert_eq!(
+        svc.validate_session(&token, &EXPORTER, TS + 1)
+            .await
+            .unwrap(),
+        RECOVERY_ID.0,
+        "the persisted session resolves to the recovery principal"
+    );
+    db.teardown().await;
+}
+
+#[tokio::test]
 async fn session_channel_bind_expiry_and_revoke() {
     let db = db_or_skip!();
     let user_id: [u8; 16] = random_array();
