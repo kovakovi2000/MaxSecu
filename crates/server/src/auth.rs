@@ -7,10 +7,10 @@ use crate::error::{AuthError, ChallengeError, ProveError, StoreError};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::store::{SessionRecord, Store};
 use maxsecu_crypto::{random_array, sha256, SigningKey, VerifyingKey};
-use std::sync::Arc;
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::AuthProofContext;
 use maxsecu_encoding::types::{Bytes32, Text, Timestamp};
+use std::sync::Arc;
 
 /// A login challenge handed to the client (`POST /v1/session/challenge`).
 #[derive(Clone, Debug)]
@@ -459,7 +459,10 @@ mod tests {
 
         // challenge: insert_nonce faults → Internal, not a bogus Ok challenge.
         assert!(
-            matches!(svc.challenge("alice", TS).await, Err(ChallengeError::Internal(_))),
+            matches!(
+                svc.challenge("alice", TS).await,
+                Err(ChallengeError::Internal(_))
+            ),
             "challenge must surface a store fault as Internal"
         );
 

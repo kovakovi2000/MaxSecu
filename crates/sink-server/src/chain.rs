@@ -164,17 +164,26 @@ mod tests {
         let mut store = ControlLogStore::new();
         // r2 chains onto r1, but the store is still at GENESIS — its prev_head
         // ≠ current head → no reorder/rewrite admitted.
-        assert_eq!(store.append(r2.bytes.clone()), Err(AppendError::NotAppending));
+        assert_eq!(
+            store.append(r2.bytes.clone()),
+            Err(AppendError::NotAppending)
+        );
         // r1 appends cleanly; re-appending r1 (prev_head = GENESIS) now also
         // fails — the chain only moves forward.
         store.append(r1.bytes.clone()).unwrap();
-        assert_eq!(store.append(r1.bytes.clone()), Err(AppendError::NotAppending));
+        assert_eq!(
+            store.append(r1.bytes.clone()),
+            Err(AppendError::NotAppending)
+        );
     }
 
     #[test]
     fn malformed_record_rejected() {
         let mut store = ControlLogStore::new();
-        assert_eq!(store.append(vec![0xFF, 0xFF, 0x00]), Err(AppendError::Malformed));
+        assert_eq!(
+            store.append(vec![0xFF, 0xFF, 0x00]),
+            Err(AppendError::Malformed)
+        );
         assert_eq!(store.append(vec![]), Err(AppendError::Malformed));
     }
 

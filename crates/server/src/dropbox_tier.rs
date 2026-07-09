@@ -241,7 +241,12 @@ impl<H: DropboxHttp> DropboxTier<H> {
         ]
     }
 
-    async fn post_json(&self, host: &str, path: &str, body: serde_json::Value) -> Result<DropboxResponse, BlobError> {
+    async fn post_json(
+        &self,
+        host: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<DropboxResponse, BlobError> {
         let req = DropboxRequest {
             method: DropboxMethod::Post,
             url: format!("{host}{path}"),
@@ -255,7 +260,11 @@ impl<H: DropboxHttp> DropboxTier<H> {
     /// success (matches [`ColdTier::delete_chunk`]/`delete_stream` semantics).
     async fn delete_path(&self, path: String, op: &'static str) -> Result<(), BlobError> {
         let resp = self
-            .post_json(&self.api_host, "/2/files/delete_v2", serde_json::json!({ "path": path }))
+            .post_json(
+                &self.api_host,
+                "/2/files/delete_v2",
+                serde_json::json!({ "path": path }),
+            )
             .await?;
         if resp.status == 200 || is_path_not_found(resp.status, &resp.body) {
             Ok(())
@@ -271,14 +280,18 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
     /// request body; NOTHING else about the plaintext/manifest is derived here.
     async fn put_chunk(&self, blob_ref: &str, index: u64, bytes: Vec<u8>) -> Result<(), BlobError> {
         let path = chunk_path(&self.root, blob_ref, index)?;
-        let arg = serde_json::json!({ "path": path, "mode": "overwrite", "mute": true }).to_string();
+        let arg =
+            serde_json::json!({ "path": path, "mode": "overwrite", "mute": true }).to_string();
         let req = DropboxRequest {
             method: DropboxMethod::Post,
             url: format!("{}/2/files/upload", self.content_host),
             headers: vec![
                 self.auth_header(),
                 ("dropbox-api-arg".to_owned(), arg),
-                ("content-type".to_owned(), "application/octet-stream".to_owned()),
+                (
+                    "content-type".to_owned(),
+                    "application/octet-stream".to_owned(),
+                ),
             ],
             body: bytes,
         };
@@ -286,7 +299,10 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
         if resp.status / 100 == 2 {
             Ok(())
         } else {
-            Err(BlobError::new("dropbox_put_chunk", format!("dropbox http {}", resp.status)))
+            Err(BlobError::new(
+                "dropbox_put_chunk",
+                format!("dropbox http {}", resp.status),
+            ))
         }
     }
 
@@ -308,7 +324,10 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
         } else if is_path_not_found(resp.status, &resp.body) {
             Ok(None)
         } else {
-            Err(BlobError::new("dropbox_get_chunk", format!("dropbox http {}", resp.status)))
+            Err(BlobError::new(
+                "dropbox_get_chunk",
+                format!("dropbox http {}", resp.status),
+            ))
         }
     }
 
@@ -318,16 +337,24 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
     async fn chunk_count(&self, blob_ref: &str) -> Result<u64, BlobError> {
         let path = stream_path(&self.root, blob_ref)?;
         let resp = self
-            .post_json(&self.api_host, "/2/files/list_folder", serde_json::json!({ "path": path }))
+            .post_json(
+                &self.api_host,
+                "/2/files/list_folder",
+                serde_json::json!({ "path": path }),
+            )
             .await?;
         if is_path_not_found(resp.status, &resp.body) {
             return Ok(0);
         }
         if resp.status != 200 {
-            return Err(BlobError::new("dropbox_chunk_count", format!("dropbox http {}", resp.status)));
+            return Err(BlobError::new(
+                "dropbox_chunk_count",
+                format!("dropbox http {}", resp.status),
+            ));
         }
-        let mut v: serde_json::Value = serde_json::from_slice(&resp.body)
-            .map_err(|e| BlobError::new("dropbox_chunk_count", format!("malformed response: {e}")))?;
+        let mut v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
+            BlobError::new("dropbox_chunk_count", format!("malformed response: {e}"))
+        })?;
         let mut count = list_folder_entry_count(&v)?;
         let mut has_more = v.get("has_more").and_then(|b| b.as_bool()).unwrap_or(false);
         while has_more {
@@ -344,10 +371,14 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
                 )
                 .await?;
             if resp.status != 200 {
-                return Err(BlobError::new("dropbox_chunk_count", format!("dropbox http {}", resp.status)));
+                return Err(BlobError::new(
+                    "dropbox_chunk_count",
+                    format!("dropbox http {}", resp.status),
+                ));
             }
-            v = serde_json::from_slice(&resp.body)
-                .map_err(|e| BlobError::new("dropbox_chunk_count", format!("malformed response: {e}")))?;
+            v = serde_json::from_slice(&resp.body).map_err(|e| {
+                BlobError::new("dropbox_chunk_count", format!("malformed response: {e}"))
+            })?;
             count += list_folder_entry_count(&v)?;
             has_more = v.get("has_more").and_then(|b| b.as_bool()).unwrap_or(false);
         }
@@ -370,14 +401,21 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
     async fn has_chunk(&self, blob_ref: &str, index: u64) -> Result<bool, BlobError> {
         let path = chunk_path(&self.root, blob_ref, index)?;
         let resp = self
-            .post_json(&self.api_host, "/2/files/get_metadata", serde_json::json!({ "path": path }))
+            .post_json(
+                &self.api_host,
+                "/2/files/get_metadata",
+                serde_json::json!({ "path": path }),
+            )
             .await?;
         if resp.status == 200 {
             Ok(true)
         } else if is_path_not_found(resp.status, &resp.body) {
             Ok(false)
         } else {
-            Err(BlobError::new("dropbox_has_chunk", format!("dropbox http {}", resp.status)))
+            Err(BlobError::new(
+                "dropbox_has_chunk",
+                format!("dropbox http {}", resp.status),
+            ))
         }
     }
 
@@ -415,7 +453,10 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
             ));
         }
         let v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
-            BlobError::new("dropbox_broker_direct_link", format!("malformed response: {e}"))
+            BlobError::new(
+                "dropbox_broker_direct_link",
+                format!("malformed response: {e}"),
+            )
         })?;
         let link = v
             .get("link")
@@ -462,7 +503,8 @@ pub struct HyperDropboxHttp {
 
 impl HyperDropboxHttp {
     pub fn new() -> Result<Self, BlobError> {
-        let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+        let provider =
+            std::sync::Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
         let mut roots = tokio_rustls::rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let tls = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
@@ -508,7 +550,10 @@ impl DropboxHttp for HyperDropboxHttp {
         let method = match req.method {
             DropboxMethod::Post => "POST",
         };
-        let mut builder = hyper::Request::builder().method(method).uri(path).header("host", host);
+        let mut builder = hyper::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", host);
         for (k, v) in &req.headers {
             builder = builder.header(k.as_str(), v.as_str());
         }
@@ -660,7 +705,10 @@ mod tests {
 
     #[tokio::test]
     async fn has_chunk_true_false_without_a_download_call() {
-        let (t, _) = tier(vec![json_resp(200, serde_json::json!({ "name": "0" })), not_found_resp()]);
+        let (t, _) = tier(vec![
+            json_resp(200, serde_json::json!({ "name": "0" })),
+            not_found_resp(),
+        ]);
         assert!(t.has_chunk(REF, 0).await.unwrap());
         assert!(!t.has_chunk(REF, 1).await.unwrap());
         // Only get_metadata calls happened — never files/download.
@@ -805,8 +853,14 @@ mod tests {
         let blob_ref = "livetest/1/1";
         let payload = maxsecu_crypto::random_array::<64>().to_vec();
 
-        tier.put_chunk(blob_ref, 0, payload.clone()).await.expect("put_chunk");
-        let got = tier.get_chunk(blob_ref, 0).await.expect("get_chunk").expect("present");
+        tier.put_chunk(blob_ref, 0, payload.clone())
+            .await
+            .expect("put_chunk");
+        let got = tier
+            .get_chunk(blob_ref, 0)
+            .await
+            .expect("get_chunk")
+            .expect("present");
         assert_eq!(got, payload);
         assert!(tier.has_chunk(blob_ref, 0).await.expect("has_chunk"));
 
@@ -818,7 +872,11 @@ mod tests {
         assert!(link.url.starts_with("https://"));
 
         tier.delete_chunk(blob_ref, 0).await.expect("delete_chunk");
-        assert!(tier.get_chunk(blob_ref, 0).await.expect("get_chunk after delete").is_none());
+        assert!(tier
+            .get_chunk(blob_ref, 0)
+            .await
+            .expect("get_chunk after delete")
+            .is_none());
 
         // Best-effort cleanup of the test folder itself.
         let _ = tier.delete_stream(blob_ref).await;

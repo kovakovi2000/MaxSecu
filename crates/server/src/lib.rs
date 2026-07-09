@@ -33,10 +33,10 @@ pub mod store;
 pub mod tier;
 pub mod writeback_tier;
 
-pub use auth::{AuthConfig, AuthService, Challenge, SessionToken};
 pub use audit::{
     AuditSink, GrantAction, GrantEdge, HttpSinkPublisher, MemoryAuditSink, NullAuditSink,
 };
+pub use auth::{AuthConfig, AuthService, Challenge, SessionToken};
 pub use blob::{
     BlobError, BlobStore, ChunkStatus, DirectLink, FetchSource, FsBlobStore, MemoryBlobStore,
 };
@@ -45,19 +45,19 @@ pub use detect::{
 };
 pub use dropbox_tier::{DropboxTier, HyperDropboxHttp};
 pub use error::{AuthError, ChallengeError, ControlAppendError, ProveError, StoreError};
+pub use files::{
+    parse_stage, AddWrapError, DeleteError, DeleteWrapError, DiscardError, FinalizeError,
+    GenesisInput, ListFilter, ParsedStage, StageError, StageInput, VersionSelector, WrapInput,
+};
 pub use http::{router, AppState, AuthedSession, TlsExporter};
 #[cfg(feature = "postgres")]
 pub use pg::PgStore;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use serve::{export_channel_binding, serve, CHANNEL_BINDING_LABEL, CHANNEL_BINDING_LEN};
-pub use tier::{CacheIndex, ChunkKey, ColdTier, FsColdTier, MemoryColdTier, TieredBlobStore};
-pub use writeback_tier::{Clock, WriteBackTier};
-pub use files::{
-    parse_stage, AddWrapError, DeleteError, DeleteWrapError, DiscardError, FinalizeError,
-    GenesisInput, ListFilter, ParsedStage, StageError, StageInput, VersionSelector, WrapInput,
-};
 pub use store::{
     ChunkSlot, EnrollOutcome, FileListEntry, FileMeta, FileView, MemoryStore, NonceRecord,
-    RecipientView, RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store,
+    RecipientView, RecoveryAccount, SessionRecord, Store, StoredBinding, StoredControlRecord,
     StreamView, UserRecord, VersionMeta, WrapView,
 };
+pub use tier::{CacheIndex, ChunkKey, ColdTier, FsColdTier, MemoryColdTier, TieredBlobStore};
+pub use writeback_tier::{Clock, WriteBackTier};

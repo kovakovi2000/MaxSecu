@@ -63,9 +63,7 @@ pub enum OutputReject {
 /// whose length exactly matches `width * height * channels`. A `u64` arithmetic
 /// avoids overflow on hostile dimensions.
 pub fn validate_decoded(img: &DecodedImage, bounds: &MediaBounds) -> Result<(), DecodeError> {
-    let reject = |reason| {
-        Err(DecodeError::OutputRejected { reason })
-    };
+    let reject = |reason| Err(DecodeError::OutputRejected { reason });
     if img.width == 0 || img.height == 0 {
         return reject(OutputReject::EmptyDims);
     }
@@ -104,7 +102,8 @@ pub fn decode_rgba_bounded(
     let (w, h) = header
         .into_dimensions()
         .map_err(|_| DecodeError::DecodeFailed)?;
-    if w > bounds.max_width || h > bounds.max_height || (w as u64) * (h as u64) > bounds.max_pixels {
+    if w > bounds.max_width || h > bounds.max_height || (w as u64) * (h as u64) > bounds.max_pixels
+    {
         return Err(DecodeError::TooLarge {
             width: w,
             height: h,

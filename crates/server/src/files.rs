@@ -321,9 +321,10 @@ pub fn parse_stage(input: StageInput) -> Result<ParsedStage, StageError> {
     }
     // Recovery wrap must be present (Phase 3 wraps to self + recovery, §12.2); the
     // client also asserts `recovery_present` in the signed manifest — coarse mirror.
-    let has_recovery = input.wraps.iter().any(|w| {
-        w.recipient_type == 2 || w.recipient_id == RECOVERY_ID.0
-    });
+    let has_recovery = input
+        .wraps
+        .iter()
+        .any(|w| w.recipient_type == 2 || w.recipient_id == RECOVERY_ID.0);
     if !has_recovery {
         return Err(StageError::MissingRecoveryWrap);
     }
@@ -334,8 +335,7 @@ pub fn parse_stage(input: StageInput) -> Result<ParsedStage, StageError> {
     // Genesis is present iff this is version 1 (immutable, one per file, §11.7).
     let genesis = match (&input.genesis, manifest.version) {
         (Some(g), 1) => {
-            let decoded: Genesis =
-                decode(&g.genesis_bytes).map_err(|_| StageError::BadGenesis)?;
+            let decoded: Genesis = decode(&g.genesis_bytes).map_err(|_| StageError::BadGenesis)?;
             if decoded.file_id.0 != input.file_id {
                 return Err(StageError::FileIdMismatch);
             }
@@ -351,7 +351,7 @@ pub fn parse_stage(input: StageInput) -> Result<ParsedStage, StageError> {
         }
         (Some(_), _) => return Err(StageError::GenesisUnexpected), // vN must not carry genesis
         (None, 1) => return Err(StageError::GenesisRequired),      // v1 must carry genesis
-        (None, _) => None,                                          // valid rotation
+        (None, _) => None,                                         // valid rotation
     };
 
     let streams = manifest
@@ -434,7 +434,10 @@ mod tests {
             alg: Suite::V1,
             chunk_size,
             dek_commit: Bytes32([0xDC; 32]),
-            streams: vec![stream(StreamType::Content, 2), stream(StreamType::Metadata, 1)],
+            streams: vec![
+                stream(StreamType::Content, 2),
+                stream(StreamType::Metadata, 1),
+            ],
             recovery_present: true,
             author_id: Id(author),
             created_at: Timestamp(1_719_500_000_000),

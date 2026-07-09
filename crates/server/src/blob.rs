@@ -85,8 +85,7 @@ pub trait BlobStore: Send + Sync {
     /// Store one chunk at `index`. **Idempotent by index** (api.md §9.1): a
     /// re-PUT overwrites the same slot, so an interrupted upload re-sends only the
     /// missing indices (resumable).
-    async fn put_chunk(&self, blob_ref: &str, index: u64, bytes: Vec<u8>)
-        -> Result<(), BlobError>;
+    async fn put_chunk(&self, blob_ref: &str, index: u64, bytes: Vec<u8>) -> Result<(), BlobError>;
     /// Fetch one chunk's bytes, or `None` if that index was never stored.
     async fn get_chunk(&self, blob_ref: &str, index: u64) -> Result<Option<Vec<u8>>, BlobError>;
     /// How many distinct indices are currently stored for `blob_ref`. With the
@@ -151,12 +150,7 @@ impl MemoryBlobStore {
 
 #[async_trait]
 impl BlobStore for MemoryBlobStore {
-    async fn put_chunk(
-        &self,
-        blob_ref: &str,
-        index: u64,
-        bytes: Vec<u8>,
-    ) -> Result<(), BlobError> {
+    async fn put_chunk(&self, blob_ref: &str, index: u64, bytes: Vec<u8>) -> Result<(), BlobError> {
         self.inner
             .lock()
             .unwrap()
@@ -229,12 +223,7 @@ impl FsBlobStore {
 
 #[async_trait]
 impl BlobStore for FsBlobStore {
-    async fn put_chunk(
-        &self,
-        blob_ref: &str,
-        index: u64,
-        bytes: Vec<u8>,
-    ) -> Result<(), BlobError> {
+    async fn put_chunk(&self, blob_ref: &str, index: u64, bytes: Vec<u8>) -> Result<(), BlobError> {
         let dir = self.stream_dir(blob_ref)?;
         std::fs::create_dir_all(&dir).map_err(|e| BlobError::new("put_chunk", e.to_string()))?;
         let path = dir.join(index.to_string());
@@ -306,19 +295,31 @@ mod tests {
         store.put_chunk(REF, 0, vec![0xAA; 16]).await.unwrap();
         store.put_chunk(REF, 1, vec![0xBB; 16]).await.unwrap();
         assert_eq!(store.chunk_count(REF).await.unwrap(), 2);
-        assert_eq!(store.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xAA; 16]);
-        assert_eq!(store.get_chunk(REF, 1).await.unwrap().unwrap(), vec![0xBB; 16]);
+        assert_eq!(
+            store.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0xAA; 16]
+        );
+        assert_eq!(
+            store.get_chunk(REF, 1).await.unwrap().unwrap(),
+            vec![0xBB; 16]
+        );
 
         // Re-PUT the same index overwrites the slot (idempotent), not a duplicate.
         store.put_chunk(REF, 0, vec![0xCC; 16]).await.unwrap();
         assert_eq!(store.chunk_count(REF).await.unwrap(), 2);
-        assert_eq!(store.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xCC; 16]);
+        assert_eq!(
+            store.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0xCC; 16]
+        );
 
         // Single-chunk delete (cache eviction primitive): removes only that index,
         // leaves the rest, and is idempotent on a repeat.
         store.delete_chunk(REF, 0).await.unwrap();
         assert!(store.get_chunk(REF, 0).await.unwrap().is_none());
-        assert_eq!(store.get_chunk(REF, 1).await.unwrap().unwrap(), vec![0xBB; 16]);
+        assert_eq!(
+            store.get_chunk(REF, 1).await.unwrap().unwrap(),
+            vec![0xBB; 16]
+        );
         assert_eq!(store.chunk_count(REF).await.unwrap(), 1);
         store.delete_chunk(REF, 0).await.unwrap(); // idempotent
         store.put_chunk(REF, 0, vec![0xAA; 16]).await.unwrap(); // restore for teardown check
@@ -339,7 +340,11 @@ mod tests {
         let store = MemoryBlobStore::new();
         store.put_chunk(REF, 0, vec![0xAA; 8]).await.unwrap();
         // A plain local store has no external-link capability.
-        assert!(store.broker_direct_link(REF, 0, 900).await.unwrap().is_none());
+        assert!(store
+            .broker_direct_link(REF, 0, 900)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

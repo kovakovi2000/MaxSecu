@@ -16,9 +16,9 @@ use maxsecu_encoding::types::{
 };
 use maxsecu_encoding::{encode, RECOVERY_ID};
 use maxsecu_server::{
-    parse_stage, AddWrapError, AuthConfig, AuthService, DeleteError, DeleteWrapError, EnrollOutcome,
-    FinalizeError, GenesisInput, ListFilter, PgStore, RecoveryAccount, SessionRecord, StageError,
-    StageInput, StoredBinding, Store, VersionSelector, WrapInput,
+    parse_stage, AddWrapError, AuthConfig, AuthService, DeleteError, DeleteWrapError,
+    EnrollOutcome, FinalizeError, GenesisInput, ListFilter, PgStore, RecoveryAccount,
+    SessionRecord, StageError, StageInput, Store, StoredBinding, VersionSelector, WrapInput,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -27,8 +27,9 @@ const EXPORTER: [u8; 32] = [0xE7; 32];
 const TS: u64 = 1_719_500_000_000;
 
 fn base_url() -> String {
-    std::env::var("MAXSECU_TEST_PG")
-        .unwrap_or_else(|_| "postgres://maxsecu:maxsecu@localhost/maxsecu?sslmode=disable".to_owned())
+    std::env::var("MAXSECU_TEST_PG").unwrap_or_else(|_| {
+        "postgres://maxsecu:maxsecu@localhost/maxsecu?sslmode=disable".to_owned()
+    })
 }
 
 /// Policy (P5.0b): an unreachable Postgres is a **hard failure** — the PG gate
@@ -77,7 +78,9 @@ impl TestDb {
                          to skip the PG suite on a box without Postgres."
                     );
                 }
-                eprintln!("SKIP pg_store (MAXSECU_PG_OPTIONAL=1): cannot reach Postgres at {url}: {e}");
+                eprintln!(
+                    "SKIP pg_store (MAXSECU_PG_OPTIONAL=1): cannot reach Postgres at {url}: {e}"
+                );
                 return None;
             }
         };
@@ -133,9 +136,12 @@ impl TestDb {
     }
 
     async fn teardown(self) {
-        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE", self.schema))
-            .execute(&self.admin)
-            .await;
+        let _ = sqlx::query(&format!(
+            "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
+            self.schema
+        ))
+        .execute(&self.admin)
+        .await;
     }
 }
 
@@ -424,7 +430,10 @@ async fn nonce_outstanding_respects_ttl_and_single_use() {
     let db = db_or_skip!();
     let nonce: [u8; 32] = random_array();
     // Expires at TS+1000 (the u64-ms ↔ TIMESTAMPTZ mapping under test).
-    db.store.insert_nonce(nonce, "dave", TS + 1000).await.unwrap();
+    db.store
+        .insert_nonce(nonce, "dave", TS + 1000)
+        .await
+        .unwrap();
 
     assert_eq!(
         db.store.outstanding_nonces("dave", TS).await.unwrap(),
@@ -443,7 +452,11 @@ async fn nonce_outstanding_respects_ttl_and_single_use() {
     // Single-use: consuming removes it from the outstanding set.
     db.store.consume_nonce(&nonce).await.unwrap();
     assert!(
-        db.store.outstanding_nonces("dave", TS).await.unwrap().is_empty(),
+        db.store
+            .outstanding_nonces("dave", TS)
+            .await
+            .unwrap()
+            .is_empty(),
         "consumed nonce is not outstanding"
     );
     db.teardown().await;
@@ -480,11 +493,16 @@ async fn session_channel_bind_expiry_and_revoke() {
     let svc = AuthService::new(db.store.clone(), AuthConfig::default());
     // Right channel, not expired → ok.
     assert_eq!(
-        svc.validate_session(&token, &EXPORTER, TS + 1).await.unwrap(),
+        svc.validate_session(&token, &EXPORTER, TS + 1)
+            .await
+            .unwrap(),
         user_id
     );
     // Wrong channel → 401.
-    assert!(svc.validate_session(&token, &[0x00; 32], TS + 1).await.is_err());
+    assert!(svc
+        .validate_session(&token, &[0x00; 32], TS + 1)
+        .await
+        .is_err());
     // Expired → 401.
     assert!(svc
         .validate_session(&token, &EXPORTER, TS + 3_600_001)
@@ -492,12 +510,21 @@ async fn session_channel_bind_expiry_and_revoke() {
         .is_err());
     // Revoked (persisted) → 401, even on the right channel.
     db.store.revoke_session(&token_hash).await.unwrap();
-    assert!(svc.validate_session(&token, &EXPORTER, TS + 1).await.is_err());
+    assert!(svc
+        .validate_session(&token, &EXPORTER, TS + 1)
+        .await
+        .is_err());
 
     db.teardown().await;
 }
 
-fn dir_binding(user_id: [u8; 16], username: &str, enc: u8, sig: u8, key_version: u64) -> DirBinding {
+fn dir_binding(
+    user_id: [u8; 16],
+    username: &str,
+    enc: u8,
+    sig: u8,
+    key_version: u64,
+) -> DirBinding {
     DirBinding {
         username: Text::new(username).unwrap(),
         user_id: Id(user_id),
@@ -531,11 +558,18 @@ async fn directory_binding_persists_and_latest_version_serves() {
     let b1 = dir_binding(user_id, "grace", 0xE1, 0x51, 1);
     let bytes1 = encode(&b1);
     let sig1 = d5.sign_canonical(labels::DIRBINDING, &b1);
-    db.store.put_binding(user_id, 1, bytes1.clone(), sig1).await.unwrap();
+    db.store
+        .put_binding(user_id, 1, bytes1.clone(), sig1)
+        .await
+        .unwrap();
 
     // Round-trips through a fresh pool (truly persisted), byte-exact.
     let store2 = db.reopen().await;
-    let got = store2.binding_by_user_id(&user_id).await.unwrap().expect("binding");
+    let got = store2
+        .binding_by_user_id(&user_id)
+        .await
+        .unwrap()
+        .expect("binding");
     assert_eq!(got.binding_bytes, bytes1);
     assert_eq!(got.signature, sig1);
     let by_name = store2
@@ -549,12 +583,24 @@ async fn directory_binding_persists_and_latest_version_serves() {
     assert!(store2.binding_by_username("ghost").await.unwrap().is_none());
 
     // Re-publishing v1 is a no-op (immutable history); a rotation to v2 becomes latest.
-    db.store.put_binding(user_id, 1, bytes1.clone(), sig1).await.unwrap();
+    db.store
+        .put_binding(user_id, 1, bytes1.clone(), sig1)
+        .await
+        .unwrap();
     let b2 = dir_binding(user_id, "grace", 0xE2, 0x52, 2);
     let bytes2 = encode(&b2);
     let sig2 = d5.sign_canonical(labels::DIRBINDING, &b2);
-    db.store.put_binding(user_id, 2, bytes2.clone(), sig2).await.unwrap();
-    let latest = db.reopen().await.binding_by_user_id(&user_id).await.unwrap().unwrap();
+    db.store
+        .put_binding(user_id, 2, bytes2.clone(), sig2)
+        .await
+        .unwrap();
+    let latest = db
+        .reopen()
+        .await
+        .binding_by_user_id(&user_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(latest.binding_bytes, bytes2, "latest key_version serves");
 
     db.teardown().await;
@@ -601,11 +647,19 @@ async fn control_log_chain_appends_serves_and_rejects_forks() {
     );
 
     let r1 = revocation_bytes(genesis, 1, 0x99, issuer);
-    let head1 = db.store.append_control(r1.clone(), [0xCC; 64], None).await.unwrap();
+    let head1 = db
+        .store
+        .append_control(r1.clone(), [0xCC; 64], None)
+        .await
+        .unwrap();
     assert_eq!(db.store.control_head().await.unwrap(), head1);
 
     let r2 = revocation_bytes(head1, 2, 0x98, issuer);
-    let head2 = db.store.append_control(r2.clone(), [0xDD; 64], None).await.unwrap();
+    let head2 = db
+        .store
+        .append_control(r2.clone(), [0xDD; 64], None)
+        .await
+        .unwrap();
 
     // Serve in append order through a fresh pool (truly persisted).
     let store2 = db.reopen().await;
@@ -743,20 +797,42 @@ async fn file_lifecycle_persists_in_postgres() {
     db.seed_user(owner, "owner").await;
 
     // Stage v1 — not visible until finalize, even via a fresh pool.
-    let p1 = parse_stage(pg_stage(file, 1, owner, Some(pg_genesis(file, owner)), FileType::Blog)).unwrap();
+    let p1 = parse_stage(pg_stage(
+        file,
+        1,
+        owner,
+        Some(pg_genesis(file, owner)),
+        FileType::Blog,
+    ))
+    .unwrap();
     assert_eq!(db.store.stage_version(p1, TS).await.unwrap(), 1);
     let fresh = db.reopen().await;
-    assert!(fresh.get_file(file, VersionSelector::Latest, owner).await.unwrap().is_none());
+    assert!(fresh
+        .get_file(file, VersionSelector::Latest, owner)
+        .await
+        .unwrap()
+        .is_none());
 
     // version_meta projects the staged slots (owner, not-yet-finalized, streams).
-    let meta = db.store.version_meta(file, 1).await.unwrap().expect("staged meta");
+    let meta = db
+        .store
+        .version_meta(file, 1)
+        .await
+        .unwrap()
+        .expect("staged meta");
     assert_eq!(meta.owner_id, owner);
     assert!(!meta.finalized);
     assert_eq!(meta.streams.len(), 2);
-    assert!(meta.streams.iter().any(|s| s.stream_type == 1 && s.chunk_count == 2));
+    assert!(meta
+        .streams
+        .iter()
+        .any(|s| s.stream_type == 1 && s.chunk_count == 2));
 
     // Finalize v1 → durably visible to the owner with its exact records.
-    db.store.finalize_version(file, 1, owner, TS + 1).await.unwrap();
+    db.store
+        .finalize_version(file, 1, owner, TS + 1)
+        .await
+        .unwrap();
     let fresh = db.reopen().await;
     let view = fresh
         .get_file(file, VersionSelector::Latest, owner)
@@ -764,23 +840,44 @@ async fn file_lifecycle_persists_in_postgres() {
         .unwrap()
         .expect("finalized v1 visible after reopen");
     assert_eq!(view.version, 1);
-    assert_eq!(view.manifest_bytes, pg_manifest(file, 1, owner, FileType::Blog));
+    assert_eq!(
+        view.manifest_bytes,
+        pg_manifest(file, 1, owner, FileType::Blog)
+    );
     assert_eq!(view.my_wrap.wrapped_dek, vec![0xA1; 48]);
     assert!(view.recovery_grant.is_some());
     assert_eq!(view.streams.len(), 2);
 
     // A non-recipient gets None — same as missing (no oracle).
-    assert!(db.store.get_file(file, VersionSelector::Latest, [0x77; 16]).await.unwrap().is_none());
+    assert!(db
+        .store
+        .get_file(file, VersionSelector::Latest, [0x77; 16])
+        .await
+        .unwrap()
+        .is_none());
 
     // Rotate to v2 (strict +1); prior wraps torn down.
     let p2 = parse_stage(pg_stage(file, 2, owner, None, FileType::Blog)).unwrap();
     db.store.stage_version(p2, TS + 2).await.unwrap();
-    db.store.finalize_version(file, 2, owner, TS + 3).await.unwrap();
+    db.store
+        .finalize_version(file, 2, owner, TS + 3)
+        .await
+        .unwrap();
     assert_eq!(
-        db.store.get_file(file, VersionSelector::Latest, owner).await.unwrap().unwrap().version,
+        db.store
+            .get_file(file, VersionSelector::Latest, owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
         2
     );
-    assert!(db.store.get_file(file, VersionSelector::Specific(1), owner).await.unwrap().is_none());
+    assert!(db
+        .store
+        .get_file(file, VersionSelector::Specific(1), owner)
+        .await
+        .unwrap()
+        .is_none());
 
     db.teardown().await;
 }
@@ -792,16 +889,29 @@ async fn finalize_strict_plus_one_and_non_owner_rejected_in_postgres() {
     let file = [0xF2u8; 16];
     db.seed_user(owner, "owner").await;
 
-    let p1 = parse_stage(pg_stage(file, 1, owner, Some(pg_genesis(file, owner)), FileType::Blog)).unwrap();
+    let p1 = parse_stage(pg_stage(
+        file,
+        1,
+        owner,
+        Some(pg_genesis(file, owner)),
+        FileType::Blog,
+    ))
+    .unwrap();
     db.store.stage_version(p1, TS).await.unwrap();
-    db.store.finalize_version(file, 1, owner, TS + 1).await.unwrap();
+    db.store
+        .finalize_version(file, 1, owner, TS + 1)
+        .await
+        .unwrap();
 
     // Stage v3 (skipping v2) then finalize → VersionConflict (expected 2).
     let p3 = parse_stage(pg_stage(file, 3, owner, None, FileType::Blog)).unwrap();
     db.store.stage_version(p3, TS + 2).await.unwrap();
     assert_eq!(
         db.store.finalize_version(file, 3, owner, TS + 3).await,
-        Err(FinalizeError::VersionConflict { expected: 2, got: 3 })
+        Err(FinalizeError::VersionConflict {
+            expected: 2,
+            got: 3
+        })
     );
 
     // Finalizing v1 again → AlreadyFinalized (immutability guard).
@@ -812,7 +922,10 @@ async fn finalize_strict_plus_one_and_non_owner_rejected_in_postgres() {
 
     // A stranger cannot rotate the file (coarse owner check, D29).
     let attacker = parse_stage(pg_stage(file, 2, [0x77; 16], None, FileType::Blog)).unwrap();
-    assert_eq!(db.store.stage_version(attacker, TS + 5).await, Err(StageError::NotOwner));
+    assert_eq!(
+        db.store.stage_version(attacker, TS + 5).await,
+        Err(StageError::NotOwner)
+    );
 
     db.teardown().await;
 }
@@ -840,21 +953,51 @@ async fn listing_filters_by_type_in_postgres() {
     let blog = [0xB1u8; 16];
     let video = [0x71u8; 16];
 
-    let pb = parse_stage(pg_stage(blog, 1, owner, Some(pg_genesis(blog, owner)), FileType::Blog)).unwrap();
+    let pb = parse_stage(pg_stage(
+        blog,
+        1,
+        owner,
+        Some(pg_genesis(blog, owner)),
+        FileType::Blog,
+    ))
+    .unwrap();
     db.store.stage_version(pb, TS).await.unwrap();
-    db.store.finalize_version(blog, 1, owner, TS + 100).await.unwrap();
-    let pv = parse_stage(pg_stage(video, 1, owner, Some(pg_genesis(video, owner)), FileType::Video)).unwrap();
+    db.store
+        .finalize_version(blog, 1, owner, TS + 100)
+        .await
+        .unwrap();
+    let pv = parse_stage(pg_stage(
+        video,
+        1,
+        owner,
+        Some(pg_genesis(video, owner)),
+        FileType::Video,
+    ))
+    .unwrap();
     db.store.stage_version(pv, TS).await.unwrap();
-    db.store.finalize_version(video, 1, owner, TS + 200).await.unwrap();
+    db.store
+        .finalize_version(video, 1, owner, TS + 200)
+        .await
+        .unwrap();
 
-    let all = db.store.list_files(ListFilter { file_type: None, limit: 10 }).await.unwrap();
+    let all = db
+        .store
+        .list_files(ListFilter {
+            file_type: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].file_id, video); // newest first
     assert!(all[0].small_streams.iter().all(|(t, _)| *t != 1)); // content excluded
 
     let blogs = db
         .store
-        .list_files(ListFilter { file_type: Some(FileType::Blog as u8 as i16), limit: 10 })
+        .list_files(ListFilter {
+            file_type: Some(FileType::Blog as u8 as i16),
+            limit: 10,
+        })
         .await
         .unwrap();
     assert_eq!(blogs.len(), 1);
@@ -874,14 +1017,43 @@ async fn listing_excludes_bundle_members_in_postgres() {
     // A listed bundle and an unlisted member (listed=false), both finalized.
     // `listed` is a post-scan filter on files_listing_idx; the PG query drops
     // members with `AND listed = true` so they never reach the public feed.
-    let pb = parse_stage(pg_stage_listed(bundle, 1, owner, Some(pg_genesis(bundle, owner)), FileType::Blog, true)).unwrap();
+    let pb = parse_stage(pg_stage_listed(
+        bundle,
+        1,
+        owner,
+        Some(pg_genesis(bundle, owner)),
+        FileType::Blog,
+        true,
+    ))
+    .unwrap();
     db.store.stage_version(pb, TS).await.unwrap();
-    db.store.finalize_version(bundle, 1, owner, TS + 100).await.unwrap();
-    let pm = parse_stage(pg_stage_listed(member, 1, owner, Some(pg_genesis(member, owner)), FileType::Blog, false)).unwrap();
+    db.store
+        .finalize_version(bundle, 1, owner, TS + 100)
+        .await
+        .unwrap();
+    let pm = parse_stage(pg_stage_listed(
+        member,
+        1,
+        owner,
+        Some(pg_genesis(member, owner)),
+        FileType::Blog,
+        false,
+    ))
+    .unwrap();
     db.store.stage_version(pm, TS).await.unwrap();
-    db.store.finalize_version(member, 1, owner, TS + 200).await.unwrap();
+    db.store
+        .finalize_version(member, 1, owner, TS + 200)
+        .await
+        .unwrap();
 
-    let all = db.store.list_files(ListFilter { file_type: None, limit: 50 }).await.unwrap();
+    let all = db
+        .store
+        .list_files(ListFilter {
+            file_type: None,
+            limit: 50,
+        })
+        .await
+        .unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].file_id, bundle);
     assert!(all.iter().all(|e| e.file_id != member)); // member hidden from the feed
@@ -912,13 +1084,29 @@ async fn reshare_and_soft_revoke_persist_in_postgres() {
     let file = [0xF5u8; 16];
     db.seed_user(owner, "owner5").await;
 
-    let p1 = parse_stage(pg_stage(file, 1, owner, Some(pg_genesis(file, owner)), FileType::Blog)).unwrap();
+    let p1 = parse_stage(pg_stage(
+        file,
+        1,
+        owner,
+        Some(pg_genesis(file, owner)),
+        FileType::Blog,
+    ))
+    .unwrap();
     db.store.stage_version(p1, TS).await.unwrap();
-    db.store.finalize_version(file, 1, owner, TS + 1).await.unwrap();
+    db.store
+        .finalize_version(file, 1, owner, TS + 1)
+        .await
+        .unwrap();
 
     // Owner re-shares to R (author-rooted), R re-shares to V (re-share edge).
-    db.store.add_wrap(file, wrap_row(r, owner, 0xB0), owner, TS + 2).await.unwrap();
-    db.store.add_wrap(file, wrap_row(v, r, 0xC0), r, TS + 3).await.unwrap();
+    db.store
+        .add_wrap(file, wrap_row(r, owner, 0xB0), owner, TS + 2)
+        .await
+        .unwrap();
+    db.store
+        .add_wrap(file, wrap_row(v, r, 0xC0), r, TS + 3)
+        .await
+        .unwrap();
 
     // V's view via a fresh pool: leaf grant + the ancestor chain [R's grant].
     let fresh = db.reopen().await;
@@ -928,11 +1116,18 @@ async fn reshare_and_soft_revoke_persist_in_postgres() {
         .unwrap()
         .expect("V holds a re-shared wrap");
     assert_eq!(vv.my_wrap.grant_bytes, vec![0xC0; 8]);
-    assert_eq!(vv.my_wrap.ancestor_grants, vec![(vec![0xB0; 8], [0xB0; 64])]);
+    assert_eq!(
+        vv.my_wrap.ancestor_grants,
+        vec![(vec![0xB0; 8], [0xB0; 64])]
+    );
 
     // The owner enumerates recipients for rotation: owner + R + V, V chained to
     // the author via R; a non-owner gets None (no oracle).
-    let recips = fresh.list_recipients(file, owner).await.unwrap().expect("owner lists");
+    let recips = fresh
+        .list_recipients(file, owner)
+        .await
+        .unwrap()
+        .expect("owner lists");
     assert_eq!(recips.len(), 3);
     let vr = recips.iter().find(|r| r.recipient_id == v).unwrap();
     assert_eq!(vr.ancestor_grants, vec![(vec![0xB0; 8], [0xB0; 64])]);
@@ -941,21 +1136,42 @@ async fn reshare_and_soft_revoke_persist_in_postgres() {
     // A non-holder cannot re-share (no oracle → NoAccess).
     assert_eq!(
         db.store
-            .add_wrap(file, wrap_row([0x44; 16], [0x77; 16], 0xD0), [0x77; 16], TS + 4)
+            .add_wrap(
+                file,
+                wrap_row([0x44; 16], [0x77; 16], 0xD0),
+                [0x77; 16],
+                TS + 4
+            )
             .await,
         Err(AddWrapError::NoAccess)
     );
 
     // Soft-revoke: the granter R revokes V; an unrelated user cannot revoke R;
     // the owner can.
-    db.store.delete_wrap(file, v, r).await.expect("granter revokes grantee");
-    assert!(db.store.get_file(file, VersionSelector::Latest, v).await.unwrap().is_none());
+    db.store
+        .delete_wrap(file, v, r)
+        .await
+        .expect("granter revokes grantee");
+    assert!(db
+        .store
+        .get_file(file, VersionSelector::Latest, v)
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(
         db.store.delete_wrap(file, r, [0x88; 16]).await,
         Err(DeleteWrapError::NotAuthorized)
     );
-    db.store.delete_wrap(file, r, owner).await.expect("owner revokes");
-    assert!(db.store.get_file(file, VersionSelector::Latest, r).await.unwrap().is_none());
+    db.store
+        .delete_wrap(file, r, owner)
+        .await
+        .expect("owner revokes");
+    assert!(db
+        .store
+        .get_file(file, VersionSelector::Latest, r)
+        .await
+        .unwrap()
+        .is_none());
 
     db.teardown().await;
 }
@@ -981,40 +1197,75 @@ async fn delete_finalized_file_cascades_in_postgres() {
 
     // A finalized bundle (file_type=Bundle, listed) + two members it owns.
     let pb = parse_stage(pg_stage_listed(
-        bundle, 1, owner, Some(pg_genesis(bundle, owner)), FileType::Bundle, true,
+        bundle,
+        1,
+        owner,
+        Some(pg_genesis(bundle, owner)),
+        FileType::Bundle,
+        true,
     ))
     .unwrap();
     db.store.stage_version(pb, TS).await.unwrap();
-    db.store.finalize_version(bundle, 1, owner, TS + 1).await.unwrap();
+    db.store
+        .finalize_version(bundle, 1, owner, TS + 1)
+        .await
+        .unwrap();
     for m in [m1, m2] {
         let pm = parse_stage(StageInput {
             bundle_id: Some(bundle),
-            ..pg_stage_listed(m, 1, owner, Some(pg_genesis(m, owner)), FileType::Blog, false)
+            ..pg_stage_listed(
+                m,
+                1,
+                owner,
+                Some(pg_genesis(m, owner)),
+                FileType::Blog,
+                false,
+            )
         })
         .unwrap();
         db.store.stage_version(pm, TS).await.unwrap();
-        db.store.finalize_version(m, 1, owner, TS + 2).await.unwrap();
+        db.store
+            .finalize_version(m, 1, owner, TS + 2)
+            .await
+            .unwrap();
     }
     // `stranger` legitimately points THEIR OWN file at `owner`'s bundle_id.
     let pf = parse_stage(StageInput {
         bundle_id: Some(bundle),
-        ..pg_stage_listed(foreign, 1, stranger, Some(pg_genesis(foreign, stranger)), FileType::Blog, false)
+        ..pg_stage_listed(
+            foreign,
+            1,
+            stranger,
+            Some(pg_genesis(foreign, stranger)),
+            FileType::Blog,
+            false,
+        )
     })
     .unwrap();
     db.store.stage_version(pf, TS).await.unwrap();
-    db.store.finalize_version(foreign, 1, stranger, TS + 2).await.unwrap();
+    db.store
+        .finalize_version(foreign, 1, stranger, TS + 2)
+        .await
+        .unwrap();
 
     // A NON-owner delete is refused (no oracle) AND removes nothing — the finalized
     // rows survive precisely because the GUC is unset on this path (immutability
     // holds), so the triggers would fire even if the code tried.
-    assert_eq!(db.store.delete_file(bundle, [0x77; 16]).await, Err(DeleteError::NotFound));
+    assert_eq!(
+        db.store.delete_file(bundle, [0x77; 16]).await,
+        Err(DeleteError::NotFound)
+    );
     assert!(db.store.get_file_meta(bundle).await.unwrap().is_some());
     assert!(db.store.get_file_meta(m1).await.unwrap().is_some());
 
     // The OWNER permanently deletes the finalized bundle: the GUC carve-out lets
     // the delete pass the file_versions + file_genesis triggers; the OWNED members
     // cascade; every removed stream's blob_ref comes back for the caller to purge.
-    let refs = db.store.delete_file(bundle, owner).await.expect("owner delete succeeds over real triggers");
+    let refs = db
+        .store
+        .delete_file(bundle, owner)
+        .await
+        .expect("owner delete succeeds over real triggers");
     assert_eq!(refs.len(), 6); // 2 streams (content+metadata) × 3 OWNED files — NOT the foreign member
 
     // Prove durability via a FRESH pool — the owned rows are gone, and the
@@ -1028,8 +1279,18 @@ async fn delete_finalized_file_cascades_in_postgres() {
         "a foreign-owned member must survive the owner's bundle delete (owner-scoped cascade)"
     );
     // The stranger can still read their surviving file.
-    assert!(fresh.get_file(foreign, VersionSelector::Latest, stranger).await.unwrap().is_some());
-    let listed = fresh.list_files(ListFilter { file_type: None, limit: 50 }).await.unwrap();
+    assert!(fresh
+        .get_file(foreign, VersionSelector::Latest, stranger)
+        .await
+        .unwrap()
+        .is_some());
+    let listed = fresh
+        .list_files(ListFilter {
+            file_type: None,
+            limit: 50,
+        })
+        .await
+        .unwrap();
     assert!(listed.is_empty()); // all remaining files are unlisted members
 
     db.teardown().await;

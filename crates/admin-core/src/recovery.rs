@@ -10,7 +10,9 @@
 //! download but is **not** carry-forward-eligible (R24, §12.3a/§12.9) — that
 //! exclusion lives in the rotation carry-forward selection, not here.
 
-use maxsecu_crypto::{unwrap_dek, wrap_dek, Dek, EncPublicKey, EncSecretKey, SigningKey, WrappedDek};
+use maxsecu_crypto::{
+    unwrap_dek, wrap_dek, Dek, EncPublicKey, EncSecretKey, SigningKey, WrappedDek,
+};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::{Grant, WrapContext};
 use maxsecu_encoding::types::{Bytes32, Id, RecipientType, Timestamp};
@@ -193,7 +195,15 @@ mod tests {
         let dek = Dek::generate();
         let wire = recovery_wire_wrap(&rpk, &dek, FILE, 3);
         assert_eq!(
-            validate_recovery_wrap(&rsk, &wire, dek.commit(), &RecoveryWrapCtx { file_id: FILE, version: 3 }),
+            validate_recovery_wrap(
+                &rsk,
+                &wire,
+                dek.commit(),
+                &RecoveryWrapCtx {
+                    file_id: FILE,
+                    version: 3
+                }
+            ),
             Ok(())
         );
     }
@@ -208,7 +218,15 @@ mod tests {
         // wrap opens, but the recovered DEK does not match → WrapMismatch.
         let wrong = recovery_wire_wrap(&rpk, &other, FILE, 3);
         assert_eq!(
-            validate_recovery_wrap(&rsk, &wrong, dek.commit(), &RecoveryWrapCtx { file_id: FILE, version: 3 }),
+            validate_recovery_wrap(
+                &rsk,
+                &wrong,
+                dek.commit(),
+                &RecoveryWrapCtx {
+                    file_id: FILE,
+                    version: 3
+                }
+            ),
             Err(SweepError::WrapMismatch)
         );
 
@@ -217,7 +235,15 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0x01;
         assert_eq!(
-            validate_recovery_wrap(&rsk, &corrupt, dek.commit(), &RecoveryWrapCtx { file_id: FILE, version: 3 }),
+            validate_recovery_wrap(
+                &rsk,
+                &corrupt,
+                dek.commit(),
+                &RecoveryWrapCtx {
+                    file_id: FILE,
+                    version: 3
+                }
+            ),
             Err(SweepError::WrapUndecryptable)
         );
     }
@@ -227,7 +253,11 @@ mod tests {
     const RECIP: Id = Id([0x55; 16]);
     const NOW: Timestamp = Timestamp(1_719_500_000_000);
 
-    fn params<'a>(admin: &'a SigningKey, enc_pub: EncPublicKey, commit: [u8; 32]) -> RecoveryGrantParams<'a> {
+    fn params<'a>(
+        admin: &'a SigningKey,
+        enc_pub: EncPublicKey,
+        commit: [u8; 32],
+    ) -> RecoveryGrantParams<'a> {
         RecoveryGrantParams {
             admin_sig: admin,
             admin_id: ADMIN_ID,
@@ -249,7 +279,11 @@ mod tests {
         let out = build_recovery_grant(&params(&admin, rpk, dek.commit()), &dek).unwrap();
 
         // The produced wrap re-opens to the same DEK under the bound context.
-        let ctx = WrapContext { file_id: FILE, version: 3, recipient_id: RECIP };
+        let ctx = WrapContext {
+            file_id: FILE,
+            version: 3,
+            recipient_id: RECIP,
+        };
         let opened = unwrap_dek(&rsk, &out.wrapped_dek, &ctx).unwrap();
         assert_eq!(opened.commit(), dek.commit());
 

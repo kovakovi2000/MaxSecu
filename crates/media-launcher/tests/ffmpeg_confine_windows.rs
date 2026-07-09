@@ -216,24 +216,59 @@ fn confined_denies_input_outside_granted_dir_while_unconfined_allows() {
 fn make_long_input(ffmpeg: &Path, out: &Path) {
     let status = Command::new(ffmpeg)
         .args([
-            "-y", "-f", "lavfi", "-i", "testsrc=duration=15:size=640x480:rate=30", "-f", "lavfi",
-            "-i", "sine=duration=15:frequency=440", "-shortest", "-pix_fmt", "yuv420p", "-c:v",
-            "libsvtav1", "-preset", "12", "-c:a", "aac", "-ac", "2",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=15:size=640x480:rate=30",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=duration=15:frequency=440",
+            "-shortest",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libsvtav1",
+            "-preset",
+            "12",
+            "-c:a",
+            "aac",
+            "-ac",
+            "2",
         ])
         .arg(out)
         .status()
         .expect("spawn unconfined ffmpeg to synthesize long input");
-    assert!(status.success() && out.exists(), "long synthetic input generation failed");
+    assert!(
+        status.success() && out.exists(),
+        "long synthetic input generation failed"
+    );
 }
 
 /// The transcode argv with a DELIBERATELY slow SVT-AV1 preset so the confined encode
 /// runs for several seconds — long enough to be mid-flight when cancel is flipped.
 fn slow_transcode_argv(input: &Path, output: &Path) -> Vec<OsString> {
     vec![
-        "-y".into(), "-i".into(), input.into(), "-vf".into(),
-        "scale=trunc(iw/2)*2:trunc(ih/2)*2".into(), "-pix_fmt".into(), "yuv420p".into(),
-        "-c:v".into(), "libsvtav1".into(), "-preset".into(), "2".into(), "-g".into(), "30".into(),
-        "-c:a".into(), "aac".into(), "-b:a".into(), "128k".into(), "-ac".into(), "2".into(),
+        "-y".into(),
+        "-i".into(),
+        input.into(),
+        "-vf".into(),
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-c:v".into(),
+        "libsvtav1".into(),
+        "-preset".into(),
+        "2".into(),
+        "-g".into(),
+        "30".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        "128k".into(),
+        "-ac".into(),
+        "2".into(),
         output.into(),
     ]
 }
@@ -273,7 +308,10 @@ fn cancel_mid_run_kills_confined_ffmpeg_and_reports_cancelled() {
         "a set cancel flag must yield the DISTINCT cancelled outcome (exit {})",
         outcome.exit_code
     );
-    assert_ne!(outcome.exit_code, 0, "a cancelled (terminated) ffmpeg exits non-zero");
+    assert_ne!(
+        outcome.exit_code, 0,
+        "a cancelled (terminated) ffmpeg exits non-zero"
+    );
     // Returned promptly after cancel — NOT after the hour-long absolute backstop.
     assert!(
         elapsed < Duration::from_secs(90),

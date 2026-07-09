@@ -289,8 +289,12 @@ async fn enrollment_is_appended_to_transparency_log_over_real_tls() {
         .issue_registration_key(sha256(b"key-two"), NEVER)
         .await
         .unwrap();
-    let publisher =
-        HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
+    let publisher = HttpSinkPublisher::new(
+        sink_addr,
+        "localhost",
+        sink_pki.client_config.clone(),
+        TOKEN,
+    );
     let state = AppState {
         auth: Arc::new(
             AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))

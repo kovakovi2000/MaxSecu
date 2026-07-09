@@ -549,7 +549,11 @@ fn binding_without_pq_roundtrips() {
     let v = valid_dirbinding();
     assert_eq!(v.mlkem_pub, None);
     let b = encode(&v);
-    assert_eq!(*b.last().unwrap(), 0x00, "absent PQ key ⇒ trailing 0x00 flag");
+    assert_eq!(
+        *b.last().unwrap(),
+        0x00,
+        "absent PQ key ⇒ trailing 0x00 flag"
+    );
     let back: DirBinding = decode(&b).expect("non-PQ binding decodes");
     assert_eq!(back, v, "value round-trip");
     assert_eq!(back.mlkem_pub, None);
@@ -565,7 +569,11 @@ fn binding_with_pq_roundtrips() {
     let b = encode(&v);
     // Tail layout: flag(1) ‖ key(1184).
     assert_eq!(b[b.len() - 1185], 0x01, "present flag");
-    assert_eq!(&b[b.len() - 1184..], &key[..], "fixed 1184-byte key, no prefix");
+    assert_eq!(
+        &b[b.len() - 1184..],
+        &key[..],
+        "fixed 1184-byte key, no prefix"
+    );
     let back: DirBinding = decode(&b).expect("PQ binding decodes");
     assert_eq!(back, v, "value round-trip");
     assert_eq!(back.mlkem_pub, Some(MlKemPub(key)));

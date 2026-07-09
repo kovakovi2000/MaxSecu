@@ -134,11 +134,11 @@ mod tests {
         "vacation.MP4",
         "archive.tar.gz",
         "my file (1).txt",
-        "résumé.docx",        // non-ASCII letters are fine
+        "résumé.docx", // non-ASCII letters are fine
         "data-2026_06_28.csv",
-        ".gitignore",          // leading dot is a normal hidden file, not traversal
-        "COMmunity.txt",       // not a reserved name (COM + letters)
-        "NULlable.rs",         // starts with NUL but is not the device name
+        ".gitignore",    // leading dot is a normal hidden file, not traversal
+        "COMmunity.txt", // not a reserved name (COM + letters)
+        "NULlable.rs",   // starts with NUL but is not the device name
         "a.b.c.d",
     ];
 
@@ -155,7 +155,10 @@ mod tests {
         ("C:\\Windows\\evil.exe", SanitizeError::AbsolutePath),
         ("z:relative", SanitizeError::AbsolutePath),
         ("name:stream", SanitizeError::AlternateDataStream),
-        ("photo.jpg:Zone.Identifier", SanitizeError::AlternateDataStream),
+        (
+            "photo.jpg:Zone.Identifier",
+            SanitizeError::AlternateDataStream,
+        ),
         ("sub/dir/file.txt", SanitizeError::PathSeparator),
         ("sub\\dir\\file.txt", SanitizeError::PathSeparator),
         ("..", SanitizeError::ParentTraversal),
@@ -173,7 +176,11 @@ mod tests {
     #[test]
     fn benign_names_pass_through_unchanged() {
         for &name in BENIGN {
-            assert_eq!(sanitize_filename(name), Ok(name.to_string()), "name={name:?}");
+            assert_eq!(
+                sanitize_filename(name),
+                Ok(name.to_string()),
+                "name={name:?}"
+            );
         }
     }
 

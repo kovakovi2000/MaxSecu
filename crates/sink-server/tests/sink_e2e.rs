@@ -223,23 +223,30 @@ async fn http_client_reads_control_and_genesis_positions() {
     let (gp, none, cp, missing) = tokio::task::spawn_blocking(move || {
         let sink = HttpSinkClient::new(addr, "localhost", cc);
         (
-            sink.fetch_genesis_pos(&file),       // anchored → Some(g)
+            sink.fetch_genesis_pos(&file),         // anchored → Some(g)
             sink.fetch_genesis_pos(&[0xABu8; 16]), // un-anchored → Ok(None)
-            sink.fetch_control_pos(1),           // 1st control append → g+1
-            sink.fetch_control_pos(99),          // no such record → Err (fail closed)
+            sink.fetch_control_pos(1),             // 1st control append → g+1
+            sink.fetch_control_pos(99),            // no such record → Err (fail closed)
         )
     })
     .await
     .unwrap();
 
     assert_eq!(gp.unwrap(), Some(g));
-    assert_eq!(none.unwrap(), None, "an un-anchored file is a clean Ok(None)");
+    assert_eq!(
+        none.unwrap(),
+        None,
+        "an un-anchored file is a clean Ok(None)"
+    );
     assert_eq!(
         cp.unwrap(),
         g + 1,
         "the control append drew the next global position after the genesis"
     );
-    assert!(missing.is_err(), "a missing chain_seq fails closed, never a silent 0");
+    assert!(
+        missing.is_err(),
+        "a missing chain_seq fails closed, never a silent 0"
+    );
 }
 
 #[tokio::test]

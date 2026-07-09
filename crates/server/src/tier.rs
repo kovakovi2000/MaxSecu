@@ -179,8 +179,7 @@ impl CacheIndex {
 /// duplicating the filesystem containment guard.
 #[async_trait]
 pub trait ColdTier: Send + Sync {
-    async fn put_chunk(&self, blob_ref: &str, index: u64, bytes: Vec<u8>)
-        -> Result<(), BlobError>;
+    async fn put_chunk(&self, blob_ref: &str, index: u64, bytes: Vec<u8>) -> Result<(), BlobError>;
     async fn get_chunk(&self, blob_ref: &str, index: u64) -> Result<Option<Vec<u8>>, BlobError>;
     async fn chunk_count(&self, blob_ref: &str) -> Result<u64, BlobError>;
     async fn delete_stream(&self, blob_ref: &str) -> Result<(), BlobError>;
@@ -254,12 +253,7 @@ impl Default for MemoryColdTier {
 
 #[async_trait]
 impl ColdTier for MemoryColdTier {
-    async fn put_chunk(
-        &self,
-        blob_ref: &str,
-        index: u64,
-        bytes: Vec<u8>,
-    ) -> Result<(), BlobError> {
+    async fn put_chunk(&self, blob_ref: &str, index: u64, bytes: Vec<u8>) -> Result<(), BlobError> {
         self.inner.put_chunk(blob_ref, index, bytes).await
     }
     async fn get_chunk(&self, blob_ref: &str, index: u64) -> Result<Option<Vec<u8>>, BlobError> {
@@ -286,7 +280,12 @@ impl ColdTier for MemoryColdTier {
         if !self.has_chunk(blob_ref, index).await? {
             return Ok(None);
         }
-        Ok(mint_direct_link(&self.master_token, blob_ref, index, ttl_secs))
+        Ok(mint_direct_link(
+            &self.master_token,
+            blob_ref,
+            index,
+            ttl_secs,
+        ))
     }
 }
 
@@ -304,7 +303,10 @@ impl FsColdTier {
             master_token: "fs-cold-master-token-SECRET".to_owned(),
         }
     }
-    pub fn with_master_token(base: impl Into<std::path::PathBuf>, token: impl Into<String>) -> Self {
+    pub fn with_master_token(
+        base: impl Into<std::path::PathBuf>,
+        token: impl Into<String>,
+    ) -> Self {
         FsColdTier {
             inner: FsBlobStore::new(base),
             master_token: token.into(),
@@ -314,12 +316,7 @@ impl FsColdTier {
 
 #[async_trait]
 impl ColdTier for FsColdTier {
-    async fn put_chunk(
-        &self,
-        blob_ref: &str,
-        index: u64,
-        bytes: Vec<u8>,
-    ) -> Result<(), BlobError> {
+    async fn put_chunk(&self, blob_ref: &str, index: u64, bytes: Vec<u8>) -> Result<(), BlobError> {
         self.inner.put_chunk(blob_ref, index, bytes).await
     }
     async fn get_chunk(&self, blob_ref: &str, index: u64) -> Result<Option<Vec<u8>>, BlobError> {
@@ -346,7 +343,12 @@ impl ColdTier for FsColdTier {
         if !self.has_chunk(blob_ref, index).await? {
             return Ok(None);
         }
-        Ok(mint_direct_link(&self.master_token, blob_ref, index, ttl_secs))
+        Ok(mint_direct_link(
+            &self.master_token,
+            blob_ref,
+            index,
+            ttl_secs,
+        ))
     }
 }
 
@@ -382,7 +384,12 @@ impl TieredBlobStore {
     /// Record `key` (size bytes) as freshly cached and physically evict whatever
     /// the index says no longer fits. The index lock is never held across an
     /// `await`.
-    async fn cache_and_evict(&self, blob_ref: &str, index: u64, size: u64) -> Result<(), BlobError> {
+    async fn cache_and_evict(
+        &self,
+        blob_ref: &str,
+        index: u64,
+        size: u64,
+    ) -> Result<(), BlobError> {
         let evicted = {
             let mut idx = self.index.lock().unwrap();
             idx.record_insert(ChunkKey::new(blob_ref, index), size)
@@ -396,12 +403,7 @@ impl TieredBlobStore {
 
 #[async_trait]
 impl BlobStore for TieredBlobStore {
-    async fn put_chunk(
-        &self,
-        blob_ref: &str,
-        index: u64,
-        bytes: Vec<u8>,
-    ) -> Result<(), BlobError> {
+    async fn put_chunk(&self, blob_ref: &str, index: u64, bytes: Vec<u8>) -> Result<(), BlobError> {
         // Write-through: the cold tier is the durable record (written first), the
         // cache a populated hot copy.
         let size = bytes.len() as u64;
@@ -504,7 +506,9 @@ impl BlobStore for TieredBlobStore {
         ttl_secs: u64,
     ) -> Result<Option<crate::blob::DirectLink>, BlobError> {
         // Direct links are a cold-tier capability — the cache never brokers.
-        self.cold.broker_direct_link(blob_ref, index, ttl_secs).await
+        self.cold
+            .broker_direct_link(blob_ref, index, ttl_secs)
+            .await
     }
 }
 
@@ -628,7 +632,10 @@ mod tests {
         tier.put_chunk(REF, 0, vec![0xAA; 16]).await.unwrap();
         tier.put_chunk(REF, 1, vec![0xBB; 16]).await.unwrap();
         assert_eq!(tier.chunk_count(REF).await.unwrap(), 2);
-        assert_eq!(tier.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xAA; 16]);
+        assert_eq!(
+            tier.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0xAA; 16]
+        );
 
         // Per-chunk delete removes only that index.
         tier.delete_chunk(REF, 0).await.unwrap();
@@ -668,11 +675,15 @@ mod tests {
         let link = cold.broker_direct_link(REF, 0, 900).await.unwrap().unwrap();
         assert_eq!(link.expires_in_s, 900);
         assert!(link.url.contains(REF)); // scoped to this blob
-        // The master token is NEVER embedded in the brokered URL (the §9.4 gate).
+                                         // The master token is NEVER embedded in the brokered URL (the §9.4 gate).
         assert!(!link.url.contains(master));
 
         // Absent chunk → no link (the handler maps this to 404, no oracle).
-        assert!(cold.broker_direct_link(REF, 7, 900).await.unwrap().is_none());
+        assert!(cold
+            .broker_direct_link(REF, 7, 900)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -696,7 +707,9 @@ mod tests {
 
     // ---- TieredBlobStore (cache over cold) ----
 
-    fn tier_with_capacity(cap: u64) -> (TieredBlobStore, Arc<MemoryBlobStore>, Arc<MemoryColdTier>) {
+    fn tier_with_capacity(
+        cap: u64,
+    ) -> (TieredBlobStore, Arc<MemoryBlobStore>, Arc<MemoryColdTier>) {
         let cache = Arc::new(MemoryBlobStore::new());
         let cold = Arc::new(MemoryColdTier::new());
         let tier = TieredBlobStore::new(cache.clone(), cold.clone(), cap);
@@ -708,8 +721,14 @@ mod tests {
         let (tier, cache, cold) = tier_with_capacity(1000);
         tier.put_chunk(REF, 0, vec![0x11; 10]).await.unwrap();
         // Durable record landed in cold AND a hot copy in the cache.
-        assert_eq!(cold.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0x11; 10]);
-        assert_eq!(cache.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0x11; 10]);
+        assert_eq!(
+            cold.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0x11; 10]
+        );
+        assert_eq!(
+            cache.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0x11; 10]
+        );
     }
 
     #[tokio::test]
@@ -722,7 +741,10 @@ mod tests {
         let got = tier.get_chunk(REF, 0).await.unwrap().unwrap();
         assert_eq!(got, vec![0x22; 10]);
         // The cache is now warm for the next read.
-        assert_eq!(cache.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0x22; 10]);
+        assert_eq!(
+            cache.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0x22; 10]
+        );
     }
 
     #[tokio::test]
@@ -731,7 +753,10 @@ mod tests {
         tier.put_chunk(REF, 0, vec![0x33; 10]).await.unwrap();
         // Even if the cold tier loses the chunk, a cache hit still serves it.
         cold.delete_stream(REF).await.unwrap();
-        assert_eq!(tier.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0x33; 10]);
+        assert_eq!(
+            tier.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0x33; 10]
+        );
     }
 
     #[tokio::test]
@@ -750,11 +775,17 @@ mod tests {
 
         // Index 0 left the hot cache but remains durable in cold.
         assert!(cache.get_chunk(REF, 0).await.unwrap().is_none());
-        assert_eq!(cold.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xA0; 10]);
+        assert_eq!(
+            cold.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0xA0; 10]
+        );
         assert!(cache.get_chunk(REF, 2).await.unwrap().is_some());
 
         // A read of the evicted chunk transparently re-fetches from cold.
-        assert_eq!(tier.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xA0; 10]);
+        assert_eq!(
+            tier.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0xA0; 10]
+        );
     }
 
     #[tokio::test]

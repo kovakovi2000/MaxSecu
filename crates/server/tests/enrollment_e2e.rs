@@ -235,7 +235,13 @@ async fn enrollment_registration_key_only_over_real_tls() {
 
     // ---- Gate 1: a valid registration key buys exactly one enrollment (201). ----
     let alice = Identity::generate();
-    let (st, res) = post(&mut c, "/v1/users", None, reg_body("alice", "key-one", &alice)).await;
+    let (st, res) = post(
+        &mut c,
+        "/v1/users",
+        None,
+        reg_body("alice", "key-one", &alice),
+    )
+    .await;
     assert_eq!(st, StatusCode::CREATED, "first registrant enrolls");
     assert_eq!(res["user_id"].as_str().unwrap().len(), 32); // 16 bytes hex
 
@@ -248,11 +254,22 @@ async fn enrollment_registration_key_only_over_real_tls() {
         vk.verify_canonical(labels::DIRBINDING, &ab, &asig).is_ok(),
         "the served binding verifies under the server's directory pubkey"
     );
-    assert_eq!(ab.enc_pub.0, alice.enc_pub_bytes(), "binds the enrolled enc key");
-    assert_eq!(ab.sig_pub.0, alice.sig_pub_bytes(), "binds the enrolled sig key");
+    assert_eq!(
+        ab.enc_pub.0,
+        alice.enc_pub_bytes(),
+        "binds the enrolled enc key"
+    );
+    assert_eq!(
+        ab.sig_pub.0,
+        alice.sig_pub_bytes(),
+        "binds the enrolled sig key"
+    );
 
     // ---- Gate 3a: the FIRST registrant is {User, Admin}. ----
-    assert!(ab.roles.roles().contains(&Role::Admin), "first registrant is admin");
+    assert!(
+        ab.roles.roles().contains(&Role::Admin),
+        "first registrant is admin"
+    );
     assert!(ab.roles.roles().contains(&Role::User));
 
     // ---- Gate 3b: the SECOND registrant (second key) is {User} only. ----
@@ -277,9 +294,17 @@ async fn enrollment_registration_key_only_over_real_tls() {
         reg_body("mallory", "key-one", &mallory),
     )
     .await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "a consumed registration key is refused");
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "a consumed registration key is refused"
+    );
     let (st, _) = get(&mut c, "/v1/directory/mallory").await;
-    assert_eq!(st, StatusCode::NOT_FOUND, "the refused registrant was never created");
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "the refused registrant was never created"
+    );
 
     // ---- Gate 5: the removed enrollment routes now 404. ----
     let (st, _) = post(&mut c, "/v1/bootstrap", None, serde_json::json!({})).await;
@@ -303,7 +328,13 @@ async fn enrollment_registration_key_only_over_real_tls() {
     assert!(!minted.is_empty(), "the plaintext key is returned once");
 
     let carol = Identity::generate();
-    let (st, _) = post(&mut c, "/v1/users", None, reg_body("carol", &minted, &carol)).await;
+    let (st, _) = post(
+        &mut c,
+        "/v1/users",
+        None,
+        reg_body("carol", &minted, &carol),
+    )
+    .await;
     assert_eq!(st, StatusCode::CREATED, "a minted key enrolls a user");
     let (st, body) = get(&mut c, "/v1/directory/carol").await;
     assert_eq!(st, StatusCode::OK);
@@ -327,5 +358,9 @@ async fn enrollment_registration_key_only_over_real_tls() {
         serde_json::json!({}),
     )
     .await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "a non-admin cannot mint registration keys");
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "a non-admin cannot mint registration keys"
+    );
 }

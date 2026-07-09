@@ -348,13 +348,19 @@ mod tests {
         let g = s.genesis_pos(&[0xF1; 16]).expect("genesis anchored");
         let c = s.control_pos(1).expect("control #1 position");
         assert!(g > c, "genesis anchored after the control append");
-        assert!(s.genesis_pos(&[0x00; 16]).is_none(), "an un-anchored file has no position");
+        assert!(
+            s.genesis_pos(&[0x00; 16]).is_none(),
+            "an un-anchored file has no position"
+        );
     }
 
     #[tokio::test]
     async fn memory_sink_records_dir_bindings_in_append_order() {
         let s = MemoryAuditSink::new();
-        assert!(s.dir_bindings().is_empty(), "no bindings before any enrollment");
+        assert!(
+            s.dir_bindings().is_empty(),
+            "no bindings before any enrollment"
+        );
         s.publish_dir_binding(vec![0x11; 8]).await;
         s.publish_dir_binding(vec![0x22; 8]).await;
         assert_eq!(

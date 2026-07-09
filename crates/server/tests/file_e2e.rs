@@ -171,7 +171,13 @@ async fn get_raw(conn: &mut Conn, uri: &str, auth: &str) -> (StatusCode, Vec<u8>
         .unwrap();
     let resp = conn.sender.send_request(req).await.unwrap();
     let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     (status, bytes)
 }
 
@@ -226,7 +232,10 @@ fn wrap_from_bytes(b: &[u8]) -> WrappedDek {
 #[tokio::test]
 async fn phase3_exit_gates_over_real_tls() {
     // ---- Server: secret-free, records in memory, ciphertext blobs on disk ----
-    let blob_dir = std::env::temp_dir().join(format!("mxe2e_{}", hex(&maxsecu_crypto::random_array::<8>())));
+    let blob_dir = std::env::temp_dir().join(format!(
+        "mxe2e_{}",
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
     let store = MemoryStore::new();
     store.add_reg_key(sha256(VOUCHER.as_bytes()));
     let signer = Arc::new(maxsecu_crypto::SigningKey::generate());
@@ -244,7 +253,11 @@ async fn phase3_exit_gates_over_real_tls() {
     let pki = test_pki();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, pki.server_config.clone(), maxsecu_server::router(state)));
+    tokio::spawn(serve(
+        listener,
+        pki.server_config.clone(),
+        maxsecu_server::router(state),
+    ));
 
     let mut c = connect(addr, pki.client_config.clone()).await;
 
@@ -265,8 +278,18 @@ async fn phase3_exit_gates_over_real_tls() {
     assert_eq!(st, StatusCode::CREATED, "registration over TLS");
     let user_id = hex16(res["user_id"].as_str().unwrap());
 
-    let (_st, ch) = post(&mut c, "/v1/session/challenge", None, serde_json::json!({"username":"alice"})).await;
-    let nonce: [u8; 32] = B64.decode(ch["nonce_b64"].as_str().unwrap()).unwrap().try_into().unwrap();
+    let (_st, ch) = post(
+        &mut c,
+        "/v1/session/challenge",
+        None,
+        serde_json::json!({"username":"alice"}),
+    )
+    .await;
+    let nonce: [u8; 32] = B64
+        .decode(ch["nonce_b64"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
     let server_id = ch["server_id"].as_str().unwrap().to_owned();
     let proof = {
         use maxsecu_encoding::structs::AuthProofContext;
@@ -370,7 +393,10 @@ async fn phase3_exit_gates_over_real_tls() {
                 "/v1/files/{fid_hex}/versions/1/streams/{}/chunks/{i}",
                 stream_name(s.stream_type)
             );
-            assert_eq!(put_raw(&mut c, &uri, &token, chunk.clone()).await, StatusCode::OK);
+            assert_eq!(
+                put_raw(&mut c, &uri, &token, chunk.clone()).await,
+                StatusCode::OK
+            );
         }
     }
     let (st, _) = post(
@@ -383,7 +409,12 @@ async fn phase3_exit_gates_over_real_tls() {
     assert_eq!(st, StatusCode::OK, "finalize after all chunks present");
 
     // ---- GET the records + chunks back, rebuild a DownloadBundle ----
-    let (st, rec) = get_json(&mut c, &format!("/v1/files/{fid_hex}?version=latest"), &token).await;
+    let (st, rec) = get_json(
+        &mut c,
+        &format!("/v1/files/{fid_hex}?version=latest"),
+        &token,
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
     let mut dl_streams = Vec::new();
     for s in rec["streams"].as_array().unwrap() {
@@ -437,9 +468,20 @@ async fn phase3_exit_gates_over_real_tls() {
     let opened = verify_and_open(&ctx, &good).expect("round-trips");
     assert_eq!(opened.version, 1);
     assert!(opened.recovery_grant_ok);
-    let got_content = &opened.streams.iter().find(|s| s.stream_type == StreamType::Content).unwrap().plaintext;
+    let got_content = &opened
+        .streams
+        .iter()
+        .find(|s| s.stream_type == StreamType::Content)
+        .unwrap()
+        .plaintext;
     assert_eq!(got_content, &content);
-    let got_meta = opened.streams.iter().find(|s| s.stream_type == StreamType::Metadata).unwrap().plaintext.clone();
+    let got_meta = opened
+        .streams
+        .iter()
+        .find(|s| s.stream_type == StreamType::Metadata)
+        .unwrap()
+        .plaintext
+        .clone();
     assert_eq!(got_meta, FILENAME);
 
     // GATE — malicious filename in decrypted metadata cannot traverse on export.
@@ -471,7 +513,10 @@ async fn phase3_exit_gates_over_real_tls() {
     // GATE — forged manifest: a bad author signature is rejected.
     let mut forged = clone_bundle(&good);
     forged.manifest_sig[0] ^= 0xFF;
-    assert_eq!(verify_and_open(&ctx, &forged).unwrap_err(), DownloadError::ManifestSignature);
+    assert_eq!(
+        verify_and_open(&ctx, &forged).unwrap_err(),
+        DownloadError::ManifestSignature
+    );
 
     // GATE — poisoned near-max version: re-sign a manifest at v=5_000_000 (above
     // the first-contact ceiling) with the genuine owner key → rejected by freshness.
@@ -532,7 +577,11 @@ async fn phase4b_media_exit_gates_over_real_tls() {
     let pki = test_pki();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, pki.server_config.clone(), maxsecu_server::router(state)));
+    tokio::spawn(serve(
+        listener,
+        pki.server_config.clone(),
+        maxsecu_server::router(state),
+    ));
     let mut c = connect(addr, pki.client_config.clone()).await;
 
     // ---- Register + login ----
@@ -551,8 +600,18 @@ async fn phase4b_media_exit_gates_over_real_tls() {
     .await;
     assert_eq!(st, StatusCode::CREATED, "registration over TLS");
     let user_id = hex16(res["user_id"].as_str().unwrap());
-    let (_st, ch) = post(&mut c, "/v1/session/challenge", None, serde_json::json!({"username":"mira"})).await;
-    let nonce: [u8; 32] = B64.decode(ch["nonce_b64"].as_str().unwrap()).unwrap().try_into().unwrap();
+    let (_st, ch) = post(
+        &mut c,
+        "/v1/session/challenge",
+        None,
+        serde_json::json!({"username":"mira"}),
+    )
+    .await;
+    let nonce: [u8; 32] = B64
+        .decode(ch["nonce_b64"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
     let server_id = ch["server_id"].as_str().unwrap().to_owned();
     let proof = {
         use maxsecu_encoding::structs::AuthProofContext;
@@ -587,7 +646,9 @@ async fn phase4b_media_exit_gates_over_real_tls() {
             .unwrap();
         buf
     };
-    let canonical = RustImageCodec.transcode(&src, &MediaBounds::default()).unwrap();
+    let canonical = RustImageCodec
+        .transcode(&src, &MediaBounds::default())
+        .unwrap();
     assert_eq!(canonical.file_type, FileType::Image);
     let canonical_content = canonical.content.clone();
     let streams = canonical.into_plaintext_streams(Some(TITLE.to_vec()));
@@ -612,12 +673,14 @@ async fn phase4b_media_exit_gates_over_real_tls() {
     let stream_specs: Vec<serde_json::Value> = bundle
         .streams
         .iter()
-        .map(|s| serde_json::json!({
-            "stream_type": stream_name(s.stream_type),
-            "chunk_count": s.chunk_count,
-            "chunk_size": s.chunk_size,
-            "total_bytes": s.total_bytes,
-        }))
+        .map(|s| {
+            serde_json::json!({
+                "stream_type": stream_name(s.stream_type),
+                "chunk_count": s.chunk_count,
+                "chunk_size": s.chunk_size,
+                "total_bytes": s.total_bytes,
+            })
+        })
         .collect();
     let wraps: Vec<serde_json::Value> = bundle
         .wraps
@@ -649,15 +712,32 @@ async fn phase4b_media_exit_gates_over_real_tls() {
     assert_eq!(st, StatusCode::CREATED, "stage media v1");
     for s in &bundle.streams {
         for (i, chunk) in s.chunks.iter().enumerate() {
-            let uri = format!("/v1/files/{fid_hex}/versions/1/streams/{}/chunks/{i}", stream_name(s.stream_type));
-            assert_eq!(put_raw(&mut c, &uri, &token, chunk.clone()).await, StatusCode::OK);
+            let uri = format!(
+                "/v1/files/{fid_hex}/versions/1/streams/{}/chunks/{i}",
+                stream_name(s.stream_type)
+            );
+            assert_eq!(
+                put_raw(&mut c, &uri, &token, chunk.clone()).await,
+                StatusCode::OK
+            );
         }
     }
-    let (st, _) = post(&mut c, &format!("/v1/files/{fid_hex}/versions/1/finalize"), Some(&token), serde_json::Value::Null).await;
+    let (st, _) = post(
+        &mut c,
+        &format!("/v1/files/{fid_hex}/versions/1/finalize"),
+        Some(&token),
+        serde_json::Value::Null,
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "finalize media");
 
     // ---- GET records + chunks, rebuild the bundle ----
-    let (st, rec) = get_json(&mut c, &format!("/v1/files/{fid_hex}?version=latest"), &token).await;
+    let (st, rec) = get_json(
+        &mut c,
+        &format!("/v1/files/{fid_hex}?version=latest"),
+        &token,
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
     let mut dl_streams = Vec::new();
     for s in rec["streams"].as_array().unwrap() {
@@ -670,7 +750,10 @@ async fn phase4b_media_exit_gates_over_real_tls() {
             assert_eq!(cs, StatusCode::OK);
             chunks.push(bytes);
         }
-        dl_streams.push(StreamChunks { stream_type: stream_from_name(st_name), chunks });
+        dl_streams.push(StreamChunks {
+            stream_type: stream_from_name(st_name),
+            chunks,
+        });
     }
     let dec = |v: &serde_json::Value| B64.decode(v.as_str().unwrap()).unwrap();
     let dec64 = |v: &serde_json::Value| -> [u8; 64] { dec(v).try_into().unwrap() };
@@ -706,14 +789,26 @@ async fn phase4b_media_exit_gates_over_real_tls() {
 
     // GATE — transcoded media round-trips: content/thumbnail/preview recovered.
     let opened = verify_and_open(&ctx, &good).expect("media round-trips");
-    let got_content = &opened.streams.iter().find(|s| s.stream_type == StreamType::Content).unwrap().plaintext;
+    let got_content = &opened
+        .streams
+        .iter()
+        .find(|s| s.stream_type == StreamType::Content)
+        .unwrap()
+        .plaintext;
     assert_eq!(got_content, &canonical_content);
-    assert!(opened.streams.iter().any(|s| s.stream_type == StreamType::Thumbnail));
-    assert!(opened.streams.iter().any(|s| s.stream_type == StreamType::Preview));
+    assert!(opened
+        .streams
+        .iter()
+        .any(|s| s.stream_type == StreamType::Thumbnail));
+    assert!(opened
+        .streams
+        .iter()
+        .any(|s| s.stream_type == StreamType::Preview));
 
     // GATE — renders: the recovered canonical content decodes to a valid frame,
     // identical to decoding the freshly-transcoded content.
-    let frame = decode_rgba_bounded(got_content, &MediaBounds::default()).expect("recovered media renders");
+    let frame =
+        decode_rgba_bounded(got_content, &MediaBounds::default()).expect("recovered media renders");
     assert!(validate_decoded(&frame, &MediaBounds::default()).is_ok());
     assert_eq!((frame.width, frame.height), (96, 72));
     let canon_frame = decode_rgba_bounded(&canonical_content, &MediaBounds::default()).unwrap();
@@ -736,7 +831,11 @@ async fn phase4b_media_exit_gates_over_real_tls() {
     std::fs::write(&cold_chunk0, &cbytes).unwrap();
     std::fs::remove_dir_all(&cache_dir).unwrap(); // force the next read to hit cold
 
-    let cidx = good.streams.iter().position(|s| s.stream_type == StreamType::Content).unwrap();
+    let cidx = good
+        .streams
+        .iter()
+        .position(|s| s.stream_type == StreamType::Content)
+        .unwrap();
     let ccount = good.streams[cidx].chunks.len();
     let mut tampered = clone_bundle(&good);
     let mut new_chunks = Vec::new();
@@ -747,11 +846,14 @@ async fn phase4b_media_exit_gates_over_real_tls() {
         new_chunks.push(b);
     }
     tampered.streams[cidx].chunks = new_chunks;
-    assert!(matches!(
-        verify_and_open(&ctx, &tampered).unwrap_err(),
-        DownloadError::StreamDigestMismatch(StreamType::Content)
-            | DownloadError::StreamFraming(StreamType::Content)
-    ), "a tampered blob served from the cold tier must be rejected");
+    assert!(
+        matches!(
+            verify_and_open(&ctx, &tampered).unwrap_err(),
+            DownloadError::StreamDigestMismatch(StreamType::Content)
+                | DownloadError::StreamFraming(StreamType::Content)
+        ),
+        "a tampered blob served from the cold tier must be rejected"
+    );
 
     let _ = std::fs::remove_dir_all(&cache_dir);
     let _ = std::fs::remove_dir_all(&cold_dir);
@@ -783,7 +885,9 @@ fn clone_bundle(b: &DownloadBundle) -> DownloadBundle {
 
 /// Recursively assert no stored blob file contains the plaintext `marker`.
 fn scan_no_plaintext(dir: &Path, marker: &[u8], files: &mut usize) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if path.is_dir() {

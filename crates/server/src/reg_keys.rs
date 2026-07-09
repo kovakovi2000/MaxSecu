@@ -86,7 +86,11 @@ mod tests {
             "the key was consumed inside enroll (single-use)"
         );
         assert_eq!(
-            s.binding_by_username("alice").await.unwrap().unwrap().binding_bytes,
+            s.binding_by_username("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .binding_bytes,
             vec![0xDD, 0xDD],
             "the admin binding was the one stored"
         );
@@ -101,7 +105,11 @@ mod tests {
             EnrollOutcome::Enrolled { is_admin: false }
         );
         assert_eq!(
-            s.binding_by_username("bob").await.unwrap().unwrap().binding_bytes,
+            s.binding_by_username("bob")
+                .await
+                .unwrap()
+                .unwrap()
+                .binding_bytes,
             vec![0xAA, 0xAA],
             "the user binding was the one stored"
         );
@@ -113,7 +121,10 @@ mod tests {
         let s = MemoryStore::new();
         let (ub, ab) = bindings();
         // A pre-existing account holds the name.
-        s.create_user("alice", [9; 32], [9; 32]).await.unwrap().unwrap();
+        s.create_user("alice", [9; 32], [9; 32])
+            .await
+            .unwrap()
+            .unwrap();
         let kh = maxsecu_crypto::sha256(b"rk");
         s.issue_registration_key(kh, NEVER).await.unwrap();
 

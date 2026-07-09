@@ -48,18 +48,18 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 
 /// A launch/confinement failure: which Win32 step failed + its `GetLastError`/
@@ -106,7 +106,10 @@ pub struct ConfinedExeOutput {
 const APPCONTAINER_NAME: &str = "MaxSecu.MediaDecodeWorker.v1";
 
 fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` — the profile is already registered.
@@ -193,7 +196,12 @@ fn appcontainer_pipe_security(sid: PSID) -> Result<*mut core::ffi::c_void, Spawn
     // SAFETY: `sddl` is a valid null-terminated wide string; `psd` receives an
     // owned descriptor (LocalAlloc'd) on success.
     let ok = unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut psd, ptr::null_mut())
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut psd,
+            ptr::null_mut(),
+        )
     };
     if ok == 0 {
         return Err(SpawnError::last("ConvertStringSecurityDescriptor"));
@@ -850,8 +858,8 @@ fn finish_confined_watchdog(
             break; // WAIT_OBJECT_0 (exited) or WAIT_FAILED — stop waiting.
         }
         let now = start.elapsed().as_millis() as u64;
-        let stalled = now.saturating_sub(last_advance_ms.load(Ordering::Relaxed))
-            >= stall_timeout_ms as u64;
+        let stalled =
+            now.saturating_sub(last_advance_ms.load(Ordering::Relaxed)) >= stall_timeout_ms as u64;
         let over_backstop = now >= max_total_ms as u64;
         if cancel.load(Ordering::Relaxed) {
             cancelled = true;
@@ -1573,23 +1581,44 @@ mod progress_tests {
             Some(((60 + 2) * 60 + 3) * 1000 + 450)
         );
         // No / unknown duration → None.
-        assert_eq!(parse_ffmpeg_duration_line("  Duration: N/A, bitrate: N/A"), None);
+        assert_eq!(
+            parse_ffmpeg_duration_line("  Duration: N/A, bitrate: N/A"),
+            None
+        );
         assert_eq!(parse_ffmpeg_duration_line("frame= 10 fps=5"), None);
     }
 
     #[test]
     fn classifies_progress_lines() {
         // out_time_us / out_time_ms are microseconds → milliseconds.
-        assert_eq!(parse_ffmpeg_progress_line("out_time_us=1500000"), FfmpegLine::OutTime(1500));
-        assert_eq!(parse_ffmpeg_progress_line("out_time_ms=2000000"), FfmpegLine::OutTime(2000));
+        assert_eq!(
+            parse_ffmpeg_progress_line("out_time_us=1500000"),
+            FfmpegLine::OutTime(1500)
+        );
+        assert_eq!(
+            parse_ffmpeg_progress_line("out_time_ms=2000000"),
+            FfmpegLine::OutTime(2000)
+        );
         // out_time= is a timecode.
-        assert_eq!(parse_ffmpeg_progress_line("out_time=00:00:01.250000"), FfmpegLine::OutTime(1250));
+        assert_eq!(
+            parse_ffmpeg_progress_line("out_time=00:00:01.250000"),
+            FfmpegLine::OutTime(1250)
+        );
         // progress=continue|end → a tick.
-        assert_eq!(parse_ffmpeg_progress_line("progress=continue"), FfmpegLine::Tick);
+        assert_eq!(
+            parse_ffmpeg_progress_line("progress=continue"),
+            FfmpegLine::Tick
+        );
         assert_eq!(parse_ffmpeg_progress_line("progress=end"), FfmpegLine::Tick);
         // Malformed values are ignored (never panic, never a bogus sample).
-        assert_eq!(parse_ffmpeg_progress_line("out_time_us=not-a-number"), FfmpegLine::Ignore);
-        assert_eq!(parse_ffmpeg_progress_line("bitrate=N/A"), FfmpegLine::Ignore);
+        assert_eq!(
+            parse_ffmpeg_progress_line("out_time_us=not-a-number"),
+            FfmpegLine::Ignore
+        );
+        assert_eq!(
+            parse_ffmpeg_progress_line("bitrate=N/A"),
+            FfmpegLine::Ignore
+        );
         assert_eq!(parse_ffmpeg_progress_line(""), FfmpegLine::Ignore);
     }
 
@@ -1612,7 +1641,10 @@ mod progress_tests {
     fn hms_parser_rejects_malformed() {
         assert_eq!(parse_hms_ms("00:00:01.5"), Some(1_500));
         assert_eq!(parse_hms_ms("00:00:01"), Some(1_000));
-        assert_eq!(parse_hms_ms("1:2:3.004"), Some((3600 + 2 * 60 + 3) * 1000 + 4));
+        assert_eq!(
+            parse_hms_ms("1:2:3.004"),
+            Some((3600 + 2 * 60 + 3) * 1000 + 4)
+        );
         assert_eq!(parse_hms_ms("00:99:00"), None); // minutes out of range
         assert_eq!(parse_hms_ms("00:00:99"), None); // seconds out of range
         assert_eq!(parse_hms_ms("garbage"), None);
@@ -1638,12 +1670,23 @@ mod progress_tests {
             b"out_time_us=1000000".as_slice(),
             b"progress=continue".as_slice(),
         ] {
-            handle_progress_line(l, &mut total, &mut max_out, &mut pending, &last, start, &sink);
+            handle_progress_line(
+                l,
+                &mut total,
+                &mut max_out,
+                &mut pending,
+                &last,
+                start,
+                &sink,
+            );
         }
         assert_eq!(total, Some(2_000));
         assert_eq!(
             samples.into_inner(),
-            vec![FfmpegProgress { percent: Some(50), out_time_ms: 1_000 }]
+            vec![FfmpegProgress {
+                percent: Some(50),
+                out_time_ms: 1_000
+            }]
         );
         assert_ne!(
             last.load(Ordering::Relaxed),

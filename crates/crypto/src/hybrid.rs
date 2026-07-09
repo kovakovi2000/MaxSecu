@@ -351,10 +351,8 @@ mod tests {
         // Same ML-KEM key, different X25519 secret → ss1 mismatches → fail.
         let (sk1, pk1) = generate_hybrid_keypair();
         let (sk2, _pk2) = generate_hybrid_keypair();
-        let mixed = HybridEncSecretKey::from_components(
-            sk2.x25519_secret_bytes(),
-            sk1.mlkem_seed_bytes(),
-        );
+        let mixed =
+            HybridEncSecretKey::from_components(sk2.x25519_secret_bytes(), sk1.mlkem_seed_bytes());
         let dek = Dek::from_bytes([0x42; 32]);
         let c = ctx(0x55, 1);
         let wrapped = wrap_dek_hybrid(&pk1, &dek, &c).unwrap();
@@ -369,10 +367,8 @@ mod tests {
         // Same X25519 key, different ML-KEM secret → ss2 mismatches → fail.
         let (sk1, pk1) = generate_hybrid_keypair();
         let (sk2, _pk2) = generate_hybrid_keypair();
-        let mixed = HybridEncSecretKey::from_components(
-            sk1.x25519_secret_bytes(),
-            sk2.mlkem_seed_bytes(),
-        );
+        let mixed =
+            HybridEncSecretKey::from_components(sk1.x25519_secret_bytes(), sk2.mlkem_seed_bytes());
         let dek = Dek::from_bytes([0x42; 32]);
         let c = ctx(0x55, 1);
         let wrapped = wrap_dek_hybrid(&pk1, &dek, &c).unwrap();
@@ -443,8 +439,14 @@ mod tests {
         assert_ne!(a.eph_x_pub, b.eph_x_pub);
         assert_ne!(a.ct_pq, b.ct_pq);
         assert_ne!(a.aead_ct, b.aead_ct);
-        assert_eq!(unwrap_dek_hybrid(&sk, &a, &c).unwrap().expose(), dek.expose());
-        assert_eq!(unwrap_dek_hybrid(&sk, &b, &c).unwrap().expose(), dek.expose());
+        assert_eq!(
+            unwrap_dek_hybrid(&sk, &a, &c).unwrap().expose(),
+            dek.expose()
+        );
+        assert_eq!(
+            unwrap_dek_hybrid(&sk, &b, &c).unwrap().expose(),
+            dek.expose()
+        );
     }
 
     #[test]
@@ -508,7 +510,10 @@ mod tests {
         let dek = Dek::from_bytes([9; 32]);
         let c = ctx(0x55, 1);
         let w = wrap_dek_hybrid(&pk, &dek, &c).unwrap();
-        assert_eq!(unwrap_dek_hybrid(&sk, &w, &c).unwrap().expose(), dek.expose());
+        assert_eq!(
+            unwrap_dek_hybrid(&sk, &w, &c).unwrap().expose(),
+            dek.expose()
+        );
     }
 
     #[test]
@@ -527,20 +532,24 @@ mod tests {
         let dek = Dek::from_bytes([0x24; 32]);
         let c = ctx(0x55, 1);
         let w = wrap_dek_hybrid(&pk, &dek, &c).unwrap();
-        assert_eq!(unwrap_dek_hybrid(&sk, &w, &c).unwrap().expose(), dek.expose());
+        assert_eq!(
+            unwrap_dek_hybrid(&sk, &w, &c).unwrap().expose(),
+            dek.expose()
+        );
     }
 
     #[test]
     fn secret_key_components_round_trip() {
         // from_components(expose) reconstructs a working unwrap key (keyblob path).
         let (sk, pk) = generate_hybrid_keypair();
-        let sk2 = HybridEncSecretKey::from_components(
-            sk.x25519_secret_bytes(),
-            sk.mlkem_seed_bytes(),
-        );
+        let sk2 =
+            HybridEncSecretKey::from_components(sk.x25519_secret_bytes(), sk.mlkem_seed_bytes());
         let dek = Dek::from_bytes([7; 32]);
         let c = ctx(0x55, 1);
         let w = wrap_dek_hybrid(&pk, &dek, &c).unwrap();
-        assert_eq!(unwrap_dek_hybrid(&sk2, &w, &c).unwrap().expose(), dek.expose());
+        assert_eq!(
+            unwrap_dek_hybrid(&sk2, &w, &c).unwrap().expose(),
+            dek.expose()
+        );
     }
 }

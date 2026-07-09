@@ -186,7 +186,7 @@ pub fn build_reshare(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maxsecu_admin_core::{ControlChain, CoSign, RevokeParams};
+    use maxsecu_admin_core::{CoSign, ControlChain, RevokeParams};
     use maxsecu_crypto::{generate_enc_keypair, unwrap_dek, SigningKey, VerifyingKey};
     use maxsecu_encoding::types::FileScope;
     use maxsecu_encoding::GENESIS_HEAD;
@@ -200,7 +200,11 @@ mod tests {
         TombstoneSet::verify(&[], GENESIS_HEAD.0).unwrap()
     }
 
-    fn params<'a>(granter: &'a Identity, recipient_enc_pub: EncPublicKey, dek: &Dek) -> ReshareParams<'a> {
+    fn params<'a>(
+        granter: &'a Identity,
+        recipient_enc_pub: EncPublicKey,
+        dek: &Dek,
+    ) -> ReshareParams<'a> {
         ReshareParams {
             granter,
             granter_id: GRANTER_ID,
@@ -221,8 +225,12 @@ mod tests {
         let (recipient_sk, recipient_pk) = generate_enc_keypair();
         let dek = Dek::generate();
 
-        let out = build_reshare(&params(&granter, recipient_pk, &dek), &dek, &empty_tombstones())
-            .expect("re-share succeeds");
+        let out = build_reshare(
+            &params(&granter, recipient_pk, &dek),
+            &dek,
+            &empty_tombstones(),
+        )
+        .expect("re-share succeeds");
 
         // granted_by is the re-sharer; the grant is a user grant for this file.
         assert_eq!(out.granted_by, GRANTER_ID);
@@ -240,7 +248,11 @@ mod tests {
             .is_ok());
 
         // The wrap actually opens to the committed DEK — self-validating access.
-        let ctx = WrapContext { file_id: FILE_ID, version: 1, recipient_id: RECIPIENT_ID };
+        let ctx = WrapContext {
+            file_id: FILE_ID,
+            version: 1,
+            recipient_id: RECIPIENT_ID,
+        };
         let opened = unwrap_dek(&recipient_sk, &out.wrapped_dek, &ctx).unwrap();
         assert_eq!(opened.commit(), dek.commit());
     }
@@ -294,7 +306,10 @@ mod tests {
                     issued_by: Id([1; 16]),
                     created_at: NOW,
                 },
-                Some(CoSign { admin_id: Id([2; 16]), key: &co }),
+                Some(CoSign {
+                    admin_id: Id([2; 16]),
+                    key: &co,
+                }),
             )
             .unwrap();
         let tombstones =

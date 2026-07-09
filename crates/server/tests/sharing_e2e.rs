@@ -38,15 +38,15 @@ use tokio_rustls::TlsConnector;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
+use maxsecu_admin_core::{
+    CoSign, ControlChain, DirectorySigner, KeyCompromiseParams, ReinstateParams, RevokeParams,
+    SignedControlRecord,
+};
 use maxsecu_client_core::{
     build_next_version, build_reshare, build_upload, verify_and_open, CarryForwardCandidate,
     CompromiseCheck, ControlRecordIn, DownloadBundle, DownloadError, Identity, IssuerInfo,
     PlaintextStreams, ReshareParams, RotateParams, RotationBundle, StreamChunks, TombstoneSet,
     UploadBundle, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
-};
-use maxsecu_admin_core::{
-    ControlChain, CoSign, DirectorySigner, KeyCompromiseParams, ReinstateParams, RevokeParams,
-    SignedControlRecord,
 };
 use maxsecu_crypto::{
     generate_enc_keypair, sha256, unwrap_dek, Dek, EncPublicKey, SigningKey, WrappedDek,
@@ -187,7 +187,13 @@ async fn get_raw(conn: &mut Conn, uri: &str, auth: &str) -> (StatusCode, Vec<u8>
         .unwrap();
     let resp = conn.sender.send_request(req).await.unwrap();
     let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     (status, bytes)
 }
 
@@ -349,7 +355,10 @@ async fn upload_chunks_and_finalize(
                 "/v1/files/{file_hex}/versions/{version}/streams/{}/chunks/{i}",
                 stream_name(s.stream_type)
             );
-            assert_eq!(put_raw(conn, &uri, token, chunk.clone()).await, StatusCode::OK);
+            assert_eq!(
+                put_raw(conn, &uri, token, chunk.clone()).await,
+                StatusCode::OK
+            );
         }
     }
     let (st, _) = post(
@@ -363,9 +372,18 @@ async fn upload_chunks_and_finalize(
 }
 
 /// Fetch a downloader's records + chunks and rebuild a [`DownloadBundle`].
-async fn fetch_bundle(conn: &mut Conn, token: &str, file_hex: &str, version: u64) -> DownloadBundle {
-    let (st, rec) =
-        get_json(conn, &format!("/v1/files/{file_hex}?version={version}"), token).await;
+async fn fetch_bundle(
+    conn: &mut Conn,
+    token: &str,
+    file_hex: &str,
+    version: u64,
+) -> DownloadBundle {
+    let (st, rec) = get_json(
+        conn,
+        &format!("/v1/files/{file_hex}?version={version}"),
+        token,
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "GET file v{version}");
     let mut dl_streams = Vec::new();
     for s in rec["streams"].as_array().unwrap() {
@@ -373,7 +391,8 @@ async fn fetch_bundle(conn: &mut Conn, token: &str, file_hex: &str, version: u64
         let count = s["chunk_count"].as_u64().unwrap();
         let mut chunks = Vec::new();
         for i in 0..count {
-            let uri = format!("/v1/files/{file_hex}/versions/{version}/streams/{st_name}/chunks/{i}");
+            let uri =
+                format!("/v1/files/{file_hex}/versions/{version}/streams/{st_name}/chunks/{i}");
             let (cs, bytes) = get_raw(conn, &uri, token).await;
             assert_eq!(cs, StatusCode::OK);
             chunks.push(bytes);
@@ -424,14 +443,27 @@ fn empty_tombstones() -> TombstoneSet {
 }
 
 /// Recover a version's DEK from a recipient's own wrap.
-fn unwrap_self(secret: &maxsecu_crypto::EncSecretKey, w: &WrappedDek, file: Id, version: u64, rid: Id) -> Dek {
-    let ctx = WrapContext { file_id: file, version, recipient_id: rid };
+fn unwrap_self(
+    secret: &maxsecu_crypto::EncSecretKey,
+    w: &WrappedDek,
+    file: Id,
+    version: u64,
+    rid: Id,
+) -> Dek {
+    let ctx = WrapContext {
+        file_id: file,
+        version,
+        recipient_id: rid,
+    };
     unwrap_dek(secret, w, &ctx).unwrap()
 }
 
 #[tokio::test]
 async fn phase4_sharing_exit_gates_over_real_tls() {
-    let blob_dir = std::env::temp_dir().join(format!("mxs4_{}", hex(&maxsecu_crypto::random_array::<8>())));
+    let blob_dir = std::env::temp_dir().join(format!(
+        "mxs4_{}",
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
     let store = MemoryStore::new();
     for code in ["v-alice", "v-bob", "v-carol"] {
         store.add_reg_key(sha256(code.as_bytes()));
@@ -451,7 +483,11 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
     let pki = test_pki();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, pki.server_config.clone(), maxsecu_server::router(state)));
+    tokio::spawn(serve(
+        listener,
+        pki.server_config.clone(),
+        maxsecu_server::router(state),
+    ));
 
     // Three parties, each on its own channel-bound connection.
     let mut c_owner = connect(addr, pki.client_config.clone()).await;
@@ -498,8 +534,18 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
     upload_chunks_and_finalize(&mut c_owner, &owner_tok, &file_hex, 1, &bundle.streams).await;
 
     let dek_commit = bundle.manifest.dek_commit.0;
-    let owner_wrap = bundle.wraps.iter().find(|x| x.recipient_type == RecipientType::User).unwrap();
-    let dek = unwrap_self(owner.enc_secret(), &owner_wrap.wrapped_dek, file_id, 1, Id(owner_id));
+    let owner_wrap = bundle
+        .wraps
+        .iter()
+        .find(|x| x.recipient_type == RecipientType::User)
+        .unwrap();
+    let dek = unwrap_self(
+        owner.enc_secret(),
+        &owner_wrap.wrapped_dek,
+        file_id,
+        1,
+        Id(owner_id),
+    );
 
     // ---- GATE: online re-share owner → V; V downloads + decrypts ----
     let to_v = build_reshare(
@@ -545,7 +591,12 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
     };
     let opened = verify_and_open(&v_ctx, &v_bundle).expect("V opens the re-shared file");
     assert_eq!(
-        opened.streams.iter().find(|s| s.stream_type == StreamType::Content).unwrap().plaintext,
+        opened
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .unwrap()
+            .plaintext,
         CONTENT
     );
 
@@ -578,7 +629,11 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
     assert_eq!(st, StatusCode::CREATED, "V re-shares to W");
 
     let w_bundle = fetch_bundle(&mut c_w, &w_tok, &file_hex, 1).await;
-    assert_eq!(w_bundle.ancestor_grants.len(), 1, "server served V's ancestor grant");
+    assert_eq!(
+        w_bundle.ancestor_grants.len(),
+        1,
+        "server served V's ancestor grant"
+    );
     let v_pub = v.sig_pub_bytes();
     let resolver = move |id: Id| (id == Id(v_id)).then_some(v_pub);
     let w_ctx = VerifyContext {
@@ -597,7 +652,12 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
     };
     let opened = verify_and_open(&w_ctx, &w_bundle).expect("W opens via the ancestor chain");
     assert_eq!(
-        opened.streams.iter().find(|s| s.stream_type == StreamType::Content).unwrap().plaintext,
+        opened
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .unwrap()
+            .plaintext,
         CONTENT
     );
 
@@ -639,7 +699,12 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|g| (dec(g["grant_b64"].as_str().unwrap()), dec64(g["grant_sig_b64"].as_str().unwrap())))
+                .map(|g| {
+                    (
+                        dec(g["grant_b64"].as_str().unwrap()),
+                        dec64(g["grant_sig_b64"].as_str().unwrap()),
+                    )
+                })
                 .collect();
             CarryForwardCandidate {
                 recipient_id: Id(rid),
@@ -701,7 +766,10 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
 
     // W reads v2 under DEK' — its grant is now re-rooted under the owner.
     let w_v2 = fetch_bundle(&mut c_w, &w_tok, &file_hex, 2).await;
-    assert!(w_v2.ancestor_grants.is_empty(), "carry-forward re-rooted W's grant");
+    assert!(
+        w_v2.ancestor_grants.is_empty(),
+        "carry-forward re-rooted W's grant"
+    );
     let w_ctx2 = VerifyContext {
         file_id,
         author_sig_pub: owner.sig_pub_bytes(),
@@ -719,21 +787,38 @@ async fn phase4_sharing_exit_gates_over_real_tls() {
     let opened2 = verify_and_open(&w_ctx2, &w_v2).expect("W opens v2 under the rotated DEK");
     assert_eq!(opened2.version, 2);
     assert_eq!(
-        opened2.streams.iter().find(|s| s.stream_type == StreamType::Content).unwrap().plaintext,
+        opened2
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .unwrap()
+            .plaintext,
         CONTENT
     );
 
     // ---- GATE: soft-revoke V → V's record 404s ----
     let revoke_uri = format!("/v1/files/{file_hex}/wraps/{}", hex(&v_id));
-    assert_eq!(delete(&mut c_owner, &revoke_uri, &owner_tok).await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        delete(&mut c_owner, &revoke_uri, &owner_tok).await,
+        StatusCode::NO_CONTENT
+    );
     let (st, _) = get_json(&mut c_v, &format!("/v1/files/{file_hex}?version=2"), &v_tok).await;
-    assert_eq!(st, StatusCode::NOT_FOUND, "soft-revoked V can no longer fetch");
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "soft-revoked V can no longer fetch"
+    );
 }
 
 // ---- Phase-5 revocation e2e helpers ----
 
 /// POST a signed control-log record (revocation / reinstatement / key-compromise).
-async fn post_control(conn: &mut Conn, token: &str, uri: &str, rec: &SignedControlRecord) -> StatusCode {
+async fn post_control(
+    conn: &mut Conn,
+    token: &str,
+    uri: &str,
+    rec: &SignedControlRecord,
+) -> StatusCode {
     let body = serde_json::json!({
         "record_b64": B64.encode(&rec.bytes),
         "sig_b64": B64.encode(rec.sig),
@@ -754,7 +839,11 @@ async fn fetch_control(conn: &mut Conn, token: &str) -> Vec<ControlRecordIn> {
         .iter()
         .map(|r| ControlRecordIn {
             bytes: B64.decode(r["record_b64"].as_str().unwrap()).unwrap(),
-            sig: B64.decode(r["sig_b64"].as_str().unwrap()).unwrap().try_into().unwrap(),
+            sig: B64
+                .decode(r["sig_b64"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
             co_sig: r["co_sig_b64"]
                 .as_str()
                 .map(|s| B64.decode(s).unwrap().try_into().unwrap()),
@@ -811,7 +900,10 @@ async fn upload_v1(
 /// (R27). The grant-graph subtree walk (R25) is unit-proven (admin-core::subtree).
 #[tokio::test]
 async fn phase5_revocation_exit_gates_over_real_tls() {
-    let blob_dir = std::env::temp_dir().join(format!("mxs5_{}", hex(&maxsecu_crypto::random_array::<8>())));
+    let blob_dir = std::env::temp_dir().join(format!(
+        "mxs5_{}",
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
     let store = MemoryStore::new();
     for code in ["v-owner", "v-victim"] {
         store.add_reg_key(sha256(code.as_bytes()));
@@ -863,8 +955,11 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
     let audit = Arc::new(MemoryAuditSink::new());
     let state = AppState {
         auth: Arc::new(
-            AuthService::new(store, AuthConfig::default().with_directory_pub(d5.public_key()))
-                .with_dir_signer(enroll_signer),
+            AuthService::new(
+                store,
+                AuthConfig::default().with_directory_pub(d5.public_key()),
+            )
+            .with_dir_signer(enroll_signer),
         ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: audit.clone(),
@@ -874,7 +969,11 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
     let pki = test_pki();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, pki.server_config.clone(), maxsecu_server::router(state)));
+    tokio::spawn(serve(
+        listener,
+        pki.server_config.clone(),
+        maxsecu_server::router(state),
+    ));
 
     let mut c_owner = connect(addr, pki.client_config.clone()).await;
     let mut c_admin = connect(addr, pki.client_config.clone()).await;
@@ -889,8 +988,18 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
     let file1 = Id(maxsecu_crypto::random_array::<16>());
     let file1_hex = hex(&file1.0);
     let bundle = upload_v1(&mut c_owner, &owner_tok, &owner, owner_id, file1).await;
-    let owner_wrap = bundle.wraps.iter().find(|x| x.recipient_type == RecipientType::User).unwrap();
-    let dek = unwrap_self(owner.enc_secret(), &owner_wrap.wrapped_dek, file1, 1, Id(owner_id));
+    let owner_wrap = bundle
+        .wraps
+        .iter()
+        .find(|x| x.recipient_type == RecipientType::User)
+        .unwrap();
+    let dek = unwrap_self(
+        owner.enc_secret(),
+        &owner_wrap.wrapped_dek,
+        file1,
+        1,
+        Id(owner_id),
+    );
     let to_v = build_reshare(
         &ReshareParams {
             granter: &owner,
@@ -908,18 +1017,35 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
         &empty_tombstones(),
     )
     .unwrap();
-    let (st, _) = post(&mut c_owner, &format!("/v1/files/{file1_hex}/wraps"), Some(&owner_tok), wrap_json(&to_v)).await;
+    let (st, _) = post(
+        &mut c_owner,
+        &format!("/v1/files/{file1_hex}/wraps"),
+        Some(&owner_tok),
+        wrap_json(&to_v),
+    )
+    .await;
     assert_eq!(st, StatusCode::CREATED, "re-share to V");
 
     // The issuer resolver: both admins, each holding the Admin effective role.
     let a1_pub = admin1.sig_pub_bytes();
     let a2_pub = admin2.sig_pub_bytes();
     let issuer = |id: Id| match id.0 {
-        x if x == a1_id => Some(IssuerInfo { sig_pub: a1_pub, roles: vec![Role::Admin], key_version: 1 }),
-        x if x == a2_id => Some(IssuerInfo { sig_pub: a2_pub, roles: vec![Role::Admin], key_version: 1 }),
+        x if x == a1_id => Some(IssuerInfo {
+            sig_pub: a1_pub,
+            roles: vec![Role::Admin],
+            key_version: 1,
+        }),
+        x if x == a2_id => Some(IssuerInfo {
+            sig_pub: a2_pub,
+            roles: vec![Role::Admin],
+            key_version: 1,
+        }),
         _ => None,
     };
-    let cosign = || CoSign { admin_id: Id(a2_id), key: admin2.signing_key() };
+    let cosign = || CoSign {
+        admin_id: Id(a2_id),
+        key: admin2.signing_key(),
+    };
     let mut chain = ControlChain::new();
 
     // ---- GATE 1: account-wide revoke V (dual control) over TLS; the served
@@ -942,11 +1068,17 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
         post_control(&mut c_admin, &admin_tok, "/v1/revocations", &rev_v).await,
         StatusCode::CREATED
     );
-    let (seq, head) = audit.latest_head().expect("server published the head to the sink");
+    let (seq, head) = audit
+        .latest_head()
+        .expect("server published the head to the sink");
     assert_eq!(seq, 1);
     let served = fetch_control(&mut c_owner, &owner_tok).await;
-    let set = TombstoneSet::verify_authenticated(&served, head, &issuer).expect("authenticated set");
-    assert!(set.is_account_revoked(&v_id), "V is account-revoked over the real served chain");
+    let set =
+        TombstoneSet::verify_authenticated(&served, head, &issuer).expect("authenticated set");
+    assert!(
+        set.is_account_revoked(&v_id),
+        "V is account-revoked over the real served chain"
+    );
 
     // ---- GATE 2 (withholding, D22): a server that serves an empty/short chain
     // against the sink-anchored head fails closed as a Gap.
@@ -993,7 +1125,10 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
         tombstones: Some(&set),
         compromise: None,
     };
-    assert_eq!(verify_and_open(&octx, &o_bundle), Err(DownloadError::AuthorRevoked));
+    assert_eq!(
+        verify_and_open(&octx, &o_bundle),
+        Err(DownloadError::AuthorRevoked)
+    );
 
     // ---- GATE 4 (reinstatement, §11.5a / R28): a dual-controlled reinstatement
     // naming the V-revoke epoch restores V (and only V).
@@ -1015,8 +1150,14 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
     let (_seq, head) = audit.latest_head().unwrap();
     let served = fetch_control(&mut c_owner, &owner_tok).await;
     let set = TombstoneSet::verify_authenticated(&served, head, &issuer).unwrap();
-    assert!(!set.is_account_revoked(&v_id), "V reinstated under dual control");
-    assert!(set.is_account_revoked(&owner_id), "the owner's revoke is untouched (R28)");
+    assert!(
+        !set.is_account_revoked(&v_id),
+        "V reinstated under dual control"
+    );
+    assert!(
+        set.is_account_revoked(&owner_id),
+        "the owner's revoke is untouched (R28)"
+    );
 
     // ---- GATE 5 (R27, §11.7/D28): a key_compromise for the owner's key, then a
     // genesis anchored AFTER it, is rejected by the sink-position cutoff.
@@ -1036,7 +1177,7 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
         StatusCode::CREATED
     );
     let kc_pos = audit.control_pos(4).expect("key-compromise sink position"); // 4th control append
-    // file2's genesis is anchored AFTER the compromise — a forgery position.
+                                                                              // file2's genesis is anchored AFTER the compromise — a forgery position.
     let file2 = Id(maxsecu_crypto::random_array::<16>());
     let file2_hex = hex(&file2.0);
     let _b2 = upload_v1(&mut c_owner, &owner_tok, &owner, owner_id, file2).await;
@@ -1047,8 +1188,14 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
     let cutoff = move |id: Id, kv: u64| (id.0 == owner_id && kv == 1).then_some(kc_pos);
     octx.file_id = file2;
     octx.tombstones = None; // isolate the R27 gate (it fires before author-revoked)
-    octx.compromise = Some(CompromiseCheck { genesis_sink_pos: Some(g_pos), cutoff: &cutoff });
-    assert_eq!(verify_and_open(&octx, &b2), Err(DownloadError::GenesisAfterCompromise));
+    octx.compromise = Some(CompromiseCheck {
+        genesis_sink_pos: Some(g_pos),
+        cutoff: &cutoff,
+    });
+    assert_eq!(
+        verify_and_open(&octx, &b2),
+        Err(DownloadError::GenesisAfterCompromise)
+    );
 }
 
 /// `DownloadBundle` is not `Clone`; rebuild for tampering.

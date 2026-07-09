@@ -165,8 +165,13 @@ pub fn build_next_version(
     // strong-revoked reader.
     let dek = Dek::generate();
     let dek_commit = dek.commit();
-    let (manifest_streams, sealed_out) =
-        seal_streams(&dek, params.file_id, params.new_version, params.chunk_size, streams);
+    let (manifest_streams, sealed_out) = seal_streams(
+        &dek,
+        params.file_id,
+        params.new_version,
+        params.chunk_size,
+        streams,
+    );
 
     let signer = params.owner.signing_key();
     let suite = params.suite;
@@ -390,13 +395,13 @@ fn candidate_survives(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maxsecu_admin_core::{ControlChain, CoSign, RevokeParams};
+    use crate::download::NO_GRANTERS;
+    use maxsecu_admin_core::{CoSign, ControlChain, RevokeParams};
     use maxsecu_crypto::{unwrap_dek, SigningKey, VerifyingKey};
     use maxsecu_encoding::encode;
     use maxsecu_encoding::structs::WrapContext;
     use maxsecu_encoding::types::{FileScope, StreamType};
     use maxsecu_encoding::GENESIS_HEAD;
-    use crate::download::NO_GRANTERS;
 
     const OWNER_ID: Id = Id([0x11; 16]);
     const V_ID: Id = Id([0x33; 16]);
@@ -432,7 +437,11 @@ mod tests {
     }
 
     /// An author-rooted candidate `V` granted by the owner at the prior version.
-    fn author_rooted_candidate(owner: &Identity, prior_dek: &Dek, v: &Identity) -> CarryForwardCandidate {
+    fn author_rooted_candidate(
+        owner: &Identity,
+        prior_dek: &Dek,
+        v: &Identity,
+    ) -> CarryForwardCandidate {
         let grant = Grant {
             file_id: FILE_ID,
             file_version: 1,
@@ -483,18 +492,31 @@ mod tests {
         assert_ne!(bundle.manifest.dek_commit, Bytes32(prior_dek.commit()));
 
         // V's carried wrap opens to the *new* DEK and its grant re-roots at owner.
-        let vw = bundle.wraps.iter().find(|w| w.recipient_id == V_ID).unwrap();
+        let vw = bundle
+            .wraps
+            .iter()
+            .find(|w| w.recipient_id == V_ID)
+            .unwrap();
         assert_eq!(vw.grant.granted_by, OWNER_ID);
         assert_eq!(vw.grant.file_version, 2);
-        let ctx = WrapContext { file_id: FILE_ID, version: 2, recipient_id: V_ID };
+        let ctx = WrapContext {
+            file_id: FILE_ID,
+            version: 2,
+            recipient_id: V_ID,
+        };
         let dek2 = unwrap_dek(v.enc_secret(), &vw.wrapped_dek, &ctx).unwrap();
         assert_eq!(Bytes32(dek2.commit()), bundle.manifest.dek_commit);
         assert_ne!(dek2.commit(), prior_dek.commit());
 
         // The new manifest grant verifies under the owner's key.
         let vk = VerifyingKey::from_bytes(&owner.sig_pub_bytes()).unwrap();
-        assert!(vk.verify_canonical(labels::GRANT, &vw.grant, &vw.grant_sig).is_ok());
-        assert!(bundle.streams.iter().any(|s| s.stream_type == StreamType::Content));
+        assert!(vk
+            .verify_canonical(labels::GRANT, &vw.grant, &vw.grant_sig)
+            .is_ok());
+        assert!(bundle
+            .streams
+            .iter()
+            .any(|s| s.stream_type == StreamType::Content));
     }
 
     #[test]
@@ -550,7 +572,11 @@ mod tests {
         .unwrap();
         // owner + recovery + W (carried via the re-share edge).
         assert_eq!(bundle.wraps.len(), 3);
-        let ww = bundle.wraps.iter().find(|x| x.recipient_id == W_ID).unwrap();
+        let ww = bundle
+            .wraps
+            .iter()
+            .find(|x| x.recipient_id == W_ID)
+            .unwrap();
         assert_eq!(ww.grant.granted_by, OWNER_ID); // re-rooted under the new author
     }
 
@@ -619,10 +645,14 @@ mod tests {
                     issued_by: Id([1; 16]),
                     created_at: NOW,
                 },
-                Some(CoSign { admin_id: Id([2; 16]), key: &co }),
+                Some(CoSign {
+                    admin_id: Id([2; 16]),
+                    key: &co,
+                }),
             )
             .unwrap();
-        let tombstones = TombstoneSet::verify(std::slice::from_ref(&rec.bytes), chain.head()).unwrap();
+        let tombstones =
+            TombstoneSet::verify(std::slice::from_ref(&rec.bytes), chain.head()).unwrap();
 
         let bundle = build_next_version(
             &rotate_params(&owner, &prior_dek),
@@ -667,7 +697,14 @@ mod tests {
         params.prior_dek_commit = other.commit(); // claims a different prior DEK
 
         assert!(matches!(
-            build_next_version(&params, &plaintext(), &prior_dek, &[], &empty_tombstones(), &NO_GRANTERS),
+            build_next_version(
+                &params,
+                &plaintext(),
+                &prior_dek,
+                &[],
+                &empty_tombstones(),
+                &NO_GRANTERS
+            ),
             Err(RotateError::PriorDekMismatch)
         ));
     }
@@ -705,8 +742,15 @@ mod tests {
         assert!(matches!(bundle.manifest.alg, Suite::V2));
         assert_eq!(bundle.wraps.len(), 3, "owner + recovery + V");
 
-        let vw = bundle.wraps.iter().find(|w| w.recipient_id == V_ID).unwrap();
-        assert_eq!(vw.grant.granted_by, OWNER_ID, "re-rooted under the new author");
+        let vw = bundle
+            .wraps
+            .iter()
+            .find(|w| w.recipient_id == V_ID)
+            .unwrap();
+        assert_eq!(
+            vw.grant.granted_by, OWNER_ID,
+            "re-rooted under the new author"
+        );
         let ctx = WrapContext {
             file_id: FILE_ID,
             version: 2,

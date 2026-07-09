@@ -58,12 +58,7 @@ pub fn revocation_subtree(edges: &[GrantEdge], file_id: Id, r: Id, owner: Id) ->
 /// for `file_id`, never traversing **through** a node in `avoid` and never adding
 /// an `avoid` node to the result. `start` itself is not included (only those it
 /// grants to, transitively).
-fn reachable_from(
-    start: Id,
-    edges: &[GrantEdge],
-    file_id: Id,
-    avoid: &HashSet<Id>,
-) -> HashSet<Id> {
+fn reachable_from(start: Id, edges: &[GrantEdge], file_id: Id, avoid: &HashSet<Id>) -> HashSet<Id> {
     let mut seen: HashSet<Id> = HashSet::new();
     let mut stack = vec![start];
     while let Some(node) = stack.pop() {
@@ -98,7 +93,11 @@ mod tests {
     const U: Id = Id([0x0D; 16]);
 
     fn edge(granted_by: Id, recipient: Id) -> GrantEdge {
-        GrantEdge { file_id: FILE, granted_by, recipient }
+        GrantEdge {
+            file_id: FILE,
+            granted_by,
+            recipient,
+        }
     }
 
     #[test]
@@ -136,11 +135,18 @@ mod tests {
         let other = Id([0xFF; 16]);
         let edges = vec![
             edge(A, V),
-            GrantEdge { file_id: other, granted_by: A, recipient: W },
+            GrantEdge {
+                file_id: other,
+                granted_by: A,
+                recipient: W,
+            },
         ];
         let sub = revocation_subtree(&edges, FILE, A, OWNER);
         assert!(sub.contains(&V));
-        assert!(!sub.contains(&W), "an edge for a different file does not extend the subtree");
+        assert!(
+            !sub.contains(&W),
+            "an edge for a different file does not extend the subtree"
+        );
     }
 
     #[test]

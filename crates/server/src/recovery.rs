@@ -27,8 +27,8 @@
 //! (spec §9). The recovery private key stays in the operator's cold file; the
 //! server only ever holds its public halves.
 
-use crate::auth::SessionToken;
 use crate::auth::AuthService;
+use crate::auth::SessionToken;
 use crate::error::StoreError;
 use crate::store::{SessionRecord, Store};
 use maxsecu_crypto::{

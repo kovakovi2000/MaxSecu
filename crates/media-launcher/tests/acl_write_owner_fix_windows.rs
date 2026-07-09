@@ -42,8 +42,10 @@ impl ScratchDir {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("target-acltest-{tag}-{}-{nanos}", std::process::id()));
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "target-acltest-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("create scratch base");
         ScratchDir(dir)
     }

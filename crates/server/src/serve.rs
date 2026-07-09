@@ -60,11 +60,7 @@ pub async fn serve(
 /// Terminate TLS on one accepted socket, bind its exporter into the router, and
 /// serve HTTP/1.1 or HTTP/2 over the stream. Errors are swallowed: a malformed
 /// handshake or a dropped peer is a per-connection event, not a server fault.
-async fn serve_connection(
-    acceptor: TlsAcceptor,
-    tcp: tokio::net::TcpStream,
-    router: axum::Router,
-) {
+async fn serve_connection(acceptor: TlsAcceptor, tcp: tokio::net::TcpStream, router: axum::Router) {
     let tls = match acceptor.accept(tcp).await {
         Ok(tls) => tls,
         Err(_) => return, // handshake failure — drop the connection

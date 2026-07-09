@@ -66,16 +66,26 @@ pub const AUDIO_BITRATE: &str = "128k";
 /// only when the launcher has probed them as available on this host); `X264` is the
 /// always-present pure-CPU fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H264Encoder { Nvenc, Amf, X264 }
+pub enum H264Encoder {
+    Nvenc,
+    Amf,
+    X264,
+}
 
 /// Per-run video disposition: `Copy` stream-copies the source video track; `Encode`
 /// re-encodes it to H.264 with the given encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VideoArg { Copy, Encode(H264Encoder) }
+pub enum VideoArg {
+    Copy,
+    Encode(H264Encoder),
+}
 
 /// The per-stream copy-vs-reencode decision produced by [`plan_ingest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IngestPlan { pub reencode_video: bool, pub reencode_audio: bool }
+pub struct IngestPlan {
+    pub reencode_video: bool,
+    pub reencode_audio: bool,
+}
 
 /// Decide per-stream copy-vs-reencode from the probe + shaping options. A video
 /// stream is copyable only if already H.264/AV1, **already a plain 8-bit 4:2:0**
@@ -89,8 +99,14 @@ pub fn plan_ingest(probe: &ProbeResult, opts: &TranscodeOptions) -> IngestPlan {
         && probe.video_8bit_420
         && matches!(opts.resolution, Resolution::Original)
         && matches!(opts.bitrate, Bitrate::Original);
-    let aud_reencode = matches!(probe.audio, AudioCodec::Opus | AudioCodec::Mp3 | AudioCodec::Other);
-    IngestPlan { reencode_video: !vid_copy_ok, reencode_audio: aud_reencode }
+    let aud_reencode = matches!(
+        probe.audio,
+        AudioCodec::Opus | AudioCodec::Mp3 | AudioCodec::Other
+    );
+    IngestPlan {
+        reencode_video: !vid_copy_ok,
+        reencode_audio: aud_reencode,
+    }
 }
 
 /// Probe argv: open the input, print stream info to stderr, produce NO output
@@ -348,14 +364,21 @@ mod tests {
         let args = build_probe_args(std::path::Path::new("/jobs/in put.mkv"));
         assert!(contains(&args, "-hide_banner"));
         let ii = pos(&args, "-i").expect("-i present");
-        assert_eq!(args[ii + 1].as_os_str(), std::ffi::OsStr::new("/jobs/in put.mkv"));
+        assert_eq!(
+            args[ii + 1].as_os_str(),
+            std::ffi::OsStr::new("/jobs/in put.mkv")
+        );
         assert!(!args.iter().any(|a| a.to_string_lossy().ends_with(".mp4")));
     }
 
     #[test]
     fn plan_copy_when_h264_aac_original() {
         use crate::probe::{AudioCodec, ProbeResult, VideoCodec};
-        let p = ProbeResult { video: VideoCodec::H264, audio: AudioCodec::Aac, video_8bit_420: true };
+        let p = ProbeResult {
+            video: VideoCodec::H264,
+            audio: AudioCodec::Aac,
+            video_8bit_420: true,
+        };
         let plan = plan_ingest(&p, &TranscodeOptions::default());
         assert!(!plan.reencode_video && !plan.reencode_audio);
     }
@@ -363,7 +386,11 @@ mod tests {
     #[test]
     fn plan_reencodes_video_when_hevc_and_audio_when_opus() {
         use crate::probe::{AudioCodec, ProbeResult, VideoCodec};
-        let p = ProbeResult { video: VideoCodec::Hevc, audio: AudioCodec::Opus, video_8bit_420: false };
+        let p = ProbeResult {
+            video: VideoCodec::Hevc,
+            audio: AudioCodec::Opus,
+            video_8bit_420: false,
+        };
         let plan = plan_ingest(&p, &TranscodeOptions::default());
         assert!(plan.reencode_video && plan.reencode_audio);
     }
@@ -371,8 +398,15 @@ mod tests {
     #[test]
     fn plan_reencodes_video_when_rescale_requested_even_if_h264() {
         use crate::probe::{AudioCodec, ProbeResult, VideoCodec};
-        let p = ProbeResult { video: VideoCodec::H264, audio: AudioCodec::Aac, video_8bit_420: true };
-        let opts = TranscodeOptions { resolution: Resolution::Height(720), bitrate: Bitrate::Original };
+        let p = ProbeResult {
+            video: VideoCodec::H264,
+            audio: AudioCodec::Aac,
+            video_8bit_420: true,
+        };
+        let opts = TranscodeOptions {
+            resolution: Resolution::Height(720),
+            bitrate: Bitrate::Original,
+        };
         let plan = plan_ingest(&p, &opts);
         assert!(plan.reencode_video);
         assert!(!plan.reencode_audio);
@@ -383,16 +417,27 @@ mod tests {
         // A 10-bit H.264 at Original res is NOT copy-safe (WebView2 can't decode it):
         // the 8-bit-4:2:0 gate forces a re-encode.
         use crate::probe::{AudioCodec, ProbeResult, VideoCodec};
-        let p = ProbeResult { video: VideoCodec::H264, audio: AudioCodec::Aac, video_8bit_420: false };
+        let p = ProbeResult {
+            video: VideoCodec::H264,
+            audio: AudioCodec::Aac,
+            video_8bit_420: false,
+        };
         let plan = plan_ingest(&p, &TranscodeOptions::default());
-        assert!(plan.reencode_video, "10-bit source must re-encode even at Original");
+        assert!(
+            plan.reencode_video,
+            "10-bit source must re-encode even at Original"
+        );
         assert!(!plan.reencode_audio);
     }
 
     #[test]
     fn plan_no_audio_reencode_when_absent() {
         use crate::probe::{AudioCodec, ProbeResult, VideoCodec};
-        let p = ProbeResult { video: VideoCodec::Av1, audio: AudioCodec::None, video_8bit_420: true };
+        let p = ProbeResult {
+            video: VideoCodec::Av1,
+            audio: AudioCodec::None,
+            video_8bit_420: true,
+        };
         let plan = plan_ingest(&p, &TranscodeOptions::default());
         assert!(!plan.reencode_video && !plan.reencode_audio);
     }
@@ -400,7 +445,16 @@ mod tests {
     #[test]
     fn copy_args_stream_copy_with_frag_and_no_filter() {
         let (i, o, t) = paths();
-        let args = build_ingest_args(&i, &o, &t, VideoArg::Copy, false, &TranscodeOptions::default(), &bounds(), 4);
+        let args = build_ingest_args(
+            &i,
+            &o,
+            &t,
+            VideoArg::Copy,
+            false,
+            &TranscodeOptions::default(),
+            &bounds(),
+            4,
+        );
         assert_eq!(value_after(&args, "-c:v"), "copy");
         assert_eq!(value_after(&args, "-c:a"), "copy");
         // The MAIN (copy) output carries no scale filter — copy cannot filter. The
@@ -410,11 +464,17 @@ mod tests {
             .iter()
             .position(|a| a.as_os_str() == o.as_os_str())
             .expect("output path present");
-        assert!(!args[..out_idx].iter().any(|a| a == "-vf"), "copy main output must not scale");
+        assert!(
+            !args[..out_idx].iter().any(|a| a == "-vf"),
+            "copy main output must not scale"
+        );
         assert!(!contains(&args, "-pix_fmt"));
         // Copy carries no encoder GOP flag either (nothing is being encoded).
         assert!(!contains(&args, "-g"), "copy must not set an encoder GOP");
-        assert_eq!(value_after(&args, "-movflags"), "+frag_keyframe+empty_moov+default_base_moof+global_sidx");
+        assert_eq!(
+            value_after(&args, "-movflags"),
+            "+frag_keyframe+empty_moov+default_base_moof+global_sidx"
+        );
         assert_eq!(value_after(&args, "-frames:v"), "1");
     }
 
@@ -423,7 +483,16 @@ mod tests {
         // A copyable H.264 video with a non-AAC audio track: copy the video, re-encode
         // only the audio to AAC.
         let (i, o, t) = paths();
-        let args = build_ingest_args(&i, &o, &t, VideoArg::Copy, true, &TranscodeOptions::default(), &bounds(), 4);
+        let args = build_ingest_args(
+            &i,
+            &o,
+            &t,
+            VideoArg::Copy,
+            true,
+            &TranscodeOptions::default(),
+            &bounds(),
+            4,
+        );
         assert_eq!(value_after(&args, "-c:v"), "copy");
         assert_eq!(value_after(&args, "-c:a"), "aac");
         assert_eq!(value_after(&args, "-b:a"), AUDIO_BITRATE);
@@ -432,7 +501,16 @@ mod tests {
     #[test]
     fn reencode_nvenc_h264_original_uses_cq() {
         let (i, o, t) = paths();
-        let args = build_ingest_args(&i, &o, &t, VideoArg::Encode(H264Encoder::Nvenc), true, &TranscodeOptions::default(), &bounds(), 4);
+        let args = build_ingest_args(
+            &i,
+            &o,
+            &t,
+            VideoArg::Encode(H264Encoder::Nvenc),
+            true,
+            &TranscodeOptions::default(),
+            &bounds(),
+            4,
+        );
         assert_eq!(value_after(&args, "-c:v"), "h264_nvenc");
         assert_eq!(value_after(&args, "-pix_fmt"), "yuv420p");
         assert!(contains(&args, "-cq"));
@@ -445,8 +523,20 @@ mod tests {
     #[test]
     fn reencode_x264_kbps_uses_bitrate_and_threads() {
         let (i, o, t) = paths();
-        let opts = TranscodeOptions { resolution: Resolution::Original, bitrate: Bitrate::Kbps(4000) };
-        let args = build_ingest_args(&i, &o, &t, VideoArg::Encode(H264Encoder::X264), false, &opts, &bounds(), 3);
+        let opts = TranscodeOptions {
+            resolution: Resolution::Original,
+            bitrate: Bitrate::Kbps(4000),
+        };
+        let args = build_ingest_args(
+            &i,
+            &o,
+            &t,
+            VideoArg::Encode(H264Encoder::X264),
+            false,
+            &opts,
+            &bounds(),
+            3,
+        );
         assert_eq!(value_after(&args, "-c:v"), "libx264");
         assert_eq!(value_after(&args, "-preset"), "veryfast");
         assert_eq!(value_after(&args, "-b:v"), "4000k");
@@ -458,7 +548,16 @@ mod tests {
     #[test]
     fn reencode_amf_h264_original_uses_cqp() {
         let (i, o, t) = paths();
-        let args = build_ingest_args(&i, &o, &t, VideoArg::Encode(H264Encoder::Amf), true, &TranscodeOptions::default(), &bounds(), 4);
+        let args = build_ingest_args(
+            &i,
+            &o,
+            &t,
+            VideoArg::Encode(H264Encoder::Amf),
+            true,
+            &TranscodeOptions::default(),
+            &bounds(),
+            4,
+        );
         assert_eq!(value_after(&args, "-c:v"), "h264_amf");
         assert!(contains(&args, "-rc") && value_after(&args, "-rc") == "cqp");
     }
@@ -473,7 +572,16 @@ mod tests {
             },
             bitrate: Bitrate::Original,
         };
-        let args = build_ingest_args(&i, &o, &t, VideoArg::Encode(H264Encoder::X264), false, &opts, &bounds(), 4);
+        let args = build_ingest_args(
+            &i,
+            &o,
+            &t,
+            VideoArg::Encode(H264Encoder::X264),
+            false,
+            &opts,
+            &bounds(),
+            4,
+        );
         // normalize floors each dim to even ⇒ 1920x1080; output marked square-pixel.
         assert_eq!(value_after(&args, "-vf"), "scale=1920:1080,setsar=1");
     }
@@ -488,7 +596,16 @@ mod tests {
             },
             bitrate: Bitrate::Kbps(10_000_000),
         };
-        let args = build_ingest_args(&i, &o, &t, VideoArg::Encode(H264Encoder::X264), false, &opts, &bounds(), 4);
+        let args = build_ingest_args(
+            &i,
+            &o,
+            &t,
+            VideoArg::Encode(H264Encoder::X264),
+            false,
+            &opts,
+            &bounds(),
+            4,
+        );
         // Per-dim clamp to the 8K caps (7680x4320 fits max_pixels exactly); square-pixel.
         assert_eq!(value_after(&args, "-vf"), "scale=7680:4320,setsar=1");
         // Bitrate clamped down to the ceiling.
@@ -504,7 +621,16 @@ mod tests {
         // the argv carries `-threads <n>` on the CPU (libx264) path.
         let (i, o, t) = paths();
         let opts = TranscodeOptions::default();
-        let args = build_ingest_args(&i, &o, &t, VideoArg::Encode(H264Encoder::X264), true, &opts, &bounds(), 3);
+        let args = build_ingest_args(
+            &i,
+            &o,
+            &t,
+            VideoArg::Encode(H264Encoder::X264),
+            true,
+            &opts,
+            &bounds(),
+            3,
+        );
         let pos = args
             .iter()
             .position(|a| a == "-threads")
@@ -517,7 +643,16 @@ mod tests {
         // A 0 budget would ask ffmpeg to auto-pick all cores; clamp to >=1.
         let (i, o, t) = paths();
         let opts = TranscodeOptions::default();
-        let args = build_ingest_args(&i, &o, &t, VideoArg::Encode(H264Encoder::X264), true, &opts, &bounds(), 0);
+        let args = build_ingest_args(
+            &i,
+            &o,
+            &t,
+            VideoArg::Encode(H264Encoder::X264),
+            true,
+            &opts,
+            &bounds(),
+            0,
+        );
         assert_eq!(value_after(&args, "-threads"), "1");
     }
 
@@ -525,7 +660,16 @@ mod tests {
     fn paths_are_discrete_args_no_injection() {
         let (i, o, t) = paths();
         let opts = TranscodeOptions::default();
-        let args = build_ingest_args(&i, &o, &t, VideoArg::Encode(H264Encoder::X264), true, &opts, &bounds(), 4);
+        let args = build_ingest_args(
+            &i,
+            &o,
+            &t,
+            VideoArg::Encode(H264Encoder::X264),
+            true,
+            &opts,
+            &bounds(),
+            4,
+        );
 
         // -i is immediately followed by the EXACT input path (its own OsString),
         // so a '-'-leading basename can't be misparsed as an option and nothing

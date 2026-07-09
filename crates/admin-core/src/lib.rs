@@ -21,7 +21,7 @@ mod subtree;
 pub mod sweep;
 
 pub use control::{
-    ControlChain, ControlRecord, CoSign, KeyCompromiseParams, ReinstateParams, RevokeParams,
+    CoSign, ControlChain, ControlRecord, KeyCompromiseParams, ReinstateParams, RevokeParams,
     SignedControlRecord,
 };
 pub use directory::{DirectorySigner, SignedBinding};

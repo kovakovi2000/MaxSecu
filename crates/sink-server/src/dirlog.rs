@@ -150,7 +150,10 @@ mod tests {
         let cp = log.checkpoint();
         assert_eq!(cp.tree_size, 3);
         assert!(vk
-            .verify_raw(&kt_checkpoint_signing_input(cp.tree_size, &cp.root), &cp.sig)
+            .verify_raw(
+                &kt_checkpoint_signing_input(cp.tree_size, &cp.root),
+                &cp.sig
+            )
             .is_ok());
 
         // Every leaf's inclusion proof verifies under the checkpoint root.

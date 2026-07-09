@@ -36,7 +36,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
 use maxsecu_admin_core::{
-    ControlChain, CoSign, DirectorySigner, KeyCompromiseParams, RevokeParams,
+    CoSign, ControlChain, DirectorySigner, KeyCompromiseParams, RevokeParams,
 };
 use maxsecu_client_core::transparency::{
     confirm_binding_logged, verify_binding_in_log, InclusionProof, KtCheckpoint, KtCheckpointStore,
@@ -192,7 +192,13 @@ async fn get_raw(conn: &mut Conn, uri: &str, auth: &str) -> (StatusCode, Vec<u8>
         .unwrap();
     let resp = conn.sender.send_request(req).await.unwrap();
     let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     (status, bytes)
 }
 
@@ -360,10 +366,7 @@ async fn stage_upload(
                 "/v1/files/{fid_hex}/versions/1/streams/{}/chunks/{i}",
                 stream_name(s.stream_type)
             );
-            assert_eq!(
-                put_raw(c, &uri, token, chunk.clone()).await,
-                StatusCode::OK
-            );
+            assert_eq!(put_raw(c, &uri, token, chunk.clone()).await, StatusCode::OK);
         }
     }
     let (st, _) = post(
@@ -620,10 +623,16 @@ async fn phase7_exit_gates_over_real_tls() {
     store.add_reg_key(sha256(VOUCHER.as_bytes()));
     let signer = Arc::new(SigningKey::generate());
     let dir_pub = signer.verifying_key().to_bytes();
-    let publisher =
-        HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
-    let blob_dir =
-        std::env::temp_dir().join(format!("mxp7_{}", hex(&maxsecu_crypto::random_array::<8>())));
+    let publisher = HttpSinkPublisher::new(
+        sink_addr,
+        "localhost",
+        sink_pki.client_config.clone(),
+        TOKEN,
+    );
+    let blob_dir = std::env::temp_dir().join(format!(
+        "mxp7_{}",
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
     let state = AppState {
         auth: Arc::new(
             AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
@@ -692,7 +701,11 @@ async fn phase7_exit_gates_over_real_tls() {
     assert_eq!(bundle.wraps.len(), 2, "owner self-wrap + recovery wrap");
     for w in &bundle.wraps {
         let wire = wrap_bytes(&w.wrapped_dek);
-        assert_eq!(wire.len(), 1168, "hybrid wrap is 1168 bytes (no 32+ct V1 wrap)");
+        assert_eq!(
+            wire.len(),
+            1168,
+            "hybrid wrap is 1168 bytes (no 32+ct V1 wrap)"
+        );
         deserialize_hybrid_wrap(&wire).expect("every wrap deserializes as a hybrid wrap");
     }
 
@@ -729,7 +742,10 @@ async fn phase7_exit_gates_over_real_tls() {
         .find(|s| s.stream_type == StreamType::Content)
         .unwrap()
         .plaintext;
-    assert_eq!(got, &content, "exact plaintext recovered via the hybrid wrap");
+    assert_eq!(
+        got, &content,
+        "exact plaintext recovered via the hybrid wrap"
+    );
 
     // Negative control: WITHOUT the ML-KEM seed, a V2 wrap cannot be opened.
     let no_pq = VerifyContext {
@@ -763,7 +779,10 @@ async fn phase7_exit_gates_over_real_tls() {
     let owner_binding = pq_binding("alice", 0x11, &owner);
     let owner_leaf = encode(&d5.sign_binding(&owner_binding, None).binding);
     let owner_idx = post_binding(sink_addr, sink_pki.client_config.clone(), &owner_leaf).await;
-    assert_eq!(owner_idx, 1, "the enrollment binding is leaf 0; the owner binding follows");
+    assert_eq!(
+        owner_idx, 1,
+        "the enrollment binding is leaf 0; the owner binding follows"
+    );
     for u in [0x21u8, 0x22] {
         let leaf = encode(&d5.sign_binding(&filler_binding(u), None).binding);
         post_binding(sink_addr, sink_pki.client_config.clone(), &leaf).await;
@@ -772,12 +791,19 @@ async fn phase7_exit_gates_over_real_tls() {
     // The client ACCEPTS the enrolled owner binding via inclusion under a pinned,
     // KT-signed checkpoint (TOFU on first contact).
     let cp_a = fetch_checkpoint(sink_addr, sink_pki.client_config.clone()).await;
-    assert_eq!(cp_a.tree_size, 4, "enrollment binding + owner binding + 2 fillers");
+    assert_eq!(
+        cp_a.tree_size, 4,
+        "enrollment binding + owner binding + 2 fillers"
+    );
     let inc0 = fetch_inclusion(sink_addr, sink_pki.client_config.clone(), owner_idx).await;
     let mut store = MemoryKtCheckpointStore::new();
     verify_binding_in_log(&owner_leaf, &inc0, &cp_a, &[], &kt_pin, &mut store)
         .expect("enrolled binding is inclusion-provable + client-accepted over TLS");
-    assert_eq!(store.latest(), Some(cp_a), "first-contact checkpoint pinned");
+    assert_eq!(
+        store.latest(),
+        Some(cp_a),
+        "first-contact checkpoint pinned"
+    );
 
     // The issuer-side confirm (fresh store) agrees the binding is logged.
     confirm_binding_logged(
@@ -799,7 +825,11 @@ async fn phase7_exit_gates_over_real_tls() {
     let cons_a = fetch_consistency(sink_addr, sink_pki.client_config.clone(), cp_a.tree_size).await;
     verify_binding_in_log(&leaf3, &inc3, &cp_a2, &cons_a, &kt_pin, &mut store)
         .expect("a consistency-proven advance is accepted");
-    assert_eq!(store.latest(), Some(cp_a2), "gossip advanced to the proven checkpoint");
+    assert_eq!(
+        store.latest(),
+        Some(cp_a2),
+        "gossip advanced to the proven checkpoint"
+    );
 
     // ---- The FORK: a SECOND sink under the SAME KT key, with a different (larger)
     // history. Its checkpoint cannot be reconciled with the pinned one ⇒ SplitView.
@@ -824,7 +854,10 @@ async fn phase7_exit_gates_over_real_tls() {
 
     // Publish DIFFERENT leaves to the fork (a divergent history, larger size).
     let mut fork_leaf0 = Vec::new();
-    for (i, u) in [0xB0u8, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5].into_iter().enumerate() {
+    for (i, u) in [0xB0u8, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5]
+        .into_iter()
+        .enumerate()
+    {
         let leaf = encode(&d5.sign_binding(&filler_binding(u), None).binding);
         let idx = post_binding(fork_addr, fork_pki.client_config.clone(), &leaf).await;
         if i == 0 {
@@ -833,17 +866,30 @@ async fn phase7_exit_gates_over_real_tls() {
         }
     }
     let cp_fork = fetch_checkpoint(fork_addr, fork_pki.client_config.clone()).await;
-    assert_eq!(cp_fork.tree_size, 6, "fork log has a divergent, larger history");
+    assert_eq!(
+        cp_fork.tree_size, 6,
+        "fork log has a divergent, larger history"
+    );
     let fork_inc0 = fetch_inclusion(fork_addr, fork_pki.client_config.clone(), 0).await;
     // The fork's own (internally valid) consistency proof from the gossiped size.
-    let fork_cons =
-        fetch_consistency(fork_addr, fork_pki.client_config.clone(), store.latest().unwrap().tree_size)
-            .await;
+    let fork_cons = fetch_consistency(
+        fork_addr,
+        fork_pki.client_config.clone(),
+        store.latest().unwrap().tree_size,
+    )
+    .await;
 
     // The client DETECTS + REJECTS the split view: the fork's checkpoint is not a
     // consistent extension of the pinned (honest) one.
     assert_eq!(
-        verify_binding_in_log(&fork_leaf0, &fork_inc0, &cp_fork, &fork_cons, &kt_pin, &mut store),
+        verify_binding_in_log(
+            &fork_leaf0,
+            &fork_inc0,
+            &cp_fork,
+            &fork_cons,
+            &kt_pin,
+            &mut store
+        ),
         Err(KtError::SplitView),
         "an equivocating fork checkpoint is rejected as a split view"
     );
@@ -881,15 +927,22 @@ async fn phase7_exit_gates_over_real_tls() {
             None,
         )
         .unwrap();
-    let probe =
-        HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
+    let probe = HttpSinkPublisher::new(
+        sink_addr,
+        "localhost",
+        sink_pki.client_config.clone(),
+        TOKEN,
+    );
     probe.publish_control_record(rev.bytes.clone()).await;
     // A genesis anchored AFTER the control append.
     probe.anchor_genesis([0xF9; 16]).await;
     let g2 = fetch_genesis_pos(sink_addr, sink_pki.client_config.clone(), &[0xF9; 16])
         .await
         .expect("second genesis anchored");
-    assert!(g2 > g1, "a genesis anchored after a control append is globally later");
+    assert!(
+        g2 > g1,
+        "a genesis anchored after a control append is globally later"
+    );
     assert_eq!(
         g2,
         g1 + 2,
@@ -978,14 +1031,23 @@ async fn r27_cutoff_over_real_sink() {
     // registration-key enrollment of `owner` is {User}-only.
     assert!(store.claim_first_admin().await.unwrap());
 
-    let publisher =
-        HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
-    let blob_dir =
-        std::env::temp_dir().join(format!("mxr27_{}", hex(&maxsecu_crypto::random_array::<8>())));
+    let publisher = HttpSinkPublisher::new(
+        sink_addr,
+        "localhost",
+        sink_pki.client_config.clone(),
+        TOKEN,
+    );
+    let blob_dir = std::env::temp_dir().join(format!(
+        "mxr27_{}",
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
     let state = AppState {
         auth: Arc::new(
-            AuthService::new(store, AuthConfig::default().with_directory_pub(d5.public_key()))
-                .with_dir_signer(enroll_signer),
+            AuthService::new(
+                store,
+                AuthConfig::default().with_directory_pub(d5.public_key()),
+            )
+            .with_dir_signer(enroll_signer),
         ),
         blobs: Arc::new(FsBlobStore::new(&blob_dir)),
         audit: Arc::new(publisher),
@@ -1057,8 +1119,18 @@ async fn r27_cutoff_over_real_sink() {
         "sig_b64": B64.encode(kc.sig),
         "co_sig_b64": kc.co_sig.map(|cs| B64.encode(cs)),
     });
-    let (st, _) = post(&mut c_admin, "/v1/key-compromise", Some(&admin_tok), kc_body).await;
-    assert_eq!(st, StatusCode::CREATED, "key_compromise appended + published to sink");
+    let (st, _) = post(
+        &mut c_admin,
+        "/v1/key-compromise",
+        Some(&admin_tok),
+        kc_body,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CREATED,
+        "key_compromise appended + published to sink"
+    );
 
     // ---- (3) file_after: genesis anchored at sink pos c (> b). ----
     let file_after = Id(maxsecu_crypto::random_array::<16>());
@@ -1070,9 +1142,17 @@ async fn r27_cutoff_over_real_sink() {
     let (fb, fa) = (file_before.0, file_after.0);
     let (a, b, c_pos) = tokio::task::spawn_blocking(move || {
         let sink = maxsecu_client_core::sink::HttpSinkClient::new(sink_addr, "localhost", cc);
-        let a = sink.fetch_genesis_pos(&fb).unwrap().expect("file_before anchored");
-        let b = sink.fetch_control_pos(1).expect("key_compromise position at the sink");
-        let c = sink.fetch_genesis_pos(&fa).unwrap().expect("file_after anchored");
+        let a = sink
+            .fetch_genesis_pos(&fb)
+            .unwrap()
+            .expect("file_before anchored");
+        let b = sink
+            .fetch_control_pos(1)
+            .expect("key_compromise position at the sink");
+        let c = sink
+            .fetch_genesis_pos(&fa)
+            .unwrap()
+            .expect("file_after anchored");
         (a, b, c)
     })
     .await

@@ -109,7 +109,7 @@ impl Default for Thresholds {
             auth_failures_per_window: 20,
             auth_window_ms: 60_000, // 1 minute
             reshare_fanout_per_window: 10,
-            reshare_window_ms: 3_600_000, // 1 hour
+            reshare_window_ms: 3_600_000,       // 1 hour
             soon_revoked_window_ms: 86_400_000, // 24 hours
             ceremony_windows: Vec::new(),
         }
@@ -359,7 +359,10 @@ mod tests {
     const T: u64 = 1_000_000;
 
     fn denied(user: [u8; 16], at_ms: u64) -> AuditEvent {
-        AuditEvent::AuthDenied { user_id: user, at_ms }
+        AuditEvent::AuthDenied {
+            user_id: user,
+            at_ms,
+        }
     }
 
     fn grant(action: GrantAction, at_ms: u64) -> AuditEvent {
@@ -404,7 +407,7 @@ mod tests {
     #[test]
     fn auth_failure_spike_alerts() {
         let t = Thresholds::default(); // 20 / 60_000ms
-        // 21 failures inside one minute → spike with peak 21.
+                                       // 21 failures inside one minute → spike with peak 21.
         let mut events: Vec<AuditEvent> = (0..21).map(|i| denied(U, T + i * 100)).collect();
         match analyze(&events, &t).as_slice() {
             [Alert::AuthFailureSpike { count, window_ms }] => {
@@ -421,7 +424,7 @@ mod tests {
     #[test]
     fn reshare_fanout_alerts() {
         let t = Thresholds::default(); // 10 / hour
-        // 11 re-shares by G within the hour → fan-out alert for G with count 11.
+                                       // 11 re-shares by G within the hour → fan-out alert for G with count 11.
         let events: Vec<AuditEvent> = (0..11)
             .map(|i| grant(GrantAction::Reshare, T + i * 1000))
             .collect();
@@ -473,7 +476,10 @@ mod tests {
         assert_eq!(analyze(&late, &t), Vec::new());
         // A revoke BEFORE the grant is not "soon-revoked after".
         let before = vec![
-            AuditEvent::UserRevoked { user_id: G, at_ms: T },
+            AuditEvent::UserRevoked {
+                user_id: G,
+                at_ms: T,
+            },
             grant(GrantAction::Reshare, T + 1000),
         ];
         assert_eq!(analyze(&before, &t), Vec::new());
@@ -486,7 +492,10 @@ mod tests {
             reported_by: U,
             at_ms: T,
         }];
-        assert_eq!(analyze(&events, &t), vec![Alert::TombstoneGap { reported_by: U }]);
+        assert_eq!(
+            analyze(&events, &t),
+            vec![Alert::TombstoneGap { reported_by: U }]
+        );
     }
 
     #[test]

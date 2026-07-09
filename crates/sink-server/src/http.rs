@@ -388,7 +388,10 @@ async fn get_control_position(
 /// Serve the global sink position at which `file_id`'s genesis was anchored, or
 /// `404` if the file is not anchored; a malformed (non-hex / wrong-length)
 /// `file_id` is `400`. Public read — the position carries no secret.
-async fn get_genesis_anchor(State(st): State<SinkState>, Path(file_id_hex): Path<String>) -> Response {
+async fn get_genesis_anchor(
+    State(st): State<SinkState>,
+    Path(file_id_hex): Path<String>,
+) -> Response {
     let Some(file_id) = decode_file_id_hex(&file_id_hex) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -445,7 +448,10 @@ struct DirInclusionQuery {
 /// Serve an inclusion proof for the `index`-th binding leaf against the current
 /// tree (the shape `transparency::InclusionProof` accepts); `404` if `index` is
 /// out of range (≥ current `tree_size`). Public read.
-async fn dir_inclusion(State(st): State<SinkState>, Query(q): Query<DirInclusionQuery>) -> Response {
+async fn dir_inclusion(
+    State(st): State<SinkState>,
+    Query(q): Query<DirInclusionQuery>,
+) -> Response {
     let inner = st.inner.lock().await;
     match inner.dirlog.inclusion(q.index) {
         Some(inc) => Json(KtInclusionJson {
@@ -560,7 +566,9 @@ mod tests {
     async fn send(router: &Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
         let resp = router.clone().oneshot(req).await.unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let json = if bytes.is_empty() {
             serde_json::Value::Null
         } else {
@@ -607,7 +615,10 @@ mod tests {
         // The append response carries the new head (chain_seq 2).
         assert_eq!(after["chain_seq"].as_u64().unwrap(), 2);
         assert!(!after["cosig_b64"].as_str().unwrap().is_empty());
-        assert!(!after["transparency"]["checkpoint_sig_b64"].as_str().unwrap().is_empty());
+        assert!(!after["transparency"]["checkpoint_sig_b64"]
+            .as_str()
+            .unwrap()
+            .is_empty());
 
         // Head endpoint now reflects chain_seq 2.
         let (_st, head) = send(&app, get("/v1/control-log/head")).await;
@@ -647,7 +658,11 @@ mod tests {
     async fn malformed_append_returns_400() {
         let app = app();
         // Valid base64 but not a canonical control-log record.
-        let (st, _) = send(&app, post_record_req(Some(TOKEN), &B64.encode([0xFF, 0xFF, 0x00]))).await;
+        let (st, _) = send(
+            &app,
+            post_record_req(Some(TOKEN), &B64.encode([0xFF, 0xFF, 0x00])),
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         // Not even base64.
         let (st, _) = send(&app, post_record_req(Some(TOKEN), "@@not-base64@@")).await;
@@ -707,8 +722,15 @@ mod tests {
         let (st, body) = send(&app, post_genesis_req(Some(TOKEN), &B64.encode(f2))).await;
         assert_eq!(st, StatusCode::OK);
         let p2 = body["position"].as_u64().unwrap();
-        assert!(p2 > p1, "genesis after control append has a higher global position");
-        assert_eq!(p2, p1 + 2, "the intervening control append consumed one position");
+        assert!(
+            p2 > p1,
+            "genesis after control append has a higher global position"
+        );
+        assert_eq!(
+            p2,
+            p1 + 2,
+            "the intervening control append consumed one position"
+        );
 
         // GET reflects the anchored positions.
         let (st, body) = send(&app, get(&format!("/v1/genesis-anchor/{}", hex16(&f1)))).await;
@@ -731,7 +753,11 @@ mod tests {
         let (st, _) = send(&app, post_genesis_req(Some("wrong"), &B64.encode(f1))).await;
         assert_eq!(st, StatusCode::FORBIDDEN);
         // Non-16-byte / undecodable file_id → 400.
-        let (st, _) = send(&app, post_genesis_req(Some(TOKEN), &B64.encode([0x01, 0x02, 0x03]))).await;
+        let (st, _) = send(
+            &app,
+            post_genesis_req(Some(TOKEN), &B64.encode([0x01, 0x02, 0x03])),
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         let (st, _) = send(&app, post_genesis_req(Some(TOKEN), "@@not-base64@@")).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);

@@ -459,8 +459,16 @@ mod tests {
         let mut emitted = Vec::new();
         let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
         let (count, digest) = seal_stream_streaming(
-            &CK, FID, 1, StreamType::Preview, 1024, &mut cursor,
-            |_, ct| { emitted.push(ct.to_vec()); Ok(()) },
+            &CK,
+            FID,
+            1,
+            StreamType::Preview,
+            1024,
+            &mut cursor,
+            |_, ct| {
+                emitted.push(ct.to_vec());
+                Ok(())
+            },
         )
         .unwrap();
         assert_eq!(count, 1);
@@ -507,7 +515,11 @@ mod tests {
         // with is_last=false, so its AAD mismatches and the open fails closed.
         let short = sealed.chunk_count - 1;
         let err = open_stream_streaming(
-            &CK, FID, 1, StreamType::Content, short,
+            &CK,
+            FID,
+            1,
+            StreamType::Content,
+            short,
             |i| Ok(sealed.chunks[i as usize].clone()),
             |_| Ok(()),
         )

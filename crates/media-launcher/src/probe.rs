@@ -9,10 +9,23 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VideoCodec { H264, Hevc, Av1, Vp9, Vp8, Other }
+pub enum VideoCodec {
+    H264,
+    Hevc,
+    Av1,
+    Vp9,
+    Vp8,
+    Other,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioCodec { Aac, Opus, Mp3, Other, None }
+pub enum AudioCodec {
+    Aac,
+    Opus,
+    Mp3,
+    Other,
+    None,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeResult {
@@ -50,7 +63,9 @@ pub fn parse_probe(stderr: &[u8]) -> ProbeResult {
             }
         }
         if audio.is_none() {
-            if let Some(tok) = codec_after(line, "Audio:") { audio = Some(classify_audio(&tok)); }
+            if let Some(tok) = codec_after(line, "Audio:") {
+                audio = Some(classify_audio(&tok));
+            }
         }
     }
     ProbeResult {
@@ -66,8 +81,12 @@ pub fn parse_probe(stderr: &[u8]) -> ProbeResult {
 /// player-safe output).
 fn is_8bit_420(video_line: &str) -> bool {
     let l = video_line;
-    let high_bit = l.contains("10le") || l.contains("10be") || l.contains("12le")
-        || l.contains("12be") || l.contains("p010") || l.contains("yuv420p10")
+    let high_bit = l.contains("10le")
+        || l.contains("10be")
+        || l.contains("12le")
+        || l.contains("12be")
+        || l.contains("p010")
+        || l.contains("yuv420p10")
         || l.contains("yuv420p12");
     let high_subsampling = l.contains("yuv422") || l.contains("yuv444");
     let ok_420 = l.contains("yuv420p") || l.contains("yuvj420p") || l.contains("nv12");
@@ -79,8 +98,15 @@ fn is_8bit_420(video_line: &str) -> bool {
 fn codec_after(line: &str, marker: &str) -> Option<String> {
     let idx = line.find(marker)? + marker.len();
     let rest = line[idx..].trim_start();
-    let tok: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-    if tok.is_empty() { None } else { Some(tok.to_ascii_lowercase()) }
+    let tok: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok.to_ascii_lowercase())
+    }
 }
 
 fn classify_video(tok: &str) -> VideoCodec {
@@ -174,7 +200,11 @@ Input #0, mp3, from '/jobs/song.mp3':\n\
     #[test]
     fn attached_cover_art_is_not_a_video_stream() {
         let r = parse_probe(MP3_COVER);
-        assert_eq!(r.video, VideoCodec::Other, "attached pic is not a real video");
+        assert_eq!(
+            r.video,
+            VideoCodec::Other,
+            "attached pic is not a real video"
+        );
         assert_eq!(r.audio, AudioCodec::Mp3);
         assert!(!r.video_8bit_420);
     }

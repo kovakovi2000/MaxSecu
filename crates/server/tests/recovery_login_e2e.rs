@@ -204,8 +204,11 @@ fn state_with_admin_gate() -> AppState<MemoryStore> {
     let dir_pub = signer.verifying_key().to_bytes();
     AppState {
         auth: Arc::new(
-            AuthService::new(MemoryStore::new(), AuthConfig::default().with_directory_pub(dir_pub))
-                .with_dir_signer(signer),
+            AuthService::new(
+                MemoryStore::new(),
+                AuthConfig::default().with_directory_pub(dir_pub),
+            )
+            .with_dir_signer(signer),
         ),
         blobs: Arc::new(MemoryBlobStore::new()),
         audit: Arc::new(NullAuditSink),
@@ -236,7 +239,11 @@ async fn recovery_login_hybrid_over_real_tls() {
 
     // A second registration is refused (once-only).
     let (st, _) = post(&mut c, "/v1/recovery/register", None, reg).await;
-    assert_eq!(st, StatusCode::CONFLICT, "recovery account is once-only (409)");
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "recovery account is once-only (409)"
+    );
 
     // ---- pubkey endpoint serves the enc + mlkem the client pins against. ----
     let (st, body) = get(&mut c, "/v1/recovery/pubkey").await;
@@ -246,15 +253,30 @@ async fn recovery_login_hybrid_over_real_tls() {
         enc_pub.x25519.to_vec(),
         "served recovery enc_pub matches the registered one"
     );
-    assert!(body["mlkem_pub_b64"].is_string(), "hybrid account serves ML-KEM pub");
+    assert!(
+        body["mlkem_pub_b64"].is_string(),
+        "hybrid account serves ML-KEM pub"
+    );
 
     // ---- challenge → unwrap the nonce with the recovery private key. ----
-    let (st, ch) = post(&mut c, "/v1/recovery/challenge", None, serde_json::json!({})).await;
+    let (st, ch) = post(
+        &mut c,
+        "/v1/recovery/challenge",
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
-    assert_eq!(ch["suite"].as_str().unwrap(), "v2", "hybrid account → v2 wrap");
+    assert_eq!(
+        ch["suite"].as_str().unwrap(),
+        "v2",
+        "hybrid account → v2 wrap"
+    );
     let server_id = ch["server_id"].as_str().unwrap().to_owned();
     let challenge_id = hex16(ch["challenge_id"].as_str().unwrap());
-    let blob = B64.decode(ch["wrapped_blob_b64"].as_str().unwrap()).unwrap();
+    let blob = B64
+        .decode(ch["wrapped_blob_b64"].as_str().unwrap())
+        .unwrap();
     let wrapped = deserialize_hybrid_wrap(&blob).unwrap();
     let dek = unwrap_dek_hybrid(&enc_sec, &wrapped, &challenge_ctx(&challenge_id)).unwrap();
     let nonce: [u8; 32] = *dek.expose();
@@ -279,7 +301,11 @@ async fn recovery_login_hybrid_over_real_tls() {
         serde_json::json!({}),
     )
     .await;
-    assert_eq!(st, StatusCode::CREATED, "recovery session mints a registration key");
+    assert_eq!(
+        st,
+        StatusCode::CREATED,
+        "recovery session mints a registration key"
+    );
     assert!(!res["registration_key"].as_str().unwrap().is_empty());
 
     // ---- BLAST RADIUS (spec §9): the recovery session authorizes admin SERVER
@@ -324,12 +350,24 @@ async fn recovery_login_hybrid_over_real_tls() {
         serde_json::json!({ "challenge_id": ch["challenge_id"], "proof_b64": proof2, "timestamp": TS }),
     )
     .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED, "a consumed challenge cannot be replayed");
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "a consumed challenge cannot be replayed"
+    );
 
     // ---- RELAY: a proof bound to a DIFFERENT exporter is rejected. ----
-    let (_st, ch) = post(&mut c, "/v1/recovery/challenge", None, serde_json::json!({})).await;
+    let (_st, ch) = post(
+        &mut c,
+        "/v1/recovery/challenge",
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     let cid = hex16(ch["challenge_id"].as_str().unwrap());
-    let blob = B64.decode(ch["wrapped_blob_b64"].as_str().unwrap()).unwrap();
+    let blob = B64
+        .decode(ch["wrapped_blob_b64"].as_str().unwrap())
+        .unwrap();
     let n: [u8; 32] = *unwrap_dek_hybrid(
         &enc_sec,
         &deserialize_hybrid_wrap(&blob).unwrap(),
@@ -345,7 +383,11 @@ async fn recovery_login_hybrid_over_real_tls() {
         serde_json::json!({ "challenge_id": ch["challenge_id"], "proof_b64": wrong_channel, "timestamp": TS }),
     )
     .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED, "a relayed (wrong-exporter) proof is rejected");
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "a relayed (wrong-exporter) proof is rejected"
+    );
 
     // ---- WRONG KEY: a proof signed by a different key is rejected. ----
     let attacker = SigningKey::generate();
@@ -357,7 +399,11 @@ async fn recovery_login_hybrid_over_real_tls() {
         serde_json::json!({ "challenge_id": ch["challenge_id"], "proof_b64": bad_key, "timestamp": TS }),
     )
     .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED, "a proof under the wrong key is rejected");
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "a proof under the wrong key is rejected"
+    );
 }
 
 #[tokio::test]
@@ -379,12 +425,24 @@ async fn recovery_login_classical_wrap_round_trips() {
     let (st, _) = post(&mut c, "/v1/recovery/register", None, reg).await;
     assert_eq!(st, StatusCode::CREATED);
 
-    let (st, ch) = post(&mut c, "/v1/recovery/challenge", None, serde_json::json!({})).await;
+    let (st, ch) = post(
+        &mut c,
+        "/v1/recovery/challenge",
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
-    assert_eq!(ch["suite"].as_str().unwrap(), "v1", "classical account → v1 wrap");
+    assert_eq!(
+        ch["suite"].as_str().unwrap(),
+        "v1",
+        "classical account → v1 wrap"
+    );
     let server_id = ch["server_id"].as_str().unwrap().to_owned();
     let cid = hex16(ch["challenge_id"].as_str().unwrap());
-    let blob = B64.decode(ch["wrapped_blob_b64"].as_str().unwrap()).unwrap();
+    let blob = B64
+        .decode(ch["wrapped_blob_b64"].as_str().unwrap())
+        .unwrap();
     // Classical blob wire form: enc(32) ‖ ct.
     let wrapped = WrappedDek {
         enc: blob[..32].try_into().unwrap(),
@@ -411,5 +469,9 @@ async fn recovery_login_classical_wrap_round_trips() {
         serde_json::json!({}),
     )
     .await;
-    assert_eq!(st, StatusCode::CREATED, "classical recovery session is admin");
+    assert_eq!(
+        st,
+        StatusCode::CREATED,
+        "classical recovery session is admin"
+    );
 }

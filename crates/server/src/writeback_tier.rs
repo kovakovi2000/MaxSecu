@@ -388,7 +388,13 @@ impl BlobStore for WriteBackTier {
             if idx.contains(&key) {
                 idx.record_access(&key, now);
             } else {
-                let _ = idx.record_put(key, bytes.len() as u64, now, false, is_pinned_stream(blob_ref));
+                let _ = idx.record_put(
+                    key,
+                    bytes.len() as u64,
+                    now,
+                    false,
+                    is_pinned_stream(blob_ref),
+                );
             }
             return Ok(Some(bytes));
         }
@@ -497,11 +503,13 @@ impl BlobStore for WriteBackTier {
             .unwrap()
             .in_cold_of(&ChunkKey::new(blob_ref, index))
         {
-            Some(true) => {} // re-cached: also in cold → brokerable
+            Some(true) => {}                // re-cached: also in cold → brokerable
             Some(false) => return Ok(None), // local-only → proxy
-            None => {}       // cold-only or absent → let the cold tier decide
+            None => {}                      // cold-only or absent → let the cold tier decide
         }
-        self.cold.broker_direct_link(blob_ref, index, ttl_secs).await
+        self.cold
+            .broker_direct_link(blob_ref, index, ttl_secs)
+            .await
     }
 }
 
@@ -516,7 +524,14 @@ mod tests {
     // A Thumbnail stream (stream_type 3) — pinned local, never offloaded.
     const THUMB: &str = "aabbccddeeff00112233445566778899/1/3";
 
-    fn tier(cap: u64) -> (Arc<WriteBackTier>, Arc<MemoryBlobStore>, Arc<MemoryColdTier>, Clock) {
+    fn tier(
+        cap: u64,
+    ) -> (
+        Arc<WriteBackTier>,
+        Arc<MemoryBlobStore>,
+        Arc<MemoryColdTier>,
+        Clock,
+    ) {
         let local = Arc::new(MemoryBlobStore::new());
         let cold = Arc::new(MemoryColdTier::new());
         let clock = Clock::Fixed(Arc::new(Mutex::new(
@@ -545,7 +560,10 @@ mod tests {
     async fn put_is_write_back_local_only_cold_stays_empty() {
         let (t, local, cold, _) = tier(1_000);
         t.put_chunk(REF, 0, vec![0xAA; 10]).await.unwrap();
-        assert_eq!(local.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xAA; 10]);
+        assert_eq!(
+            local.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0xAA; 10]
+        );
         assert_eq!(cold.chunk_count(REF).await.unwrap(), 0);
         assert_eq!(t.chunk_count(REF).await.unwrap(), 1);
     }
@@ -558,7 +576,10 @@ mod tests {
         t.put_chunk(REF, 2, vec![0xA2; 10]).await.unwrap(); // overflow → offload idx 0
 
         assert!(local.get_chunk(REF, 0).await.unwrap().is_none());
-        assert_eq!(cold.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xA0; 10]);
+        assert_eq!(
+            cold.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0xA0; 10]
+        );
         assert!(local.get_chunk(REF, 1).await.unwrap().is_some());
         assert!(local.get_chunk(REF, 2).await.unwrap().is_some());
         assert_eq!(t.chunk_count(REF).await.unwrap(), 3); // 1 cold + 2 local, no loss
@@ -584,8 +605,14 @@ mod tests {
         let got = t.get_chunk(REF, 0).await.unwrap().unwrap();
         assert_eq!(got, vec![0xBB; 10]);
         // Now resident in BOTH: local re-cached AND the cold original retained.
-        assert_eq!(local.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xBB; 10]);
-        assert_eq!(cold.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xBB; 10]);
+        assert_eq!(
+            local.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0xBB; 10]
+        );
+        assert_eq!(
+            cold.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0xBB; 10]
+        );
         // Counted once, not twice.
         assert_eq!(t.chunk_count(REF).await.unwrap(), 1);
     }
@@ -601,7 +628,10 @@ mod tests {
         t.put_chunk(REF, 1, vec![0xC1; 10]).await.unwrap();
         assert!(local.get_chunk(REF, 0).await.unwrap().is_none());
         // The permanent cold copy is still there (never deleted on eviction).
-        assert_eq!(cold.get_chunk(REF, 0).await.unwrap().unwrap(), vec![0xC0; 10]);
+        assert_eq!(
+            cold.get_chunk(REF, 0).await.unwrap().unwrap(),
+            vec![0xC0; 10]
+        );
         assert_eq!(t.chunk_count(REF).await.unwrap(), 2);
     }
 
@@ -641,14 +671,20 @@ mod tests {
         t.put_chunk(REF, 2, vec![0x04; 10]).await.unwrap(); // evicts content idx 1
 
         // The thumbnail stayed local through every eviction; only content was offloaded.
-        assert_eq!(local.get_chunk(THUMB, 0).await.unwrap().unwrap(), vec![0x01; 10]);
+        assert_eq!(
+            local.get_chunk(THUMB, 0).await.unwrap().unwrap(),
+            vec![0x01; 10]
+        );
         assert_eq!(cold.chunk_count(THUMB).await.unwrap(), 0);
         assert!(cold.chunk_count(REF).await.unwrap() >= 1);
 
         // Idle sweep also never offloads the pinned thumbnail.
         clock.advance(Duration::from_secs(60 * 24 * 3600));
         t.run_idle_sweep().await;
-        assert_eq!(local.get_chunk(THUMB, 0).await.unwrap().unwrap(), vec![0x01; 10]);
+        assert_eq!(
+            local.get_chunk(THUMB, 0).await.unwrap().unwrap(),
+            vec![0x01; 10]
+        );
         assert_eq!(cold.chunk_count(THUMB).await.unwrap(), 0);
     }
 
@@ -677,7 +713,12 @@ mod tests {
             }
         }
         let local = Arc::new(MemoryBlobStore::new());
-        let t = WriteBackTier::new(local.clone(), Arc::new(FailingCold), 20, Duration::from_secs(1));
+        let t = WriteBackTier::new(
+            local.clone(),
+            Arc::new(FailingCold),
+            20,
+            Duration::from_secs(1),
+        );
         t.put_chunk(REF, 0, vec![0xD0; 10]).await.unwrap();
         t.put_chunk(REF, 1, vec![0xD1; 10]).await.unwrap();
         t.put_chunk(REF, 2, vec![0xD2; 10]).await.unwrap(); // offload of idx 0 fails

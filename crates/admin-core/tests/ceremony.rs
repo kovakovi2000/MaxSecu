@@ -4,7 +4,7 @@
 //! linkage, per-scope monotonic epochs, and dual-control enforcement.
 
 use maxsecu_admin_core::{
-    CeremonyError, ControlChain, ControlRecord, CoSign, DirectorySigner, KeyCompromiseParams,
+    CeremonyError, CoSign, ControlChain, ControlRecord, DirectorySigner, KeyCompromiseParams,
     ReinstateParams, RevokeParams,
 };
 use maxsecu_crypto::{fingerprint, sha256, SigningKey};
@@ -87,7 +87,9 @@ fn enrollment_signs_only_when_the_confirmed_fingerprint_matches() {
     let confirmed = fingerprint(&[0xE1; 32], &[0x51; 32]);
 
     // Admin confirmed the correct fingerprint in person → signs.
-    let signed = d5.sign_enrollment(&b, &confirmed).expect("matching fingerprint signs");
+    let signed = d5
+        .sign_enrollment(&b, &confirmed)
+        .expect("matching fingerprint signs");
     assert!(signed.verify(&d5.public_key()).is_ok());
 }
 
@@ -126,14 +128,26 @@ fn first_record_chains_to_genesis_head_then_each_links_to_the_prior() {
     let r1 = chain
         .revoke(&admin, revoke_params(file, 0x99, 0x01), None)
         .unwrap();
-    assert_eq!(r1.prev_head(), GENESIS_HEAD.0, "first record seeds from GENESIS_HEAD");
-    assert_eq!(r1.head, sha256(&encode_record(&r1.record)), "head = SHA-256(canonical(record))");
+    assert_eq!(
+        r1.prev_head(),
+        GENESIS_HEAD.0,
+        "first record seeds from GENESIS_HEAD"
+    );
+    assert_eq!(
+        r1.head,
+        sha256(&encode_record(&r1.record)),
+        "head = SHA-256(canonical(record))"
+    );
     assert_eq!(chain.head(), r1.head);
 
     let r2 = chain
         .revoke(&admin, revoke_params(file, 0x98, 0x01), None)
         .unwrap();
-    assert_eq!(r2.prev_head(), r1.head, "each record's prev_head is the prior head (contiguity)");
+    assert_eq!(
+        r2.prev_head(),
+        r1.head,
+        "each record's prev_head is the prior head (contiguity)"
+    );
     assert_eq!(chain.head(), r2.head);
 }
 
@@ -144,9 +158,15 @@ fn revocation_epoch_is_monotonic_per_scope_and_independent_across_scopes() {
     let file_a = FileScope::Specific(Id([0x0A; 16]));
     let file_b = FileScope::Specific(Id([0x0B; 16]));
 
-    let a1 = chain.revoke(&admin, revoke_params(file_a, 0x91, 1), None).unwrap();
-    let a2 = chain.revoke(&admin, revoke_params(file_a, 0x92, 1), None).unwrap();
-    let b1 = chain.revoke(&admin, revoke_params(file_b, 0x93, 1), None).unwrap();
+    let a1 = chain
+        .revoke(&admin, revoke_params(file_a, 0x91, 1), None)
+        .unwrap();
+    let a2 = chain
+        .revoke(&admin, revoke_params(file_a, 0x92, 1), None)
+        .unwrap();
+    let b1 = chain
+        .revoke(&admin, revoke_params(file_b, 0x93, 1), None)
+        .unwrap();
 
     assert_eq!(a1.epoch(), Some(1));
     assert_eq!(a2.epoch(), Some(2), "same scope ⇒ next epoch");
@@ -159,15 +179,26 @@ fn issuer_signature_and_canonical_bytes_round_trip() {
     let admin = SigningKey::generate();
     let admin_pub = admin.verifying_key().to_bytes();
     let rec = chain
-        .revoke(&admin, revoke_params(FileScope::AccountWide, 0x99, 1),
-            Some(CoSign { admin_id: Id([2; 16]), key: &SigningKey::generate() }))
+        .revoke(
+            &admin,
+            revoke_params(FileScope::AccountWide, 0x99, 1),
+            Some(CoSign {
+                admin_id: Id([2; 16]),
+                key: &SigningKey::generate(),
+            }),
+        )
         .unwrap();
 
     // The signature verifies under the issuer's key, over the published bytes…
     assert!(rec.verify(&admin_pub).is_ok());
     // …and the bytes are the one canonical form (decode round-trips).
-    let ControlRecord::Revocation(ref rv) = rec.record else { panic!("expected revocation") };
-    assert_eq!(decode::<maxsecu_encoding::structs::Revocation>(&rec.bytes).unwrap(), *rv);
+    let ControlRecord::Revocation(ref rv) = rec.record else {
+        panic!("expected revocation")
+    };
+    assert_eq!(
+        decode::<maxsecu_encoding::structs::Revocation>(&rec.bytes).unwrap(),
+        *rv
+    );
 }
 
 // ---- dual control (§10.1 / §11.5a) ----
@@ -194,14 +225,24 @@ fn single_file_revoke_needs_no_co_signer_but_account_wide_co_sig_verifies() {
 
     // single-file: no co-signer needed.
     let single = chain
-        .revoke(&admin, revoke_params(FileScope::Specific(Id([7; 16])), 0x99, 1), None)
+        .revoke(
+            &admin,
+            revoke_params(FileScope::Specific(Id([7; 16])), 0x99, 1),
+            None,
+        )
         .unwrap();
     assert!(single.co_sig.is_none());
 
     // account-wide: co-signed, and the second signature verifies.
     let mass = chain
-        .revoke(&admin, revoke_params(FileScope::AccountWide, 0x98, 1),
-            Some(CoSign { admin_id: Id([2; 16]), key: &co }))
+        .revoke(
+            &admin,
+            revoke_params(FileScope::AccountWide, 0x98, 1),
+            Some(CoSign {
+                admin_id: Id([2; 16]),
+                key: &co,
+            }),
+        )
         .unwrap();
     assert!(mass.verify_co_sign(&co_pub).is_ok());
 }
@@ -215,7 +256,9 @@ fn reinstatement_is_always_dual_controlled_and_links_into_the_chain() {
     let co_pub = co.verifying_key().to_bytes();
     let file = FileScope::Specific(Id([0x10; 16]));
 
-    let rev = chain.revoke(&admin, revoke_params(file, 0x99, 1), None).unwrap();
+    let rev = chain
+        .revoke(&admin, revoke_params(file, 0x99, 1), None)
+        .unwrap();
     let rein = chain.reinstate(
         &admin,
         ReinstateParams {
@@ -225,9 +268,16 @@ fn reinstatement_is_always_dual_controlled_and_links_into_the_chain() {
             issued_by: Id([1; 16]),
             created_at: TS,
         },
-        CoSign { admin_id: Id([2; 16]), key: &co },
+        CoSign {
+            admin_id: Id([2; 16]),
+            key: &co,
+        },
     );
-    assert_eq!(rein.prev_head(), rev.head, "reinstatement extends the same chain");
+    assert_eq!(
+        rein.prev_head(),
+        rev.head,
+        "reinstatement extends the same chain"
+    );
     assert!(rein.verify(&admin_pub).is_ok());
     assert!(rein.verify_co_sign(&co_pub).is_ok());
 }
@@ -249,13 +299,20 @@ fn key_compromise_record_is_dual_controlled_and_chains() {
             issued_by: Id([1; 16]),
             created_at: TS,
         },
-        CoSign { admin_id: Id([2; 16]), key: &co },
+        CoSign {
+            admin_id: Id([2; 16]),
+            key: &co,
+        },
     );
     assert_eq!(kc.prev_head(), GENESIS_HEAD.0);
     assert!(kc.verify(&admin_pub).is_ok());
     assert!(kc.verify_co_sign(&co_pub).is_ok());
     assert!(matches!(kc.record, ControlRecord::KeyCompromise(_)));
-    assert_eq!(kc.epoch(), None, "key_compromise carries no per-scope epoch");
+    assert_eq!(
+        kc.epoch(),
+        None,
+        "key_compromise carries no per-scope epoch"
+    );
 }
 
 // Helper mirroring the core's head derivation, so the test pins the formula.

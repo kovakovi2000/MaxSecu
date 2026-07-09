@@ -160,7 +160,12 @@ async fn login(conn: &mut Conn, username: &str, id: &Identity) -> String {
 }
 
 /// POST a signed control record to the app server.
-async fn post_control(conn: &mut Conn, token: &str, uri: &str, rec: &SignedControlRecord) -> StatusCode {
+async fn post_control(
+    conn: &mut Conn,
+    token: &str,
+    uri: &str,
+    rec: &SignedControlRecord,
+) -> StatusCode {
     let body = serde_json::json!({
         "record_b64": B64.encode(&rec.bytes),
         "sig_b64": B64.encode(rec.sig),
@@ -237,8 +242,10 @@ async fn boot() -> Booted {
         sink_pki.client_config.clone(),
         TOKEN,
     );
-    let blob_dir =
-        std::env::temp_dir().join(format!("mxs65_{}", hex(&maxsecu_crypto::random_array::<8>())));
+    let blob_dir = std::env::temp_dir().join(format!(
+        "mxs65_{}",
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
     let state = AppState {
         auth: Arc::new(AuthService::new(
             store,
@@ -353,8 +360,12 @@ async fn genesis_anchoring_is_real_and_globally_ordered_over_sink() {
 
     // A real publisher pinned to the sink's channel (the same transport the app
     // server's `AuditSink` uses).
-    let publisher =
-        HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
+    let publisher = HttpSinkPublisher::new(
+        sink_addr,
+        "localhost",
+        sink_pki.client_config.clone(),
+        TOKEN,
+    );
 
     // An un-anchored file has no sink position.
     assert!(
@@ -425,7 +436,11 @@ async fn control_append_publishes_record_to_sink() {
         .unwrap()
         .expect("sink head fetched");
     assert_eq!(head.chain_seq, 1, "sink chain advanced by the publish");
-    assert_eq!(head.head, sha256(&rev.bytes), "sink derived head == sha256(record)");
+    assert_eq!(
+        head.head,
+        sha256(&rev.bytes),
+        "sink derived head == sha256(record)"
+    );
 }
 
 #[tokio::test]
@@ -448,7 +463,11 @@ async fn issuer_confirms_anchoring() {
     let pre = tokio::task::spawn_blocking(move || confirm_anchored(&sink, &[cp], &[lp], expected))
         .await
         .unwrap();
-    assert_eq!(pre, Err(SinkError::NotAnchored), "unpublished head is not anchored");
+    assert_eq!(
+        pre,
+        Err(SinkError::NotAnchored),
+        "unpublished head is not anchored"
+    );
 
     // ---- Append + publish. ----
     assert_eq!(
@@ -472,5 +491,9 @@ async fn issuer_confirms_anchoring() {
     let bad = tokio::task::spawn_blocking(move || confirm_anchored(&sink, &[cp], &[lp], stale))
         .await
         .unwrap();
-    assert_eq!(bad, Err(SinkError::NotAnchored), "a stale expected head is not anchored");
+    assert_eq!(
+        bad,
+        Err(SinkError::NotAnchored),
+        "a stale expected head is not anchored"
+    );
 }

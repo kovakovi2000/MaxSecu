@@ -36,7 +36,7 @@ use crate::files::{
 };
 use crate::store::{
     ancestor_chain, ChunkSlot, EnrollOutcome, FileListEntry, FileMeta, FileView, RecipientView,
-    RecoveryAccount, SessionRecord, StoredBinding, StoredControlRecord, Store, StreamView,
+    RecoveryAccount, SessionRecord, Store, StoredBinding, StoredControlRecord, StreamView,
     UserRecord, VersionMeta, WrapView, BUNDLE_FILE_TYPE,
 };
 
@@ -213,10 +213,12 @@ impl Store for PgStore {
         .await
         .map_err(store_err("get_session"))?;
         let Some(row) = row else { return Ok(None) };
-        let expires_at: OffsetDateTime =
-            row.try_get("expires_at").map_err(store_err("get_session"))?;
-        let revoked_at: Option<OffsetDateTime> =
-            row.try_get("revoked_at").map_err(store_err("get_session"))?;
+        let expires_at: OffsetDateTime = row
+            .try_get("expires_at")
+            .map_err(store_err("get_session"))?;
+        let revoked_at: Option<OffsetDateTime> = row
+            .try_get("revoked_at")
+            .map_err(store_err("get_session"))?;
         Ok(Some(SessionRecord {
             user_id: col_fixed(&row, "get_session", "user_id")?,
             tls_exporter: col_fixed(&row, "get_session", "tls_exporter")?,
@@ -428,7 +430,11 @@ impl Store for PgStore {
 
         // 4. Store the matching already-signed binding (+ the advisory projection
         // columns / users mirror, exactly as `put_binding` does), all on the txn.
-        let binding = if is_admin { admin_binding } else { user_binding };
+        let binding = if is_admin {
+            admin_binding
+        } else {
+            user_binding
+        };
         let b: DirBinding = decode(&binding.binding_bytes)
             .map_err(|_| StoreError::new("enroll", "binding bytes are not canonical"))?;
         let roles: Vec<String> = b.roles.roles().iter().map(role_text).collect();
@@ -537,7 +543,9 @@ impl Store for PgStore {
             return Err(ControlAppendError::Conflict);
         }
         let effective_from = match d.effective_from_ms {
-            Some(ms) => Some(try_ms_to_ts(ms, "append_control").map_err(ControlAppendError::Store)?),
+            Some(ms) => {
+                Some(try_ms_to_ts(ms, "append_control").map_err(ControlAppendError::Store)?)
+            }
             None => None,
         };
         let res = sqlx::query(
@@ -671,12 +679,14 @@ impl Store for PgStore {
         }
 
         // Idempotent overwrite of a still-staged version (cascades streams + wraps).
-        sqlx::query("DELETE FROM file_versions WHERE file_id = $1 AND version = $2 AND finalized = false")
-            .bind(&parsed.file_id[..])
-            .bind(version)
-            .execute(&mut *tx)
-            .await
-            .map_err(serr)?;
+        sqlx::query(
+            "DELETE FROM file_versions WHERE file_id = $1 AND version = $2 AND finalized = false",
+        )
+        .bind(&parsed.file_id[..])
+        .bind(version)
+        .execute(&mut *tx)
+        .await
+        .map_err(serr)?;
         sqlx::query(
             "INSERT INTO file_versions \
              (file_id, version, manifest_bytes, manifest_sig, author_id, alg, finalized) \
@@ -749,11 +759,13 @@ impl Store for PgStore {
         let mut tx = self.pool.begin().await.map_err(serr)?;
 
         // Lock the file row to serialize concurrent finalizes (the strict +1 race).
-        let frow = sqlx::query("SELECT owner_id, current_version FROM files WHERE file_id = $1 FOR UPDATE")
-            .bind(&file_id[..])
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(serr)?;
+        let frow = sqlx::query(
+            "SELECT owner_id, current_version FROM files WHERE file_id = $1 FOR UPDATE",
+        )
+        .bind(&file_id[..])
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(serr)?;
         let Some(frow) = frow else {
             return Err(FinalizeError::NoSuchVersion);
         };
@@ -784,12 +796,14 @@ impl Store for PgStore {
             });
         }
 
-        sqlx::query("UPDATE file_versions SET finalized = true WHERE file_id = $1 AND version = $2")
-            .bind(&file_id[..])
-            .bind(v)
-            .execute(&mut *tx)
-            .await
-            .map_err(serr)?;
+        sqlx::query(
+            "UPDATE file_versions SET finalized = true WHERE file_id = $1 AND version = $2",
+        )
+        .bind(&file_id[..])
+        .bind(v)
+        .execute(&mut *tx)
+        .await
+        .map_err(serr)?;
         sqlx::query("UPDATE files SET current_version = $2, updated_at = now() WHERE file_id = $1")
             .bind(&file_id[..])
             .bind(v)
@@ -894,13 +908,12 @@ impl Store for PgStore {
         let owner_id: [u8; 16] = col_fixed(&orow, op, "owner_id")?;
         let ancestor_grants = ancestor_chain(&wraps, my, owner_id);
 
-        let grow = sqlx::query(
-            "SELECT genesis_bytes, genesis_sig FROM file_genesis WHERE file_id = $1",
-        )
-        .bind(&file_id[..])
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(store_err(op))?;
+        let grow =
+            sqlx::query("SELECT genesis_bytes, genesis_sig FROM file_genesis WHERE file_id = $1")
+                .bind(&file_id[..])
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(store_err(op))?;
         let Some(grow) = grow else { return Ok(None) };
 
         let srows = sqlx::query(
@@ -969,7 +982,12 @@ impl Store for PgStore {
             .map_err(store_err(op))?;
             let small_streams = srows
                 .iter()
-                .map(|s| (s.get::<i16, _>("stream_type"), s.get::<i64, _>("total_bytes") as u64))
+                .map(|s| {
+                    (
+                        s.get::<i16, _>("stream_type"),
+                        s.get::<i64, _>("total_bytes") as u64,
+                    )
+                })
                 .collect();
             out.push(FileListEntry {
                 file_id,
@@ -1026,16 +1044,15 @@ impl Store for PgStore {
         }))
     }
 
-    async fn get_file_meta(
-        &self,
-        file_id: [u8; 16],
-    ) -> Result<Option<FileMeta>, StoreError> {
+    async fn get_file_meta(&self, file_id: [u8; 16]) -> Result<Option<FileMeta>, StoreError> {
         let op = "get_file_meta";
-        let row = sqlx::query("SELECT owner_id, file_type, listed, bundle_id FROM files WHERE file_id = $1")
-            .bind(&file_id[..])
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(store_err(op))?;
+        let row = sqlx::query(
+            "SELECT owner_id, file_type, listed, bundle_id FROM files WHERE file_id = $1",
+        )
+        .bind(&file_id[..])
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err(op))?;
         let Some(row) = row else { return Ok(None) };
         // `bundle_id` is a nullable 16-byte BYTEA; widen-check like `col_fixed`.
         let raw: Option<Vec<u8>> = row.try_get("bundle_id").map_err(store_err(op))?;
@@ -1313,15 +1330,17 @@ impl Store for PgStore {
         // Owner-check the target under a row lock. No oracle: an absent file and
         // a non-owner both collapse to NotFound (early return → ROLLBACK, so the
         // GUC never persists and nothing is deleted).
-        let frow = sqlx::query("SELECT owner_id, file_type FROM files WHERE file_id = $1 FOR UPDATE")
-            .bind(&file_id[..])
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(serr)?;
+        let frow =
+            sqlx::query("SELECT owner_id, file_type FROM files WHERE file_id = $1 FOR UPDATE")
+                .bind(&file_id[..])
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(serr)?;
         let Some(frow) = frow else {
             return Err(DeleteError::NotFound);
         };
-        let target_owner: [u8; 16] = col_fixed(&frow, op, "owner_id").map_err(DeleteError::Store)?;
+        let target_owner: [u8; 16] =
+            col_fixed(&frow, op, "owner_id").map_err(DeleteError::Store)?;
         if target_owner != owner_id {
             return Err(DeleteError::NotFound); // non-owner is indistinguishable from missing
         }

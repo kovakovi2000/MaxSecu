@@ -8,20 +8,15 @@
 //! tests). Handlers never see the socket — only the exporter the connection
 //! was bound to (api.md §1.5).
 
+use crate::audit::{AuditSink, GrantAction, GrantEdge};
 use crate::auth::AuthService;
+use crate::blob::BlobStore;
 use crate::error::{AuthError, ChallengeError, ControlAppendError, ProveError};
 use crate::files::{
     parse_stage, AddWrapError, DeleteError, DeleteWrapError, DiscardError, FinalizeError,
     GenesisInput, ListFilter, StageError, StageInput, VersionSelector, WrapInput,
 };
-use crate::audit::{AuditSink, GrantAction, GrantEdge};
-use crate::blob::BlobStore;
 use crate::store::{FileView, Store};
-use maxsecu_encoding::labels::DIRBINDING;
-use maxsecu_encoding::structs::{DirBinding, Manifest};
-use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
-use maxsecu_encoding::{decode, encode};
-use maxsecu_crypto::{random_array, VerifyingKey};
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Json, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{request::Parts, StatusCode};
@@ -30,6 +25,11 @@ use axum::routing::{delete, get, post, put};
 use axum::{Extension, Router};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use maxsecu_crypto::{random_array, VerifyingKey};
+use maxsecu_encoding::labels::DIRBINDING;
+use maxsecu_encoding::structs::{DirBinding, Manifest};
+use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
+use maxsecu_encoding::{decode, encode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -97,15 +97,12 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
         .route("/v1/reinstatements", post(post_control::<S>))
         .route("/v1/key-compromise", post(post_control::<S>))
         .route("/v1/files", get(list_files::<S>).post(create_file::<S>))
-        .route("/v1/files/{file_id}", get(get_file::<S>).delete(discard_file::<S>))
         .route(
-            "/v1/files/{file_id}/recipients",
-            get(list_recipients::<S>),
+            "/v1/files/{file_id}",
+            get(get_file::<S>).delete(discard_file::<S>),
         )
-        .route(
-            "/v1/files/{file_id}/wraps",
-            post(add_wrap::<S>),
-        )
+        .route("/v1/files/{file_id}/recipients", get(list_recipients::<S>))
+        .route("/v1/files/{file_id}/wraps", post(add_wrap::<S>))
         .route(
             "/v1/files/{file_id}/wraps/{recipient_id}",
             delete(delete_wrap::<S>),
@@ -319,7 +316,11 @@ async fn register<S: Store>(
             // exact variant `enroll` persisted, so the logged leaf byte-matches the
             // served one. Best-effort: a publish failure does not undo enrollment
             // (the fail-closed authority is the client-side inclusion check, T10).
-            let logged = if is_admin { &admin_binding } else { &user_binding };
+            let logged = if is_admin {
+                &admin_binding
+            } else {
+                &user_binding
+            };
             st.audit
                 .publish_dir_binding(logged.binding_bytes.clone())
                 .await;
@@ -374,7 +375,12 @@ async fn mint_registration_key<S: Store + 'static>(
         .issue_registration_key(key_hash, now_ms() + REG_KEY_TTL_MS)
         .await
     {
-        Ok(()) => (StatusCode::CREATED, Json(MintRegKeyRes { registration_key: key }))
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(MintRegKeyRes {
+                registration_key: key,
+            }),
+        )
             .into_response(),
         Err(e) => internal_error(e),
     }
@@ -526,7 +532,9 @@ async fn recovery_verify<S: Store + 'static>(
         .into_response(),
         // Single 401 shape for every auth-failure cause — no oracle.
         Err(crate::recovery::RecoveryError::Unauthorized)
-        | Err(crate::recovery::RecoveryError::NoAccount) => StatusCode::UNAUTHORIZED.into_response(),
+        | Err(crate::recovery::RecoveryError::NoAccount) => {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
         Err(crate::recovery::RecoveryError::WrapFailed) => StatusCode::UNAUTHORIZED.into_response(),
         Err(crate::recovery::RecoveryError::Internal(e)) => internal_error(e),
     }
@@ -625,7 +633,7 @@ async fn logout<S: Store + 'static>(
 
 #[derive(Serialize)]
 struct BindingRes {
-    binding_b64: String,            // canonical(dirbinding)
+    binding_b64: String,             // canonical(dirbinding)
     directory_signature_b64: String, // Ed25519 by the offline D5 key
 }
 
@@ -802,7 +810,12 @@ async fn post_control<S: Store + 'static>(
             None => return StatusCode::BAD_REQUEST.into_response(),
         },
     };
-    match st.auth.store().append_control(record.clone(), sig, co_sig).await {
+    match st
+        .auth
+        .store()
+        .append_control(record.clone(), sig, co_sig)
+        .await
+    {
         Ok(head) => {
             // §6 (sink-interface): publish the appended record to the external
             // sink (which re-derives the head) so a server cannot silently swallow
@@ -986,9 +999,10 @@ async fn create_file<S: Store + 'static>(
     session: AuthedSession,
     Json(req): Json<CreateFileReq>,
 ) -> Response {
-    let (Some(file_id), Some(file_type)) =
-        (hex_fixed::<16>(&req.file_id), file_type_code(&req.file_type))
-    else {
+    let (Some(file_id), Some(file_type)) = (
+        hex_fixed::<16>(&req.file_id),
+        file_type_code(&req.file_type),
+    ) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let (Some(manifest_bytes), Some(manifest_sig), Some(genesis_bytes), Some(genesis_sig)) = (
@@ -1212,9 +1226,10 @@ async fn put_chunk<S: Store + 'static>(
     Path((file_id_hex, version, stream_type, index)): Path<(String, u64, String, u64)>,
     body: axum::body::Bytes,
 ) -> Response {
-    let (Some(file_id), Some(stype)) =
-        (hex_fixed::<16>(&file_id_hex), stream_type_code(&stream_type))
-    else {
+    let (Some(file_id), Some(stype)) = (
+        hex_fixed::<16>(&file_id_hex),
+        stream_type_code(&stream_type),
+    ) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let meta = match st.auth.store().version_meta(file_id, version).await {
@@ -1237,7 +1252,11 @@ async fn put_chunk<S: Store + 'static>(
     if body.len() as u64 > slot.chunk_size as u64 + AEAD_TAG_LEN {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response(); // oversized chunk
     }
-    match st.blobs.put_chunk(&slot.blob_ref, index, body.to_vec()).await {
+    match st
+        .blobs
+        .put_chunk(&slot.blob_ref, index, body.to_vec())
+        .await
+    {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => internal_error(e),
     }
@@ -1251,9 +1270,10 @@ async fn get_chunk<S: Store + 'static>(
     session: AuthedSession,
     Path((file_id_hex, version, stream_type, index)): Path<(String, u64, String, u64)>,
 ) -> Response {
-    let (Some(file_id), Some(stype)) =
-        (hex_fixed::<16>(&file_id_hex), stream_type_code(&stream_type))
-    else {
+    let (Some(file_id), Some(stype)) = (
+        hex_fixed::<16>(&file_id_hex),
+        stream_type_code(&stream_type),
+    ) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let meta = match st.auth.store().version_meta(file_id, version).await {
@@ -1307,9 +1327,10 @@ async fn chunk_status<S: Store + 'static>(
     session: AuthedSession,
     Path((file_id_hex, version, stream_type, index)): Path<(String, u64, String, u64)>,
 ) -> Response {
-    let (Some(file_id), Some(stype)) =
-        (hex_fixed::<16>(&file_id_hex), stream_type_code(&stream_type))
-    else {
+    let (Some(file_id), Some(stype)) = (
+        hex_fixed::<16>(&file_id_hex),
+        stream_type_code(&stream_type),
+    ) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let meta = match st.auth.store().version_meta(file_id, version).await {
@@ -1377,9 +1398,10 @@ async fn direct_link<S: Store + 'static>(
         )
             .into_response();
     }
-    let (Some(file_id), Some(stype)) =
-        (hex_fixed::<16>(&file_id_hex), stream_type_code(&stream_type))
-    else {
+    let (Some(file_id), Some(stype)) = (
+        hex_fixed::<16>(&file_id_hex),
+        stream_type_code(&stream_type),
+    ) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let meta = match st.auth.store().version_meta(file_id, version).await {
@@ -1626,7 +1648,12 @@ async fn discard_file<S: Store + 'static>(
     let Some(file_id) = hex_fixed::<16>(&file_id_hex) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    match st.auth.store().discard_unfinalized(file_id, session.user_id).await {
+    match st
+        .auth
+        .store()
+        .discard_unfinalized(file_id, session.user_id)
+        .await
+    {
         Ok(blob_refs) => {
             // Best-effort blob cleanup; the discard already committed in the store.
             for r in &blob_refs {
@@ -1750,11 +1777,22 @@ async fn list_files<S: Store + 'static>(
         None => None,
         Some(s) => match file_type_code(s) {
             Some(c) => Some(c),
-            None => return Json(ListRes { files: Vec::new(), next_cursor: None }).into_response(),
+            None => {
+                return Json(ListRes {
+                    files: Vec::new(),
+                    next_cursor: None,
+                })
+                .into_response()
+            }
         },
     };
     let limit = q.limit.unwrap_or(50).min(200);
-    match st.auth.store().list_files(ListFilter { file_type, limit }).await {
+    match st
+        .auth
+        .store()
+        .list_files(ListFilter { file_type, limit })
+        .await
+    {
         Ok(entries) => {
             let files = entries
                 .iter()
@@ -1947,7 +1985,10 @@ mod tests {
         // `recovery_verify`'s `challenge_id` (and every other hex_fixed caller).
         let s = "a\u{20AC}".repeat(8); // 'a'(1) + '€'(3) × 8 = 32 bytes, offsets straddle
         assert_eq!(s.len(), 32, "the length guard would pass");
-        assert!(hex_fixed::<16>(&s).is_none(), "non-ASCII hex input is rejected, not a panic");
+        assert!(
+            hex_fixed::<16>(&s).is_none(),
+            "non-ASCII hex input is rejected, not a panic"
+        );
         // A well-formed ASCII hex string of the right length still decodes.
         assert!(hex_fixed::<16>("00112233445566778899aabbccddeeff").is_some());
     }
@@ -2299,7 +2340,10 @@ mod tests {
         let binding = decode::<DirBinding>(&bytes).unwrap();
         let vk = VerifyingKey::from_bytes(&dir_pub).unwrap();
         assert!(vk.verify_canonical(DIRBINDING, &binding, &sig).is_ok());
-        assert!(binding.roles.roles().contains(&Role::Admin), "first = admin");
+        assert!(
+            binding.roles.roles().contains(&Role::Admin),
+            "first = admin"
+        );
 
         // Second registrant → {User} only.
         let sk2 = SigningKey::generate();
@@ -2309,7 +2353,10 @@ mod tests {
         let bytes = B64.decode(body["binding_b64"].as_str().unwrap()).unwrap();
         let binding = decode::<DirBinding>(&bytes).unwrap();
         assert!(binding.roles.roles().contains(&Role::User));
-        assert!(!binding.roles.roles().contains(&Role::Admin), "second = user only");
+        assert!(
+            !binding.roles.roles().contains(&Role::Admin),
+            "second = user only"
+        );
     }
 
     #[tokio::test]
@@ -2346,12 +2393,7 @@ mod tests {
     async fn bad_key_is_forbidden() {
         let router = app_with_reg_keys(&["real-key"]);
         let sk = SigningKey::generate();
-        let (st, _) = post_json(
-            &router,
-            "/v1/users",
-            register_body(&sk, "bob", "wrong-key"),
-        )
-        .await;
+        let (st, _) = post_json(&router, "/v1/users", register_body(&sk, "bob", "wrong-key")).await;
         assert_eq!(st, StatusCode::FORBIDDEN);
     }
 
@@ -2441,7 +2483,10 @@ mod tests {
         };
         let bytes = encode(&binding);
         let sig = d5.sign_canonical(labels::DIRBINDING, &binding);
-        store.put_binding(user_id, 1, bytes.clone(), sig).await.unwrap();
+        store
+            .put_binding(user_id, 1, bytes.clone(), sig)
+            .await
+            .unwrap();
 
         let router = router(AppState {
             auth: Arc::new(AuthService::new(store, AuthConfig::default())),
@@ -2461,7 +2506,9 @@ mod tests {
         );
         let got_sig = b64_fixed::<64>(body["directory_signature_b64"].as_str().unwrap()).unwrap();
         let vk = VerifyingKey::from_bytes(&d5.verifying_key().to_bytes()).unwrap();
-        assert!(vk.verify_canonical(labels::DIRBINDING, &binding, &got_sig).is_ok());
+        assert!(vk
+            .verify_canonical(labels::DIRBINDING, &binding, &got_sig)
+            .is_ok());
 
         // By id resolves the same binding.
         let (st2, body2) = get_json(
@@ -2693,8 +2740,13 @@ mod tests {
         assert_eq!(st, StatusCode::UNAUTHORIZED);
 
         // Admin → 201 with a plaintext key handed back once.
-        let (st, res) =
-            post_json_auth(&app, "/v1/registration-keys", serde_json::json!({}), &admin_token).await;
+        let (st, res) = post_json_auth(
+            &app,
+            "/v1/registration-keys",
+            serde_json::json!({}),
+            &admin_token,
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
         let key = res["registration_key"].as_str().unwrap().to_owned();
         assert!(!key.is_empty());
@@ -2823,7 +2875,10 @@ mod tests {
         let (st, body) = post_json_auth(&router, &dl_uri, serde_json::json!({}), &token).await;
         assert_eq!(st, StatusCode::OK);
         let url = body["url"].as_str().unwrap();
-        assert!(!url.contains(master), "master token leaked into direct link");
+        assert!(
+            !url.contains(master),
+            "master token leaked into direct link"
+        );
         assert_eq!(body["expires_in_s"].as_u64().unwrap(), 900);
 
         // A non-recipient gets the uniform 404 (no access oracle).
@@ -2944,8 +2999,11 @@ mod tests {
         let dir_pub = signer.verifying_key().to_bytes();
         let state = AppState {
             auth: Arc::new(
-                AuthService::new(FaultyStore, AuthConfig::default().with_directory_pub(dir_pub))
-                    .with_dir_signer(signer),
+                AuthService::new(
+                    FaultyStore,
+                    AuthConfig::default().with_directory_pub(dir_pub),
+                )
+                .with_dir_signer(signer),
             ),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
@@ -2961,7 +3019,11 @@ mod tests {
             serde_json::json!({"username":"alice"}),
         )
         .await;
-        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "challenge over a faulty store");
+        assert_eq!(
+            st,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "challenge over a faulty store"
+        );
 
         // register: a reg-key-table fault → 500, not a misleading 403 "bad key".
         let sk = SigningKey::generate();
@@ -2977,7 +3039,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "register over a faulty store");
+        assert_eq!(
+            st,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "register over a faulty store"
+        );
     }
 
     async fn get_json_auth(
@@ -2998,7 +3064,9 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let json = if bytes.is_empty() {
             serde_json::Value::Null
         } else {
@@ -3064,12 +3132,7 @@ mod tests {
         ])
     }
 
-    async fn put_chunk_auth(
-        router: &Router,
-        uri: &str,
-        body: Vec<u8>,
-        token: &str,
-    ) -> StatusCode {
+    async fn put_chunk_auth(router: &Router, uri: &str, body: Vec<u8>, token: &str) -> StatusCode {
         router
             .clone()
             .oneshot(
@@ -3100,7 +3163,9 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 21).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 21)
+            .await
+            .unwrap();
         (status, bytes.to_vec())
     }
 
@@ -3114,15 +3179,33 @@ mod tests {
     /// Upload the chunks the fixture manifest declares (content: 2, metadata: 1).
     async fn upload_declared_chunks(router: &Router, file: [u8; 16], version: u64, token: &str) {
         assert_eq!(
-            put_chunk_auth(router, &chunk_uri(file, version, "content", 0), vec![0x10; 32], token).await,
+            put_chunk_auth(
+                router,
+                &chunk_uri(file, version, "content", 0),
+                vec![0x10; 32],
+                token
+            )
+            .await,
             StatusCode::OK
         );
         assert_eq!(
-            put_chunk_auth(router, &chunk_uri(file, version, "content", 1), vec![0x11; 32], token).await,
+            put_chunk_auth(
+                router,
+                &chunk_uri(file, version, "content", 1),
+                vec![0x11; 32],
+                token
+            )
+            .await,
             StatusCode::OK
         );
         assert_eq!(
-            put_chunk_auth(router, &chunk_uri(file, version, "metadata", 0), vec![0x20; 16], token).await,
+            put_chunk_auth(
+                router,
+                &chunk_uri(file, version, "metadata", 0),
+                vec![0x20; 16],
+                token
+            )
+            .await,
             StatusCode::OK
         );
     }
@@ -3235,7 +3318,12 @@ mod tests {
     }
 
     /// Stage v1, upload the declared chunks, and finalize a file over HTTP.
-    async fn stage_upload_finalize(router: &Router, body: serde_json::Value, file: [u8; 16], token: &str) {
+    async fn stage_upload_finalize(
+        router: &Router,
+        body: serde_json::Value,
+        file: [u8; 16],
+        token: &str,
+    ) {
         let (st, _) = post_json_auth(router, "/v1/files", body, token).await;
         assert_eq!(st, StatusCode::CREATED);
         upload_declared_chunks(router, file, 1, token).await;
@@ -3260,9 +3348,27 @@ mod tests {
         let m1 = [0xB2u8; 16];
         let m2 = [0xB3u8; 16];
         // Owner finalizes a bundle + two members it owns.
-        stage_upload_finalize(&router, typed_file_body(bundle, owner, FileType::Bundle, true, None), bundle, &token).await;
-        stage_upload_finalize(&router, typed_file_body(m1, owner, FileType::Blog, false, Some(bundle)), m1, &token).await;
-        stage_upload_finalize(&router, typed_file_body(m2, owner, FileType::Blog, false, Some(bundle)), m2, &token).await;
+        stage_upload_finalize(
+            &router,
+            typed_file_body(bundle, owner, FileType::Bundle, true, None),
+            bundle,
+            &token,
+        )
+        .await;
+        stage_upload_finalize(
+            &router,
+            typed_file_body(m1, owner, FileType::Blog, false, Some(bundle)),
+            m1,
+            &token,
+        )
+        .await;
+        stage_upload_finalize(
+            &router,
+            typed_file_body(m2, owner, FileType::Blog, false, Some(bundle)),
+            m2,
+            &token,
+        )
+        .await;
 
         // (a) A non-owner delete of the finalized bundle → 404 (no oracle) and
         // nothing is removed.
@@ -3273,14 +3379,22 @@ mod tests {
 
         // (b) Owner delete of the finalized bundle → 204; the bundle AND its
         // members are gone; the feed listing is empty.
-        let st = delete_auth(&router, &format!("/v1/files/{}", hex_encode(&bundle)), &token).await;
+        let st = delete_auth(
+            &router,
+            &format!("/v1/files/{}", hex_encode(&bundle)),
+            &token,
+        )
+        .await;
         assert_eq!(st, StatusCode::NO_CONTENT);
         assert!(auth.store().get_file_meta(bundle).await.unwrap().is_none());
         assert!(auth.store().get_file_meta(m1).await.unwrap().is_none());
         assert!(auth.store().get_file_meta(m2).await.unwrap().is_none());
         let listed = auth
             .store()
-            .list_files(ListFilter { file_type: None, limit: 50 })
+            .list_files(ListFilter {
+                file_type: None,
+                limit: 50,
+            })
             .await
             .unwrap();
         assert!(listed.is_empty());
@@ -3301,7 +3415,8 @@ mod tests {
         assert!(res["upload_token"].as_str().is_some());
 
         // Not visible until finalize.
-        let (st, _) = get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &token).await;
+        let (st, _) =
+            get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &token).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
 
         // Upload the declared chunks, then finalize → 200.
@@ -3351,11 +3466,18 @@ mod tests {
         assert_eq!(st, StatusCode::FORBIDDEN);
         assert_eq!(body["code"], "direct_disabled");
 
-        let (st, body) =
-            get_json_auth(&router, &format!("/v1/files/{}?version=latest", hex_encode(&file)), &token).await;
+        let (st, body) = get_json_auth(
+            &router,
+            &format!("/v1/files/{}?version=latest", hex_encode(&file)),
+            &token,
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(body["version"].as_u64().unwrap(), 1);
-        assert_eq!(body["manifest_b64"].as_str().unwrap(), file_manifest_b64(file, 1, owner));
+        assert_eq!(
+            body["manifest_b64"].as_str().unwrap(),
+            file_manifest_b64(file, 1, owner)
+        );
         assert!(body["my_wrap"]["wrapped_dek_b64"].as_str().is_some());
         assert!(body["recovery_grant"]["grant_b64"].as_str().is_some());
         assert_eq!(body["streams"].as_array().unwrap().len(), 2);
@@ -3363,7 +3485,8 @@ mod tests {
         // A different authenticated user holds no wrap → 404 (no access oracle),
         // for both the record and its chunks.
         let bob = login(&router, "bob", &bob_sk).await;
-        let (st, _) = get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &bob).await;
+        let (st, _) =
+            get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &bob).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
         let (st, _) = get_chunk_auth(&router, &chunk_uri(file, 1, "content", 0), &bob).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
@@ -3413,7 +3536,8 @@ mod tests {
 
     /// Create + chunk + finalize a v1 blog owned by `owner` (admin's token).
     async fn create_finalize_v1(router: &Router, file: [u8; 16], owner: [u8; 16], token: &str) {
-        let (st, _) = post_json_auth(router, "/v1/files", create_file_body(file, owner), token).await;
+        let (st, _) =
+            post_json_auth(router, "/v1/files", create_file_body(file, owner), token).await;
         assert_eq!(st, StatusCode::CREATED);
         upload_declared_chunks(router, file, 1, token).await;
         let (st, _) = post_json_auth(
@@ -3439,29 +3563,49 @@ mod tests {
         let wraps_uri = format!("/v1/files/{}/wraps", hex_encode(&file));
 
         // Bob holds no wrap → cannot re-share; indistinguishable from missing (404).
-        let (st, _) = post_json_auth(&router, &wraps_uri, reshare_body([0x44; 16], bob_id), &bob).await;
+        let (st, _) =
+            post_json_auth(&router, &wraps_uri, reshare_body([0x44; 16], bob_id), &bob).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
 
         // An inconsistent `granted_by` (not the caller) → 400.
-        let (st, _) =
-            post_json_auth(&router, &wraps_uri, reshare_body([0x55; 16], [0x99; 16]), &token).await;
+        let (st, _) = post_json_auth(
+            &router,
+            &wraps_uri,
+            reshare_body([0x55; 16], [0x99; 16]),
+            &token,
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
 
         // Owner re-shares read to bob → 201; bob can now GET (ancestor chain empty,
         // the grant is author-rooted).
-        let (st, _) = post_json_auth(&router, &wraps_uri, reshare_body(bob_id, owner), &token).await;
+        let (st, _) =
+            post_json_auth(&router, &wraps_uri, reshare_body(bob_id, owner), &token).await;
         assert_eq!(st, StatusCode::CREATED);
         let (st, body) =
             get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &bob).await;
         assert_eq!(st, StatusCode::OK);
         assert!(body["my_wrap"]["wrapped_dek_b64"].as_str().is_some());
-        assert_eq!(body["my_wrap"]["ancestor_grants"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            body["my_wrap"]["ancestor_grants"].as_array().unwrap().len(),
+            0
+        );
 
         // Soft-revoke: bob (neither owner nor the granter) cannot revoke his own
         // wrap → 403; the owner can → 204, and bob is then 404.
-        let revoke_uri = format!("/v1/files/{}/wraps/{}", hex_encode(&file), hex_encode(&bob_id));
-        assert_eq!(delete_auth(&router, &revoke_uri, &bob).await, StatusCode::FORBIDDEN);
-        assert_eq!(delete_auth(&router, &revoke_uri, &token).await, StatusCode::NO_CONTENT);
+        let revoke_uri = format!(
+            "/v1/files/{}/wraps/{}",
+            hex_encode(&file),
+            hex_encode(&bob_id)
+        );
+        assert_eq!(
+            delete_auth(&router, &revoke_uri, &bob).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            delete_auth(&router, &revoke_uri, &token).await,
+            StatusCode::NO_CONTENT
+        );
         let (st, _) =
             get_json_auth(&router, &format!("/v1/files/{}", hex_encode(&file)), &bob).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
@@ -3478,7 +3622,8 @@ mod tests {
 
         // Re-share to bob, then the owner enumerates recipients (owner + bob).
         let wraps_uri = format!("/v1/files/{}/wraps", hex_encode(&file));
-        let (st, _) = post_json_auth(&router, &wraps_uri, reshare_body(bob_id, owner), &token).await;
+        let (st, _) =
+            post_json_auth(&router, &wraps_uri, reshare_body(bob_id, owner), &token).await;
         assert_eq!(st, StatusCode::CREATED);
 
         let recips_uri = format!("/v1/files/{}/recipients", hex_encode(&file));
@@ -3517,19 +3662,33 @@ mod tests {
 
         // Re-share to bob → a Reshare edge.
         let wraps_uri = format!("/v1/files/{}/wraps", hex_encode(&file));
-        let (st, _) = post_json_auth(&router, &wraps_uri, reshare_body(bob_id, owner), &token).await;
+        let (st, _) =
+            post_json_auth(&router, &wraps_uri, reshare_body(bob_id, owner), &token).await;
         assert_eq!(st, StatusCode::CREATED);
-        assert!(audit.edges().iter().any(|e| e.action == GrantAction::Reshare
-            && e.file_id == file
-            && e.granted_by == owner
-            && e.recipient_id == bob_id));
+        assert!(audit
+            .edges()
+            .iter()
+            .any(|e| e.action == GrantAction::Reshare
+                && e.file_id == file
+                && e.granted_by == owner
+                && e.recipient_id == bob_id));
 
         // Soft-revoke bob → a SoftRevoke edge (granted_by = the acting caller).
-        let revoke_uri = format!("/v1/files/{}/wraps/{}", hex_encode(&file), hex_encode(&bob_id));
-        assert_eq!(delete_auth(&router, &revoke_uri, &token).await, StatusCode::NO_CONTENT);
-        assert!(audit.edges().iter().any(|e| e.action == GrantAction::SoftRevoke
-            && e.granted_by == owner
-            && e.recipient_id == bob_id));
+        let revoke_uri = format!(
+            "/v1/files/{}/wraps/{}",
+            hex_encode(&file),
+            hex_encode(&bob_id)
+        );
+        assert_eq!(
+            delete_auth(&router, &revoke_uri, &token).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(audit
+            .edges()
+            .iter()
+            .any(|e| e.action == GrantAction::SoftRevoke
+                && e.granted_by == owner
+                && e.recipient_id == bob_id));
     }
 
     #[tokio::test]
@@ -3554,9 +3713,15 @@ mod tests {
 
         // Creating a file (v1) anchors its genesis in the sink (R27/§11.7).
         let file = [0xFAu8; 16];
-        assert!(audit.genesis_pos(&file).is_none(), "no genesis before create");
+        assert!(
+            audit.genesis_pos(&file).is_none(),
+            "no genesis before create"
+        );
         create_finalize_v1(&router, file, owner, &token).await;
-        assert!(audit.genesis_pos(&file).is_some(), "genesis anchored at create");
+        assert!(
+            audit.genesis_pos(&file).is_some(),
+            "genesis anchored at create"
+        );
     }
 
     #[tokio::test]
@@ -3579,7 +3744,8 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_REQUEST);
 
         // Stage a real v1; finalizing before the chunks arrive → 400 (incomplete).
-        let (st, _) = post_json_auth(&router, "/v1/files", create_file_body(file, owner), &token).await;
+        let (st, _) =
+            post_json_auth(&router, "/v1/files", create_file_body(file, owner), &token).await;
         assert_eq!(st, StatusCode::CREATED);
         let (st, _) = post_json_auth(
             &router,
@@ -3588,7 +3754,11 @@ mod tests {
             &token,
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "finalize with missing chunks is incomplete");
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "finalize with missing chunks is incomplete"
+        );
         // Now upload the chunks and finalize → 200.
         upload_declared_chunks(&router, file, 1, &token).await;
         let (st, _) = post_json_auth(
@@ -3601,7 +3771,13 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         // A chunk PUT after finalize → 409 (immutable).
         assert_eq!(
-            put_chunk_auth(&router, &chunk_uri(file, 1, "content", 0), vec![0x10; 32], &token).await,
+            put_chunk_auth(
+                &router,
+                &chunk_uri(file, 1, "content", 0),
+                vec![0x10; 32],
+                &token
+            )
+            .await,
             StatusCode::CONFLICT
         );
         // Stage v3 (skips v2), upload its chunks, then finalize → strict-+1 409.
@@ -3613,7 +3789,13 @@ mod tests {
                          {"stream_type":"metadata","chunk_count":1,"chunk_size":1048576,"total_bytes":256} ],
             "wraps": file_wraps_json(owner),
         });
-        let (st, _) = post_json_auth(&router, &format!("/v1/files/{}/versions", hex_encode(&file)), v3, &token).await;
+        let (st, _) = post_json_auth(
+            &router,
+            &format!("/v1/files/{}/versions", hex_encode(&file)),
+            v3,
+            &token,
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
         upload_declared_chunks(&router, file, 3, &token).await;
         let (st, _) = post_json_auth(
@@ -3627,16 +3809,29 @@ mod tests {
 
         // Index past the declared chunk_count → 413 (bound-check before storage).
         let file2 = [0xF3u8; 16];
-        let (st, _) = post_json_auth(&router, "/v1/files", create_file_body(file2, owner), &token).await;
+        let (st, _) =
+            post_json_auth(&router, "/v1/files", create_file_body(file2, owner), &token).await;
         assert_eq!(st, StatusCode::CREATED);
         assert_eq!(
-            put_chunk_auth(&router, &chunk_uri(file2, 1, "content", 9), vec![0x10; 32], &token).await,
+            put_chunk_auth(
+                &router,
+                &chunk_uri(file2, 1, "content", 9),
+                vec![0x10; 32],
+                &token
+            )
+            .await,
             StatusCode::PAYLOAD_TOO_LARGE
         );
         // A non-owner cannot upload chunks (owner-only write, D29) → 403.
         let other = login(&router, "bob", &bob_sk).await;
         assert_eq!(
-            put_chunk_auth(&router, &chunk_uri(file2, 1, "content", 0), vec![0x10; 32], &other).await,
+            put_chunk_auth(
+                &router,
+                &chunk_uri(file2, 1, "content", 0),
+                vec![0x10; 32],
+                &other
+            )
+            .await,
             StatusCode::FORBIDDEN
         );
 

@@ -153,7 +153,9 @@ pub fn unlock(password: &str, blob: &[u8]) -> Result<Identity, ClientError> {
     } else {
         None
     };
-    Ok(Identity::from_secret_bytes(enc_sk, enc_pk, sig_seed, mlkem_seed))
+    Ok(Identity::from_secret_bytes(
+        enc_sk, enc_pk, sig_seed, mlkem_seed,
+    ))
 }
 
 /// Password change (DESIGN §9.5): unlock with the old password, re-seal under

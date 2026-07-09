@@ -28,9 +28,9 @@ pub use ffmpeg_args::{
 };
 
 pub mod probe;
-pub use probe::{parse_probe, AudioCodec, ProbeResult, VideoCodec};
 #[cfg(windows)]
 pub use probe::probe_source;
+pub use probe::{parse_probe, AudioCodec, ProbeResult, VideoCodec};
 
 pub mod transcode_opts;
 pub use transcode_opts::{Bitrate, Resolution, TranscodeOptions};

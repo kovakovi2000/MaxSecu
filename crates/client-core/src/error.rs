@@ -117,17 +117,27 @@ pub enum DownloadError {
     /// A record's `file_id` did not match the requested file (substitution).
     FileIdMismatch,
     /// Served `version` is older than the highest trust-on-last-use record (§7.5).
-    VersionRollback { seen_max: u64, served: u64 },
+    VersionRollback {
+        seen_max: u64,
+        served: u64,
+    },
     /// Served `version` exceeds the highest seen by more than 1 — rollback-memory
     /// poisoning guard (§7.5 / D23).
-    VersionTooHigh { seen_max: u64, served: u64 },
+    VersionTooHigh {
+        seen_max: u64,
+        served: u64,
+    },
     /// First contact (no prior record) and `version` exceeds the absolute sanity
     /// ceiling (parameters §4 / D23).
-    FirstContactCeiling { served: u64 },
+    FirstContactCeiling {
+        served: u64,
+    },
     /// The served `version` equals the highest remembered, but its content digest
     /// differs — a fork/equivocation at a reused version number (§7.5). The
     /// monotonic-by-1 rule means two distinct contents cannot share a version.
-    VersionForked { version: u64 },
+    VersionForked {
+        version: u64,
+    },
     /// A grant field did not match the manifest/context (file/version/recipient/
     /// dek_commit/granted_by) — the wrap is treated as absent (§12.3a).
     GrantMismatch(&'static str),

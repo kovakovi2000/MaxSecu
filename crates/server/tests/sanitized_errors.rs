@@ -38,6 +38,7 @@ use maxsecu_admin_core::DirectorySigner;
 use maxsecu_crypto::SigningKey;
 use maxsecu_encoding::encode;
 use maxsecu_encoding::labels;
+use maxsecu_encoding::structs::MLKEM768_PUB_LEN;
 use maxsecu_encoding::structs::{
     AuthProofContext, DirBinding, Genesis, Manifest, Revocation, Stream,
 };
@@ -45,12 +46,10 @@ use maxsecu_encoding::types::{
     Bytes32, Compression, FileScope, FileType, Id, Role, RoleSet, StreamType, Suite, Text,
     Timestamp,
 };
-use maxsecu_encoding::structs::MLKEM768_PUB_LEN;
 use maxsecu_server::{
     router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteError,
     DeleteWrapError, DiscardError, EnrollOutcome, FileListEntry, FileMeta, FileView, FinalizeError,
-    ListFilter,
-    MemoryBlobStore, MemoryStore, NullAuditSink, ParsedStage, RecipientView,
+    ListFilter, MemoryBlobStore, MemoryStore, NullAuditSink, ParsedStage, RecipientView,
     RecoveryAccount, SessionRecord, StageError, Store, StoreError, StoredBinding,
     StoredControlRecord, TlsExporter, UserRecord, VersionMeta, VersionSelector, WrapInput,
 };
@@ -221,11 +220,7 @@ impl Store for FaultyStore {
     async fn list_files(&self, _f: ListFilter) -> Result<Vec<FileListEntry>, StoreError> {
         Err(bait("list_files"))
     }
-    async fn version_meta(
-        &self,
-        _f: [u8; 16],
-        _v: u64,
-    ) -> Result<Option<VersionMeta>, StoreError> {
+    async fn version_meta(&self, _f: [u8; 16], _v: u64) -> Result<Option<VersionMeta>, StoreError> {
         Err(bait("version_meta"))
     }
     async fn get_file_meta(&self, _f: [u8; 16]) -> Result<Option<FileMeta>, StoreError> {
@@ -406,11 +401,7 @@ impl Store for FileFaultyStore {
     async fn list_files(&self, _f: ListFilter) -> Result<Vec<FileListEntry>, StoreError> {
         Err(bait("list_files"))
     }
-    async fn version_meta(
-        &self,
-        _f: [u8; 16],
-        _v: u64,
-    ) -> Result<Option<VersionMeta>, StoreError> {
+    async fn version_meta(&self, _f: [u8; 16], _v: u64) -> Result<Option<VersionMeta>, StoreError> {
         Err(bait("version_meta"))
     }
     async fn get_file_meta(&self, _f: [u8; 16]) -> Result<Option<FileMeta>, StoreError> {
@@ -554,7 +545,12 @@ async fn app() -> (Router, SigningKey, SigningKey) {
     (router, admin, bob)
 }
 
-fn req_json(method: &str, uri: &str, body: &serde_json::Value, token: Option<&str>) -> Request<Body> {
+fn req_json(
+    method: &str,
+    uri: &str,
+    body: &serde_json::Value,
+    token: Option<&str>,
+) -> Request<Body> {
     let mut b = Request::builder()
         .method(method)
         .uri(uri)
@@ -607,7 +603,12 @@ fn make_proof(sk: &SigningKey, server_id: &str, nonce: &[u8; 32], ts: u64) -> St
 async fn login(router: &Router, username: &str, sk: &SigningKey) -> String {
     let (_s, _h, body) = send(
         router,
-        req_json("POST", "/v1/session/challenge", &json!({ "username": username }), None),
+        req_json(
+            "POST",
+            "/v1/session/challenge",
+            &json!({ "username": username }),
+            None,
+        ),
     )
     .await;
     let ch: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -707,7 +708,12 @@ fn chunk_uri(file: [u8; 16], version: u64, stream: &str, index: u64) -> String {
 async fn create_finalize_v1(router: &Router, file: [u8; 16], token: &str) {
     let (st, _, _) = send(
         router,
-        req_json("POST", "/v1/files", &create_file_body(file, ADMIN_ID), Some(token)),
+        req_json(
+            "POST",
+            "/v1/files",
+            &create_file_body(file, ADMIN_ID),
+            Some(token),
+        ),
     )
     .await;
     assert_eq!(st, StatusCode::CREATED);
@@ -779,7 +785,12 @@ async fn error_responses_never_leak_internals() {
     // challenge → insert_nonce faults
     let (st, _, body) = send(
         &faulty,
-        req_json("POST", "/v1/session/challenge", &json!({ "username": "alice" }), None),
+        req_json(
+            "POST",
+            "/v1/session/challenge",
+            &json!({ "username": "alice" }),
+            None,
+        ),
     )
     .await;
     assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
@@ -807,7 +818,10 @@ async fn error_responses_never_leak_internals() {
     // session-extractor (get_session faults) — still bare.
     let (st, _, body) = send(
         &faulty,
-        req_get(&format!("/v1/files/{}", hex(&[0xF1; 16])), Some(&hex(&[0x01; 32]))),
+        req_get(
+            &format!("/v1/files/{}", hex(&[0xF1; 16])),
+            Some(&hex(&[0x01; 32])),
+        ),
     )
     .await;
     assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
@@ -865,7 +879,11 @@ async fn error_responses_never_leak_internals() {
     // bad hex file_id on a file create
     let mut bad = create_file_body([0xF5; 16], ADMIN_ID);
     bad["file_id"] = json!("zz");
-    let (st, _, body) = send(&router, req_json("POST", "/v1/files", &bad, Some(&admin_tok))).await;
+    let (st, _, body) = send(
+        &router,
+        req_json("POST", "/v1/files", &bad, Some(&admin_tok)),
+    )
+    .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert_generic("400 bad hex file_id", &body);
 
@@ -884,7 +902,12 @@ async fn error_responses_never_leak_internals() {
     // ----- 403 non-admin control append -----
     let (st, _, body) = send(
         &router,
-        req_json("POST", "/v1/revocations", &revocation_b64([0u8; 32], 1, 0x99), Some(&bob_tok)),
+        req_json(
+            "POST",
+            "/v1/revocations",
+            &revocation_b64([0u8; 32], 1, 0x99),
+            Some(&bob_tok),
+        ),
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
@@ -894,7 +917,12 @@ async fn error_responses_never_leak_internals() {
     let file = [0xF2; 16];
     let (st, _, _) = send(
         &router,
-        req_json("POST", "/v1/files", &create_file_body(file, ADMIN_ID), Some(&admin_tok)),
+        req_json(
+            "POST",
+            "/v1/files",
+            &create_file_body(file, ADMIN_ID),
+            Some(&admin_tok),
+        ),
     )
     .await;
     assert_eq!(st, StatusCode::CREATED);
@@ -909,13 +937,23 @@ async fn error_responses_never_leak_internals() {
     // ----- 409 conflict (stale control append) -----
     let (st, _, _) = send(
         &router,
-        req_json("POST", "/v1/revocations", &revocation_b64([0u8; 32], 1, 0x11), Some(&admin_tok)),
+        req_json(
+            "POST",
+            "/v1/revocations",
+            &revocation_b64([0u8; 32], 1, 0x11),
+            Some(&admin_tok),
+        ),
     )
     .await;
     assert_eq!(st, StatusCode::CREATED);
     let (st, _, body) = send(
         &router,
-        req_json("POST", "/v1/revocations", &revocation_b64([0u8; 32], 2, 0x12), Some(&admin_tok)),
+        req_json(
+            "POST",
+            "/v1/revocations",
+            &revocation_b64([0u8; 32], 2, 0x12),
+            Some(&admin_tok),
+        ),
     )
     .await; // prev_head=GENESIS again, but the head has moved → Conflict
     assert_eq!(st, StatusCode::CONFLICT);
@@ -924,7 +962,11 @@ async fn error_responses_never_leak_internals() {
     // ----- 413 payload too large (chunk index past the framing) -----
     let (st, _, body) = send(
         &router,
-        req_put_bytes(&chunk_uri(file, 1, "content", 99), vec![0x10; 32], &admin_tok),
+        req_put_bytes(
+            &chunk_uri(file, 1, "content", 99),
+            vec![0x10; 32],
+            &admin_tok,
+        ),
     )
     .await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
@@ -935,14 +977,24 @@ async fn error_responses_never_leak_internals() {
     for i in 0..30 {
         let (st, _, _) = send(
             &rl,
-            req_json("POST", "/v1/session/challenge", &json!({ "username": "admin" }), None),
+            req_json(
+                "POST",
+                "/v1/session/challenge",
+                &json!({ "username": "admin" }),
+                None,
+            ),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "challenge #{i}");
     }
     let (st, headers, body) = send(
         &rl,
-        req_json("POST", "/v1/session/challenge", &json!({ "username": "admin" }), None),
+        req_json(
+            "POST",
+            "/v1/session/challenge",
+            &json!({ "username": "admin" }),
+            None,
+        ),
     )
     .await;
     assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
@@ -994,7 +1046,11 @@ async fn no_existence_oracle() {
     let (us, _, ub) = send(&router, req_get("/v1/directory/ghost", None)).await;
     let (ks, _, kb) = send(&router, req_get("/v1/directory/bob", None)).await;
     assert_eq!(us, StatusCode::NOT_FOUND);
-    assert_eq!((us, &ub), (ks, &kb), "directory: unknown vs unsigned must match");
+    assert_eq!(
+        (us, &ub),
+        (ks, &kb),
+        "directory: unknown vs unsigned must match"
+    );
     assert_generic("directory no-oracle", &ub);
 
     // --- file get-wrap route: unknown file vs known-but-unauthorized ---
@@ -1009,22 +1065,36 @@ async fn no_existence_oracle() {
     )
     .await;
     assert_eq!(us, StatusCode::NOT_FOUND);
-    assert_eq!((us, &ub), (ks, &kb), "get_file: unknown vs unauthorized must match");
+    assert_eq!(
+        (us, &ub),
+        (ks, &kb),
+        "get_file: unknown vs unauthorized must match"
+    );
     assert_generic("get_file no-oracle", &ub);
 
     // --- recipients route (owner-only): unknown vs known-non-owner ---
     let (us, _, ub) = send(
         &router,
-        req_get(&format!("/v1/files/{}/recipients", hex(&unknown)), Some(&bob_tok)),
+        req_get(
+            &format!("/v1/files/{}/recipients", hex(&unknown)),
+            Some(&bob_tok),
+        ),
     )
     .await;
     let (ks, _, kb) = send(
         &router,
-        req_get(&format!("/v1/files/{}/recipients", hex(&known)), Some(&bob_tok)),
+        req_get(
+            &format!("/v1/files/{}/recipients", hex(&known)),
+            Some(&bob_tok),
+        ),
     )
     .await;
     assert_eq!(us, StatusCode::NOT_FOUND);
-    assert_eq!((us, &ub), (ks, &kb), "recipients: unknown vs non-owner must match");
+    assert_eq!(
+        (us, &ub),
+        (ks, &kb),
+        "recipients: unknown vs non-owner must match"
+    );
     assert_generic("recipients no-oracle", &ub);
 
     // --- chunk download: unknown file vs known-but-unauthorized ---
@@ -1039,7 +1109,11 @@ async fn no_existence_oracle() {
     )
     .await;
     assert_eq!(us, StatusCode::NOT_FOUND);
-    assert_eq!((us, &ub), (ks, &kb), "chunk get: unknown vs unauthorized must match");
+    assert_eq!(
+        (us, &ub),
+        (ks, &kb),
+        "chunk get: unknown vs unauthorized must match"
+    );
     assert_generic("chunk get no-oracle", &ub);
 }
 
@@ -1054,16 +1128,22 @@ async fn mint_requires_admin_no_oracle() {
     let (router, _admin, bob) = app().await;
 
     // No Authorization header → uniform 401, empty body (no "missing token" hint).
-    let (st, _, body) =
-        send(&router, req_json("POST", "/v1/registration-keys", &json!({}), None)).await;
+    let (st, _, body) = send(
+        &router,
+        req_json("POST", "/v1/registration-keys", &json!({}), None),
+    )
+    .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
     assert_generic("401 mint no-token", &body);
 
     // bob is an authentic session but has no published binding ⇒ not an admin →
     // 403, empty body (no "not an admin" hint).
     let bob_tok = login(&router, "bob", &bob).await;
-    let (st, _, body) =
-        send(&router, req_json("POST", "/v1/registration-keys", &json!({}), Some(&bob_tok))).await;
+    let (st, _, body) = send(
+        &router,
+        req_json("POST", "/v1/registration-keys", &json!({}), Some(&bob_tok)),
+    )
+    .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
     assert_generic("403 mint non-admin", &body);
 }

@@ -160,7 +160,13 @@ async fn get_raw(conn: &mut Conn, uri: &str, auth: Option<&str>) -> (StatusCode,
     let req = req.body(Full::new(Bytes::new())).unwrap();
     let resp = conn.sender.send_request(req).await.unwrap();
     let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     (status, bytes)
 }
 
@@ -202,7 +208,12 @@ async fn login(conn: &mut Conn, username: &str, id: &Identity) -> String {
 }
 
 /// POST a signed control record to the app server.
-async fn post_control(conn: &mut Conn, token: &str, uri: &str, rec: &SignedControlRecord) -> StatusCode {
+async fn post_control(
+    conn: &mut Conn,
+    token: &str,
+    uri: &str,
+    rec: &SignedControlRecord,
+) -> StatusCode {
     let body = serde_json::json!({
         "record_b64": B64.encode(&rec.bytes),
         "sig_b64": B64.encode(rec.sig),
@@ -224,7 +235,11 @@ async fn fetch_control(conn: &mut Conn, token: &str) -> Vec<ControlRecordIn> {
         .iter()
         .map(|r| ControlRecordIn {
             bytes: B64.decode(r["record_b64"].as_str().unwrap()).unwrap(),
-            sig: B64.decode(r["sig_b64"].as_str().unwrap()).unwrap().try_into().unwrap(),
+            sig: B64
+                .decode(r["sig_b64"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
             co_sig: r["co_sig_b64"]
                 .as_str()
                 .map(|s| B64.decode(s).unwrap().try_into().unwrap()),
@@ -328,9 +343,16 @@ async fn boot() -> Booted {
         .await
         .unwrap();
 
-    let publisher = HttpSinkPublisher::new(sink_addr, "localhost", sink_pki.client_config.clone(), TOKEN);
-    let blob_dir =
-        std::env::temp_dir().join(format!("mxs612_{}", hex(&maxsecu_crypto::random_array::<8>())));
+    let publisher = HttpSinkPublisher::new(
+        sink_addr,
+        "localhost",
+        sink_pki.client_config.clone(),
+        TOKEN,
+    );
+    let blob_dir = std::env::temp_dir().join(format!(
+        "mxs612_{}",
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
     let state = AppState {
         auth: Arc::new(AuthService::new(
             store,
@@ -476,8 +498,12 @@ async fn phase6_integrity_ops_exit_gates_over_real_tls() {
 
     // ---- GATE 7 (§16.2): an app-server error path stays sanitized over the wire —
     // a 404 (no-oracle, unknown file) carries a bare status with an EMPTY body. ----
-    let (st, body) =
-        get_raw(&mut c_admin, &format!("/v1/files/{}", hex(&[0xDE; 16])), Some(&admin_tok)).await;
+    let (st, body) = get_raw(
+        &mut c_admin,
+        &format!("/v1/files/{}", hex(&[0xDE; 16])),
+        Some(&admin_tok),
+    )
+    .await;
     assert_eq!(st, StatusCode::NOT_FOUND, "unknown file 404s");
     assert!(
         body.is_empty(),
@@ -498,7 +524,11 @@ fn r26_sweep_flags_bad_recovery_wrap() {
     // Build the wire recovery wrap `enc(32) ‖ ct` exactly as the upload path does:
     // `wrap_dek` to the recovery key under the RECOVERY_ID-bound context (§5).
     let wire = |dek: &Dek, file: Id, version: u64| -> Vec<u8> {
-        let ctx = WrapContext { file_id: file, version, recipient_id: RECOVERY_ID };
+        let ctx = WrapContext {
+            file_id: file,
+            version,
+            recipient_id: RECOVERY_ID,
+        };
         let w = wrap_dek(&recovery_pub, dek, &ctx).unwrap();
         let mut v = w.enc.to_vec();
         v.extend_from_slice(&w.ct);
@@ -533,7 +563,10 @@ fn r26_sweep_flags_bad_recovery_wrap() {
     assert_eq!(report.checked, 2);
     assert_eq!(
         report.bad,
-        vec![RecoveryWrapCtx { file_id: bad, version: 3 }],
+        vec![RecoveryWrapCtx {
+            file_id: bad,
+            version: 3
+        }],
         "the sweep flags exactly the bad recovery wrap"
     );
 }

@@ -213,7 +213,8 @@ impl HttpSinkClient {
     /// untrusted until [`verify_anchor_proof`] passes.
     pub fn fetch_head_all_proofs(&self) -> Result<(AnchoredHead, Vec<AnchorProof>), SinkError> {
         let body = self.get("/v1/control-log/head")?;
-        let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| SinkError::Unreachable)?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| SinkError::Unreachable)?;
         parse_head_all_proofs(&v).ok_or(SinkError::Unreachable)
     }
 
@@ -251,8 +252,8 @@ impl HttpSinkClient {
             .await
             .map_err(|_| SinkError::Unreachable)?;
         let connector = TlsConnector::from(self.tls.clone());
-        let server_name = ServerName::try_from(self.server_name.clone())
-            .map_err(|_| SinkError::Unreachable)?;
+        let server_name =
+            ServerName::try_from(self.server_name.clone()).map_err(|_| SinkError::Unreachable)?;
         let tls = connector
             .connect(server_name, tcp)
             .await
@@ -316,7 +317,10 @@ impl HttpSinkClient {
         let body = self.get("/v1/dir-log/checkpoint")?;
         let v: serde_json::Value =
             serde_json::from_slice(&body).map_err(|_| SinkError::Unreachable)?;
-        let tree_size = v.get("tree_size").and_then(|x| x.as_u64()).ok_or(SinkError::Unreachable)?;
+        let tree_size = v
+            .get("tree_size")
+            .and_then(|x| x.as_u64())
+            .ok_or(SinkError::Unreachable)?;
         let root = v
             .get("root_b64")
             .and_then(|x| x.as_str())
@@ -345,8 +349,14 @@ impl HttpSinkClient {
         let body = self.get(&format!("/v1/dir-log/inclusion?index={index}"))?;
         let v: serde_json::Value =
             serde_json::from_slice(&body).map_err(|_| SinkError::Unreachable)?;
-        let index = v.get("index").and_then(|x| x.as_u64()).ok_or(SinkError::Unreachable)?;
-        let tree_size = v.get("tree_size").and_then(|x| x.as_u64()).ok_or(SinkError::Unreachable)?;
+        let index = v
+            .get("index")
+            .and_then(|x| x.as_u64())
+            .ok_or(SinkError::Unreachable)?;
+        let tree_size = v
+            .get("tree_size")
+            .and_then(|x| x.as_u64())
+            .ok_or(SinkError::Unreachable)?;
         let path = parse_hash_path(&v).ok_or(SinkError::Unreachable)?;
         Ok(crate::transparency::InclusionProof {
             index,
@@ -692,7 +702,13 @@ mod tests {
         let mut sink = FakeSink::new(SigningKey::generate());
         sink.anchor(7, [0x5A; 32]);
         let (head, proof) = sink.fetch_head().unwrap();
-        assert_eq!(head, AnchoredHead { chain_seq: 7, head: [0x5A; 32] });
+        assert_eq!(
+            head,
+            AnchoredHead {
+                chain_seq: 7,
+                head: [0x5A; 32]
+            }
+        );
         assert!(verify_anchor_proof(&head, &proof, &[sink.custodian_pub()], &[]).is_ok());
     }
 

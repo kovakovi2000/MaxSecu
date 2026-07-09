@@ -370,13 +370,25 @@ mod tests {
         forked[1] = b"forked-leaf".to_vec();
         let forked_root_n = merkle_root(&forked);
         assert_ne!(forked_root_n, honest_root_n);
-        assert!(!verify_consistency(m, honest_root_m, n, forked_root_n, &proof));
+        assert!(!verify_consistency(
+            m,
+            honest_root_m,
+            n,
+            forked_root_n,
+            &proof
+        ));
 
         // Symmetric view: the client persisted a forked size-`m` checkpoint; the
         // honest later root_n no longer extends it.
         let forked_root_m = merkle_root(&forked[..m as usize]);
         assert_ne!(forked_root_m, honest_root_m);
-        assert!(!verify_consistency(m, forked_root_m, n, honest_root_n, &proof));
+        assert!(!verify_consistency(
+            m,
+            forked_root_m,
+            n,
+            honest_root_n,
+            &proof
+        ));
     }
 
     #[test]
@@ -404,7 +416,13 @@ mod tests {
         assert!(!verify_consistency(m, root_m, n, bad_n, &proof));
 
         // A truncated proof must not panic and must reject.
-        assert!(!verify_consistency(m, root_m, n, root_n, &proof[..proof.len() - 1]));
+        assert!(!verify_consistency(
+            m,
+            root_m,
+            n,
+            root_n,
+            &proof[..proof.len() - 1]
+        ));
 
         // An over-long proof rejects (trailing element unconsumed).
         let mut longer = proof.clone();

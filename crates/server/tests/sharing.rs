@@ -131,7 +131,10 @@ async fn reshare_adds_a_wrap_visible_to_the_new_recipient() {
     let store = MemoryStore::new();
     finalized_v1(
         &store,
-        vec![wrap(OWNER, 1, OWNER, 0xA0), wrap(RECOVERY_ID.0, 2, OWNER, 0x5E)],
+        vec![
+            wrap(OWNER, 1, OWNER, 0xA0),
+            wrap(RECOVERY_ID.0, 2, OWNER, 0x5E),
+        ],
     )
     .await;
 
@@ -161,7 +164,10 @@ async fn reshare_by_a_non_holder_is_refused_without_an_oracle() {
     let store = MemoryStore::new();
     finalized_v1(
         &store,
-        vec![wrap(OWNER, 1, OWNER, 0xA0), wrap(RECOVERY_ID.0, 2, OWNER, 0x5E)],
+        vec![
+            wrap(OWNER, 1, OWNER, 0xA0),
+            wrap(RECOVERY_ID.0, 2, OWNER, 0x5E),
+        ],
     )
     .await;
 
@@ -179,14 +185,15 @@ async fn reshare_with_granted_by_not_the_caller_is_rejected() {
     let store = MemoryStore::new();
     finalized_v1(
         &store,
-        vec![wrap(OWNER, 1, OWNER, 0xA0), wrap(RECOVERY_ID.0, 2, OWNER, 0x5E)],
+        vec![
+            wrap(OWNER, 1, OWNER, 0xA0),
+            wrap(RECOVERY_ID.0, 2, OWNER, 0x5E),
+        ],
     )
     .await;
     // Caller is owner but the grant claims someone else granted it — inconsistent.
     assert_eq!(
-        store
-            .add_wrap(FILE, wrap(V, 1, R, 0xC0), OWNER, 2000)
-            .await,
+        store.add_wrap(FILE, wrap(V, 1, R, 0xC0), OWNER, 2000).await,
         Err(AddWrapError::BadRequest)
     );
 }
@@ -196,7 +203,10 @@ async fn reshare_to_the_recovery_recipient_is_rejected() {
     let store = MemoryStore::new();
     finalized_v1(
         &store,
-        vec![wrap(OWNER, 1, OWNER, 0xA0), wrap(RECOVERY_ID.0, 2, OWNER, 0x5E)],
+        vec![
+            wrap(OWNER, 1, OWNER, 0xA0),
+            wrap(RECOVERY_ID.0, 2, OWNER, 0x5E),
+        ],
     )
     .await;
     assert_eq!(
@@ -212,7 +222,10 @@ async fn soft_revoke_by_owner_denies_the_recipient() {
     let store = MemoryStore::new();
     finalized_v1(
         &store,
-        vec![wrap(OWNER, 1, OWNER, 0xA0), wrap(RECOVERY_ID.0, 2, OWNER, 0x5E)],
+        vec![
+            wrap(OWNER, 1, OWNER, 0xA0),
+            wrap(RECOVERY_ID.0, 2, OWNER, 0x5E),
+        ],
     )
     .await;
     store
@@ -221,12 +234,18 @@ async fn soft_revoke_by_owner_denies_the_recipient() {
         .unwrap();
 
     // Owner soft-revokes V.
-    store.delete_wrap(FILE, V, OWNER).await.expect("owner may revoke");
-    assert!(store
-        .get_file(FILE, VersionSelector::Latest, V)
+    store
+        .delete_wrap(FILE, V, OWNER)
         .await
-        .unwrap()
-        .is_none(), "V's wrap is gone");
+        .expect("owner may revoke");
+    assert!(
+        store
+            .get_file(FILE, VersionSelector::Latest, V)
+            .await
+            .unwrap()
+            .is_none(),
+        "V's wrap is gone"
+    );
 }
 
 #[tokio::test]
@@ -247,7 +266,10 @@ async fn soft_revoke_by_the_granter_denies_their_grantee() {
         .await
         .unwrap();
 
-    store.delete_wrap(FILE, V, R).await.expect("granter may revoke grantee");
+    store
+        .delete_wrap(FILE, V, R)
+        .await
+        .expect("granter may revoke grantee");
     assert!(store
         .get_file(FILE, VersionSelector::Latest, V)
         .await
@@ -260,7 +282,10 @@ async fn soft_revoke_by_an_unrelated_user_is_refused() {
     let store = MemoryStore::new();
     finalized_v1(
         &store,
-        vec![wrap(OWNER, 1, OWNER, 0xA0), wrap(RECOVERY_ID.0, 2, OWNER, 0x5E)],
+        vec![
+            wrap(OWNER, 1, OWNER, 0xA0),
+            wrap(RECOVERY_ID.0, 2, OWNER, 0x5E),
+        ],
     )
     .await;
     store
@@ -312,7 +337,10 @@ async fn non_owner_listing_recipients_is_indistinguishable_404() {
     let store = MemoryStore::new();
     finalized_v1(
         &store,
-        vec![wrap(OWNER, 1, OWNER, 0xA0), wrap(RECOVERY_ID.0, 2, OWNER, 0x5E)],
+        vec![
+            wrap(OWNER, 1, OWNER, 0xA0),
+            wrap(RECOVERY_ID.0, 2, OWNER, 0x5E),
+        ],
     )
     .await;
     // A non-owner (even a recipient) cannot enumerate recipients — None (404).
@@ -321,5 +349,9 @@ async fn non_owner_listing_recipients_is_indistinguishable_404() {
         .await
         .unwrap();
     assert!(store.list_recipients(FILE, V).await.unwrap().is_none());
-    assert!(store.list_recipients(FILE, STRANGER).await.unwrap().is_none());
+    assert!(store
+        .list_recipients(FILE, STRANGER)
+        .await
+        .unwrap()
+        .is_none());
 }

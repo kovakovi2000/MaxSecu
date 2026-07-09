@@ -35,10 +35,10 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         RateLimitConfig {
-            backoff_base_ms: 1_000,        // 1 s (parameters.md §3)
-            backoff_cap_ms: 60_000,        // 60 s cap
-            challenge_window_ms: 60_000,   // per minute
-            challenge_max_per_window: 30,  // 30 / account / minute
+            backoff_base_ms: 1_000,       // 1 s (parameters.md §3)
+            backoff_cap_ms: 60_000,       // 60 s cap
+            challenge_window_ms: 60_000,  // per minute
+            challenge_max_per_window: 30, // 30 / account / minute
         }
     }
 }
@@ -192,7 +192,7 @@ mod tests {
         rl.record_proof("dave", T, false); // #1 → blocked until T+1000
         assert!(rl.admit_proof("dave", T + 1000).is_ok());
         rl.record_proof("dave", T + 1000, true); // success resets
-        // The NEXT failure must be a 1s step again (not 2s), proving the reset.
+                                                 // The NEXT failure must be a 1s step again (not 2s), proving the reset.
         rl.record_proof("dave", T + 1000, false);
         assert_eq!(rl.admit_proof("dave", T + 1001).err(), Some(1));
     }

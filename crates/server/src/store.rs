@@ -268,8 +268,10 @@ pub trait Store: Send + Sync {
     ) -> Result<(), StoreError>;
     /// The latest signed binding for a username (`GET /v1/directory/{username}`).
     /// `Ok(None)` if the account has no signed binding (→ 404, not a recipient).
-    async fn binding_by_username(&self, username: &str)
-        -> Result<Option<StoredBinding>, StoreError>;
+    async fn binding_by_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<StoredBinding>, StoreError>;
     /// The latest signed binding for a `user_id` (`GET /v1/directory/by-id/...`).
     async fn binding_by_user_id(
         &self,
@@ -290,8 +292,7 @@ pub trait Store: Send + Sync {
     /// Consume a registration key by its hash; `Ok(true)` iff it was present,
     /// unused and unexpired (deleted-on-consume — atomic single-use). `Ok(false)`
     /// = unknown/used/expired; `Err` = fault.
-    async fn consume_registration_key(&self, key_hash: &[u8; 32])
-        -> Result<bool, StoreError>;
+    async fn consume_registration_key(&self, key_hash: &[u8; 32]) -> Result<bool, StoreError>;
     /// Atomically claim the ONE-TIME "first admin" slot: `Ok(true)` for exactly
     /// the first caller ever, `Ok(false)` thereafter. The race-safe primitive
     /// backing [`enroll`](Store::enroll)'s admin decision — a singleton row claimed
@@ -378,11 +379,7 @@ pub trait Store: Send + Sync {
     /// (coarse, D29). Idempotent by `(file_id, version)` while still staged — a
     /// re-stage overwrites the staged rows (api.md §12); re-staging a *finalized*
     /// version is `AlreadyFinalized`. Returns the staged `version`.
-    async fn stage_version(
-        &self,
-        parsed: ParsedStage,
-        now_ms: u64,
-    ) -> Result<u64, StageError>;
+    async fn stage_version(&self, parsed: ParsedStage, now_ms: u64) -> Result<u64, StageError>;
 
     /// Atomically commit a staged version (`POST .../finalize`, api.md §8.4).
     /// Enforces the serialize-on-`(file_id, version)` strict `+1` rule and flips
@@ -425,10 +422,7 @@ pub trait Store: Send + Sync {
     /// File-level metadata (owner, type, and the set-once feed-visibility fields
     /// `listed`/`bundle_id`) regardless of any version's finalize state — Task 1.3.
     /// `Ok(None)` if no such file exists.
-    async fn get_file_meta(
-        &self,
-        file_id: [u8; 16],
-    ) -> Result<Option<FileMeta>, StoreError>;
+    async fn get_file_meta(&self, file_id: [u8; 16]) -> Result<Option<FileMeta>, StoreError>;
 
     /// Add a read re-share wrap to the file's current finalized version
     /// (`POST /v1/files/{id}/wraps`, api.md §10.1). Coarse-gated: the posted
@@ -759,10 +753,7 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn consume_registration_key(
-        &self,
-        key_hash: &[u8; 32],
-    ) -> Result<bool, StoreError> {
+    async fn consume_registration_key(&self, key_hash: &[u8; 32]) -> Result<bool, StoreError> {
         Ok(self.inner.lock().unwrap().reg_keys.remove(key_hash))
     }
 
@@ -803,7 +794,11 @@ impl Store for MemoryStore {
         }
         // 3. First-admin slot (same flag as `claim_first_admin`).
         let is_admin = !inner.first_admin_claimed;
-        let binding = if is_admin { admin_binding } else { user_binding };
+        let binding = if is_admin {
+            admin_binding
+        } else {
+            user_binding
+        };
         // All preconditions passed — commit every mutation together.
         inner.reg_keys.remove(&reg_key_hash);
         inner.first_admin_claimed = true;
@@ -902,17 +897,20 @@ impl Store for MemoryStore {
                         return Err(StageError::AlreadyFinalized);
                     }
                 }
-                let entry = inner.files.entry(parsed.file_id).or_insert_with(|| FileEntry {
-                    owner_id: g.owner_id,
-                    file_type: parsed.file_type,
-                    listed: parsed.listed,
-                    bundle_id: parsed.bundle_id,
-                    current_version: 0,
-                    updated_at_ms: now_ms,
-                    genesis_bytes: g.genesis_bytes,
-                    genesis_sig: g.genesis_sig,
-                    versions: HashMap::new(),
-                });
+                let entry = inner
+                    .files
+                    .entry(parsed.file_id)
+                    .or_insert_with(|| FileEntry {
+                        owner_id: g.owner_id,
+                        file_type: parsed.file_type,
+                        listed: parsed.listed,
+                        bundle_id: parsed.bundle_id,
+                        current_version: 0,
+                        updated_at_ms: now_ms,
+                        genesis_bytes: g.genesis_bytes,
+                        genesis_sig: g.genesis_sig,
+                        versions: HashMap::new(),
+                    });
                 entry.versions.insert(version, new_ver);
             }
             // Rotation (vN): the file must exist and the caller own it. parse_stage
@@ -1104,10 +1102,7 @@ impl Store for MemoryStore {
         }))
     }
 
-    async fn get_file_meta(
-        &self,
-        file_id: [u8; 16],
-    ) -> Result<Option<FileMeta>, StoreError> {
+    async fn get_file_meta(&self, file_id: [u8; 16]) -> Result<Option<FileMeta>, StoreError> {
         let inner = self.inner.lock().unwrap();
         let Some(entry) = inner.files.get(&file_id) else {
             return Ok(None);
@@ -1398,10 +1393,7 @@ impl Store for FaultyStore {
     ) -> Result<(), StoreError> {
         Err(Self::fault("issue_registration_key"))
     }
-    async fn consume_registration_key(
-        &self,
-        _key_hash: &[u8; 32],
-    ) -> Result<bool, StoreError> {
+    async fn consume_registration_key(&self, _key_hash: &[u8; 32]) -> Result<bool, StoreError> {
         Err(Self::fault("consume_registration_key"))
     }
     async fn claim_first_admin(&self) -> Result<bool, StoreError> {
@@ -1474,10 +1466,7 @@ impl Store for FaultyStore {
     ) -> Result<Option<VersionMeta>, StoreError> {
         Err(Self::fault("version_meta"))
     }
-    async fn get_file_meta(
-        &self,
-        _file_id: [u8; 16],
-    ) -> Result<Option<FileMeta>, StoreError> {
+    async fn get_file_meta(&self, _file_id: [u8; 16]) -> Result<Option<FileMeta>, StoreError> {
         Err(Self::fault("get_file_meta"))
     }
 
@@ -1566,7 +1555,10 @@ mod memory_store_tests {
 
         // A bundle member: listed=false, bundle_id=Some(..) → round-trips.
         store
-            .stage_version(v1_parsed([1u8; 16], [7u8; 16], false, Some([9u8; 16])), 1_000)
+            .stage_version(
+                v1_parsed([1u8; 16], [7u8; 16], false, Some([9u8; 16])),
+                1_000,
+            )
             .await
             .unwrap();
         let rec = store.get_file_meta([1u8; 16]).await.unwrap().unwrap();
@@ -1635,7 +1627,10 @@ mod memory_store_tests {
                 .stage_version(v1_parsed_typed(id, owner_o1, ftype, listed, parent), 1_000)
                 .await
                 .unwrap();
-            store.finalize_version(id, 1, owner_o1, 1_000).await.unwrap();
+            store
+                .finalize_version(id, 1, owner_o1, 1_000)
+                .await
+                .unwrap();
         }
 
         // Deleting the bundle removes B, M1, M2 and returns all their blob refs.
@@ -1651,7 +1646,10 @@ mod memory_store_tests {
             .stage_version(v1_parsed_typed(stray, owner_o1, 3, true, None), 1_000)
             .await
             .unwrap();
-        store.finalize_version(stray, 1, owner_o1, 1_000).await.unwrap();
+        store
+            .finalize_version(stray, 1, owner_o1, 1_000)
+            .await
+            .unwrap();
         assert!(matches!(
             store.delete_file(stray, [0x42u8; 16]).await,
             Err(DeleteError::NotFound)
@@ -1684,17 +1682,26 @@ mod memory_store_tests {
             (member_a, owner_a, 3, Some(bundle_a)),
         ] {
             store
-                .stage_version(v1_parsed_typed(id, owner, ftype, id == bundle_a, parent), 1_000)
+                .stage_version(
+                    v1_parsed_typed(id, owner, ftype, id == bundle_a, parent),
+                    1_000,
+                )
                 .await
                 .unwrap();
             store.finalize_version(id, 1, owner, 1_000).await.unwrap();
         }
         // B legitimately points B's OWN file at A's bundle_id.
         store
-            .stage_version(v1_parsed_typed(member_b, owner_b, 3, false, Some(bundle_a)), 1_000)
+            .stage_version(
+                v1_parsed_typed(member_b, owner_b, 3, false, Some(bundle_a)),
+                1_000,
+            )
             .await
             .unwrap();
-        store.finalize_version(member_b, 1, owner_b, 1_000).await.unwrap();
+        store
+            .finalize_version(member_b, 1, owner_b, 1_000)
+            .await
+            .unwrap();
 
         // A deletes the bundle: A's bundle + A's member go; B's file is untouched.
         let refs = store.delete_file(bundle_a, owner_a).await.unwrap();
@@ -1705,7 +1712,7 @@ mod memory_store_tests {
             "a foreign-owned member must survive the owner's bundle delete"
         );
         assert_eq!(refs.len(), 2); // only A's bundle + A's member
-        // B's member's blob_ref (its `{hex}/1/1`) must NOT be in the purge set.
+                                   // B's member's blob_ref (its `{hex}/1/1`) must NOT be in the purge set.
         let b_ref = format!("{}/1/1", "03".repeat(16));
         assert!(!refs.contains(&b_ref), "B's blob_ref must not be purged");
     }

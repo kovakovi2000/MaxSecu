@@ -20,7 +20,10 @@
 pub enum AuditEvent {
     /// Oversized open fell through to disk (the §8.1 exception). Records the
     /// sizes that forced it — the user is warned and confirms before this.
-    DiskUnlock { plaintext_size: u64, ram_budget: u64 },
+    DiskUnlock {
+        plaintext_size: u64,
+        ram_budget: u64,
+    },
     /// An explicit "save decrypted to disk" export (§8.1) — the copy leaves
     /// MaxSecu's protection. `to` is the sanitized, in-export-dir path string.
     PlaintextExport { to: String },

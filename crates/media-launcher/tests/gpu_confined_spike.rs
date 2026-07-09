@@ -89,7 +89,10 @@ fn confined_gpu_encode(encoder: &str, extra: &[&str]) -> (u32, u64) {
 fn nvenc_initializes_inside_appcontainer() {
     let (exit, size) = confined_gpu_encode("h264_nvenc", &["-preset", "p5"]);
     assert_eq!(exit, 0, "h264_nvenc must exit 0 inside the AppContainer");
-    assert!(size > 0, "h264_nvenc must produce non-empty output inside the AppContainer");
+    assert!(
+        size > 0,
+        "h264_nvenc must produce non-empty output inside the AppContainer"
+    );
 }
 
 #[test]
@@ -97,5 +100,8 @@ fn nvenc_initializes_inside_appcontainer() {
 fn amf_initializes_inside_appcontainer() {
     let (exit, size) = confined_gpu_encode("h264_amf", &[]);
     assert_eq!(exit, 0, "h264_amf must exit 0 inside the AppContainer");
-    assert!(size > 0, "h264_amf must produce non-empty output inside the AppContainer");
+    assert!(
+        size > 0,
+        "h264_amf must produce non-empty output inside the AppContainer"
+    );
 }

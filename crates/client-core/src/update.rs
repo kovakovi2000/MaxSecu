@@ -171,7 +171,12 @@ mod tests {
 
     /// Build a transparency tree with `manifest_signing_bytes(m)` placed at `index`
     /// among `n_leaves` total, returning a signed-and-included [`LogInclusion`].
-    fn log_inclusion(log: &SigningKey, m: &UpdateManifest, index: usize, n_leaves: usize) -> LogInclusion {
+    fn log_inclusion(
+        log: &SigningKey,
+        m: &UpdateManifest,
+        index: usize,
+        n_leaves: usize,
+    ) -> LogInclusion {
         let leaf = manifest_signing_bytes(m);
         let mut leaves: Vec<Vec<u8>> = (0..n_leaves)
             .map(|i| format!("other-leaf-{i}").into_bytes())
@@ -251,14 +256,30 @@ mod tests {
         let mut bad_sig = release.sign_raw(&manifest_signing_bytes(&m));
         bad_sig[0] ^= 0x01;
         assert_eq!(
-            verify_update(&m, bad_sig, &incl, &[release.verifying_key().to_bytes()], &lp, 4, ART),
+            verify_update(
+                &m,
+                bad_sig,
+                &incl,
+                &[release.verifying_key().to_bytes()],
+                &lp,
+                4,
+                ART
+            ),
             Err(UpdateError::BadSignature)
         );
 
         // A valid signature but a different pinned release key → BadSignature.
         let good_sig = release.sign_raw(&manifest_signing_bytes(&m));
         assert_eq!(
-            verify_update(&m, good_sig, &incl, &[other.verifying_key().to_bytes()], &lp, 4, ART),
+            verify_update(
+                &m,
+                good_sig,
+                &incl,
+                &[other.verifying_key().to_bytes()],
+                &lp,
+                4,
+                ART
+            ),
             Err(UpdateError::BadSignature)
         );
 

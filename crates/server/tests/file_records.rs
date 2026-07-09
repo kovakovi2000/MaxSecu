@@ -118,11 +118,14 @@ async fn two_phase_upload_then_rotate_lifecycle() {
     ))
     .unwrap();
     assert_eq!(store.stage_version(parsed, 1000).await.unwrap(), 1);
-    assert!(store
-        .get_file(FILE, VersionSelector::Latest, OWNER)
-        .await
-        .unwrap()
-        .is_none(), "staged version must not be visible");
+    assert!(
+        store
+            .get_file(FILE, VersionSelector::Latest, OWNER)
+            .await
+            .unwrap()
+            .is_none(),
+        "staged version must not be visible"
+    );
 
     // Finalize v1 → now visible to the owner with its wrap + genesis + streams.
     store.finalize_version(FILE, 1, OWNER, 1001).await.unwrap();
@@ -132,9 +135,15 @@ async fn two_phase_upload_then_rotate_lifecycle() {
         .unwrap()
         .expect("finalized v1 is visible");
     assert_eq!(view.version, 1);
-    assert_eq!(view.manifest_bytes, manifest_bytes(FILE, 1, OWNER, FileType::Blog));
+    assert_eq!(
+        view.manifest_bytes,
+        manifest_bytes(FILE, 1, OWNER, FileType::Blog)
+    );
     assert_eq!(view.my_wrap.wrapped_dek, vec![0xA1; 48]);
-    assert!(view.recovery_grant.is_some(), "recovery grant served for presence check");
+    assert!(
+        view.recovery_grant.is_some(),
+        "recovery grant served for presence check"
+    );
     assert_eq!(view.streams.len(), 2);
 
     // Stage + finalize v2 (rotation, no genesis) — strict +1.
@@ -142,26 +151,46 @@ async fn two_phase_upload_then_rotate_lifecycle() {
     assert_eq!(store.stage_version(parsed2, 2000).await.unwrap(), 2);
     // v1 is still the visible version until v2 finalizes.
     assert_eq!(
-        store.get_file(FILE, VersionSelector::Latest, OWNER).await.unwrap().unwrap().version,
+        store
+            .get_file(FILE, VersionSelector::Latest, OWNER)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
         1
     );
     store.finalize_version(FILE, 2, OWNER, 2001).await.unwrap();
     assert_eq!(
-        store.get_file(FILE, VersionSelector::Latest, OWNER).await.unwrap().unwrap().version,
+        store
+            .get_file(FILE, VersionSelector::Latest, OWNER)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
         2
     );
     // The prior version's wraps were torn down (api.md §8.4): v1 no longer serves.
-    assert!(store
-        .get_file(FILE, VersionSelector::Specific(1), OWNER)
-        .await
-        .unwrap()
-        .is_none(), "prior version's wraps deleted on finalize");
+    assert!(
+        store
+            .get_file(FILE, VersionSelector::Specific(1), OWNER)
+            .await
+            .unwrap()
+            .is_none(),
+        "prior version's wraps deleted on finalize"
+    );
 }
 
 #[tokio::test]
 async fn finalize_enforces_strict_plus_one() {
     let store = MemoryStore::new();
-    let p1 = parse_stage(stage_input(FILE, 1, OWNER, Some(genesis_input(FILE, OWNER)), FileType::Blog)).unwrap();
+    let p1 = parse_stage(stage_input(
+        FILE,
+        1,
+        OWNER,
+        Some(genesis_input(FILE, OWNER)),
+        FileType::Blog,
+    ))
+    .unwrap();
     store.stage_version(p1, 1).await.unwrap();
     store.finalize_version(FILE, 1, OWNER, 2).await.unwrap();
 
@@ -170,27 +199,47 @@ async fn finalize_enforces_strict_plus_one() {
     store.stage_version(p3, 3).await.unwrap();
     assert_eq!(
         store.finalize_version(FILE, 3, OWNER, 4).await,
-        Err(FinalizeError::VersionConflict { expected: 2, got: 3 })
+        Err(FinalizeError::VersionConflict {
+            expected: 2,
+            got: 3
+        })
     );
 }
 
 #[tokio::test]
 async fn rotation_by_non_owner_is_rejected() {
     let store = MemoryStore::new();
-    let p1 = parse_stage(stage_input(FILE, 1, OWNER, Some(genesis_input(FILE, OWNER)), FileType::Blog)).unwrap();
+    let p1 = parse_stage(stage_input(
+        FILE,
+        1,
+        OWNER,
+        Some(genesis_input(FILE, OWNER)),
+        FileType::Blog,
+    ))
+    .unwrap();
     store.stage_version(p1, 1).await.unwrap();
     store.finalize_version(FILE, 1, OWNER, 2).await.unwrap();
 
     // A stranger authors v2 of someone else's file (author == caller passes the
     // pure parse, but the store's caller==owner check rejects it, D29).
     let attacker = parse_stage(stage_input(FILE, 2, STRANGER, None, FileType::Blog)).unwrap();
-    assert_eq!(store.stage_version(attacker, 3).await, Err(StageError::NotOwner));
+    assert_eq!(
+        store.stage_version(attacker, 3).await,
+        Err(StageError::NotOwner)
+    );
 }
 
 #[tokio::test]
 async fn non_recipient_get_is_indistinguishable_404() {
     let store = MemoryStore::new();
-    let p1 = parse_stage(stage_input(FILE, 1, OWNER, Some(genesis_input(FILE, OWNER)), FileType::Blog)).unwrap();
+    let p1 = parse_stage(stage_input(
+        FILE,
+        1,
+        OWNER,
+        Some(genesis_input(FILE, OWNER)),
+        FileType::Blog,
+    ))
+    .unwrap();
     store.stage_version(p1, 1).await.unwrap();
     store.finalize_version(FILE, 1, OWNER, 2).await.unwrap();
 
@@ -208,15 +257,35 @@ async fn listing_filters_by_type_newest_first() {
     // A blog and a video, finalized at increasing times.
     let blog = [0xB1; 16];
     let video = [0x71; 16];
-    let pb = parse_stage(stage_input(blog, 1, OWNER, Some(genesis_input(blog, OWNER)), FileType::Blog)).unwrap();
+    let pb = parse_stage(stage_input(
+        blog,
+        1,
+        OWNER,
+        Some(genesis_input(blog, OWNER)),
+        FileType::Blog,
+    ))
+    .unwrap();
     store.stage_version(pb, 10).await.unwrap();
     store.finalize_version(blog, 1, OWNER, 100).await.unwrap();
-    let pv = parse_stage(stage_input(video, 1, OWNER, Some(genesis_input(video, OWNER)), FileType::Video)).unwrap();
+    let pv = parse_stage(stage_input(
+        video,
+        1,
+        OWNER,
+        Some(genesis_input(video, OWNER)),
+        FileType::Video,
+    ))
+    .unwrap();
     store.stage_version(pv, 20).await.unwrap();
     store.finalize_version(video, 1, OWNER, 200).await.unwrap();
 
     // All files, newest (video) first.
-    let all = store.list_files(ListFilter { file_type: None, limit: 10 }).await.unwrap();
+    let all = store
+        .list_files(ListFilter {
+            file_type: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].file_id, video);
     // Small streams exclude content (stream_type 1); metadata (2) is listed.
@@ -224,7 +293,13 @@ async fn listing_filters_by_type_newest_first() {
     assert!(all[0].small_streams.iter().any(|(t, _)| *t == 2));
 
     // Filter to blogs only.
-    let blogs = store.list_files(ListFilter { file_type: Some(FileType::Blog as u8 as i16), limit: 10 }).await.unwrap();
+    let blogs = store
+        .list_files(ListFilter {
+            file_type: Some(FileType::Blog as u8 as i16),
+            limit: 10,
+        })
+        .await
+        .unwrap();
     assert_eq!(blogs.len(), 1);
     assert_eq!(blogs[0].file_id, blog);
 }

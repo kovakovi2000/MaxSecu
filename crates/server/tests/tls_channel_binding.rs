@@ -20,7 +20,9 @@ use maxsecu_crypto::{generate_enc_keypair, sha256, SigningKey};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::AuthProofContext;
 use maxsecu_encoding::types::{Bytes32, Text, Timestamp};
-use maxsecu_server::{export_channel_binding, serve, AppState, AuthConfig, AuthService, MemoryStore};
+use maxsecu_server::{
+    export_channel_binding, serve, AppState, AuthConfig, AuthService, MemoryStore,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -210,9 +212,18 @@ async fn full_login_over_real_tls_then_relay_to_new_channel_is_401() {
 
     // ---- Connection B: a DIFFERENT TLS channel (different exporter) ----
     let mut b = connect(addr, pki.client_config.clone()).await;
-    assert_ne!(a.exporter, b.exporter, "each connection has a unique exporter");
+    assert_ne!(
+        a.exporter, b.exporter,
+        "each connection has a unique exporter"
+    );
     // The (still-valid, unrevoked) token replayed on B is rejected: channel mismatch.
-    let (st, _) = post(&mut b, "/v1/session/logout", Some(&token), serde_json::Value::Null).await;
+    let (st, _) = post(
+        &mut b,
+        "/v1/session/logout",
+        Some(&token),
+        serde_json::Value::Null,
+    )
+    .await;
     assert_eq!(
         st,
         StatusCode::UNAUTHORIZED,
@@ -220,6 +231,16 @@ async fn full_login_over_real_tls_then_relay_to_new_channel_is_401() {
     );
 
     // ---- Same token on connection A still works (proves the authed path) ----
-    let (st, _) = post(&mut a, "/v1/session/logout", Some(&token), serde_json::Value::Null).await;
-    assert_eq!(st, StatusCode::NO_CONTENT, "authed request on the bound channel");
+    let (st, _) = post(
+        &mut a,
+        "/v1/session/logout",
+        Some(&token),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NO_CONTENT,
+        "authed request on the bound channel"
+    );
 }

@@ -64,10 +64,7 @@ mod tests {
         let enc = [0x11u8; 32];
         let sig = [0x22u8; 32];
         let mlkem = [0x33u8; MLKEM768_PUB_LEN];
-        assert!(s
-            .set_recovery_account(enc, sig, Some(mlkem))
-            .await
-            .unwrap());
+        assert!(s.set_recovery_account(enc, sig, Some(mlkem)).await.unwrap());
         // A second attempt with DIFFERENT keys (and a different ML-KEM posture)
         // must lose and must NOT overwrite.
         assert!(

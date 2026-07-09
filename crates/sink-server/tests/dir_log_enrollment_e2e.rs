@@ -223,12 +223,13 @@ async fn enrolled_binding_published_to_kt_log_is_inclusion_provable_over_tls() {
     let signed = d5.sign_binding(&candidate, None);
     // The KT leaf is the canonical DirBinding bytes the directory publishes (§7.2);
     // it verifies under the pinned D5 root before we ever publish it (sanity).
-    signed.verify(&d5.public_key()).expect("D5-signed binding verifies");
+    signed
+        .verify(&d5.public_key())
+        .expect("D5-signed binding verifies");
     let leaf_bytes = maxsecu_encoding::encode(&signed.binding);
 
     // ---- 3. Publish the signed binding to the KT log over TLS (admin-gated). ----
-    let (status, index) =
-        post_binding(addr, pki.client_config.clone(), TOKEN, &leaf_bytes).await;
+    let (status, index) = post_binding(addr, pki.client_config.clone(), TOKEN, &leaf_bytes).await;
     assert_eq!(status, StatusCode::OK);
     let index = index.expect("publish returns the new leaf index");
     assert_eq!(index, 0, "first enrolled binding lands at leaf 0");

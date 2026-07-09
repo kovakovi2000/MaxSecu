@@ -246,7 +246,11 @@ mod tests {
         let tree_size = leaves.len() as u64;
         let root = merkle::merkle_root(leaves);
         let sig = log.sign_raw(&checkpoint_signing_bytes(tree_size, &root));
-        KtCheckpoint { tree_size, root, sig }
+        KtCheckpoint {
+            tree_size,
+            root,
+            sig,
+        }
     }
 
     /// An inclusion proof for the `index`-th leaf of `leaves`.
@@ -271,16 +275,30 @@ mod tests {
         // A small log; pin its first checkpoint (TOFU) by verifying a leaf in it.
         let small: Vec<Vec<u8>> = (0..3).map(leaf).collect();
         let cp1 = checkpoint(&log, &small);
-        verify_binding_in_log(&small[0], &inclusion(0, &small), &cp1, &[], &pin, &mut store)
-            .expect("first checkpoint pins on first use");
+        verify_binding_in_log(
+            &small[0],
+            &inclusion(0, &small),
+            &cp1,
+            &[],
+            &pin,
+            &mut store,
+        )
+        .expect("first checkpoint pins on first use");
         assert_eq!(store.latest(), Some(cp1));
 
         // The log grows; a consistent later checkpoint + a valid inclusion accepts.
         let big: Vec<Vec<u8>> = (0..6).map(leaf).collect();
         let cp2 = checkpoint(&log, &big);
         let consistency = merkle::consistency_path(&big, cp1.tree_size, cp2.tree_size);
-        verify_binding_in_log(&big[4], &inclusion(4, &big), &cp2, &consistency, &pin, &mut store)
-            .expect("consistent extension + valid inclusion accepts");
+        verify_binding_in_log(
+            &big[4],
+            &inclusion(4, &big),
+            &cp2,
+            &consistency,
+            &pin,
+            &mut store,
+        )
+        .expect("consistent extension + valid inclusion accepts");
         assert_eq!(store.latest(), Some(cp2));
     }
 
@@ -293,8 +311,15 @@ mod tests {
         // Pin checkpoint over one history.
         let view_a: Vec<Vec<u8>> = (0..3).map(leaf).collect();
         let cp1 = checkpoint(&log, &view_a);
-        verify_binding_in_log(&view_a[0], &inclusion(0, &view_a), &cp1, &[], &pin, &mut store)
-            .unwrap();
+        verify_binding_in_log(
+            &view_a[0],
+            &inclusion(0, &view_a),
+            &cp1,
+            &[],
+            &pin,
+            &mut store,
+        )
+        .unwrap();
 
         // A FORK: a different, larger history that does NOT extend view_a. Even with
         // its own valid inclusion + a (forged-from-the-fork) consistency proof, the
@@ -303,7 +328,14 @@ mod tests {
         let cp2 = checkpoint(&log, &fork);
         let consistency = merkle::consistency_path(&fork, cp1.tree_size, cp2.tree_size);
         assert_eq!(
-            verify_binding_in_log(&fork[4], &inclusion(4, &fork), &cp2, &consistency, &pin, &mut store),
+            verify_binding_in_log(
+                &fork[4],
+                &inclusion(4, &fork),
+                &cp2,
+                &consistency,
+                &pin,
+                &mut store
+            ),
             Err(KtError::SplitView)
         );
         // The gossip state is unchanged (the equivocal checkpoint is not adopted).
@@ -318,13 +350,21 @@ mod tests {
 
         let big: Vec<Vec<u8>> = (0..6).map(leaf).collect();
         let cp_big = checkpoint(&log, &big);
-        verify_binding_in_log(&big[0], &inclusion(0, &big), &cp_big, &[], &pin, &mut store).unwrap();
+        verify_binding_in_log(&big[0], &inclusion(0, &big), &cp_big, &[], &pin, &mut store)
+            .unwrap();
 
         // A validly-signed but SHORTER checkpoint is a rollback.
         let small: Vec<Vec<u8>> = (0..3).map(leaf).collect();
         let cp_small = checkpoint(&log, &small);
         assert_eq!(
-            verify_binding_in_log(&small[0], &inclusion(0, &small), &cp_small, &[], &pin, &mut store),
+            verify_binding_in_log(
+                &small[0],
+                &inclusion(0, &small),
+                &cp_small,
+                &[],
+                &pin,
+                &mut store
+            ),
             Err(KtError::Regression)
         );
     }
@@ -464,7 +504,10 @@ mod tests {
             sig: attacker.sign_raw(&checkpoint_signing_bytes(u64::MAX, &root)),
         };
         assert!(!verify_checkpoint_sig(&forged, &pin), "forged sig rejected");
-        assert!(!verify_checkpoint_sig(&forged, &[]), "empty pin set fails closed");
+        assert!(
+            !verify_checkpoint_sig(&forged, &[]),
+            "empty pin set fails closed"
+        );
 
         // A genuinely pinned-key checkpoint verifies (even at a huge tree_size).
         let genuine = KtCheckpoint {
@@ -485,8 +528,15 @@ mod tests {
         let leaves: Vec<Vec<u8>> = (0..3).map(leaf).collect();
         let cp1 = checkpoint(&log, &leaves);
         assert!(store.latest().is_none());
-        verify_binding_in_log(&leaves[2], &inclusion(2, &leaves), &cp1, &[], &pin, &mut store)
-            .unwrap();
+        verify_binding_in_log(
+            &leaves[2],
+            &inclusion(2, &leaves),
+            &cp1,
+            &[],
+            &pin,
+            &mut store,
+        )
+        .unwrap();
         assert_eq!(store.latest(), Some(cp1));
 
         // A subsequent inconsistent checkpoint (a fork) is then caught.
@@ -494,7 +544,14 @@ mod tests {
         let cp2 = checkpoint(&log, &fork);
         let consistency = merkle::consistency_path(&fork, cp1.tree_size, cp2.tree_size);
         assert_eq!(
-            verify_binding_in_log(&fork[0], &inclusion(0, &fork), &cp2, &consistency, &pin, &mut store),
+            verify_binding_in_log(
+                &fork[0],
+                &inclusion(0, &fork),
+                &cp2,
+                &consistency,
+                &pin,
+                &mut store
+            ),
             Err(KtError::SplitView)
         );
     }

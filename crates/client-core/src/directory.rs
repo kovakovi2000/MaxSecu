@@ -404,7 +404,8 @@ mod tests {
         let mut trust = MemoryTrustStore::new();
         // Pin v2…
         let b2 = binding(1, 0xE2, 0x52, 2);
-        v.verify_binding(&b2, &sign(&d5, &b2), NOW, &mut trust).unwrap();
+        v.verify_binding(&b2, &sign(&d5, &b2), NOW, &mut trust)
+            .unwrap();
         // …then the server replays a validly-signed v1 (rollback).
         let b1 = binding(1, 0xE1, 0x51, 1);
         assert_eq!(
@@ -433,7 +434,8 @@ mod tests {
         let v = verifier(&d5);
         let mut trust = MemoryTrustStore::new();
         let b1 = binding(1, 0xE1, 0x51, 1);
-        v.verify_binding(&b1, &sign(&d5, &b1), NOW, &mut trust).unwrap();
+        v.verify_binding(&b1, &sign(&d5, &b1), NOW, &mut trust)
+            .unwrap();
 
         // A legitimately-rotated v2 is NOT silently accepted (§7.2 step 3).
         let b2 = binding(1, 0xE2, 0x52, 2);
@@ -458,7 +460,8 @@ mod tests {
         let v = verifier(&d5);
         let mut trust = MemoryTrustStore::new();
         let b = binding(1, 0xE1, 0x51, 1);
-        v.verify_binding(&b, &sign(&d5, &b), NOW, &mut trust).unwrap();
+        v.verify_binding(&b, &sign(&d5, &b), NOW, &mut trust)
+            .unwrap();
 
         let equivocal = binding(1, 0xAA, 0xBB, 1); // same version, different keys
         assert_eq!(
@@ -496,7 +499,12 @@ mod tests {
         let mlkem = maxsecu_encoding::types::MlKemPub([0x9C; 1184]);
         let pq = d5.sign_binding(&binding(1, 0xE1, 0x51, 1), Some(mlkem));
         let verified = v
-            .verify_binding(&pq.binding, &pq.signature, NOW, &mut MemoryTrustStore::new())
+            .verify_binding(
+                &pq.binding,
+                &pq.signature,
+                NOW,
+                &mut MemoryTrustStore::new(),
+            )
             .unwrap();
         assert_eq!(verified.mlkem_pub, Some([0x9C; 1184]));
         // …and the PQ key carries through to the authorized recipient too.
@@ -528,7 +536,7 @@ mod tests {
     // ---- the full §7.2 recipient rule (binding + §7.6 revocation) ----
 
     use crate::revocation::TombstoneSet;
-    use maxsecu_admin_core::{ControlChain, CoSign, RevokeParams};
+    use maxsecu_admin_core::{CoSign, ControlChain, RevokeParams};
     use maxsecu_encoding::GENESIS_HEAD;
 
     fn admin_binding(d5: &SigningKey, uid: u8) -> ([u8; 64], DirBinding) {
@@ -561,7 +569,10 @@ mod tests {
                     issued_by: Id([1; 16]),
                     created_at: Timestamp(NOW),
                 },
-                Some(CoSign { admin_id: Id([2; 16]), key: &co }),
+                Some(CoSign {
+                    admin_id: Id([2; 16]),
+                    key: &co,
+                }),
             )
             .unwrap();
         ([r.bytes.clone()], r.head)

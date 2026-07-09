@@ -29,7 +29,7 @@ use tokio_rustls::TlsConnector;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
-use maxsecu_admin_core::{ControlChain, CoSign, DirectorySigner, RevokeParams};
+use maxsecu_admin_core::{CoSign, ControlChain, DirectorySigner, RevokeParams};
 use maxsecu_client_core::{DirectoryVerifier, MemoryTrustStore, TombstoneSet, VerifyError};
 use maxsecu_crypto::SigningKey;
 use maxsecu_encoding::structs::DirBinding;
@@ -141,9 +141,12 @@ async fn phase2_exit_gates_over_real_tls() {
 
     // alice: a genuine, fingerprint-confirmed recipient.
     let alice = binding("alice", 0x0A, 0xE1, 0x51, 1);
-    let alice_signed =
-        d5.sign_enrollment(&alice, &maxsecu_crypto::fingerprint(&[0xE1; 32], &[0x51; 32]))
-            .unwrap();
+    let alice_signed = d5
+        .sign_enrollment(
+            &alice,
+            &maxsecu_crypto::fingerprint(&[0xE1; 32], &[0x51; 32]),
+        )
+        .unwrap();
 
     // victim: a genuine binding, but account-wide revoked below.
     let victim = binding("victim", 0x0F, 0xE2, 0x52, 1);
@@ -152,7 +155,8 @@ async fn phase2_exit_gates_over_real_tls() {
     // mallory: the server tries to substitute an ATTACKER-signed binding.
     let attacker = SigningKey::generate();
     let mallory = binding("mallory", 0x11, 0xEE, 0xEE, 1);
-    let mallory_forged_sig = attacker.sign_canonical(maxsecu_encoding::labels::DIRBINDING, &mallory);
+    let mallory_forged_sig =
+        attacker.sign_canonical(maxsecu_encoding::labels::DIRBINDING, &mallory);
 
     // A `*` tombstone revoking victim (account-wide ⇒ dual-controlled).
     let mut chain = ControlChain::new();

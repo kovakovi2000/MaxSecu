@@ -37,11 +37,7 @@ impl DirectorySigner {
     /// `None` for a classical (v1) binding. The caller is responsible for the
     /// fingerprint confirmation; prefer [`DirectorySigner::sign_enrollment`],
     /// which enforces it.
-    pub fn sign_binding(
-        &self,
-        binding: &DirBinding,
-        mlkem_pub: Option<MlKemPub>,
-    ) -> SignedBinding {
+    pub fn sign_binding(&self, binding: &DirBinding, mlkem_pub: Option<MlKemPub>) -> SignedBinding {
         let mut binding = binding.clone();
         binding.mlkem_pub = mlkem_pub;
         SignedBinding {

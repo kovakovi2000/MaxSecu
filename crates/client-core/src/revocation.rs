@@ -120,7 +120,9 @@ impl Decoded {
         match self {
             Decoded::Revocation(r) => vk.verify_canonical(labels::REVOCATION, r, sig).is_ok(),
             Decoded::Reinstatement(r) => vk.verify_canonical(labels::REINSTATEMENT, r, sig).is_ok(),
-            Decoded::KeyCompromise(r) => vk.verify_canonical(labels::KEY_COMPROMISE, r, sig).is_ok(),
+            Decoded::KeyCompromise(r) => {
+                vk.verify_canonical(labels::KEY_COMPROMISE, r, sig).is_ok()
+            }
         }
     }
 
@@ -344,7 +346,9 @@ fn scope_matches_file(scope: FileScope, file_id: &[u8; 16]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maxsecu_admin_core::{ControlChain, CoSign, KeyCompromiseParams, ReinstateParams, RevokeParams};
+    use maxsecu_admin_core::{
+        CoSign, ControlChain, KeyCompromiseParams, ReinstateParams, RevokeParams,
+    };
     use maxsecu_crypto::SigningKey;
     use maxsecu_encoding::types::{Bytes32, Id, Timestamp};
 
@@ -392,11 +396,14 @@ mod tests {
     /// Resolver over several (id, sig_pub, ceiling) admins.
     fn multi_issuer(entries: Vec<(Id, [u8; 32], Vec<Role>)>) -> impl Fn(Id) -> Option<IssuerInfo> {
         move |id: Id| {
-            entries.iter().find(|(i, _, _)| *i == id).map(|(_, pk, roles)| IssuerInfo {
-                sig_pub: *pk,
-                roles: roles.clone(),
-                key_version: 1,
-            })
+            entries
+                .iter()
+                .find(|(i, _, _)| *i == id)
+                .map(|(_, pk, roles)| IssuerInfo {
+                    sig_pub: *pk,
+                    roles: roles.clone(),
+                    key_version: 1,
+                })
         }
     }
 
@@ -413,7 +420,12 @@ mod tests {
         (sha256(&bytes), ControlRecordIn { bytes, sig, co_sig })
     }
 
-    fn account_revoke(victim: u8, epoch: u64, prev_head: [u8; 32], cap: Option<Role>) -> Revocation {
+    fn account_revoke(
+        victim: u8,
+        epoch: u64,
+        prev_head: [u8; 32],
+        cap: Option<Role>,
+    ) -> Revocation {
         Revocation {
             scope: FileScope::AccountWide,
             revoked_user_id: Id([victim; 16]),
@@ -438,8 +450,12 @@ mod tests {
         rec.sig[0] ^= 0x01; // corrupt the issuer signature
 
         assert_eq!(
-            TombstoneSet::verify_authenticated(&[rec], chain.head(), &admin_issuer(&admin, ADMIN_ID))
-                .unwrap_err(),
+            TombstoneSet::verify_authenticated(
+                &[rec],
+                chain.head(),
+                &admin_issuer(&admin, ADMIN_ID)
+            )
+            .unwrap_err(),
             TombstoneError::BadAuthority
         );
     }
@@ -481,9 +497,14 @@ mod tests {
         let file = FileScope::Specific(Id([0x0A; 16]));
         let r1 = chain.revoke(&admin, rp(file, U, None, 1), None).unwrap();
         // The issuer's binding carries only the User ceiling — no admin authority.
-        let user_only = multi_issuer(vec![(ADMIN_ID, admin.verifying_key().to_bytes(), vec![Role::User])]);
+        let user_only = multi_issuer(vec![(
+            ADMIN_ID,
+            admin.verifying_key().to_bytes(),
+            vec![Role::User],
+        )]);
         assert_eq!(
-            TombstoneSet::verify_authenticated(&[rec_in(&r1)], chain.head(), &user_only).unwrap_err(),
+            TombstoneSet::verify_authenticated(&[rec_in(&r1)], chain.head(), &user_only)
+                .unwrap_err(),
             TombstoneError::NotAdmin
         );
     }
@@ -493,8 +514,13 @@ mod tests {
         let admin = SigningKey::generate();
         // A `*` revoke hand-forged with NO co-signature (ControlChain would refuse
         // to build this — the verifier must independently reject it).
-        let (head, rec) = signed_revocation(account_revoke(U, 1, GENESIS_HEAD.0, None), &admin, None);
-        let res = multi_issuer(vec![(ADMIN_ID, admin.verifying_key().to_bytes(), vec![Role::Admin])]);
+        let (head, rec) =
+            signed_revocation(account_revoke(U, 1, GENESIS_HEAD.0, None), &admin, None);
+        let res = multi_issuer(vec![(
+            ADMIN_ID,
+            admin.verifying_key().to_bytes(),
+            vec![Role::Admin],
+        )]);
         assert_eq!(
             TombstoneSet::verify_authenticated(&[rec], head, &res).unwrap_err(),
             TombstoneError::DualControlMissing
@@ -508,7 +534,11 @@ mod tests {
         let mut rev = account_revoke(U, 1, GENESIS_HEAD.0, None);
         rev.co_signed_by = Some(ADMIN_ID); // same as issued_by
         let (head, rec) = signed_revocation(rev, &admin, Some(&admin));
-        let res = multi_issuer(vec![(ADMIN_ID, admin.verifying_key().to_bytes(), vec![Role::Admin])]);
+        let res = multi_issuer(vec![(
+            ADMIN_ID,
+            admin.verifying_key().to_bytes(),
+            vec![Role::Admin],
+        )]);
         assert_eq!(
             TombstoneSet::verify_authenticated(&[rec], head, &res).unwrap_err(),
             TombstoneError::DualControlMissing
@@ -519,12 +549,14 @@ mod tests {
     fn account_wide_revoke_with_valid_dual_control_verifies() {
         let a1 = SigningKey::generate();
         let a2 = SigningKey::generate();
-        let (head, rec) = signed_revocation(account_revoke(U, 1, GENESIS_HEAD.0, None), &a1, Some(&a2));
+        let (head, rec) =
+            signed_revocation(account_revoke(U, 1, GENESIS_HEAD.0, None), &a1, Some(&a2));
         let res = multi_issuer(vec![
             (ADMIN_ID, a1.verifying_key().to_bytes(), vec![Role::Admin]),
             (A2_ID, a2.verifying_key().to_bytes(), vec![Role::Admin]),
         ]);
-        let set = TombstoneSet::verify_authenticated(&[rec], head, &res).expect("dual-controlled `*` verifies");
+        let set = TombstoneSet::verify_authenticated(&[rec], head, &res)
+            .expect("dual-controlled `*` verifies");
         assert!(set.is_account_revoked(&[U; 16]));
     }
 
@@ -534,8 +566,11 @@ mod tests {
         let a1 = SigningKey::generate();
         let a2 = SigningKey::generate();
         let b = SigningKey::generate();
-        let (head0, r0) =
-            signed_revocation(account_revoke(3, 1, GENESIS_HEAD.0, Some(Role::Admin)), &a1, Some(&a2));
+        let (head0, r0) = signed_revocation(
+            account_revoke(3, 1, GENESIS_HEAD.0, Some(Role::Admin)),
+            &a1,
+            Some(&a2),
+        );
         // Record 1: B issues a per-file revoke — but B was de-admined at record 0,
         // so its effective role over the prefix is no longer admin → NotAdmin.
         let b_rev = Revocation {
@@ -554,7 +589,11 @@ mod tests {
             (ADMIN_ID, a1.verifying_key().to_bytes(), vec![Role::Admin]),
             (A2_ID, a2.verifying_key().to_bytes(), vec![Role::Admin]),
             // B's binding ceiling still lists Admin, but the tombstone narrows it.
-            (B_ID, b.verifying_key().to_bytes(), vec![Role::User, Role::Admin]),
+            (
+                B_ID,
+                b.verifying_key().to_bytes(),
+                vec![Role::User, Role::Admin],
+            ),
         ]);
         assert_eq!(
             TombstoneSet::verify_authenticated(&[r0, r1], head1, &res).unwrap_err(),
@@ -571,14 +610,25 @@ mod tests {
         let admin = SigningKey::generate();
         let co = SigningKey::generate();
         let res = multi_issuer(vec![
-            (ADMIN_ID, admin.verifying_key().to_bytes(), vec![Role::Admin]),
+            (
+                ADMIN_ID,
+                admin.verifying_key().to_bytes(),
+                vec![Role::Admin],
+            ),
             (A2_ID, co.verifying_key().to_bytes(), vec![Role::Admin]),
         ]);
-        let cosign = || CoSign { admin_id: A2_ID, key: &co };
+        let cosign = || CoSign {
+            admin_id: A2_ID,
+            key: &co,
+        };
 
         let mut chain = ControlChain::new();
         let rev = chain
-            .revoke(&admin, rp(FileScope::AccountWide, U, None, 1), Some(cosign()))
+            .revoke(
+                &admin,
+                rp(FileScope::AccountWide, U, None, 1),
+                Some(cosign()),
+            )
             .unwrap();
         let set = TombstoneSet::verify_authenticated(&[rec_in(&rev)], chain.head(), &res).unwrap();
         assert!(
@@ -622,16 +672,32 @@ mod tests {
                 issued_by: ADMIN_ID,
                 created_at: NOW,
             },
-            CoSign { admin_id: A2_ID, key: &co },
+            CoSign {
+                admin_id: A2_ID,
+                key: &co,
+            },
         );
         let res = multi_issuer(vec![
-            (ADMIN_ID, admin.verifying_key().to_bytes(), vec![Role::Admin]),
+            (
+                ADMIN_ID,
+                admin.verifying_key().to_bytes(),
+                vec![Role::Admin],
+            ),
             (A2_ID, co.verifying_key().to_bytes(), vec![Role::Admin]),
         ]);
         let set = TombstoneSet::verify_authenticated(&[rec_in(&kc)], chain.head(), &res).unwrap();
-        assert!(set.key_compromise_for(&[U; 16], 3).is_some(), "the compromised key");
-        assert!(set.key_compromise_for(&[U; 16], 2).is_none(), "a different key_version");
-        assert!(set.key_compromise_for(&[0x55; 16], 3).is_none(), "a different user");
+        assert!(
+            set.key_compromise_for(&[U; 16], 3).is_some(),
+            "the compromised key"
+        );
+        assert!(
+            set.key_compromise_for(&[U; 16], 2).is_none(),
+            "a different key_version"
+        );
+        assert!(
+            set.key_compromise_for(&[0x55; 16], 3).is_none(),
+            "a different user"
+        );
     }
 
     #[test]
@@ -651,8 +717,16 @@ mod tests {
         let bytes = maxsecu_encoding::encode(&rein);
         let sig = admin.sign_canonical(labels::REINSTATEMENT, &rein);
         // Privilege-restoring record presented with NO co-signature → rejected.
-        let rec = ControlRecordIn { bytes: bytes.clone(), sig, co_sig: None };
-        let res = multi_issuer(vec![(ADMIN_ID, admin.verifying_key().to_bytes(), vec![Role::Admin])]);
+        let rec = ControlRecordIn {
+            bytes: bytes.clone(),
+            sig,
+            co_sig: None,
+        };
+        let res = multi_issuer(vec![(
+            ADMIN_ID,
+            admin.verifying_key().to_bytes(),
+            vec![Role::Admin],
+        )]);
         assert_eq!(
             TombstoneSet::verify_authenticated(&[rec], sha256(&bytes), &res).unwrap_err(),
             TombstoneError::DualControlMissing
@@ -678,8 +752,14 @@ mod tests {
         let r2 = chain.revoke(&admin, rp(file, 0x77, None, 1), None).unwrap();
 
         let set = TombstoneSet::verify(&bytes(&[r1, r2]), chain.head()).unwrap();
-        assert!(set.is_revoked(&[U; 16], &[0x0A; 16], 1), "U revoked from file A");
-        assert!(!set.is_revoked(&[U; 16], &[0x0B; 16], 1), "but not from another file");
+        assert!(
+            set.is_revoked(&[U; 16], &[0x0A; 16], 1),
+            "U revoked from file A"
+        );
+        assert!(
+            !set.is_revoked(&[U; 16], &[0x0B; 16], 1),
+            "but not from another file"
+        );
     }
 
     #[test]
@@ -720,7 +800,10 @@ mod tests {
             .revoke(
                 &admin,
                 rp(FileScope::AccountWide, U, None, 1),
-                Some(CoSign { admin_id: Id([2; 16]), key: &co }),
+                Some(CoSign {
+                    admin_id: Id([2; 16]),
+                    key: &co,
+                }),
             )
             .unwrap();
         let set = TombstoneSet::verify(&bytes(&[r]), chain.head()).unwrap();
@@ -733,11 +816,18 @@ mod tests {
         let mut chain = ControlChain::new();
         let admin = SigningKey::generate();
         let co = SigningKey::generate();
-        let cosign = || CoSign { admin_id: Id([2; 16]), key: &co };
+        let cosign = || CoSign {
+            admin_id: Id([2; 16]),
+            key: &co,
+        };
 
         // Revoke (epoch 1), then reinstate superseding epoch 1 → cleared.
         let rev1 = chain
-            .revoke(&admin, rp(FileScope::AccountWide, U, None, 1), Some(cosign()))
+            .revoke(
+                &admin,
+                rp(FileScope::AccountWide, U, None, 1),
+                Some(cosign()),
+            )
             .unwrap();
         let rein = chain.reinstate(
             &admin,
@@ -750,15 +840,26 @@ mod tests {
             },
             cosign(),
         );
-        let set = TombstoneSet::verify(&bytes(&[rev1.clone(), rein.clone()]), chain.head()).unwrap();
-        assert!(!set.is_account_revoked(&[U; 16]), "epoch-1 revoke is superseded");
+        let set =
+            TombstoneSet::verify(&bytes(&[rev1.clone(), rein.clone()]), chain.head()).unwrap();
+        assert!(
+            !set.is_account_revoked(&[U; 16]),
+            "epoch-1 revoke is superseded"
+        );
 
         // A *later* re-revoke (epoch 2) is NOT cleared by the stale reinstatement.
         let rev2 = chain
-            .revoke(&admin, rp(FileScope::AccountWide, U, None, 1), Some(cosign()))
+            .revoke(
+                &admin,
+                rp(FileScope::AccountWide, U, None, 1),
+                Some(cosign()),
+            )
             .unwrap();
         let set = TombstoneSet::verify(&bytes(&[rev1, rein, rev2]), chain.head()).unwrap();
-        assert!(set.is_account_revoked(&[U; 16]), "re-revoke (epoch 2) stands");
+        assert!(
+            set.is_account_revoked(&[U; 16]),
+            "re-revoke (epoch 2) stands"
+        );
     }
 
     #[test]
@@ -770,7 +871,10 @@ mod tests {
             .revoke(
                 &admin,
                 rp(FileScope::AccountWide, U, Some(Role::Admin), 1),
-                Some(CoSign { admin_id: Id([2; 16]), key: &co }),
+                Some(CoSign {
+                    admin_id: Id([2; 16]),
+                    key: &co,
+                }),
             )
             .unwrap();
         let set = TombstoneSet::verify(&bytes(&[r]), chain.head()).unwrap();
@@ -779,7 +883,10 @@ mod tests {
             set.effective_roles(&[U; 16], &[Role::User, Role::Admin]),
             vec![Role::User]
         );
-        assert!(!set.is_account_revoked(&[U; 16]), "de-admin is not an access revoke");
+        assert!(
+            !set.is_account_revoked(&[U; 16]),
+            "de-admin is not an access revoke"
+        );
     }
 
     #[test]
@@ -789,8 +896,17 @@ mod tests {
         let file = FileScope::Specific(Id([0x0A; 16]));
         let r = chain.revoke(&admin, rp(file, U, None, 5), None).unwrap();
         let set = TombstoneSet::verify(&bytes(&[r]), chain.head()).unwrap();
-        assert!(set.is_revoked(&[U; 16], &[0x0A; 16], 5), "revoked at from_version");
-        assert!(set.is_revoked(&[U; 16], &[0x0A; 16], 9), "and later versions");
-        assert!(!set.is_revoked(&[U; 16], &[0x0A; 16], 4), "but not earlier versions");
+        assert!(
+            set.is_revoked(&[U; 16], &[0x0A; 16], 5),
+            "revoked at from_version"
+        );
+        assert!(
+            set.is_revoked(&[U; 16], &[0x0A; 16], 9),
+            "and later versions"
+        );
+        assert!(
+            !set.is_revoked(&[U; 16], &[0x0A; 16], 4),
+            "but not earlier versions"
+        );
     }
 }

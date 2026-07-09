@@ -217,7 +217,12 @@ fn verify_header(
     if manifest.chunk_size < CHUNK_SIZE_MIN || manifest.chunk_size > CHUNK_SIZE_MAX {
         return Err(FramingBoundsExceeded("chunk_size out of range"));
     }
-    if !verify(&ctx.author_sig_pub, labels::MANIFEST, &manifest, manifest_sig) {
+    if !verify(
+        &ctx.author_sig_pub,
+        labels::MANIFEST,
+        &manifest,
+        manifest_sig,
+    ) {
         return Err(ManifestSignature);
     }
 
@@ -302,14 +307,14 @@ fn verify_header(
         recipient_id: ctx.recipient_id,
     };
     let dek = match manifest.alg {
-        Suite::V1 => unwrap_dek(ctx.recipient_secret, wrapped_dek, &wrap_ctx).map_err(|_| DekUnwrap)?,
+        Suite::V1 => {
+            unwrap_dek(ctx.recipient_secret, wrapped_dek, &wrap_ctx).map_err(|_| DekUnwrap)?
+        }
         Suite::V2 => {
             let seed = ctx.recipient_mlkem_seed.ok_or(PqKeyMissing)?;
             let hybrid = crate::upload::unpack_hybrid_wrap(wrapped_dek).map_err(|_| DekUnwrap)?;
-            let hsk = HybridEncSecretKey::from_components(
-                ctx.recipient_secret.expose_bytes(),
-                seed,
-            );
+            let hsk =
+                HybridEncSecretKey::from_components(ctx.recipient_secret.expose_bytes(), seed);
             unwrap_dek_hybrid(&hsk, &hybrid, &wrap_ctx).map_err(|_| DekUnwrap)?
         }
     };
@@ -366,8 +371,14 @@ pub fn verify_and_open(
             return Err(StreamDigestMismatch(ms.stream_type));
         }
         let ck = dek.stream_subkey(ms.stream_type);
-        let plaintext = open_stream(&ck, ctx.file_id, manifest.version, ms.stream_type, &provided.chunks)
-            .map_err(|_| StreamFraming(ms.stream_type))?;
+        let plaintext = open_stream(
+            &ck,
+            ctx.file_id,
+            manifest.version,
+            ms.stream_type,
+            &provided.chunks,
+        )
+        .map_err(|_| StreamFraming(ms.stream_type))?;
         if ms.stream_type == StreamType::Content {
             content_digest = ms.digest.0;
         }
@@ -628,8 +639,14 @@ fn open_small_streams<'m>(
             return Err(StreamDigestMismatch(ms.stream_type));
         }
         let ck = dek.stream_subkey(ms.stream_type);
-        let plaintext = open_stream(&ck, ctx.file_id, manifest.version, ms.stream_type, &provided.chunks)
-            .map_err(|_| StreamFraming(ms.stream_type))?;
+        let plaintext = open_stream(
+            &ck,
+            ctx.file_id,
+            manifest.version,
+            ms.stream_type,
+            &provided.chunks,
+        )
+        .map_err(|_| StreamFraming(ms.stream_type))?;
         small.push(OpenedStream {
             stream_type: ms.stream_type,
             plaintext,
@@ -638,7 +655,10 @@ fn open_small_streams<'m>(
 
     // The content stream must be declared in the manifest (DESIGN §12.3).
     let content_ms = content_ms.ok_or(StreamMissing(StreamType::Content))?;
-    match content_ms.chunk_count.checked_mul(manifest.chunk_size as u64) {
+    match content_ms
+        .chunk_count
+        .checked_mul(manifest.chunk_size as u64)
+    {
         Some(b) if b <= MAX_ADDRESSABLE_BYTES => {}
         _ => return Err(FramingBoundsExceeded("addressable size")),
     }
@@ -933,7 +953,10 @@ pub fn open_content_decryptor(
     if content_ms.chunk_count == 0 {
         return Err(StreamFraming(StreamType::Content));
     }
-    match content_ms.chunk_count.checked_mul(manifest.chunk_size as u64) {
+    match content_ms
+        .chunk_count
+        .checked_mul(manifest.chunk_size as u64)
+    {
         Some(b) if b <= MAX_ADDRESSABLE_BYTES => {}
         _ => return Err(FramingBoundsExceeded("addressable size")),
     }
@@ -1067,20 +1090,42 @@ mod tests {
             preview: None,
         };
         let bundle = build_upload(&params, &streams).unwrap();
-        (Built { owner, recovery_sk, bundle }, content)
+        (
+            Built {
+                owner,
+                recovery_sk,
+                bundle,
+            },
+            content,
+        )
     }
 
     /// Split an UploadBundle into a streaming header (small streams) + the
     /// content stream's ciphertext chunks (fetched lazily by the test).
     fn stream_header(b: &UploadBundle) -> (StreamHeader, Vec<Vec<u8>>) {
-        let sw = b.wraps.iter().find(|w| w.recipient_type == RecipientType::User).unwrap();
-        let rw = b.wraps.iter().find(|w| w.recipient_type == RecipientType::Recovery).unwrap();
-        let content = b.streams.iter().find(|s| s.stream_type == StreamType::Content).unwrap();
+        let sw = b
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == RecipientType::User)
+            .unwrap();
+        let rw = b
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == RecipientType::Recovery)
+            .unwrap();
+        let content = b
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .unwrap();
         let small = b
             .streams
             .iter()
             .filter(|s| s.stream_type != StreamType::Content)
-            .map(|s| StreamChunks { stream_type: s.stream_type, chunks: s.chunks.clone() })
+            .map(|s| StreamChunks {
+                stream_type: s.stream_type,
+                chunks: s.chunks.clone(),
+            })
             .collect();
         let header = StreamHeader {
             manifest_bytes: encode(&b.manifest),
@@ -1121,10 +1166,17 @@ mod tests {
         assert_eq!(opened.version, 1);
         assert!(opened.recovery_grant_ok);
         assert_eq!(opened.content_chunk_count, chunks.len() as u64);
-        assert!(max_frame <= 4096, "no frame exceeds the chunk size (O(chunk_size) RAM)");
+        assert!(
+            max_frame <= 4096,
+            "no frame exceeds the chunk size (O(chunk_size) RAM)"
+        );
         assert_eq!(out, content, "streamed content reconstructs the plaintext");
         // The small metadata stream is decoded whole and digest-checked.
-        let meta = opened.small_streams.iter().find(|s| s.stream_type == StreamType::Metadata).unwrap();
+        let meta = opened
+            .small_streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Metadata)
+            .unwrap();
         assert_eq!(meta.plaintext, b"title=big");
     }
 
@@ -1172,7 +1224,10 @@ mod tests {
             .streams
             .iter()
             .filter(|s| s.stream_type != StreamType::Content)
-            .map(|s| StreamChunks { stream_type: s.stream_type, chunks: s.chunks.clone() })
+            .map(|s| StreamChunks {
+                stream_type: s.stream_type,
+                chunks: s.chunks.clone(),
+            })
             .collect();
         let header = StreamHeader {
             manifest_bytes: db.manifest_bytes.clone(),
@@ -1197,7 +1252,10 @@ mod tests {
             .find(|s| s.stream_type == StreamType::Metadata)
             .unwrap();
         assert_eq!(meta.plaintext, b"title=fox");
-        assert!(opened.small_streams.iter().all(|s| s.stream_type != StreamType::Content));
+        assert!(opened
+            .small_streams
+            .iter()
+            .all(|s| s.stream_type != StreamType::Content));
         // The content framing count is still reported from the verified manifest.
         assert!(opened.content_chunk_count >= 1);
     }
@@ -1208,7 +1266,11 @@ mod tests {
         let db = self_bundle(&built.bundle);
         let header = StreamHeader {
             manifest_bytes: db.manifest_bytes.clone(),
-            manifest_sig: { let mut s = db.manifest_sig; s[0] ^= 0x01; s },
+            manifest_sig: {
+                let mut s = db.manifest_sig;
+                s[0] ^= 0x01;
+                s
+            },
             genesis_bytes: db.genesis_bytes.clone(),
             genesis_sig: db.genesis_sig,
             wrapped_dek: db.wrapped_dek.clone(),
@@ -1234,7 +1296,10 @@ mod tests {
             .streams
             .iter()
             .filter(|s| s.stream_type != StreamType::Content)
-            .map(|s| StreamChunks { stream_type: s.stream_type, chunks: s.chunks.clone() })
+            .map(|s| StreamChunks {
+                stream_type: s.stream_type,
+                chunks: s.chunks.clone(),
+            })
             .collect();
         let meta = small
             .iter_mut()
@@ -1276,7 +1341,10 @@ mod tests {
             .iter()
             .find(|s| s.stream_type == StreamType::Content)
             .unwrap();
-        assert_eq!(content.plaintext, b"the quick brown fox jumps over the lazy dog");
+        assert_eq!(
+            content.plaintext,
+            b"the quick brown fox jumps over the lazy dog"
+        );
         let meta = opened
             .streams
             .iter()
@@ -1322,7 +1390,7 @@ mod tests {
     /// (dual-controlled), plus the leak-free issuer resolver for its two admins.
     fn account_revoke_set(victim: Id) -> crate::revocation::TombstoneSet {
         use crate::revocation::{ControlRecordIn, IssuerInfo, TombstoneSet};
-        use maxsecu_admin_core::{ControlChain, CoSign, RevokeParams};
+        use maxsecu_admin_core::{CoSign, ControlChain, RevokeParams};
         use maxsecu_crypto::SigningKey;
         use maxsecu_encoding::types::{FileScope, Role};
 
@@ -1342,17 +1410,32 @@ mod tests {
                     issued_by: a1_id,
                     created_at: NOW,
                 },
-                Some(CoSign { admin_id: a2_id, key: &a2 }),
+                Some(CoSign {
+                    admin_id: a2_id,
+                    key: &a2,
+                }),
             )
             .unwrap();
         let (a1_pub, a2_pub) = (a1.verifying_key().to_bytes(), a2.verifying_key().to_bytes());
         let issuer = move |id: Id| match id {
-            x if x == a1_id => Some(IssuerInfo { sig_pub: a1_pub, roles: vec![Role::Admin], key_version: 1 }),
-            x if x == a2_id => Some(IssuerInfo { sig_pub: a2_pub, roles: vec![Role::Admin], key_version: 1 }),
+            x if x == a1_id => Some(IssuerInfo {
+                sig_pub: a1_pub,
+                roles: vec![Role::Admin],
+                key_version: 1,
+            }),
+            x if x == a2_id => Some(IssuerInfo {
+                sig_pub: a2_pub,
+                roles: vec![Role::Admin],
+                key_version: 1,
+            }),
             _ => None,
         };
         TombstoneSet::verify_authenticated(
-            &[ControlRecordIn { bytes: rev.bytes.clone(), sig: rev.sig, co_sig: rev.co_sig }],
+            &[ControlRecordIn {
+                bytes: rev.bytes.clone(),
+                sig: rev.sig,
+                co_sig: rev.co_sig,
+            }],
             chain.head(),
             &issuer,
         )
@@ -1382,7 +1465,10 @@ mod tests {
         let ts = account_revoke_set(V_ID);
         let mut c = reshare_ctx(&built, &v, &resolver);
         c.tombstones = Some(&ts);
-        assert_eq!(verify_and_open(&c, &bundle), Err(DownloadError::RecipientRevoked));
+        assert_eq!(
+            verify_and_open(&c, &bundle),
+            Err(DownloadError::RecipientRevoked)
+        );
     }
 
     #[test]
@@ -1407,8 +1493,16 @@ mod tests {
     ) -> (DownloadBundle, Identity, maxsecu_crypto::SigningKey) {
         use maxsecu_admin_core::{build_recovery_grant, RecoveryGrantParams};
         let b = &built.bundle;
-        let sw = b.wraps.iter().find(|w| w.recipient_type == RecipientType::User).unwrap();
-        let owner_ctx = WrapContext { file_id: FILE_ID, version: 1, recipient_id: OWNER_ID };
+        let sw = b
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == RecipientType::User)
+            .unwrap();
+        let owner_ctx = WrapContext {
+            file_id: FILE_ID,
+            version: 1,
+            recipient_id: OWNER_ID,
+        };
         let dek = unwrap_dek(built.owner.enc_secret(), &sw.wrapped_dek, &owner_ctx).unwrap();
 
         let admin = maxsecu_crypto::SigningKey::generate();
@@ -1466,8 +1560,15 @@ mod tests {
         let admin_res = move |id: Id| (id == ADMIN_ID).then_some(admin_pub);
         let opened = verify_and_open(&recovery_ctx(&built, &recip, &admin_res), &db)
             .expect("recovery-operator grant opens for its version");
-        let content = opened.streams.iter().find(|s| s.stream_type == StreamType::Content).unwrap();
-        assert_eq!(content.plaintext, b"the quick brown fox jumps over the lazy dog");
+        let content = opened
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .unwrap();
+        assert_eq!(
+            content.plaintext,
+            b"the quick brown fox jumps over the lazy dog"
+        );
     }
 
     #[test]
@@ -1504,8 +1605,14 @@ mod tests {
         // backdated via created_at cannot acquire an earlier sink position (D28).
         let cutoff = |id: Id, kv: u64| (id == OWNER_ID && kv == 1).then_some(5u64);
         let mut c = ctx(&built);
-        c.compromise = Some(CompromiseCheck { genesis_sink_pos: Some(9), cutoff: &cutoff });
-        assert_eq!(verify_and_open(&c, &db), Err(DownloadError::GenesisAfterCompromise));
+        c.compromise = Some(CompromiseCheck {
+            genesis_sink_pos: Some(9),
+            cutoff: &cutoff,
+        });
+        assert_eq!(
+            verify_and_open(&c, &db),
+            Err(DownloadError::GenesisAfterCompromise)
+        );
     }
 
     #[test]
@@ -1516,7 +1623,10 @@ mod tests {
         // old file under a key that was only later compromised; still opens.
         let cutoff = |id: Id, kv: u64| (id == OWNER_ID && kv == 1).then_some(5u64);
         let mut c = ctx(&built);
-        c.compromise = Some(CompromiseCheck { genesis_sink_pos: Some(2), cutoff: &cutoff });
+        c.compromise = Some(CompromiseCheck {
+            genesis_sink_pos: Some(2),
+            cutoff: &cutoff,
+        });
         assert!(verify_and_open(&c, &db).is_ok());
     }
 
@@ -1528,8 +1638,14 @@ mod tests {
         let mut c = ctx(&built);
         // Cannot establish the genesis's sink position while a compromise exists
         // for its key → fail closed rather than honor a possibly-forged genesis.
-        c.compromise = Some(CompromiseCheck { genesis_sink_pos: None, cutoff: &cutoff });
-        assert_eq!(verify_and_open(&c, &db), Err(DownloadError::GenesisAfterCompromise));
+        c.compromise = Some(CompromiseCheck {
+            genesis_sink_pos: None,
+            cutoff: &cutoff,
+        });
+        assert_eq!(
+            verify_and_open(&c, &db),
+            Err(DownloadError::GenesisAfterCompromise)
+        );
     }
 
     #[test]
@@ -1540,7 +1656,10 @@ mod tests {
         // irrelevant and the file opens.
         let cutoff = |_: Id, _: u64| None;
         let mut c = ctx(&built);
-        c.compromise = Some(CompromiseCheck { genesis_sink_pos: None, cutoff: &cutoff });
+        c.compromise = Some(CompromiseCheck {
+            genesis_sink_pos: None,
+            cutoff: &cutoff,
+        });
         assert!(verify_and_open(&c, &db).is_ok());
     }
 
@@ -1739,7 +1858,10 @@ mod tests {
             granted_by: OWNER_ID,
             created_at: NOW,
         };
-        let r_grant_sig = built.owner.signing_key().sign_canonical(labels::GRANT, &r_grant);
+        let r_grant_sig = built
+            .owner
+            .signing_key()
+            .sign_canonical(labels::GRANT, &r_grant);
 
         // V: re-shared by R (granted_by = R), signed with R's own key.
         let v = Identity::generate();
@@ -1933,7 +2055,10 @@ mod tests {
             manifest_sig: built.bundle.manifest_sig,
             genesis_bytes: encode(&built.bundle.genesis),
             genesis_sig: built.bundle.genesis_sig,
-            wrapped_dek: WrappedDek { enc: [0; 32], ct: vec![0; 48] },
+            wrapped_dek: WrappedDek {
+                enc: [0; 32],
+                ct: vec![0; 48],
+            },
             grant_bytes: leaf_bytes,
             grant_sig: leaf_sig,
             ancestor_grants: vec![a, b],
@@ -1992,7 +2117,10 @@ mod tests {
             manifest_sig: built.bundle.manifest_sig,
             genesis_bytes: encode(&built.bundle.genesis),
             genesis_sig: built.bundle.genesis_sig,
-            wrapped_dek: WrappedDek { enc: [0; 32], ct: vec![0; 48] },
+            wrapped_dek: WrappedDek {
+                enc: [0; 32],
+                ct: vec![0; 48],
+            },
             grant_bytes: encode(&leaf_g),
             grant_sig: leaf_sig,
             ancestor_grants: ancestors,
@@ -2041,14 +2169,18 @@ mod tests {
             author_id: OWNER_ID,
             created_at: NOW,
         };
-        let manifest_sig = owner.signing_key().sign_canonical(labels::MANIFEST, &manifest);
+        let manifest_sig = owner
+            .signing_key()
+            .sign_canonical(labels::MANIFEST, &manifest);
         let genesis = Genesis {
             file_id: FILE_ID,
             owner_id: OWNER_ID,
             owner_key_version: 1,
             created_at: NOW,
         };
-        let genesis_sig = owner.signing_key().sign_canonical(labels::GENESIS, &genesis);
+        let genesis_sig = owner
+            .signing_key()
+            .sign_canonical(labels::GENESIS, &genesis);
         let db = DownloadBundle {
             manifest_bytes: encode(&manifest),
             manifest_sig,
@@ -2249,9 +2381,7 @@ mod tests {
 
         // Non-overlapping fragments [0,2) and [2,N) reconstruct the whole content.
         let f0 = dec.open_range(0, &chunks[0..2]).expect("frag 0");
-        let f1 = dec
-            .open_range(2, &chunks[2..chunks.len()])
-            .expect("frag 1");
+        let f1 = dec.open_range(2, &chunks[2..chunks.len()]).expect("frag 1");
         let mut joined = Vec::new();
         joined.extend_from_slice(&f0);
         joined.extend_from_slice(&f1);

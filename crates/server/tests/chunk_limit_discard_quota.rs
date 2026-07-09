@@ -134,10 +134,7 @@ fn req_get(uri: &str, token: &str) -> Request<Body> {
 
 // ── Send helpers ─────────────────────────────────────────────────────────────
 
-async fn send(
-    r: &axum::Router,
-    req: Request<Body>,
-) -> (StatusCode, serde_json::Value) {
+async fn send(r: &axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
     let resp = r.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 22)
@@ -474,7 +471,11 @@ async fn discard_staged_by_owner_is_204_and_idempotent() {
     // PUT one chunk to exercise blob-reference cleanup on discard
     let st = send_status(
         &r,
-        req_put_bytes(&chunk_uri(FILE, 1, "content", 0), vec![0x10u8; 32], &alice_tok),
+        req_put_bytes(
+            &chunk_uri(FILE, 1, "content", 0),
+            vec![0x10u8; 32],
+            &alice_tok,
+        ),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "PUT content/0");
@@ -557,7 +558,11 @@ async fn delete_finalized_owner_only_removes_file() {
         req_get(&format!("{}?version=latest", file_uri(FILE)), &alice_tok),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "file survives a non-owner delete attempt");
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "file survives a non-owner delete attempt"
+    );
 
     // The OWNER DELETE → 204 permanent delete; the file is gone.
     let st = send_status(&r, req_delete(&file_uri(FILE), &alice_tok)).await;
