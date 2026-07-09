@@ -42,8 +42,9 @@ test("index.html defaults data-frontend and loads the external boot script (CSP-
   assert.doesNotMatch(html, /<script>[\s\S]*maxsecu\.frontend/); // no inline JS
 });
 
-test("boot.js applies the persisted frontend pre-paint, mirroring the stylesheet map", () => {
-  assert.match(boot, /maxsecu\.frontend/);
+test("boot.js prefers the injected __MAXSECU_BOOT__ skin, falls back to localStorage, mirrors the map", () => {
+  assert.match(boot, /__MAXSECU_BOOT__/);
+  assert.match(boot, /maxsecu\.frontend/); // legacy fallback still present
   assert.match(boot, /styles\.pizza\.css/);
   assert.match(boot, /styles\.slot3\.css/);
 });

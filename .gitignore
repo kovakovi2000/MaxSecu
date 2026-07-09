@@ -30,6 +30,12 @@ Thumbs.db
 target-repro-a/
 target-repro-b/
 
+# Storage-audit scratch: the copied exe + ProcMon captures (.pml/.csv) are large
+# runtime artifacts, and the Sysinternals ProcMon binaries are a downloaded tool —
+# never source, never committed. (The audit SCRIPT under tools/storage-audit IS.)
+/.audit-run/
+/ProcessMonitor/
+
 # Brainstorming visual-companion scratch (superpowers)
 .superpowers/
 

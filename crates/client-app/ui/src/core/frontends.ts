@@ -2,10 +2,13 @@
 // complete stylesheet it owns (styles.<id>.css, swapped on the #frontend-css link)
 // plus an optional decoration module that injects decorative DOM into data-deco-slot
 // mount points. One shared component tree/backend serves all frontends. The choice is
-// UI-local (localStorage), exactly like the retired theme presets. DOM/storage access
-// is guarded so this module imports cleanly under node:test.
+// persisted in the backend settings.json (appearance.frontend, via the shared settings
+// store) so nothing lands in browser localStorage; the Rust host injects it pre-paint.
+// DOM access is guarded so this module imports cleanly under node:test.
 import { pizzaDeco } from "../frontends/pizza/deco.ts";
 import { slot3Deco } from "../frontends/slot3/deco.ts";
+import { settingsStore } from "./settings-store-instance.ts";
+import { updateSettings } from "./settings.ts";
 
 export type FrontendId = "default" | "pizza" | "slot3";
 
@@ -23,8 +26,6 @@ export const FRONTENDS: ReadonlyArray<{ id: FrontendId; label: string }> = [
   { id: "pizza", label: "Cheese Pizza" },
   { id: "slot3", label: "Marauder's Map" },
 ];
-
-const FRONTEND_KEY = "maxsecu.frontend";
 
 const STYLESHEETS: Record<FrontendId, string> = {
   default: "styles.css",
@@ -50,11 +51,7 @@ export function frontendStylesheet(id: FrontendId): string {
 }
 
 export function getFrontend(): FrontendId {
-  try {
-    return normalizeFrontend(window.localStorage.getItem(FRONTEND_KEY));
-  } catch {
-    return "default";
-  }
+  return normalizeFrontend(settingsStore.get().appearance.frontend);
 }
 
 // Effect the frontend: swap stylesheet href + data-frontend attr, then unmount the
@@ -79,13 +76,9 @@ export function applyFrontend(value: unknown = getFrontend()): FrontendId {
 
 export function setFrontend(value: unknown): FrontendId {
   const id = normalizeFrontend(value);
-  try {
-    window.localStorage.setItem(FRONTEND_KEY, id);
-  } catch {
-    // Storage can be unavailable in tests / locked-down webviews; the frontend still
-    // applies for this session via the DOM.
-  }
-  applyFrontend(id);
+  applyFrontend(id); // apply immediately (sync, responsive)
+  // Persist to settings.json (source of truth); fire-and-forget, never blocks the UI.
+  void updateSettings({ appearance: { ...settingsStore.get().appearance, frontend: id } }).catch(() => {});
   return id;
 }
 

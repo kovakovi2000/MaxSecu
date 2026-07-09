@@ -19,6 +19,40 @@ fn main() {
     // not crash startup.
     let _ = maxsecu_client_app::layout::ensure_portable_layout(&app_dir);
 
+    // Redirect the process temp dir INTO the portable folder BEFORE anything resolves
+    // a temp path — critically before the WebView2 child spawns, since it inherits our
+    // environment. This keeps WebView2's browser scratch (msedge_*, WebView2Downloads)
+    // AND our own transient scratch (the confined video-transcode per-job dirs) inside
+    // <app_dir>/tmp, which the exit-wipe removes.
+    //
+    // The temp dir is a SIBLING of `webview/`, NOT nested inside it: WebView2
+    // ACL-locks its own user-data directory (`webview/`), and a confined-ffmpeg job
+    // dir created under that locked tree fails the AppContainer child's access
+    // ("That video could not be processed."). A plain `<app_dir>/tmp` has ordinary
+    // inherited ACLs — identical to the OS-temp location the confinement was proven
+    // against — so the per-job `grant_path_to_appcontainer` ACE + bypass-traverse work
+    // exactly as before and GPU-accelerated transcode is preserved.
+    //
+    // Env is read lazily by `std::env::temp_dir()`, so setting it now takes effect for
+    // every later call. Best-effort: a create failure leaves the OS default in place
+    // rather than crashing startup.
+    let webview_dir = app_dir.join("webview");
+    let app_tmp = app_dir.join("tmp");
+    if std::fs::create_dir_all(&app_tmp).is_ok() {
+        std::env::set_var("TEMP", &app_tmp);
+        std::env::set_var("TMP", &app_tmp);
+        // Give the temp root an inheritable CREATOR OWNER Full-Control ACE so each
+        // confined-transcode job dir created beneath it grants its creator
+        // WRITE_OWNER — required for the AppContainer grant to drop that dir to a Low
+        // integrity label. Without this, on a data-drive volume whose inherited ACL is
+        // only "Modify", the label set is ACCESS_DENIED and video ingest fails ("That
+        // video could not be processed."). Reproduces the ACL %TEMP% already carries.
+        // Best-effort: a failure leaves confinement intact, only the on-drive transcode
+        // may still hit the limitation. Windows-only (the confinement/label machinery is).
+        #[cfg(windows)]
+        let _ = maxsecu_media_launcher::grant_creator_owner_full_control(&app_tmp);
+    }
+
     // Initial cache cap from persisted settings, clamped to the live RAM bounds.
     // `load` normalizes a present file, but the missing-file default (1 GiB)
     // is not; `normalized()` here also bounds that first-run default to the
@@ -33,6 +67,13 @@ fn main() {
     // than `feed_concurrency` at once. Read ONCE at startup — changing
     // `feed_concurrency` in settings takes effect on the next app restart.
     let pool_cap = normalized.performance.feed_concurrency as usize;
+
+    // WebView2 user-data folder lives INSIDE the portable folder (`webview_dir`,
+    // defined above) so localStorage, cache, cookies, and GPU cache never escape
+    // <app_dir>. Wiped on exit.
+    // The persisted skin, injected pre-paint via an initialization script so boot.js
+    // can apply it before first paint with no flash (settings.json is the source of truth).
+    let boot_frontend = normalized.appearance.frontend.clone();
 
     // Initialize the process-wide Tor state (arti state under <app-dir>/config/tor).
     // Lazily bootstrapped on the first TorOnly connect; read only by the connection
@@ -79,6 +120,52 @@ fn main() {
         .manage(maxsecu_client_app::disk_free::DiskFreeEstimate(disk_free_est))
         .manage(maxsecu_client_app::directory::DirectoryCache::new())
         .manage(maxsecu_client_app::commands::pool::AppPool::new(pool_cap))
+        .setup(move |app| {
+            use tauri::{WebviewUrl, WebviewWindowBuilder};
+            // Set the injected global BEFORE any page script (incl. boot.js) runs.
+            let boot_script = format!(
+                "window.__MAXSECU_BOOT__ = {{ frontend: {} }};",
+                serde_json::to_string(&boot_frontend).unwrap_or_else(|_| "\"default\"".into())
+            );
+            // WebView2/Chromium command-line args. Setting this REPLACES wry's
+            // defaults, so we re-list them first, then add our hardening:
+            //   * wry defaults (must keep): msWebOOUI/msPdfOOUI (out-of-proc UI off),
+            //     msSmartScreenProtection (no SmartScreen phone-home),
+            //     --autoplay-policy=no-user-gesture-required (autoplay defaults on in
+            //     wry, our media player relies on it).
+            //   * --disable-gpu-shader-disk-cache: stop the GPU driver writing its
+            //     shader cache OUTSIDE the folder, WITHOUT disabling GPU-accelerated
+            //     video decode (we do NOT pass --disable-gpu).
+            //   * msImplicitSignin + msSingleSignOnOSForPrimaryAccountIsShared:
+            //     best-effort suppression of Edge's implicit OS single-sign-on, the
+            //     path that makes the runtime's identity broker (oneauth.dll) read the
+            //     machine's Microsoft/OneDrive account store. We have no MS-account
+            //     integration, so disabling it changes nothing we use.
+            //   * --disable-spell-checking: belt-and-suspenders only. It disables
+            //     Chromium's own spellcheck but NOT the Windows OS spellchecker
+            //     (WinRT Globalization), which is what WebView2 uses on Windows and
+            //     which learns words into %APPDATA%\Microsoft\Spelling\*. The effective
+            //     fix for that out-of-folder trace is `spellcheck="false"` on the UI
+            //     root (index.html) — this flag is kept as a harmless secondary guard.
+            const BROWSER_ARGS: &str = concat!(
+                "--disable-features=",
+                "msWebOOUI,msPdfOOUI,msSmartScreenProtection,",
+                "msImplicitSignin,msSingleSignOnOSForPrimaryAccountIsShared",
+                " --disable-gpu-shader-disk-cache",
+                " --disable-spell-checking",
+                " --autoplay-policy=no-user-gesture-required",
+            );
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                .title("MaxSecu")
+                .inner_size(1100.0, 720.0)
+                .resizable(true)
+                .maximized(true)
+                .data_directory(webview_dir.clone())
+                .additional_browser_args(BROWSER_ARGS)
+                .initialization_script(boot_script)
+                .build()?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             maxsecu_client_app::commands::connection::connect,
             maxsecu_client_app::commands::auth::unlock_keystore,
@@ -191,6 +278,13 @@ fn main() {
                 .try_state::<std::sync::Arc<maxsecu_client_app::session_seal::SessionSeal>>()
             {
                 seal.zeroize(); // wipe the key's in-RAM copy (swap copy from before this is the accepted residual)
+            }
+            // Wipe the WebView2 user-data folder AND the in-folder temp dir so no
+            // browser artifacts or transient transcode scratch persist between runs.
+            // Best-effort — never block or panic shutdown.
+            if let Some(dir) = app_handle.try_state::<AppDir>() {
+                let _ = std::fs::remove_dir_all(dir.0.join("webview"));
+                let _ = std::fs::remove_dir_all(dir.0.join("tmp"));
             }
         }
         _ => {}

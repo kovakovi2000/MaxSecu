@@ -104,12 +104,16 @@ test("Privacy copy is expanded and accurate", () => {
   }
 });
 
-test("Appearance offers a Frontend selector wired to get/setFrontend", () => {
+test("Appearance offers a Frontend selector wired to the store-backed skin", () => {
   assert.match(src, /<select name="frontend">/, "Frontend <select> missing");
   for (const id of ["default", "pizza", "slot3"]) {
     assert.match(src, new RegExp(`<option value="${id}"`), `frontend option ${id} missing`);
   }
   assert.match(src, /getFrontend\(\)/, "load path must read getFrontend()");
-  assert.match(src, /setFrontend\(/, "change path must call setFrontend()");
+  // The change path applies the skin visually now and folds the frontend into the
+  // SINGLE save patch (no second set_settings write racing the main one).
+  assert.match(src, /applyFrontend\(/, "change path must apply the skin visually");
+  assert.match(src, /appearance:\s*\{\s*theme:[^}]*frontend\s*\}/, "save patch must persist frontend");
+  assert.doesNotMatch(src, /setFrontend\(/, "must not double-persist via setFrontend");
   assert.doesNotMatch(src, /<select name="theme">/, "old theme select must be removed");
 });

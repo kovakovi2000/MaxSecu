@@ -27,21 +27,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, SetHandleInformation, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
-    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    CloseHandle, LocalFree, SetHandleInformation, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    ConvertStringSidToSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID,
+    TRUSTEE_IS_USER, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    FreeSid, GetSecurityDescriptorSacl, ACL, DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION,
-    NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
-    SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    FreeSid, GetSecurityDescriptorSacl, ACL, DACL_SECURITY_INFORMATION, INHERIT_ONLY,
+    LABEL_SECURITY_INFORMATION, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    SECURITY_CAPABILITIES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -134,12 +135,19 @@ fn appcontainer_sid() -> Result<PSID, SpawnError> {
     if hr == 0 {
         return Ok(sid);
     }
+    // Any non-success create falls back to derive. HR_ALREADY_EXISTS is the common
+    // case (the persistent profile is already registered), but a CONCURRENT create
+    // of the same profile by another process (a second app instance, or parallel
+    // test binaries) can also surface a transient race error — in every such case
+    // the profile exists (or was just created by the winner), so deriving its SID is
+    // the correct, robust recovery. We only fail if the derive ALSO fails, and then
+    // report the original create error when it was not a plain ALREADY_EXISTS.
+    // SAFETY: deriving the SID for the (now-existing) profile; `sid` receives it.
+    let hr2 = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+    if hr2 == 0 {
+        return Ok(sid);
+    }
     if hr == HR_ALREADY_EXISTS {
-        // SAFETY: deriving the SID for an existing profile; `sid` receives it.
-        let hr2 = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
-        if hr2 == 0 {
-            return Ok(sid);
-        }
         return Err(SpawnError {
             ctx: "DeriveAppContainerSid",
             code: hr2 as u32,
@@ -443,6 +451,130 @@ fn set_low_label(wpath: &[u16]) -> Result<(), SpawnError> {
     if err != 0 {
         return Err(SpawnError {
             ctx: "SetNamedSecurityInfo.label",
+            code: err,
+        });
+    }
+    Ok(())
+}
+
+/// Grant **CREATOR OWNER** (`S-1-3-0`) an inheritable Full-Control ACE on `dir`,
+/// MERGED non-destructively into its existing DACL. This reproduces the ACL the
+/// per-user `%TEMP%` already carries: every subdirectory the current process
+/// creates under `dir` receives an effective Full-Control ACE for its creator,
+/// **including `WRITE_OWNER`**.
+///
+/// That is required by the confined-transcode workspace grant: for
+/// [`GrantAccess::ReadWrite`], [`grant_path_to_appcontainer`] drops each per-job
+/// dir to a Low integrity label via `SetNamedSecurityInfoW(.. LABEL ..)`, and
+/// Windows only permits setting a mandatory label with `WRITE_OWNER` access to the
+/// object. When the portable folder lives on a volume whose inherited ACL grants
+/// the user merely *Modify* (no `WRITE_OWNER`) — typical of a non-system data drive
+/// — that label set is otherwise `ACCESS_DENIED` and the transcode fails. Applying
+/// this ACE to the in-folder temp root once (owner has `WRITE_DAC`, so the DACL
+/// edit itself is permitted) restores the working `%TEMP%`-equivalent condition.
+///
+/// The ACE is inherit-only (`SUB_CONTAINERS_AND_OBJECTS_INHERIT | INHERIT_ONLY`),
+/// so it affects only children (the job dirs), never `dir` itself. Best-effort at
+/// the call site: a failure leaves confinement fully intact — it only means an
+/// on-that-volume transcode may still hit the WRITE_OWNER limitation.
+pub fn grant_creator_owner_full_control(dir: &Path) -> Result<(), SpawnError> {
+    let wpath = wide(&dir.to_string_lossy());
+
+    // CREATOR OWNER template SID (instantiated to the actual creator on each child).
+    let sid_str = wide("S-1-3-0");
+    let mut sid: PSID = ptr::null_mut();
+    // SAFETY: `sid_str` is a valid NUL-terminated wide SID string; on success `sid`
+    // receives a LocalAlloc'd SID (freed via LocalFree below).
+    if unsafe { ConvertStringSidToSidW(sid_str.as_ptr(), &mut sid) } == 0 {
+        return Err(SpawnError::last("ConvertStringSidToSid.creator_owner"));
+    }
+    // A ConvertStringSidToSidW SID is LocalAlloc'd — it MUST be freed with LocalFree
+    // (never FreeSid, which is only for the AllocateAndInitializeSid family).
+    let free_str_sid = |s: PSID| {
+        if !s.is_null() {
+            // SAFETY: `s` was LocalAlloc'd by ConvertStringSidToSidW; freed once per path.
+            unsafe { LocalFree(s as _) };
+        }
+    };
+
+    // Capture the current DACL so we MERGE (never clobber inherited SYSTEM/Admin ACEs).
+    let mut prior_dacl: *mut ACL = ptr::null_mut();
+    let mut prior_sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: valid path + out-params; on success `prior_sd` owns the descriptor
+    // backing `prior_dacl`.
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            wpath.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut prior_dacl,
+            ptr::null_mut(),
+            &mut prior_sd,
+        )
+    };
+    if err != 0 {
+        free_str_sid(sid);
+        return Err(SpawnError {
+            ctx: "GetNamedSecurityInfo.tmp",
+            code: err,
+        });
+    }
+
+    let mut trustee: TRUSTEE_W = unsafe { core::mem::zeroed() };
+    trustee.pMultipleTrustee = ptr::null_mut();
+    trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
+    trustee.TrusteeForm = TRUSTEE_IS_SID;
+    trustee.TrusteeType = TRUSTEE_IS_USER;
+    trustee.ptstrName = sid as windows_sys::core::PWSTR;
+
+    let mut ea: EXPLICIT_ACCESS_W = unsafe { core::mem::zeroed() };
+    ea.grfAccessPermissions = GENERIC_ALL;
+    ea.grfAccessMode = GRANT_ACCESS;
+    // "Subfolders and files only": inherit-only, so `dir` itself is unaffected and
+    // each created job dir gets an effective Full-Control (incl. WRITE_OWNER) ACE.
+    ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT | INHERIT_ONLY;
+    ea.Trustee = trustee;
+
+    let mut new_dacl: *mut ACL = ptr::null_mut();
+    // SAFETY: `ea` is fully initialized; `prior_dacl` may be null; `new_dacl`
+    // receives a LocalAlloc'd merged ACL on success.
+    let err = unsafe { SetEntriesInAclW(1, &ea, prior_dacl, &mut new_dacl) };
+    if err != 0 {
+        // SAFETY: `prior_sd` freed once; no DACL changed yet.
+        unsafe { LocalFree(prior_sd as _) };
+        free_str_sid(sid);
+        return Err(SpawnError {
+            ctx: "SetEntriesInAcl.tmp",
+            code: err,
+        });
+    }
+
+    // Apply the merged DACL. The process is the dir's owner, so it holds WRITE_DAC
+    // implicitly — this edit is permitted even where WRITE_OWNER is not.
+    // SAFETY: `new_dacl` is the merged ACL; only DACL info is written.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            wpath.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_dacl,
+            ptr::null(),
+        )
+    };
+    // SAFETY: each pointer was LocalAlloc'd (or SID via ConvertStringSidToSid) and
+    // is freed exactly once now that the DACL has been applied.
+    unsafe {
+        LocalFree(new_dacl as _);
+        LocalFree(prior_sd as _);
+    }
+    free_str_sid(sid);
+    if err != 0 {
+        return Err(SpawnError {
+            ctx: "SetNamedSecurityInfo.tmp_dacl",
             code: err,
         });
     }

@@ -9,7 +9,9 @@ function base(): Settings {
     behavior: { confirm_destructive: false },
     performance: { media_cache_cap_mb: 1024, thumb_cache_cap_mb: 256, feed_concurrency: 4, transcode_threads: 4, decode_threads: 4, cache_location: "Memory" },
     connection: { route_mode: "prefer-server" },
-    appearance: { theme: "dark" },
+    appearance: { theme: "dark", frontend: "default" },
+    ui: { bundle_view: "gallery" },
+    playback: { volume: 1.0, muted: false },
   };
 }
 
@@ -24,7 +26,7 @@ test("patch merges a nested section and notifies", () => {
   const s = new SettingsStore(base());
   let seen: Settings | null = null;
   s.subscribe((v) => (seen = v));
-  s.patchLocal({ appearance: { theme: "dark" } });
+  s.patchLocal({ appearance: { theme: "dark", frontend: "default" } });
   assert.equal(seen!.appearance.theme, "dark");
   assert.equal(seen!.a11y.text_size, "normal", "other sections preserved");
 });
@@ -34,6 +36,6 @@ test("unsubscribe stops notifications", () => {
   let count = 0;
   const off = s.subscribe(() => count++);
   off();
-  s.patchLocal({ appearance: { theme: "dark" } });
+  s.patchLocal({ appearance: { theme: "dark", frontend: "default" } });
   assert.equal(count, 1, "only the immediate call fired");
 });

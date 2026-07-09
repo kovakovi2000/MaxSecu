@@ -39,8 +39,8 @@ pub use transcode_opts::{Bitrate, Resolution, TranscodeOptions};
 mod win32;
 #[cfg(windows)]
 pub use win32::{
-    appcontainer_sid_string, grant_path_to_appcontainer, spawn_confined_exe, ConfinedExeOutput,
-    FfmpegProgress, GrantAccess, PathGrant, SpawnError,
+    appcontainer_sid_string, grant_creator_owner_full_control, grant_path_to_appcontainer,
+    spawn_confined_exe, ConfinedExeOutput, FfmpegProgress, GrantAccess, PathGrant, SpawnError,
 };
 
 /// Default Job-Object memory cap for the confined **ffmpeg** ingest (Task 2.2).

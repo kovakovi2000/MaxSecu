@@ -5,76 +5,29 @@ import {
   normalizeBundleViewMode,
   readBundleViewMode,
   writeBundleViewMode,
-  BUNDLE_VIEW_MODE_KEY,
 } from "../core/bundle-view.ts";
+import { settingsStore } from "../core/settings-store-instance.ts";
 
-// --- Pure view-mode persistence helper (DOM-free) --------------------------
-// The chosen view mode ("gallery" | "stacked") is a pure client UI preference
-// persisted in localStorage. The helper is a pure/guardable module so it can be
-// unit-tested without a DOM (the node harness has no localStorage or Tauri API).
+// --- Store-backed view-mode persistence (DOM-free) -------------------------
+// The chosen view mode ("gallery" | "stacked") is a non-secret UI preference now
+// persisted in the backend settings.json (settings.ui.bundle_view) via the shared
+// settings store — no browser localStorage. The helpers are pure/guardable so they
+// unit-test without a DOM (the node harness has no Tauri host).
 
-test("normalizeBundleViewMode defaults to gallery on first-ever / junk", () => {
+test("normalizeBundleViewMode coerces to a valid mode (default gallery)", () => {
+  assert.equal(normalizeBundleViewMode("stacked"), "stacked");
+  assert.equal(normalizeBundleViewMode("gallery"), "gallery");
+  assert.equal(normalizeBundleViewMode("nope"), "gallery");
   assert.equal(normalizeBundleViewMode(null), "gallery");
   assert.equal(normalizeBundleViewMode(undefined), "gallery");
-  assert.equal(normalizeBundleViewMode(""), "gallery");
-  assert.equal(normalizeBundleViewMode("nonsense"), "gallery");
 });
 
-test("normalizeBundleViewMode round-trips the two valid modes", () => {
-  assert.equal(normalizeBundleViewMode("gallery"), "gallery");
-  assert.equal(normalizeBundleViewMode("stacked"), "stacked");
-});
-
-test("read/write round-trips the chosen mode through localStorage", () => {
-  const store = new Map<string, string>();
-  const fake = {
-    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
-    setItem: (k: string, v: string) => void store.set(k, v),
-    removeItem: (k: string) => void store.delete(k),
-  };
-  (globalThis as unknown as { localStorage?: unknown }).localStorage = fake;
-  try {
-    // Default when nothing is stored yet.
-    assert.equal(readBundleViewMode(), "gallery");
-    writeBundleViewMode("stacked");
-    assert.equal(store.get(BUNDLE_VIEW_MODE_KEY), "stacked");
-    assert.equal(readBundleViewMode(), "stacked");
-    writeBundleViewMode("gallery");
-    assert.equal(readBundleViewMode(), "gallery");
-  } finally {
-    delete (globalThis as unknown as { localStorage?: unknown }).localStorage;
-  }
-});
-
-test("read/write are safe when localStorage is unavailable (node env)", () => {
-  const g = globalThis as unknown as { localStorage?: unknown };
-  const had = "localStorage" in g;
-  const prev = g.localStorage;
-  delete g.localStorage;
-  try {
-    assert.equal(readBundleViewMode(), "gallery"); // falls back, no throw
-    assert.doesNotThrow(() => writeBundleViewMode("stacked"));
-  } finally {
-    if (had) g.localStorage = prev;
-  }
-});
-
-test("read/write swallow a throwing localStorage (private-mode / quota)", () => {
-  const throwing = {
-    getItem: () => {
-      throw new Error("blocked");
-    },
-    setItem: () => {
-      throw new Error("blocked");
-    },
-  };
-  (globalThis as unknown as { localStorage?: unknown }).localStorage = throwing;
-  try {
-    assert.equal(readBundleViewMode(), "gallery");
-    assert.doesNotThrow(() => writeBundleViewMode("stacked"));
-  } finally {
-    delete (globalThis as unknown as { localStorage?: unknown }).localStorage;
-  }
+test("read reflects the settings store; write patches it locally", () => {
+  settingsStore.patchLocal({ ui: { bundle_view: "stacked" } });
+  assert.equal(readBundleViewMode(), "stacked");
+  writeBundleViewMode("gallery");
+  assert.equal(settingsStore.get().ui.bundle_view, "gallery");
+  assert.equal(readBundleViewMode(), "gallery");
 });
 
 // --- Source-structural assertions on the routed screen ----------------------

@@ -2,6 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from "node:fs";
 import { streamSrc, previewSrc } from './video-src.ts';
+import { clampVolume } from "./video-player.ts";
+
+test("clampVolume constrains volume to [0,1] and maps NaN to 1", () => {
+  assert.equal(clampVolume(0.5), 0.5);
+  assert.equal(clampVolume(-2), 0);
+  assert.equal(clampVolume(5), 1);
+  assert.equal(clampVolume(NaN), 1);
+});
 
 test('streamSrc builds the Windows WebView2 custom-protocol URL from the file id', () => {
   assert.equal(streamSrc('abc123'), 'http://stream.localhost/media/abc123');
