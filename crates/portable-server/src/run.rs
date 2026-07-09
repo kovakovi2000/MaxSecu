@@ -13,8 +13,8 @@ use tokio_rustls::rustls::ServerConfig;
 use std::time::Duration;
 
 use maxsecu_server::{
-    router, serve, AppState, AuthConfig, AuthService, BlobStore, ColdTier, DropboxTier, FsBlobStore,
-    FsColdTier, MemoryStore, NullAuditSink, PgStore, WriteBackTier,
+    router, serve, AppState, AuthConfig, AuthService, BlobStore, ColdTier, DropboxTier,
+    FsBlobStore, FsColdTier, MemoryStore, NullAuditSink, PgStore, WriteBackTier,
 };
 
 use crate::config::{ColdTierCfg, LauncherConfig, Profile};
@@ -81,7 +81,7 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
     // non-self-signed cert + an external WORM/audit sink + the offline ceremony
     // key). Only the Store backend differs: MemoryStore vs PgStore.
     let layout = Layout::ensure(&cfg.data_dir)?;
-    pki::ensure_dev_cert(&layout)?;
+    pki::ensure_dev_cert(&layout, cfg.public_addr.as_deref())?;
     let directory_pub = bootstrap::ensure_dev_d5(&layout)?;
     // The server is the enrollment authority (§5, T4): it signs enrollment
     // bindings with the DEV D5 key (the private half of `directory_pub`). The
@@ -133,7 +133,7 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
         }
     };
 
-    let listener = TcpListener::bind(("127.0.0.1", cfg.port)).await?;
+    let listener = TcpListener::bind((cfg.bind.as_str(), cfg.port)).await?;
     let local_addr = listener.local_addr()?;
     Ok(Prepared {
         router: app_router,
@@ -180,7 +180,11 @@ pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
     );
     eprintln!(
         "  direct-link downloads: {}",
-        if cfg.direct_links_enabled { "on" } else { "off" }
+        if cfg.direct_links_enabled {
+            "on"
+        } else {
+            "off"
+        }
     );
     eprintln!(
         "  pinned D5 (DEV ONLY — replace with the offline ceremony key in production): {}",
@@ -190,8 +194,12 @@ pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
     // on a fresh server and CLOSES (409) once used; enrollment is registration-key
     // only — the first account to enroll with a key becomes admin.
     eprintln!("  enrollment: registration-key only (first registrant = admin);");
-    eprintln!("    provision the recovery account + the first registration key with `maxsecu-setup`");
-    eprintln!("    (once-only: recovery registration is open now, and closes after the first use).");
+    eprintln!(
+        "    provision the recovery account + the first registration key with `maxsecu-setup`"
+    );
+    eprintln!(
+        "    (once-only: recovery registration is open now, and closes after the first use)."
+    );
     serve(prepared.listener, prepared.server_config, prepared.router).await
 }
 

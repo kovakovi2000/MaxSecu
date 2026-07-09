@@ -5,6 +5,7 @@
 //!     (a bogus key is a `403`, no account created);
 //!   - recovery registration (`POST /v1/recovery/register`) is OPEN on a fresh
 //!     server (`201`) and CLOSES after the first use (a second attempt is `409`).
+//!
 //! Proves "it just runs" under the registration-key-only model.
 
 use std::sync::Arc;
@@ -39,6 +40,8 @@ async fn dev_server_boots_and_enforces_registration_key_model() {
     let cfg = LauncherConfig {
         data_dir: tmp.clone(),
         port: 0,
+        bind: "127.0.0.1".to_owned(),
+        public_addr: None,
         profile: Profile::Dev,
         database_url: None,
         cold_tier: ColdTierCfg::Off,
@@ -78,10 +81,7 @@ async fn dev_server_boots_and_enforces_registration_key_model() {
         .with_no_client_auth();
 
     // Open a fresh pinned-TLS HTTP/1.1 connection.
-    async fn connect(
-        addr: std::net::SocketAddr,
-        cfg: &ClientConfig,
-    ) -> SendRequest<Full<Bytes>> {
+    async fn connect(addr: std::net::SocketAddr, cfg: &ClientConfig) -> SendRequest<Full<Bytes>> {
         let tcp = TcpStream::connect(addr).await.unwrap();
         let connector = TlsConnector::from(Arc::new(cfg.clone()));
         let tls = connector

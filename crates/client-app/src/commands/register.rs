@@ -30,13 +30,14 @@ use zeroize::Zeroizing;
 
 use maxsecu_client_core::Identity;
 
+use crate::config::ConnectionConfig;
 use crate::dto::{RegisterWithKeyRequest, RegisteredDto};
 use crate::error::UiError;
 use crate::http_client::post_json;
 use crate::keystore;
 
 use super::auth::AppDir;
-use super::connection::{open_conn, server_of};
+use super::connection::open_conn;
 
 /// Where the single-use registration key file lives in the portable layout:
 /// `<app-dir>/register.key`, beside the exe (a sibling of the recovery keyblob at
@@ -143,6 +144,22 @@ pub async fn register_with_key_exchange(
     })
 }
 
+/// Persist the address the user just enrolled against into `<dir>/config/connection.json`
+/// so their SUBSEQUENT logins default to it (`connection::server_of` reads
+/// `ConnectionConfig::server`). Load-then-patch so any pre-existing preference on the
+/// file (e.g. `use_tor`) is preserved; only `server` is (re)set and `auto_connect` is
+/// forced off (registration never implies auto-connect). The connect `server_name` is
+/// derived from the host part of `server` at dial time by `open_conn` (host before the
+/// last `:`), so it is not stored separately here. Best-effort by design: the account
+/// already exists and the identity is sealed, so a failed write must not fail the
+/// enrollment (the caller ignores the result).
+fn persist_registered_server(dir: &Path, server: &str) -> std::io::Result<()> {
+    let mut cfg = ConnectionConfig::load(dir);
+    cfg.server = server.to_owned();
+    cfg.auto_connect = false;
+    cfg.save(dir)
+}
+
 /// `register_with_key` — startup mode #2 (spec §5). Read the local `register.key`,
 /// generate a fresh identity, enrol via `POST /v1/users`, seal the identity into the
 /// keystore, and delete the consumed key file. Only DTOs cross the seam; the
@@ -154,9 +171,18 @@ pub async fn register_with_key(
 ) -> Result<RegisteredDto, UiError> {
     // Scrub the passphrase on every exit path (success, failure, panic).
     let passphrase = Zeroizing::new(req.passphrase);
-    let server = server_of(&dir.0)?;
-    let (mut sender, host, _exp) = open_conn(&dir.0, &server).await?;
-    register_with_key_exchange(&mut sender, &host, &dir.0, &req.username, passphrase.as_str()).await
+    // Mirror `login`/`connect`: bind to the server the USER typed on the register
+    // screen (`req.server`), NOT the saved/default `connection.json` (`server_of`).
+    // A fresh device has no saved server yet, so reading it here was the bug.
+    let (mut sender, host, _exp) = open_conn(&dir.0, &req.server).await?;
+    let dto =
+        register_with_key_exchange(&mut sender, &host, &dir.0, &req.username, passphrase.as_str())
+            .await?;
+    // Only after a fully successful enrollment (201 + sealed identity + consumed
+    // key) persist the entered address so later logins default to it. Best-effort:
+    // the account already exists, so a failed write must not fail registration.
+    let _ = persist_registered_server(&dir.0, &req.server);
+    Ok(dto)
 }
 
 #[cfg(test)]
@@ -179,6 +205,52 @@ mod tests {
     fn register_key_path_is_beside_the_exe() {
         let p = register_key_path(Path::new("/app"));
         assert!(p.ends_with("register.key"));
+    }
+
+    #[test]
+    fn register_with_key_request_carries_server() {
+        // The register screen now sends the typed server on the seam (mirroring
+        // `login`/`connect`), so the request must deserialize a `server` field.
+        let req: RegisterWithKeyRequest = serde_json::from_str(
+            r#"{"server":"123.123.123.123:8443","username":"alice","passphrase":"hunter2hunter2"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.server, "123.123.123.123:8443");
+        assert_eq!(req.username, "alice");
+        assert_eq!(req.passphrase, "hunter2hunter2");
+    }
+
+    #[test]
+    fn persist_registered_server_writes_entered_address() {
+        // After a successful enrollment the entered address is written to
+        // connection.json so `connection::server_of` (which reads
+        // `ConnectionConfig::server`) defaults later logins to it.
+        let dir = tempdir();
+        persist_registered_server(&dir, "123.123.123.123:8443").unwrap();
+        let cfg = ConnectionConfig::load(&dir);
+        assert_eq!(cfg.server, "123.123.123.123:8443");
+        assert!(!cfg.auto_connect);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_registered_server_preserves_prior_prefs_and_forces_manual() {
+        // Load-then-patch: a pre-existing preference on the file survives, only
+        // `server` is (re)set and `auto_connect` is forced off.
+        let dir = tempdir();
+        ConnectionConfig {
+            server: "old:1".into(),
+            use_tor: true,
+            auto_connect: true,
+        }
+        .save(&dir)
+        .unwrap();
+        persist_registered_server(&dir, "new-host:8443").unwrap();
+        let cfg = ConnectionConfig::load(&dir);
+        assert_eq!(cfg.server, "new-host:8443");
+        assert!(cfg.use_tor, "prior use_tor preference preserved");
+        assert!(!cfg.auto_connect, "registration never implies auto-connect");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

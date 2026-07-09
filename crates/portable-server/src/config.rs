@@ -28,6 +28,14 @@ pub enum ColdTierCfg {
 pub struct LauncherConfig {
     pub data_dir: PathBuf,
     pub port: u16,
+    /// Interface the listener binds to (`MAXSECU_BIND`, default `127.0.0.1`).
+    /// Set to `0.0.0.0` to accept connections from the public internet.
+    pub bind: String,
+    /// Public IP/hostname this server is reachable at (`MAXSECU_PUBLIC_ADDR`).
+    /// Host-only (any `:port` is stripped); added to the self-signed cert SAN so
+    /// a client typing the bare public address passes the pinned TLS handshake.
+    /// `None` keeps today's localhost-only cert.
+    pub public_addr: Option<String>,
     pub profile: Profile,
     pub database_url: Option<String>,
     /// The cold tier the write-back offload engine migrates idle/evicted chunks to.
@@ -49,6 +57,8 @@ pub struct LauncherConfig {
 const DEFAULT_PORT: u16 = 8443;
 /// Default data directory (relative to the launcher's working dir).
 const DEFAULT_DATA_DIR: &str = "./maxsecu-server-data";
+/// Default bind interface: loopback only (unreachable from the internet).
+const DEFAULT_BIND: &str = "127.0.0.1";
 /// Default local hot-store capacity (200 GB) before offload kicks in — leaves
 /// headroom on the deployment disk for everything else.
 const DEFAULT_CACHE_CAPACITY_BYTES: u64 = 200_000_000_000;
@@ -68,6 +78,17 @@ impl LauncherConfig {
         let port = env("MAXSECU_PORT")
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(DEFAULT_PORT);
+
+        // Bind interface: default loopback (unreachable from the internet); the
+        // public deployment sets this to `0.0.0.0`. An empty value falls back to
+        // the default rather than binding an empty (invalid) address.
+        let bind = env("MAXSECU_BIND")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_BIND.to_owned());
+
+        // Public address for the cert SAN: host or host:port; we keep host only
+        // (the SAN carries no port). Empty → None (localhost-only cert).
+        let public_addr = env("MAXSECU_PUBLIC_ADDR").and_then(|s| host_only(&s));
 
         let database_url = env("DATABASE_URL");
         let profile = if database_url.is_some() {
@@ -110,12 +131,16 @@ impl LauncherConfig {
         // Direct-link downloads: off unless explicitly turned on. Any other value
         // (absent, empty, typo) fails closed to Off, mirroring the cold-tier rule
         // above (never silently enable a feature that skips the server proxy).
-        let direct_links_enabled =
-            matches!(env("MAXSECU_DIRECT_LINKS").as_deref(), Some("1") | Some("true"));
+        let direct_links_enabled = matches!(
+            env("MAXSECU_DIRECT_LINKS").as_deref(),
+            Some("1") | Some("true")
+        );
 
         LauncherConfig {
             data_dir,
             port,
+            bind,
+            public_addr,
             profile,
             database_url,
             cold_tier,
@@ -130,6 +155,37 @@ impl LauncherConfig {
     pub fn from_env() -> LauncherConfig {
         Self::from_parts(|k| std::env::var(k).ok())
     }
+}
+
+/// Reduce a `MAXSECU_PUBLIC_ADDR` value (host or host:port) to the host only,
+/// which is what a certificate SAN carries. Returns `None` for an empty value.
+///
+/// - a bare IP literal (v4 or v6, incl. `::1`) is returned unchanged;
+/// - a bracketed IPv6 (`[::1]` or `[::1]:8443`) yields the inner address;
+/// - a single trailing `:port` on a host/IPv4 is stripped;
+/// - anything else (a hostname) is returned as-is.
+fn host_only(addr: &str) -> Option<String> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return None;
+    }
+    // A bare IP literal (including multi-colon IPv6) is kept verbatim.
+    if addr.parse::<std::net::IpAddr>().is_ok() {
+        return Some(addr.to_owned());
+    }
+    // Bracketed IPv6, with or without a port: take the address inside the brackets.
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return Some(rest[..end].to_owned());
+        }
+    }
+    // host:port (a single colon, i.e. hostname or IPv4 with a port) → strip the port.
+    if let Some((host, _port)) = addr.rsplit_once(':') {
+        if !host.is_empty() && !host.contains(':') {
+            return Some(host.to_owned());
+        }
+    }
+    Some(addr.to_owned())
 }
 
 #[cfg(test)]
@@ -161,6 +217,49 @@ mod tests {
     fn bad_port_falls_back_to_default() {
         let c = LauncherConfig::from_parts(env(&[("MAXSECU_PORT", "not-a-number")]));
         assert_eq!(c.port, 8443);
+    }
+
+    #[test]
+    fn bind_defaults_to_loopback_and_honors_explicit_value() {
+        // Default: loopback only.
+        assert_eq!(LauncherConfig::from_parts(env(&[])).bind, "127.0.0.1");
+        // Explicit public bind.
+        assert_eq!(
+            LauncherConfig::from_parts(env(&[("MAXSECU_BIND", "0.0.0.0")])).bind,
+            "0.0.0.0"
+        );
+        // Empty falls back to the default (never binds an empty address).
+        assert_eq!(
+            LauncherConfig::from_parts(env(&[("MAXSECU_BIND", "")])).bind,
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn public_addr_is_none_by_default_and_host_only_when_set() {
+        // Absent → None (localhost-only cert, today's behavior).
+        assert_eq!(LauncherConfig::from_parts(env(&[])).public_addr, None);
+        // Empty → None.
+        assert_eq!(
+            LauncherConfig::from_parts(env(&[("MAXSECU_PUBLIC_ADDR", "")])).public_addr,
+            None
+        );
+        // A bare IP is kept as-is.
+        assert_eq!(
+            LauncherConfig::from_parts(env(&[("MAXSECU_PUBLIC_ADDR", "1.2.3.4")])).public_addr,
+            Some("1.2.3.4".to_owned())
+        );
+        // ip:port → the port is stripped (SAN is host-only).
+        assert_eq!(
+            LauncherConfig::from_parts(env(&[("MAXSECU_PUBLIC_ADDR", "1.2.3.4:8443")])).public_addr,
+            Some("1.2.3.4".to_owned())
+        );
+        // host:port → the port is stripped, hostname preserved.
+        assert_eq!(
+            LauncherConfig::from_parts(env(&[("MAXSECU_PUBLIC_ADDR", "vps.example.com:8443")]))
+                .public_addr,
+            Some("vps.example.com".to_owned())
+        );
     }
 
     #[test]
@@ -199,8 +298,7 @@ mod tests {
             }
         );
         // Missing/empty token → fails closed to Off (never runs without a token).
-        let missing =
-            LauncherConfig::from_parts(env(&[("MAXSECU_COLD_TIER", "dropbox")]));
+        let missing = LauncherConfig::from_parts(env(&[("MAXSECU_COLD_TIER", "dropbox")]));
         assert_eq!(missing.cold_tier, ColdTierCfg::Off);
     }
 
@@ -220,8 +318,7 @@ mod tests {
         assert!(!LauncherConfig::from_parts(env(&[])).direct_links_enabled);
         // Explicit "1" and "true" — on.
         assert!(
-            LauncherConfig::from_parts(env(&[("MAXSECU_DIRECT_LINKS", "1")]))
-                .direct_links_enabled
+            LauncherConfig::from_parts(env(&[("MAXSECU_DIRECT_LINKS", "1")])).direct_links_enabled
         );
         assert!(
             LauncherConfig::from_parts(env(&[("MAXSECU_DIRECT_LINKS", "true")]))

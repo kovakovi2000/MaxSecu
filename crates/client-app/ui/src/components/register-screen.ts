@@ -24,6 +24,8 @@ export class RegisterScreen extends HTMLElement {
             <p class="auth-note">Your encryption keys are generated on this device and never leave it; the registration key is used once and then destroyed.</p>
           </div>
         <form id="rg-f" class="auth-card">
+          <label>Server
+            <input name="server" required autocomplete="off" placeholder="123.123.123.123:8443" /></label>
           <label>Username
             <input name="username" required autocomplete="username" /></label>
           <label>Keystore passphrase
@@ -39,6 +41,7 @@ export class RegisterScreen extends HTMLElement {
     const submitBtn = this.querySelector("#rg-submit") as HTMLButtonElement;
     const status = this.querySelector("#rg-status") as HTMLElement;
     const err = this.querySelector("#rg-err") as HTMLElement;
+    const serverInput = form.querySelector('input[name="server"]') as HTMLInputElement;
     const userInput = form.querySelector('input[name="username"]') as HTMLInputElement;
     const passInput = form.querySelector('input[name="passphrase"]') as HTMLInputElement;
 
@@ -54,13 +57,18 @@ export class RegisterScreen extends HTMLElement {
       status.textContent = "Generating your keys and enrolling…";
       try {
         const res = await call<RegisteredDto>("register_with_key", {
-          req: { username: userInput.value, passphrase: passInput.value },
+          req: {
+            server: serverInput.value,
+            username: userInput.value,
+            passphrase: passInput.value,
+          },
         });
         // The identity is sealed and the single-use key destroyed; the passphrase
         // is no longer needed on the (untrusted) UI side.
         passInput.value = "";
         passInput.disabled = true;
         userInput.disabled = true;
+        serverInput.disabled = true;
         status.textContent =
           `Account "${res.username}" is ready. You can now sign in.`;
       } catch (x) {
