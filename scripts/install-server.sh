@@ -172,7 +172,13 @@ for pkg in $APT_PKGS; do
 done
 if [ -n "$missing" ]; then
 	echo "    installing:$missing"
-	run_root "DEBIAN_FRONTEND=noninteractive apt-get update"
+	# --allow-releaseinfo-change: on a non-fresh VPS a pre-existing third-party
+	# repo (e.g. an ondrej/php PPA) may have changed its Label/Suite metadata,
+	# which makes a plain `apt-get update` exit non-zero and — under `set -e` —
+	# abort the whole install for a reason unrelated to MaxSecu. Accepting the
+	# (metadata-only) change lets the update proceed. It does NOT bypass GPG
+	# signature verification: unsigned/badly-signed repos still fail.
+	run_root "DEBIAN_FRONTEND=noninteractive apt-get update --allow-releaseinfo-change"
 	run_root "DEBIAN_FRONTEND=noninteractive apt-get install -y$missing"
 else
 	echo "    all packages already present — nothing to do"
