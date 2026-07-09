@@ -30,9 +30,13 @@ pub struct ExportKeystoreRequest {
 
 /// Registration-key enrollment (spec §5). The single-use key itself is NOT on the
 /// seam — it is read from the local `register.key` file entirely in Rust — so only
-/// the chosen username + the keystore passphrase cross the boundary.
+/// the server address the user typed on the register screen, the chosen username,
+/// and the keystore passphrase cross the boundary. `server` mirrors `login`/`connect`
+/// (`host:port`): enrollment binds to the address the user just entered, not the
+/// saved/default `connection.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterWithKeyRequest {
+    pub server: String, // host:port or domain — the address the user typed
     pub username: String,
     pub passphrase: String,
 }
