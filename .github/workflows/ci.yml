@@ -18,6 +18,14 @@ jobs:
   test:
     # Windows MSVC is the production target for the client core (stack.md §1.5).
     runs-on: windows-latest
+    env:
+      # The Postgres integration gate (server/tests/pg_store.rs) can't run here:
+      # GitHub service containers are Linux-only, so the Windows runner has no
+      # reachable Postgres. Downgrade its unreachable-PG hard-fail to a loud skip
+      # (P5.0b) — the gate itself runs on the Linux `pg-gate` job below, so it is
+      # never skipped everywhere. Scoped to this job on purpose: putting it in the
+      # top-level `env` would make `pg-gate` skip PG too, defeating the gate.
+      MAXSECU_PG_OPTIONAL: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Show toolchain (installs the pinned channel)
@@ -28,6 +36,35 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked
       - name: Test
         run: cargo test --workspace --locked
+
+  pg-gate:
+    # The Postgres persistence gate (server/tests/pg_store.rs) against a real
+    # Postgres. The Windows `test` job skips it (no service containers on Windows
+    # runners); this Linux job actually runs it so the gate is never vacuous
+    # (P5.0b). pg_store loads docs/schema.sql into a throwaway schema per test, so
+    # no migration step is needed — only the maxsecu role/db, which the service
+    # env provides. It reaches PG at the default localhost URL baked into the test.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: maxsecu
+          POSTGRES_PASSWORD: maxsecu
+          POSTGRES_DB: maxsecu
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain (installs the pinned channel)
+        run: rustup show
+      - name: Postgres integration gate
+        run: cargo test -p maxsecu-server --test pg_store --locked
 
   supply-chain:
     runs-on: ubuntu-latest
