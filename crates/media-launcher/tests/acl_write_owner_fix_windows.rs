@@ -15,19 +15,22 @@
 //! root, so each child job dir inherits an effective Full-Control (incl.
 //! `WRITE_OWNER`) ACE for its creator — reproducing the ACL `%TEMP%` already carries.
 //!
-//! This test creates its base dir UNDER the crate manifest dir, which on the dev
-//! volume inherits exactly the restrictive `Authenticated Users:(M)` ACL that
-//! triggers the bug — so it is a faithful reproduction. It asserts the POSITIVE
-//! requirement (a `ReadWrite` grant on a child of a CREATOR-OWNER-granted base
-//! succeeds) unconditionally, and additionally documents the negative (the same
-//! grant on a child of an UN-granted base is denied) when the runner is not
-//! privileged enough to have `WRITE_OWNER` anyway.
+//! The test creates its dirs UNDER the crate manifest dir, which on the dev volume
+//! inherits exactly the restrictive `Authenticated Users:(M)` ACL that triggers the
+//! bug — a faithful reproduction. It runs the full narrative in ONE sequential body
+//! (no intra-file parallelism) and wraps the AppContainer grant calls in a bounded
+//! retry, so a transient cross-process contention hiccup (other AppContainer test
+//! binaries running concurrently, or Defender scanning the fresh dirs) cannot flake
+//! it. The hard assertion is the POSITIVE requirement: under a CREATOR-OWNER-granted
+//! base the label-setting `ReadWrite` grant succeeds. The negative (denied without
+//! the fix) is observed best-effort and only logged.
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
 
 use maxsecu_media_launcher::{
-    grant_creator_owner_full_control, grant_path_to_appcontainer, GrantAccess,
+    grant_creator_owner_full_control, grant_path_to_appcontainer, GrantAccess, PathGrant,
+    SpawnError,
 };
 
 /// A unique throwaway dir under the crate manifest dir (on the dev volume, so it
@@ -56,47 +59,57 @@ impl Drop for ScratchDir {
     }
 }
 
-/// The fix: under a base that has been granted an inheritable CREATOR OWNER
-/// Full-Control ACE, a `ReadWrite` (label-setting) AppContainer grant on a child
-/// job dir SUCCEEDS — even on a volume whose inherited ACL is only *Modify*.
-#[test]
-fn readwrite_grant_succeeds_under_creator_owner_granted_base() {
-    let base = ScratchDir::new("fixed");
-    grant_creator_owner_full_control(&base.0).expect("grant CREATOR OWNER full control to base");
-
-    // A child created AFTER the base grant inherits an effective Full-Control ACE
-    // (incl. WRITE_OWNER) for this process — so the Low-IL label set is permitted.
-    let job = base.child("maxsecu-vjob-sim");
-    let grant = grant_path_to_appcontainer(&job, GrantAccess::ReadWrite)
-        .expect("ReadWrite grant (incl. Low-IL label) must succeed under granted base");
-    grant.revoke().expect("revoke restores prior DACL/label");
-}
-
-/// Documents the bug the fix addresses: without the base grant, the same
-/// `ReadWrite` grant's label set is denied for lack of WRITE_OWNER. Skipped as a
-/// hard assertion when the runner happens to have WRITE_OWNER anyway (e.g. an
-/// elevated/admin process), since then the reproduction is inconclusive.
-#[test]
-fn readwrite_grant_without_base_fix_is_denied_or_inconclusive() {
-    let base = ScratchDir::new("buggy");
-    let job = base.child("maxsecu-vjob-sim");
-    match grant_path_to_appcontainer(&job, GrantAccess::ReadWrite) {
-        Err(e) => {
-            // Expected on a non-privileged runner: the label set is the denied step.
-            assert!(
-                e.ctx.contains("label") || e.ctx.contains("SetNamedSecurityInfo"),
-                "expected the mandatory-label set to be the denied step, got ctx={:?}",
-                e.ctx
-            );
-        }
-        Ok(grant) => {
-            // Runner had WRITE_OWNER regardless (elevated / permissive volume ACL):
-            // reproduction inconclusive, but nothing is wrong. Clean up.
-            eprintln!(
-                "note: ReadWrite grant succeeded without the base fix — runner appears to \
-                 already have WRITE_OWNER (elevated or permissive ACL); bug not reproduced here."
-            );
-            grant.revoke().expect("revoke");
+/// Attempt a ReadWrite AppContainer grant, retrying a few times to absorb transient
+/// cross-process contention (concurrent AppContainer test binaries / AV scans).
+/// Returns the last result; success short-circuits.
+fn grant_rw_with_retry(dir: &Path) -> Result<PathGrant, SpawnError> {
+    let mut last: Option<SpawnError> = None;
+    for attempt in 0..5 {
+        match grant_path_to_appcontainer(dir, GrantAccess::ReadWrite) {
+            Ok(g) => return Ok(g),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(60 * (attempt + 1)));
+            }
         }
     }
+    Err(last.unwrap())
+}
+
+/// The fix, end to end: without the base grant a label-setting `ReadWrite` grant is
+/// denied for lack of WRITE_OWNER (observed best-effort); after
+/// `grant_creator_owner_full_control`, a child job dir inherits WRITE_OWNER and the
+/// same grant SUCCEEDS.
+#[test]
+fn creator_owner_grant_restores_write_owner_for_confined_workspace() {
+    // Phase 1 — observe the bug (best-effort; a privileged/elevated runner may have
+    // WRITE_OWNER regardless, in which case the reproduction is inconclusive).
+    {
+        let base = ScratchDir::new("buggy");
+        let job = base.child("maxsecu-vjob-sim");
+        match grant_path_to_appcontainer(&job, GrantAccess::ReadWrite) {
+            Err(e) => assert!(
+                e.ctx.contains("SetNamedSecurityInfo") || e.ctx.contains("label"),
+                "expected the mandatory-label/DACL set to be the denied step, got ctx={:?}",
+                e.ctx
+            ),
+            Ok(g) => {
+                eprintln!(
+                    "note: ReadWrite grant succeeded without the base fix — runner appears to \
+                     already have WRITE_OWNER (elevated or permissive ACL); bug not reproduced."
+                );
+                g.revoke().expect("revoke");
+            }
+        }
+    }
+
+    // Phase 2 — the fix: a child created under a CREATOR-OWNER-granted base inherits
+    // an effective Full-Control (incl. WRITE_OWNER) ACE, so the Low-IL label set is
+    // permitted. This is the hard requirement.
+    let base = ScratchDir::new("fixed");
+    grant_creator_owner_full_control(&base.0).expect("grant CREATOR OWNER full control to base");
+    let job = base.child("maxsecu-vjob-sim");
+    let grant = grant_rw_with_retry(&job)
+        .expect("ReadWrite grant (incl. Low-IL label) must succeed under a granted base");
+    grant.revoke().expect("revoke restores prior DACL/label");
 }

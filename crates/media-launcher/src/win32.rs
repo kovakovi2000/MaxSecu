@@ -135,12 +135,19 @@ fn appcontainer_sid() -> Result<PSID, SpawnError> {
     if hr == 0 {
         return Ok(sid);
     }
+    // Any non-success create falls back to derive. HR_ALREADY_EXISTS is the common
+    // case (the persistent profile is already registered), but a CONCURRENT create
+    // of the same profile by another process (a second app instance, or parallel
+    // test binaries) can also surface a transient race error — in every such case
+    // the profile exists (or was just created by the winner), so deriving its SID is
+    // the correct, robust recovery. We only fail if the derive ALSO fails, and then
+    // report the original create error when it was not a plain ALREADY_EXISTS.
+    // SAFETY: deriving the SID for the (now-existing) profile; `sid` receives it.
+    let hr2 = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+    if hr2 == 0 {
+        return Ok(sid);
+    }
     if hr == HR_ALREADY_EXISTS {
-        // SAFETY: deriving the SID for an existing profile; `sid` receives it.
-        let hr2 = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
-        if hr2 == 0 {
-            return Ok(sid);
-        }
         return Err(SpawnError {
             ctx: "DeriveAppContainerSid",
             code: hr2 as u32,
