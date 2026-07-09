@@ -463,6 +463,35 @@ async fn nonce_outstanding_respects_ttl_and_single_use() {
 }
 
 #[tokio::test]
+async fn recovery_style_nonce_key_with_nul_round_trips_in_postgres() {
+    // Regression: the recovery-challenge nonce key embeds NUL (0x00) so it can
+    // never collide with a real username. Postgres TEXT cannot store 0x00, so
+    // `insert_nonce` used to 500 ("invalid byte sequence for encoding UTF8: 0x00")
+    // on EVERY recovery challenge (invisible to the MemoryStore e2e). The key must
+    // now insert, match itself, and stay disjoint from a plain username.
+    let db = db_or_skip!();
+    let nonce: [u8; 32] = random_array();
+    let key = "\u{0}recovery\u{0}deadbeefdeadbeefdeadbeefdeadbeef";
+
+    db.store.insert_nonce(nonce, key, TS + 1000).await.unwrap();
+
+    assert_eq!(
+        db.store.outstanding_nonces(key, TS).await.unwrap(),
+        vec![nonce],
+        "a NUL-containing recovery key must insert and match itself"
+    );
+    assert!(
+        db.store
+            .outstanding_nonces("recovery", TS)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a plain username must not collide with the recovery key"
+    );
+    db.teardown().await;
+}
+
+#[tokio::test]
 async fn session_channel_bind_expiry_and_revoke() {
     let db = db_or_skip!();
     let user_id: [u8; 16] = random_array();

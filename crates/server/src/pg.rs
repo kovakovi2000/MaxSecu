@@ -76,6 +76,21 @@ fn ts_to_ms(ts: OffsetDateTime) -> u64 {
     (ts.unix_timestamp_nanos() / 1_000_000) as u64
 }
 
+/// Encode an opaque nonce-association key for the `auth_nonces.username` column.
+///
+/// That column is `TEXT`, but a nonce key is not always a printable username: the
+/// recovery challenge key deliberately embeds NUL (`0x00`) so it can never collide
+/// with a real username (see `recovery::recovery_nonce_key`). Postgres `TEXT`
+/// cannot store `0x00` ("invalid byte sequence for encoding UTF8"), which made
+/// `insert_nonce` 500 on every recovery challenge. Hex-encoding the key sidesteps
+/// that: the encoding is injective and applied identically on insert AND lookup,
+/// so it preserves both exact matching and the NUL-based disjointness from
+/// usernames (a username's raw bytes can never contain NUL, so its hex can never
+/// equal a recovery key's hex). MemoryStore keeps the raw key — only PG needs this.
+fn nonce_key_col(key: &str) -> String {
+    key.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Map any sqlx failure to a `StoreError` tagged with the operation name. The
 /// message stays server-side (logged at the HTTP boundary), never sent to a client.
 fn store_err(op: &'static str) -> impl Fn(sqlx::Error) -> StoreError {
@@ -145,7 +160,7 @@ impl Store for PgStore {
     ) -> Result<(), StoreError> {
         sqlx::query("INSERT INTO auth_nonces (nonce, username, expires_at) VALUES ($1, $2, $3)")
             .bind(&nonce[..])
-            .bind(username)
+            .bind(nonce_key_col(username))
             .bind(ms_to_ts(expires_at_ms))
             .execute(&self.pool)
             .await
@@ -162,7 +177,7 @@ impl Store for PgStore {
             "SELECT nonce FROM auth_nonces \
              WHERE username = $1 AND used_at IS NULL AND expires_at > $2",
         )
-        .bind(username)
+        .bind(nonce_key_col(username))
         .bind(ms_to_ts(now_ms))
         .fetch_all(&self.pool)
         .await
