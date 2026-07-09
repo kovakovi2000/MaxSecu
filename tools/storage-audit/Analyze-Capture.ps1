@@ -54,6 +54,8 @@ $benignPatterns = @(
   '\\d3dscache\\',                               # OS DirectX pipeline/shader cache (GPU process; compiled shader blobs, no user data)
   '\\explorer\\iconcache',                       # Windows shell icon cache — touched by the native file open/save dialog, global OS bookkeeping
   '\\microsoft\\oneauth\\',                      # Edge/WebView2 runtime identity broker
+  '\\microsoft\\identitycache\\',                # Windows Web Account Manager (WAM) identity cache — OS token store, no app data (sibling of OneAuth)
+  '\\microsoft\\tokenbroker\\',                  # Windows Token Broker (WAM) token cache (.tbres) — OS token store, no app data
   '\\temp\\webview2downloads',                   # WebView2 runtime download temp
   '\\temp\\msedge_',                             # WebView2/Edge runtime temp
   '\\edgewebview\\application\\'                  # DLLs loaded from the shared runtime install
@@ -72,18 +74,35 @@ function Test-Write($row) {
   return ($op -eq 'CreateFile' -and $row.Detail -match 'Disposition:\s*(Create|Overwrite|Supersede|OpenIf|OverwriteIf)')
 }
 
-# Pass 1 — establish OUR PID set: all maxsecu.exe PIDs, plus any webview-host PID
-# that wrote into <app_dir>.
+# Pass 1 — establish OUR PID set (all maxsecu.exe PIDs + any webview-host PID that
+# wrote into <app_dir>) AND collect user-directed DOWNLOAD final paths. The client's
+# `download_content` writes the plaintext to a unique `<save_path>.<pid>.<nanos>.part`
+# sibling of the user-chosen destination, then atomically renames it to the final
+# path the user picked in the Save dialog. Both the `.part` and its rename TARGET are
+# user-directed exports (the user chose the folder) — expected, not stray traces — so
+# we bucket them separately and they do NOT fail the audit. We harvest the rename
+# targets here so Pass 2 can recognize the final file even though it has no `.part`.
 $ourPids = @{}
+$downloadFinals = @{}
 Import-Csv -Path $Csv | ForEach-Object {
   $pn = $_.'Process Name'; if (-not $pn) { return }
   $pn = $pn.ToLowerInvariant(); if ($procNames -notcontains $pn) { return }
-  if ($pn -eq 'maxsecu.exe') { $ourPids[$_.PID] = 1; return }
-  $p = $_.Path; if ($p -and $p.ToLowerInvariant().StartsWith($app)) { $ourPids[$_.PID] = 1 }
+  if ($pn -eq 'maxsecu.exe') { $ourPids[$_.PID] = 1 }
+  else {
+    $p = $_.Path; if ($p -and $p.ToLowerInvariant().StartsWith($app)) { $ourPids[$_.PID] = 1 }
+  }
+  # A rename of a `.part` source → its target is a completed download final path.
+  if ($_.Operation -eq 'SetRenameInformationFile' -and $_.Result -eq 'SUCCESS') {
+    $src = $_.Path
+    if ($src -and $src.ToLowerInvariant().EndsWith('.part') -and
+        $_.Detail -match 'FileName:\s*(.+?)\s*$') {
+      $downloadFinals[$matches[1].ToLowerInvariant()] = 1
+    }
+  }
 }
 
 # Pass 2 — flag out-of-folder file writes by our PIDs, bucketed.
-$leak = @{}; $benign = @{}; $temp = @{}
+$leak = @{}; $benign = @{}; $temp = @{}; $downloads = @{}
 Import-Csv -Path $Csv | ForEach-Object {
   $pn = $_.'Process Name'; if (-not $pn) { return }
   $pn = $pn.ToLowerInvariant(); if ($procNames -notcontains $pn) { return }
@@ -95,7 +114,8 @@ Import-Csv -Path $Csv | ForEach-Object {
   $low = $p.ToLowerInvariant()
   if ($low.StartsWith($app)) { return }          # in-folder: OK
   if (Test-NtfsPseudo $p) { return }             # NTFS journal/metadata for in-folder writes
-  if (Test-Benign $low) { $benign[$p] = 1 + $benign[$p] }
+  if ($low.EndsWith('.part') -or $downloadFinals[$low]) { $downloads[$p] = 1 + $downloads[$p] }  # user-directed download to a chosen path
+  elseif (Test-Benign $low) { $benign[$p] = 1 + $benign[$p] }
   elseif ($low -match '\\(appdata\\local|windows)\\temp\\') { $temp[$p] = 1 + $temp[$p] }  # runtime temp scratch
   else { $leak[$p] = 1 + $leak[$p] }
 }
@@ -111,6 +131,12 @@ if ($leak.Count -eq 0) { "  (none)" } else {
 "== Shared WebView2-runtime / GPU-driver bookkeeping (expected; no app user data): $($benign.Count) distinct =="
 if ($benign.Count -eq 0) { "  (none)" } else {
   $benign.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 30 |
+    ForEach-Object { "  [{0,5}x] {1}" -f $_.Value, $_.Key }
+}
+""
+"== User-directed downloads / exports to a chosen path (expected; does not fail): $($downloads.Count) distinct =="
+if ($downloads.Count -eq 0) { "  (none)" } else {
+  $downloads.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 20 |
     ForEach-Object { "  [{0,5}x] {1}" -f $_.Value, $_.Key }
 }
 ""
