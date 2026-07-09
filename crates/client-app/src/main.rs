@@ -41,6 +41,16 @@ fn main() {
     if std::fs::create_dir_all(&app_tmp).is_ok() {
         std::env::set_var("TEMP", &app_tmp);
         std::env::set_var("TMP", &app_tmp);
+        // Give the temp root an inheritable CREATOR OWNER Full-Control ACE so each
+        // confined-transcode job dir created beneath it grants its creator
+        // WRITE_OWNER — required for the AppContainer grant to drop that dir to a Low
+        // integrity label. Without this, on a data-drive volume whose inherited ACL is
+        // only "Modify", the label set is ACCESS_DENIED and video ingest fails ("That
+        // video could not be processed."). Reproduces the ACL %TEMP% already carries.
+        // Best-effort: a failure leaves confinement intact, only the on-drive transcode
+        // may still hit the limitation. Windows-only (the confinement/label machinery is).
+        #[cfg(windows)]
+        let _ = maxsecu_media_launcher::grant_creator_owner_full_control(&app_tmp);
     }
 
     // Initial cache cap from persisted settings, clamped to the live RAM bounds.
