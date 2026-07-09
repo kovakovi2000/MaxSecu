@@ -139,7 +139,7 @@ impl ContentStreamSealer {
         E: FnMut(u64, &[u8]) -> Result<(), CryptoError>,
     {
         seal_stream_streaming(
-            &*self.subkey,
+            &self.subkey,
             self.file_id,
             self.version,
             self.stream_type,
@@ -162,7 +162,7 @@ impl ContentStreamSealer {
             chunk_index: index,
             is_last,
         };
-        maxsecu_crypto::seal_chunk(&*self.subkey, &aad, plaintext)
+        maxsecu_crypto::seal_chunk(&self.subkey, &aad, plaintext)
     }
 }
 
@@ -433,6 +433,10 @@ pub(crate) fn unpack_hybrid_wrap(w: &WrappedDek) -> Result<HybridWrappedDek, Cry
     deserialize_hybrid_wrap(&bytes)
 }
 
+/// Output of [`assemble_records`]: the manifest and its signature, the genesis
+/// and its signature, and the per-recipient wraps (in that order).
+type AssembledRecords = (Manifest, [u8; 64], Genesis, [u8; 64], Vec<WrapOut>);
+
 /// Shared manifest+genesis+wraps assembly used by both [`build_upload_inner`]
 /// and [`build_records_inner`]. Takes `manifest_streams` already in ascending
 /// order (caller's responsibility) and the pre-computed `dek_commit`. Applies
@@ -442,7 +446,7 @@ fn assemble_records(
     dek_commit: [u8; 32],
     params: &UploadParams,
     manifest_streams: Vec<Stream>,
-) -> Result<(Manifest, [u8; 64], Genesis, [u8; 64], Vec<WrapOut>), UploadError> {
+) -> Result<AssembledRecords, UploadError> {
     let signer = params.owner.signing_key();
 
     // Suite-selection policy (P7.5): V2 iff BOTH the uploader AND the recovery
@@ -575,8 +579,13 @@ pub(crate) fn build_upload_inner(
         });
     }
     let dek_commit = dek.commit();
-    let (manifest_streams, sealed_out) =
-        seal_streams(dek, params.file_id, FIRST_VERSION, params.chunk_size, streams);
+    let (manifest_streams, sealed_out) = seal_streams(
+        dek,
+        params.file_id,
+        FIRST_VERSION,
+        params.chunk_size,
+        streams,
+    );
     let (manifest, manifest_sig, genesis, genesis_sig, wraps) =
         assemble_records(dek, dek_commit, params, manifest_streams)?;
     Ok(UploadBundle {
@@ -620,8 +629,13 @@ pub(crate) fn build_records_inner(
     if let Some(p) = &small.preview {
         small_inputs.push((StreamType::Preview, p));
     }
-    let (small_manifest, small_sealed) =
-        seal_inputs(dek, params.file_id, FIRST_VERSION, params.chunk_size, &small_inputs);
+    let (small_manifest, small_sealed) = seal_inputs(
+        dek,
+        params.file_id,
+        FIRST_VERSION,
+        params.chunk_size,
+        &small_inputs,
+    );
 
     // Content sorts lowest (encoding-spec V-13); prepend it then extend.
     let mut manifest_streams = vec![Stream {
@@ -658,7 +672,9 @@ pub struct StreamingUploadBuilder {
 impl StreamingUploadBuilder {
     /// Generate a fresh DEK for this upload.
     pub fn new() -> Self {
-        Self { dek: Dek::generate() }
+        Self {
+            dek: Dek::generate(),
+        }
     }
 
     /// Derive a [`ContentStreamSealer`] for the content stream. The sealer holds
@@ -682,7 +698,13 @@ impl StreamingUploadBuilder {
         content_digest: [u8; 32],
         content_chunk_count: u64,
     ) -> Result<UploadRecords, UploadError> {
-        build_records_inner(&self.dek, params, small, content_digest, content_chunk_count)
+        build_records_inner(
+            &self.dek,
+            params,
+            small,
+            content_digest,
+            content_chunk_count,
+        )
     }
 }
 
@@ -733,10 +755,7 @@ pub fn resume_content_sealer(
             let seed = owner
                 .mlkem_seed()
                 .ok_or(UploadError::Crypto(CryptoError::WrapOpen))?;
-            let sk = HybridEncSecretKey::from_components(
-                owner.enc_secret().expose_bytes(),
-                seed,
-            );
+            let sk = HybridEncSecretKey::from_components(owner.enc_secret().expose_bytes(), seed);
             recover_dek_hybrid(&sk, self_wrapped_dek, ctx)?
         }
     };
@@ -794,8 +813,16 @@ mod tests {
         assert!(matches!(b.manifest.alg, Suite::V1));
 
         // Streams ascending and unique by type: content then metadata.
-        let types: Vec<u8> = b.manifest.streams.iter().map(|s| s.stream_type as u8).collect();
-        assert_eq!(types, vec![StreamType::Content as u8, StreamType::Metadata as u8]);
+        let types: Vec<u8> = b
+            .manifest
+            .streams
+            .iter()
+            .map(|s| s.stream_type as u8)
+            .collect();
+        assert_eq!(
+            types,
+            vec![StreamType::Content as u8, StreamType::Metadata as u8]
+        );
 
         // manifest_sig verifies under the owner's signing key.
         owner
@@ -804,7 +831,10 @@ mod tests {
             .expect("manifest signature verifies");
 
         // The manifest decodes canonically (round-trips through the strict codec).
-        assert_eq!(decode::<Manifest>(&encode(&b.manifest)).unwrap(), b.manifest);
+        assert_eq!(
+            decode::<Manifest>(&encode(&b.manifest)).unwrap(),
+            b.manifest
+        );
     }
 
     #[test]
@@ -843,7 +873,11 @@ mod tests {
             recipient_id: p.owner_id,
         };
         let dek = unwrap_dek(owner.enc_secret(), &w.wrapped_dek, &ctx).expect("self wrap opens");
-        assert_eq!(dek.commit(), b.manifest.dek_commit.0, "DEK matches commitment");
+        assert_eq!(
+            dek.commit(),
+            b.manifest.dek_commit.0,
+            "DEK matches commitment"
+        );
 
         // The content stream decrypts to the original plaintext.
         let content = b
@@ -869,7 +903,10 @@ mod tests {
             .iter()
             .find(|w| w.recipient_type == RecipientType::Recovery)
             .expect("a recovery wrap exists");
-        assert_eq!(w.recipient_id, RECOVERY_ID, "recovery wrap uses RECOVERY_ID");
+        assert_eq!(
+            w.recipient_id, RECOVERY_ID,
+            "recovery wrap uses RECOVERY_ID"
+        );
 
         let ctx = WrapContext {
             file_id: p.file_id,
@@ -920,7 +957,11 @@ mod tests {
                 .iter()
                 .find(|s| s.stream_type == sealed.stream_type)
                 .expect("each sealed stream is in the manifest");
-            assert_eq!(m.digest, Bytes32(sealed.digest), "manifest digest binds the stream");
+            assert_eq!(
+                m.digest,
+                Bytes32(sealed.digest),
+                "manifest digest binds the stream"
+            );
             assert_eq!(m.chunk_count, sealed.chunk_count);
             assert_eq!(m.compression, Compression::None);
         }
@@ -954,18 +995,13 @@ mod tests {
                 })
                 .expect("sealing succeeds");
 
-            assert_eq!(
-                got, expected.chunks,
-                "chunks match for len={}", len
-            );
+            assert_eq!(got, expected.chunks, "chunks match for len={}", len);
             assert_eq!(
                 count, expected.chunk_count,
-                "chunk_count matches for len={}", len
+                "chunk_count matches for len={}",
+                len
             );
-            assert_eq!(
-                digest, expected.digest,
-                "digest matches for len={}", len
-            );
+            assert_eq!(digest, expected.digest, "digest matches for len={}", len);
         }
     }
 
@@ -1010,7 +1046,11 @@ mod tests {
             .find(|w| w.recipient_id == p.owner_id && w.recipient_type == RecipientType::User)
             .expect("a self wrap");
         let self_wire = wrap_wire(&sw.wrapped_dek);
-        assert_eq!(self_wire.len(), 1168, "hybrid wrap is eph(32)+ct_pq(1088)+aead(48)");
+        assert_eq!(
+            self_wire.len(),
+            1168,
+            "hybrid wrap is eph(32)+ct_pq(1088)+aead(48)"
+        );
         let self_hybrid = deserialize_hybrid_wrap(&self_wire).expect("self wrap is hybrid wire");
         let owner_sec = HybridEncSecretKey::from_components(
             owner.enc_secret().expose_bytes(),
@@ -1022,7 +1062,11 @@ mod tests {
             recipient_id: p.owner_id,
         };
         let dek = unwrap_dek_hybrid(&owner_sec, &self_hybrid, &sctx).expect("self hybrid opens");
-        assert_eq!(dek.commit(), b.manifest.dek_commit.0, "self → committed DEK");
+        assert_eq!(
+            dek.commit(),
+            b.manifest.dek_commit.0,
+            "self → committed DEK"
+        );
 
         // The recovery wrap opens with a test recovery hybrid secret.
         let rw = b
@@ -1040,7 +1084,11 @@ mod tests {
             recipient_id: RECOVERY_ID,
         };
         let rdek = unwrap_dek_hybrid(&rec_sec, &rec_hybrid, &rctx).expect("recovery hybrid opens");
-        assert_eq!(rdek.commit(), b.manifest.dek_commit.0, "recovery → committed DEK");
+        assert_eq!(
+            rdek.commit(),
+            b.manifest.dek_commit.0,
+            "recovery → committed DEK"
+        );
     }
 
     #[test]
@@ -1075,7 +1123,10 @@ mod tests {
         let mut p2 = params(&v1_owner, rpk);
         p2.recovery_mlkem_pub = Some(rmlkem);
         let b2 = build_upload(&p2, &streams()).expect("v1 upload builds");
-        assert!(matches!(b2.manifest.alg, Suite::V1), "identity-missing ⇒ V1");
+        assert!(
+            matches!(b2.manifest.alg, Suite::V1),
+            "identity-missing ⇒ V1"
+        );
     }
 
     // ── Streaming-path tests ──────────────────────────────────────────────────
@@ -1139,7 +1190,10 @@ mod tests {
             encode(&recs.manifest),
             "manifests are byte-identical"
         );
-        assert_eq!(bundle.manifest_sig, recs.manifest_sig, "manifest sigs match");
+        assert_eq!(
+            bundle.manifest_sig, recs.manifest_sig,
+            "manifest sigs match"
+        );
         assert_eq!(bundle.genesis, recs.genesis, "genesis matches");
         assert_eq!(bundle.genesis_sig, recs.genesis_sig, "genesis sigs match");
 
@@ -1196,9 +1250,15 @@ mod tests {
             .iter()
             .find(|s| s.stream_type == StreamType::Metadata)
             .expect("recs has metadata stream");
-        assert_eq!(bundle_meta.chunk_count, recs_meta.chunk_count, "meta chunk_count");
+        assert_eq!(
+            bundle_meta.chunk_count, recs_meta.chunk_count,
+            "meta chunk_count"
+        );
         assert_eq!(bundle_meta.digest, recs_meta.digest, "meta digest");
-        assert_eq!(bundle_meta.total_bytes, recs_meta.total_bytes, "meta total_bytes");
+        assert_eq!(
+            bundle_meta.total_bytes, recs_meta.total_bytes,
+            "meta total_bytes"
+        );
         assert_eq!(bundle_meta.chunks, recs_meta.chunks, "meta chunks");
     }
 
@@ -1243,8 +1303,7 @@ mod tests {
         );
 
         // Sealing with the recovered DEK reproduces the original ciphertext.
-        let sealer2 =
-            ContentStreamSealer::new(&dek2, p.file_id, 1, StreamType::Content, 4096);
+        let sealer2 = ContentStreamSealer::new(&dek2, p.file_id, 1, StreamType::Content, 4096);
         let mut got: Vec<Vec<u8>> = Vec::new();
         let (count2, digest2) = sealer2
             .seal_from_reader(&mut Cursor::new(&content), |_, ct| {
@@ -1262,9 +1321,16 @@ mod tests {
         assert_eq!(digest2, orig_content.digest, "digest matches");
 
         // resume_content_sealer produces the same ciphertext.
-        let sealer3 =
-            resume_content_sealer(&owner, &self_wrap.wrapped_dek, &ctx, Suite::V1, p.file_id, 1, 4096)
-                .expect("resume_content_sealer succeeds");
+        let sealer3 = resume_content_sealer(
+            &owner,
+            &self_wrap.wrapped_dek,
+            &ctx,
+            Suite::V1,
+            p.file_id,
+            1,
+            4096,
+        )
+        .expect("resume_content_sealer succeeds");
         let mut got3: Vec<Vec<u8>> = Vec::new();
         let (count3, digest3) = sealer3
             .seal_from_reader(&mut Cursor::new(&content), |_, ct| {
@@ -1300,7 +1366,10 @@ mod tests {
         };
         let dek = Dek::generate();
         let bundle = build_upload_inner(&dek, &p, &full_streams).expect("v2 inner build");
-        assert!(matches!(bundle.manifest.alg, Suite::V2), "manifest.alg is V2");
+        assert!(
+            matches!(bundle.manifest.alg, Suite::V2),
+            "manifest.alg is V2"
+        );
 
         let self_wrap = bundle
             .wraps
@@ -1369,13 +1438,8 @@ mod tests {
         let plaintext: Vec<u8> = (0..pt_len).map(|i| (i % 251) as u8).collect();
 
         let dek = Dek::generate();
-        let sealer = ContentStreamSealer::new(
-            &dek,
-            file_id,
-            version,
-            StreamType::Content,
-            chunk_size,
-        );
+        let sealer =
+            ContentStreamSealer::new(&dek, file_id, version, StreamType::Content, chunk_size);
 
         // (a) reference — drive seal_from_reader and collect each emitted chunk.
         let mut reference: Vec<Vec<u8>> = Vec::new();
