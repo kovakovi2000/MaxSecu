@@ -18,6 +18,9 @@ param(
     [int]    $Iterations = 1
 )
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1's progress stream can overflow the script call stack on
+# large operations (notably Invoke-WebRequest); silence it globally.
+$ProgressPreference = 'SilentlyContinue'
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Stamp = Get-Date -Format 'yyyyMMddHHmmss'
@@ -53,7 +56,11 @@ function Provision-Wsl {
         $url = 'https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz'
         $tmp = "$RootFsCache.partial"
         if (Test-Path $tmp) { Remove-Item -Force $tmp }
-        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+        # Use curl.exe (ships with Windows 10/11): it streams straight to disk with
+        # no in-memory buffering and no PowerShell progress records, avoiding the
+        # Invoke-WebRequest call-depth overflow on large downloads under PS 5.1.
+        & curl.exe -fSL --retry 3 -o $tmp $url
+        if ($LASTEXITCODE -ne 0) { Die "rootfs download failed (curl exit $LASTEXITCODE)" }
         if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -lt 1000000) {
             Die "rootfs download failed or is implausibly small"
         }
