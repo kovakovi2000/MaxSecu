@@ -3267,6 +3267,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxsecu-live-smoke"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "maxsecu-client-app",
+ "maxsecu-client-core",
+ "maxsecu-crypto",
+ "maxsecu-encoding",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "maxsecu-media-launcher"
 version = "0.0.0"
 dependencies = [
