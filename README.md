@@ -372,6 +372,33 @@ app (Admin screen → mint a registration key).
 Requires that you have run `install-client.ps1` at least once (that creates the
 recovery account and embeds its pin, which this script reuses).
 
+### Upgrade existing users' app — `build-upgrade-zip.ps1`
+
+When you've updated the client code and want your **existing** users on the new
+version **without losing their accounts**, build an upgrade ZIP — the client-side
+twin of [`upgrade-server.sh`](#upgrade-a-running-server--upgrade-serversh):
+
+```
+powershell -ExecutionPolicy Bypass -File .\scripts\build-upgrade-zip.ps1
+```
+
+It writes `dist\MaxSecuClient-upgrade.zip` — just the new `maxsecu-client-app.exe`
++ `ui\` + an `UPGRADE-HERE.txt`. Each user copies those two items over their
+existing `MaxSecuClient` folder, replacing the old ones, and reopens the app.
+Their **keystore (login), saved settings, and pinned server all live in that same
+folder and are kept** — no re-enroll, no new registration key, no re-pin. The ZIP
+deliberately carries **no** account data and **no** server pins.
+
+| Option | What it does |
+|---|---|
+| *(no arguments)* | Rebuild the client and write `dist\MaxSecuClient-upgrade.zip`. |
+| `-SkipBuild` | Reuse the already-compiled client + UI (fast; skip if the code hasn't changed). |
+| `-Out <path>` | Output ZIP path (default `dist\MaxSecuClient-upgrade.zip`). |
+
+> Only for a **code** update. If your server **address or certificate** changed,
+> that's a re-pin, not an upgrade — hand out a fresh `build-user-zip.ps1` ZIP
+> instead.
+
 ---
 
 ## Full-install E2E test harness
