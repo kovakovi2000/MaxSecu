@@ -105,6 +105,29 @@ function Copy-Source {
     Invoke-WslCmd "rm -rf ~/maxsecu && cp -r '$($wslStage.Trim())' ~/maxsecu && chmod +x ~/maxsecu/scripts/*.sh"
 }
 
+# Wait until the server accepts a TCP connection from the host on 127.0.0.1:$port.
+# Right after install the unit can briefly crash-loop on EADDRINUSE (install-server
+# does `enable --now` then a redundant `systemctl restart`, racing the just-bound
+# socket, which releases slowly under WSL mirrored networking) and may hit systemd's
+# start-limit. Poll, and every ~10s clear any failed state and restart to guarantee
+# recovery, so the client's fetch-pins never runs against a momentarily-down server.
+function Wait-ServerReachable([int]$port) {
+    for ($i = 0; $i -lt 45; $i++) {
+        try {
+            $c = New-Object System.Net.Sockets.TcpClient
+            $c.Connect('127.0.0.1', $port)
+            $c.Close()
+            Write-Host "  server reachable on 127.0.0.1:$port"
+            return
+        } catch { }
+        if (($i % 5) -eq 4) {
+            Invoke-WslCmd "systemctl reset-failed maxsecu-server 2>/dev/null; systemctl restart maxsecu-server 2>/dev/null; true" | Out-Null
+        }
+        Start-Sleep -Seconds 2
+    }
+    Die "server did not become reachable on 127.0.0.1:$port within timeout"
+}
+
 # mode: 'install' (returns the connection code) or 'reset' (returns $null).
 function Install-Server([string]$mode) {
     Phase "Install server ($mode)"
@@ -124,6 +147,7 @@ function Install-Server([string]$mode) {
     if (-not $m.Success) { Die "could not parse the connection code from install-server output" }
     $code = $m.Groups[1].Value
     Write-Host "  connection code: $code"
+    Wait-ServerReachable $Port
     return $code
 }
 
