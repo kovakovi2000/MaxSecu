@@ -43,6 +43,11 @@ Usage: install-server.sh [--public [IP]] [--port N]
                   browser authorization code, and the installer exchanges it for a
                   long-lived refresh token itself.
   --no-dropbox    Skip the Dropbox cold-tier prompt entirely.
+  --reset         Tear the server down to ZERO and exit (do NOT reinstall): stop +
+                  remove the service, DROP the database + role (all accounts incl.
+                  the recovery account), delete the data dir + TLS cert, remove the
+                  saved Dropbox login, and close the firewall port. Idempotent and
+                  safe on a never-installed box. The source folder is left in place.
   -h, --help      Show this help.
 EOF
 }
@@ -55,6 +60,8 @@ PUBLIC_IP=""
 PORT=8443
 # Dropbox cold-tier: -1 = decide interactively (default), 1 = forced on, 0 = forced off.
 DROPBOX_FORCE=-1
+# --reset / --uninstall: tear everything down and exit instead of installing.
+RESET=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -92,6 +99,10 @@ while [ $# -gt 0 ]; do
 		;;
 	--no-dropbox)
 		DROPBOX_FORCE=0
+		shift
+		;;
+	--reset | --uninstall)
+		RESET=1
 		shift
 		;;
 	-h | --help)
@@ -166,6 +177,71 @@ psql_super_stdin() {
 		sudo -u postgres psql -v ON_ERROR_STOP=1
 	fi
 }
+
+# --------------------------------------------------------------------------- #
+# 2b. Full teardown (--reset). Removes ALL server state so the next install is
+#     truly from zero, then EXITS. Every step is guarded / idempotent, so this is
+#     safe to run twice, or on a box where MaxSecu was never installed (it just
+#     reports "nothing to do" for each already-absent piece). The one thing it
+#     never touches is the source checkout it is running from.
+# --------------------------------------------------------------------------- #
+if [ "$RESET" -eq 1 ]; then
+	DROPBOX_ENV_DIR="/etc/maxsecu"
+	echo "==> MaxSecu server RESET — removing ALL server state (no reinstall)"
+	echo "    run as   : $RUN_USER"
+	echo "    data dir : $DATA_DIR"
+	echo "    db       : maxsecu (role + database)"
+	echo ""
+
+	# 1. Stop + disable + remove the systemd service so nothing restarts mid-wipe.
+	echo "==> Stopping and removing the systemd service"
+	run_root "systemctl disable --now maxsecu-server 2>/dev/null || true"
+	run_root "rm -f '$UNIT_PATH'"
+	run_root "systemctl daemon-reload 2>/dev/null || true"
+
+	# 2. Drop the database (all accounts incl. the singleton recovery account) and
+	#    the login role. WITH (FORCE) evicts any lingering connections (PG13+); if
+	#    the local Postgres is older it falls back to a plain DROP DATABASE. Guarded
+	#    so a missing/stopped Postgres does not abort the rest of the teardown.
+	if run_root "systemctl is-active --quiet postgresql"; then
+		echo "==> Dropping the 'maxsecu' database and role"
+		printf 'DROP DATABASE IF EXISTS maxsecu WITH (FORCE);\n' | psql_super_stdin >/dev/null 2>&1 ||
+			printf 'DROP DATABASE IF EXISTS maxsecu;\n' | psql_super_stdin >/dev/null 2>&1 || true
+		printf 'DROP ROLE IF EXISTS maxsecu;\n' | psql_super_stdin >/dev/null 2>&1 || true
+	else
+		echo "==> PostgreSQL is not running — skipping the database drop"
+	fi
+
+	# 3. Remove the data dir (TLS cert, client pins, blob store, recovery state).
+	echo "==> Removing the data directory $DATA_DIR"
+	run_as_user "rm -rf '$DATA_DIR'" 2>/dev/null || run_root "rm -rf '$DATA_DIR'"
+
+	# 4. Remove the Dropbox cold-tier credentials (root-only 0600 env file + dir).
+	echo "==> Removing Dropbox cold-tier credentials ($DROPBOX_ENV_DIR)"
+	run_root "rm -rf '$DROPBOX_ENV_DIR'"
+
+	# 5. Close the firewall port if ufw manages it. Uses $PORT, so pass the same
+	#    --port you installed with if it was not the 8443 default.
+	if command -v ufw >/dev/null 2>&1; then
+		echo "==> Removing the ufw allow rule for ${PORT}/tcp"
+		run_root "ufw delete allow ${PORT}/tcp 2>/dev/null || true"
+	fi
+
+	echo ""
+	echo "============================================================"
+	echo " MaxSecu server state removed. This machine is back to zero."
+	echo "============================================================"
+	echo ""
+	echo " The source folder was left in place:"
+	echo "     $ROOT"
+	echo " To also discard any local code edits there, run:"
+	echo "     git -C '$ROOT' reset --hard && git -C '$ROOT' clean -xffd"
+	echo ""
+	echo " To install again from scratch:"
+	echo "     $0 --public"
+	echo "============================================================"
+	exit 0
+fi
 
 echo "==> MaxSecu server install"
 echo "    repo root : $ROOT"
@@ -533,13 +609,32 @@ if [ "$pins_ready" -ne 1 ]; then
 fi
 
 # --------------------------------------------------------------------------- #
+# 13b. Compute the pin fingerprint from the freshly built server binary. This is
+#      the load-bearing half of the connection code: it commits to the exact
+#      client-pins/*.der bytes so install-client can fetch them over the network
+#      and verify them without SSH. print-fingerprint is deterministic (reads
+#      <data_dir>/client-pins), so MAXSECU_DATA_DIR must point at the right dir.
+# --------------------------------------------------------------------------- #
+echo "==> Computing the pin fingerprint for the connection code"
+FP="$(MAXSECU_DATA_DIR="$DATA_DIR" "$SERVER_BIN" print-fingerprint)"
+if [ -z "$FP" ]; then
+	echo "error: could not compute the pin fingerprint (print-fingerprint returned" >&2
+	echo "       nothing). Check the server binary and $DATA_DIR/client-pins." >&2
+	exit 1
+fi
+
+# --------------------------------------------------------------------------- #
 # 14. Friendly summary. Never prints the DB password.
 # --------------------------------------------------------------------------- #
 if [ "$PUBLIC" -eq 1 ]; then
 	PUBLIC_ADDRESS="$PUBLIC_IP:$PORT"
+	# Clean dial target for the connection code: bare IP:PORT, no annotation.
+	CONN_ADDR="$PUBLIC_IP:$PORT"
 else
 	PUBLIC_ADDRESS="127.0.0.1:$PORT (local-only — re-run with --public to expose it)"
+	CONN_ADDR="127.0.0.1:$PORT"
 fi
+CONN_CODE="$CONN_ADDR#$FP"
 
 echo ""
 echo "============================================================"
@@ -551,17 +646,20 @@ echo "    login / register screen):"
 echo ""
 echo "        $PUBLIC_ADDRESS"
 echo ""
-echo " 2. The client pins the app needs are here on this server:"
+echo " 2. Connection code (give this to install-client):"
 echo ""
-echo "        $DATA_DIR/client-pins/server_cert.der"
-echo "        $DATA_DIR/client-pins/directory_pub.der"
+echo "        $CONN_CODE"
+echo ""
+echo "    This single code replaces the old \"fetch the pins over SSH\" step:"
+echo "    install-client dials the server, downloads the pins, and trusts them"
+echo "    only if they hash to the fingerprint after the '#'. No SSH needed."
 echo ""
 echo " 3. NEXT STEP — on your Windows PC, in the repo folder, run:"
 echo ""
-echo "        powershell -ExecutionPolicy Bypass -File scripts\\install-client.ps1 -Vps $RUN_USER@${PUBLIC_IP:-<server-ip>}"
+echo "        powershell -ExecutionPolicy Bypass -File scripts\\install-client.ps1 -ConnectionCode $CONN_CODE"
 echo ""
-echo "    That builds your app + the shareable ZIP and fetches the"
-echo "    pins above for you automatically."
+echo "    That builds your app + the shareable ZIP and fetches + verifies the"
+echo "    pins for you automatically — no SSH to this server required."
 echo ""
 echo " 4. To watch the server's live logs at any time:"
 echo ""

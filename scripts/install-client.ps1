@@ -4,49 +4,64 @@
 
 .DESCRIPTION
     Run ONCE by the admin on a Windows PC after the Linux VPS server has finished
-    its first run (so the pinned certs exist under maxsecu-server-data/client-pins).
+    its first run (so the pinned certs exist and the server printed a connection
+    code).
 
     This script:
       * verifies the Rust (MSVC) + Node/npm toolchains are installed,
-      * downloads the two pinned certs from the VPS over scp,
+      * fetches the two pinned certs over the network from the server and verifies
+        them against the connection-code fingerprint (no SSH required),
       * runs maxsecu-setup against the PUBLIC server to create the recovery
         account + the admin's first registration key,
       * builds the UI and the client binary,
       * lays out the admin working client (dist\MaxSecuClient),
       * produces the clean handout (dist\MaxSecuClient-share.zip).
 
-.PARAMETER Vps
-    SSH target of the server, e.g. root@123.123.123.123 (required).
+.PARAMETER ConnectionCode
+    The connection code the server printed, of the form addr:port#fingerprint
+    (e.g. 123.123.123.123:8443#K7QF9M2ATBZ4C6XU...). This is the primary input:
+    it is parsed into -ServerAddr, -Port and -Fingerprint for you.
+
+.PARAMETER ServerAddr
+    Public host/IP the client dials + the cert SAN. Manual alternative to
+    -ConnectionCode (must be paired with -Fingerprint).
 
 .PARAMETER Port
     Server listen port. Default 8443.
 
-.PARAMETER ServerAddr
-    Public host/IP the client dials + the cert SAN. Default: the IP parsed from -Vps.
+.PARAMETER Fingerprint
+    The pin fingerprint (the part after '#' in the connection code). Manual
+    alternative to -ConnectionCode (must be paired with -ServerAddr).
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File scripts\install-client.ps1 -Vps root@123.123.123.123
+    powershell -ExecutionPolicy Bypass -File scripts\install-client.ps1 -ConnectionCode 123.123.123.123:8443#K7QF9M2ATBZ4C6XU...
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Install')]
 param(
-    [Parameter(Mandatory = $true)]
-    [string] $Vps,
+    # The connection code the server printed: "addr:port#fingerprint". Primary
+    # input — it is split into $ServerAddr, $Port and $Fingerprint below. Provide
+    # this OR the manual -ServerAddr/-Fingerprint pair.
+    [Parameter(ParameterSetName = 'Install', Position = 0)]
+    [string] $ConnectionCode = '',
 
-    [int] $Port = 8443,
-
+    [Parameter(ParameterSetName = 'Install')]
     [string] $ServerAddr = '',
 
-    # SSH port used ONLY for the scp cert fetch. Default 22; set this when the VPS
-    # runs sshd on a non-standard port (a common hardening — e.g. -SshPort 14269).
-    # It does not affect the app connection, which always uses -ServerAddr:$Port.
-    [int] $SshPort = 22,
+    [Parameter(ParameterSetName = 'Install')]
+    [int] $Port = 8443,
 
-    # Escape hatch: a local folder that already contains the two pins
-    # (server_cert.der + directory_pub.der). Use this when Windows OpenSSH scp
-    # can't authenticate — e.g. your key lives only in PuTTY's Pageant. Fetch the
-    # pins yourself with pscp/WinSCP (both use Pageant), then pass -PinsDir. When
-    # set, the scp step is skipped entirely (so -SshPort is not needed).
-    [string] $PinsDir = ''
+    # The pin fingerprint (the text after '#' in the connection code). Load-bearing:
+    # the fetched pins are trusted ONLY if their recomputed hash matches this.
+    [Parameter(ParameterSetName = 'Install')]
+    [string] $Fingerprint = '',
+
+    # Tear the CLIENT down to zero and exit (no build): delete dist\ (both the admin
+    # app and the handout ZIP), the recovery + registration secrets in the repo root
+    # (recovery_key.blob / recovery_pin.bin / register.key), and the recovery pin
+    # embedded into the client crate. Its own parameter set, so no other args are
+    # required. Idempotent — absent files are simply reported and skipped.
+    [Parameter(Mandatory = $true, ParameterSetName = 'Reset')]
+    [switch] $Reset
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,26 +80,88 @@ function Fail {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Resolve paths + default ServerAddr from -Vps
+# 1. Resolve paths (server address/port/fingerprint are parsed after the reset block)
 # ---------------------------------------------------------------------------
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Write-Host "Repo root: $Root"
 
-# Parse the host portion out of user@host (host may itself be an IP or name).
-$VpsHost = $Vps
-if ($Vps -match '@') {
-    $VpsHost = ($Vps -split '@', 2)[1]
-}
-if ([string]::IsNullOrWhiteSpace($VpsHost)) {
-    Fail "Could not parse a host from -Vps '$Vps'. Expected the form user@host."
+# ---------------------------------------------------------------------------
+# 1b. Full reset (-Reset): delete this PC's built app + the security files it
+#     created, so the next run starts from zero. Then exit — no build.
+# ---------------------------------------------------------------------------
+if ($Reset) {
+    Write-Section 'Resetting the client (removing built app + security files)'
+
+    # State this PC accumulated. NOT the git-tracked source, and NOT the build
+    # caches (target\, node_modules\) — those are just caches; a rebuild refreshes
+    # them and deleting them only costs you a slow recompile.
+    $targets = @(
+        (Join-Path $Root 'dist'),
+        (Join-Path $Root 'recovery_key.blob'),
+        (Join-Path $Root 'recovery_pin.bin'),
+        (Join-Path $Root 'register.key'),
+        (Join-Path $Root 'crates\client-app\recovery_pin.bin')
+    )
+    foreach ($t in $targets) {
+        if (Test-Path $t) {
+            Remove-Item -Path $t -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "  removed  $t"
+        } else {
+            Write-Host "  absent   $t" -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ''
+    Write-Host 'Client state removed. This PC is back to zero.' -ForegroundColor Green
+    Write-Host ''
+    Write-Host 'NOTE: this erased recovery_key.blob and the embedded recovery pin -- the' -ForegroundColor Yellow
+    Write-Host '      master key to the OLD server. Only do this to abandon that server.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'If you unzipped/copied the admin app elsewhere (e.g. your Desktop) and'
+    Write-Host 'signed in there, delete that copy too -- it keeps its own login data.'
+    Write-Host ''
+    Write-Host 'For a completely clean rebuild you may ALSO delete the build caches:'
+    Write-Host '  target\  crates\client-app\target\  crates\client-app\ui\node_modules\  crates\client-app\ui\dist\'
+    Write-Host ''
+    Write-Host 'To build again from scratch:' -ForegroundColor Cyan
+    Write-Host '  .\scripts\install-client.ps1 -ConnectionCode <code-from-the-server>'
+    exit 0
 }
 
-if ([string]::IsNullOrWhiteSpace($ServerAddr)) {
-    $ServerAddr = $VpsHost
+# Resolve the dial target + fingerprint from either -ConnectionCode or the manual
+# -ServerAddr/-Fingerprint pair. The connection code is "addr:port#fingerprint";
+# only the fingerprint is load-bearing (the address is untrusted transport info).
+if (-not [string]::IsNullOrWhiteSpace($ConnectionCode)) {
+    # Split off the fingerprint on '#', then split the address on the LAST ':' so
+    # IPv6 / host:port forms parse correctly.
+    $codeParts = $ConnectionCode -split '#', 2
+    $addrPart  = $codeParts[0].Trim()
+    if ($codeParts.Count -lt 2 -or [string]::IsNullOrWhiteSpace($codeParts[1])) {
+        Fail "Could not parse a fingerprint from -ConnectionCode '$ConnectionCode'. Expected the form addr:port#fingerprint."
+    }
+    $Fingerprint = $codeParts[1].Trim()
+
+    $lastColon = $addrPart.LastIndexOf(':')
+    if ($lastColon -lt 0) {
+        Fail "Could not parse addr:port from -ConnectionCode '$ConnectionCode'. Expected the form addr:port#fingerprint."
+    }
+    $ServerAddr = $addrPart.Substring(0, $lastColon)
+    $portText   = $addrPart.Substring($lastColon + 1)
+    $parsedPort = 0
+    if (-not [int]::TryParse($portText, [ref] $parsedPort)) {
+        Fail "Could not parse a numeric port from -ConnectionCode '$ConnectionCode' (got '$portText')."
+    }
+    $Port = $parsedPort
 }
-Write-Host "VPS ssh target : $Vps"
+
+# Require either a connection code (parsed above) OR the manual pair.
+if ([string]::IsNullOrWhiteSpace($ServerAddr) -or [string]::IsNullOrWhiteSpace($Fingerprint)) {
+    Fail "Provide -ConnectionCode ""addr:port#fingerprint"" (the code the server printed), or the manual pair -ServerAddr <host/IP> and -Fingerprint <code> (optionally -Port, default 8443)."
+}
+
 Write-Host "Server address : $ServerAddr"
 Write-Host "Server port    : $Port"
+Write-Host "Pin fingerprint: $Fingerprint"
 
 # ---------------------------------------------------------------------------
 # 2. Ensure toolchains (do NOT auto-install system-wide)
@@ -138,9 +215,9 @@ Write-Host "node  : $($node.Source)"
 Write-Host "npm   : $($npm.Source)"
 
 # ---------------------------------------------------------------------------
-# 3. Download the two pinned certs from the VPS via scp
+# 3. Fetch + verify the two pinned certs over the network
 # ---------------------------------------------------------------------------
-Write-Section 'Downloading pinned certs from the VPS'
+Write-Section 'Fetching + verifying pins from the server'
 
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("maxsecu-install-" + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
@@ -148,42 +225,32 @@ New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 $CertTmp = Join-Path $TmpDir 'server_cert.der'
 $DirTmp  = Join-Path $TmpDir 'directory_pub.der'
 
-if ($PinsDir -ne '') {
-    # Pins already fetched by the operator (see the -PinsDir help above). This
-    # avoids Windows OpenSSH scp entirely — handy when the key lives in Pageant.
-    $srcCert = Join-Path $PinsDir 'server_cert.der'
-    $srcDir  = Join-Path $PinsDir 'directory_pub.der'
-    if (-not (Test-Path $srcCert)) { Fail "server_cert.der not found in -PinsDir '$PinsDir'." }
-    if (-not (Test-Path $srcDir))  { Fail "directory_pub.der not found in -PinsDir '$PinsDir'." }
-    Copy-Item $srcCert $CertTmp -Force
-    Copy-Item $srcDir  $DirTmp  -Force
-    Write-Host "Using pins supplied in $PinsDir"
-} else {
-    $scp = Get-Command scp -ErrorAction SilentlyContinue
-    if ($null -eq $scp) {
-        Fail 'scp was not found. Enable the Windows OpenSSH Client (Settings > Apps > Optional features) and re-run, or fetch the two pins yourself and pass -PinsDir.'
+# maxsecu-setup fetch-pins dials the server, downloads the two public pins, and
+# recomputes their fingerprint. It writes the .der files ONLY if that hash matches
+# the connection-code fingerprint (integrity without SSH); on any mismatch,
+# network, or parse error it writes NOTHING and exits non-zero.
+if ($null -eq (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+    if (Test-Path (Join-Path $cargoBin 'cargo.exe')) {
+        $env:Path = "$cargoBin;$env:Path"
+        Write-Host "cargo not on PATH; using rustup install at $cargoBin" -ForegroundColor DarkYellow
     }
+}
 
-    # accept-new: trust the VPS host key on first connect instead of blocking on an
-    # interactive yes/no prompt, which a `-File` script cannot answer.
-    $sshOpts = @('-P', $SshPort, '-o', 'StrictHostKeyChecking=accept-new')
-
-    Write-Host "Fetching server_cert.der ... (ssh port $SshPort)"
-    & scp @sshOpts "${Vps}:maxsecu-server-data/client-pins/server_cert.der" $CertTmp
-    if ($LASTEXITCODE -ne 0) {
-        Fail "scp of server_cert.der failed. If your key lives in PuTTY/Pageant (Windows OpenSSH scp can't use it), fetch the two pins with pscp or WinSCP and re-run with -PinsDir <folder>. Otherwise check the VPS is reachable on SSH port $SshPort (custom port: -SshPort <port>; VPN-only: -Vps root@<vpn-ip> together with -ServerAddr <public-ip>), your key works, and the server finished its first run (pins live at maxsecu-server-data/client-pins/)."
-    }
-
-    Write-Host "Fetching directory_pub.der ..."
-    & scp @sshOpts "${Vps}:maxsecu-server-data/client-pins/directory_pub.der" $DirTmp
-    if ($LASTEXITCODE -ne 0) {
-        Fail "scp of directory_pub.der failed. Same checks as above (or fetch both pins yourself and use -PinsDir)."
-    }
+Write-Host "Fetching pins from ${ServerAddr}:${Port} and verifying against the fingerprint ..."
+& cargo run --release --manifest-path (Join-Path $Root 'tools\maxsecu-setup\Cargo.toml') -- fetch-pins `
+    --server "${ServerAddr}:${Port}" `
+    --host "$ServerAddr" `
+    --fingerprint "$Fingerprint" `
+    --cert-out "$CertTmp" `
+    --dir-out "$DirTmp"
+if ($LASTEXITCODE -ne 0) {
+    Fail "Fetching/verifying the pins failed (exit code $LASTEXITCODE). Check that the server at ${ServerAddr}:${Port} is reachable and finished its first run, and that the fingerprint '$Fingerprint' exactly matches the connection code the server printed."
 }
 
 if (-not (Test-Path $CertTmp)) { Fail "server_cert.der is missing at $CertTmp." }
 if (-not (Test-Path $DirTmp))  { Fail "directory_pub.der is missing at $DirTmp." }
-Write-Host "Pins ready in $TmpDir"
+Write-Host "Pins fetched + verified, ready in $TmpDir"
 
 # ---------------------------------------------------------------------------
 # 4. Create the recovery account + first key via maxsecu-setup

@@ -266,7 +266,14 @@ async fn recovery_login(
     id: &Identity,
     exporter: &[u8; 32],
 ) -> Result<Zeroizing<String>, SetupError> {
-    let (st, ch) = post(conn, host, "/v1/recovery/challenge", serde_json::json!({}), None).await?;
+    let (st, ch) = post(
+        conn,
+        host,
+        "/v1/recovery/challenge",
+        serde_json::json!({}),
+        None,
+    )
+    .await?;
     if st != StatusCode::OK {
         return Err(SetupError::Protocol(format!("recovery challenge: {st}")));
     }
@@ -278,8 +285,8 @@ async fn recovery_login(
     let challenge_id_hex = ch["challenge_id"]
         .as_str()
         .ok_or_else(|| SetupError::Protocol("challenge missing challenge_id".into()))?;
-    let challenge_id =
-        hex16(challenge_id_hex).ok_or_else(|| SetupError::Protocol("bad challenge_id hex".into()))?;
+    let challenge_id = hex16(challenge_id_hex)
+        .ok_or_else(|| SetupError::Protocol("bad challenge_id hex".into()))?;
     let blob = B64
         .decode(
             ch["wrapped_blob_b64"]
@@ -297,12 +304,12 @@ async fn recovery_login(
             "unexpected challenge suite {suite:?} (expected v2 hybrid)"
         )));
     }
-    let mlkem_seed = id
-        .mlkem_seed()
-        .ok_or_else(|| SetupError::Protocol("v2 challenge but recovery identity has no ML-KEM".into()))?;
+    let mlkem_seed = id.mlkem_seed().ok_or_else(|| {
+        SetupError::Protocol("v2 challenge but recovery identity has no ML-KEM".into())
+    })?;
     let sk = HybridEncSecretKey::from_components(id.enc_secret().expose_bytes(), mlkem_seed);
-    let wrapped =
-        deserialize_hybrid_wrap(&blob).map_err(|_| SetupError::Protocol("malformed hybrid wrap".into()))?;
+    let wrapped = deserialize_hybrid_wrap(&blob)
+        .map_err(|_| SetupError::Protocol("malformed hybrid wrap".into()))?;
     let dek = unwrap_dek_hybrid(&sk, &wrapped, &ctx)
         .map_err(|_| SetupError::Protocol("recovery nonce unwrap failed".into()))?;
     let nonce: Zeroizing<[u8; 32]> = Zeroizing::new(*dek.expose());
@@ -332,7 +339,9 @@ async fn recovery_login(
     )
     .await?;
     if st != StatusCode::OK {
-        return Err(SetupError::Protocol(format!("recovery verify rejected: {st}")));
+        return Err(SetupError::Protocol(format!(
+            "recovery verify rejected: {st}"
+        )));
     }
     let token = res["session_token"]
         .as_str()

@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod bootstrap_pins;
 pub mod config;
 pub mod layout;
 pub mod pki;

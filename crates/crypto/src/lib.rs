@@ -16,6 +16,7 @@ mod hash;
 mod hybrid;
 mod kdf;
 pub mod merkle;
+mod pin_fp;
 mod pwkdf;
 mod rng;
 mod sign;
@@ -33,6 +34,7 @@ pub use hybrid::{
     x25519_public_from_secret, HybridEncPublicKey, HybridEncSecretKey, HybridWrappedDek,
 };
 pub use kdf::hkdf_sha256_32;
+pub use pin_fp::pin_fingerprint;
 pub use pwkdf::{derive_key, Argon2Params, ARGON2_DESKTOP_TARGET, ARGON2_FLOOR};
 pub use rng::{fill_random, random_array};
 pub use sign::{SigningKey, VerifyingKey};

@@ -65,7 +65,12 @@ fn parse_flags() -> HashMap<String, String> {
 }
 
 /// flag → env → default resolution.
-fn opt(flags: &HashMap<String, String>, flag: &str, env: &str, default: Option<&str>) -> Option<String> {
+fn opt(
+    flags: &HashMap<String, String>,
+    flag: &str,
+    env: &str,
+    default: Option<&str>,
+) -> Option<String> {
     flags
         .get(flag)
         .cloned()
@@ -96,9 +101,13 @@ async fn real_main() -> Result<(), SetupExit> {
 
     let dial = opt(&flags, "server", "SETUP_SERVER", Some("127.0.0.1:8443")).unwrap();
     let host = opt(&flags, "host", "SETUP_HOST", Some("localhost")).unwrap();
-    let out = PathBuf::from(opt(&flags, "out", "SETUP_OUT", None).ok_or("--out / SETUP_OUT is required")?);
-    let pin_out =
-        PathBuf::from(opt(&flags, "pin-out", "SETUP_PIN_OUT", None).ok_or("--pin-out / SETUP_PIN_OUT is required")?);
+    let out = PathBuf::from(
+        opt(&flags, "out", "SETUP_OUT", None).ok_or("--out / SETUP_OUT is required")?,
+    );
+    let pin_out = PathBuf::from(
+        opt(&flags, "pin-out", "SETUP_PIN_OUT", None)
+            .ok_or("--pin-out / SETUP_PIN_OUT is required")?,
+    );
     let first_key_out = PathBuf::from(
         opt(&flags, "first-key-out", "SETUP_FIRST_KEY_OUT", None)
             .ok_or("--first-key-out / SETUP_FIRST_KEY_OUT is required")?,
@@ -109,8 +118,16 @@ async fn real_main() -> Result<(), SetupExit> {
     let cert_path = match opt(&flags, "cert", "SETUP_CERT", None) {
         Some(p) => PathBuf::from(p),
         None => {
-            let data_dir = opt(&flags, "data-dir", "SETUP_DATA_DIR", Some("./maxsecu-server-data")).unwrap();
-            PathBuf::from(data_dir).join("client-pins").join("server_cert.der")
+            let data_dir = opt(
+                &flags,
+                "data-dir",
+                "SETUP_DATA_DIR",
+                Some("./maxsecu-server-data"),
+            )
+            .unwrap();
+            PathBuf::from(data_dir)
+                .join("client-pins")
+                .join("server_cert.der")
         }
     };
     let cert_bytes = std::fs::read(&cert_path)
@@ -144,11 +161,20 @@ async fn real_main() -> Result<(), SetupExit> {
             println!("================ MAXSECU SETUP COMPLETE ================");
             println!("recovery account registered (hybrid: {}).", report.hybrid);
             println!("  sealed recovery private key  → {}", report.out.display());
-            println!("  recovery pin (embed in build) → {}", report.pin_out.display());
-            println!("  first registration key        → {}", report.first_key_out.display());
+            println!(
+                "  recovery pin (embed in build) → {}",
+                report.pin_out.display()
+            );
+            println!(
+                "  first registration key        → {}",
+                report.first_key_out.display()
+            );
             println!();
             println!("OPERATOR — do all THREE, then destroy your working copies:");
-            println!("  (a) MOVE {} to COLD/offline storage (it is the only recovery private key).", report.out.display());
+            println!(
+                "  (a) MOVE {} to COLD/offline storage (it is the only recovery private key).",
+                report.out.display()
+            );
             println!(
                 "  (b) copy {} → crates/client-app/recovery_pin.bin and REBUILD/repackage the client",
                 report.pin_out.display()
@@ -168,8 +194,49 @@ async fn real_main() -> Result<(), SetupExit> {
     }
 }
 
+/// `fetch-pins` mode (spec §4): fetch the two public trust-anchor pins from the
+/// server over the network and write them ONLY if they match the operator's
+/// `--fingerprint` connection code. Distinct from `real_main` (which does recovery
+/// setup and consumes an already-pinned `--cert`).
+async fn fetch_pins_main() -> Result<(), String> {
+    let flags = parse_flags();
+    let server = opt(&flags, "server", "SETUP_FETCH_SERVER", None)
+        .ok_or("--server ADDR:PORT is required")?;
+    // Default --host = the host part of --server (everything before the LAST colon),
+    // so an `ADDR:PORT` dial target yields `ADDR` as SNI/Host.
+    let default_host = server
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(server.as_str());
+    let host = opt(&flags, "host", "SETUP_FETCH_HOST", Some(default_host)).unwrap();
+    let fingerprint = opt(&flags, "fingerprint", "SETUP_FETCH_FINGERPRINT", None)
+        .ok_or("--fingerprint is required")?;
+    let cert_out =
+        opt(&flags, "cert-out", "SETUP_FETCH_CERT_OUT", None).ok_or("--cert-out is required")?;
+    let dir_out =
+        opt(&flags, "dir-out", "SETUP_FETCH_DIR_OUT", None).ok_or("--dir-out is required")?;
+
+    maxsecu_setup::fetch::fetch_and_verify(
+        &server,
+        &host,
+        &fingerprint,
+        std::path::Path::new(&cert_out),
+        std::path::Path::new(&dir_out),
+    )
+    .await
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("fetch-pins") {
+        return match fetch_pins_main().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("[fetch-pins] error: {msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match real_main().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(SetupExit::AlreadyRegistered) => {

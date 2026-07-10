@@ -145,6 +145,19 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
         }
     };
 
+    // In-band pin bootstrap (design 2026-07-10 §2): export the two PUBLIC pins so
+    // the files exist here in `prepare`, read them back, and merge a router that
+    // serves those exact bytes over `GET /v1/bootstrap/pins`. `run::run` also
+    // exports the pins (idempotent copy) — doing it here too makes `prepare`
+    // self-contained for the smoke test and guarantees the served bytes are
+    // byte-identical to `client-pins/*.der`.
+    let client_pins = cfg.data_dir.join("client-pins");
+    pki::export_client_pin(&layout, &client_pins)?;
+    bootstrap::export_client_pin_d5(&layout, &client_pins)?;
+    let cert_bytes = std::fs::read(client_pins.join("server_cert.der"))?;
+    let dir_bytes = std::fs::read(client_pins.join("directory_pub.der"))?;
+    let app_router = app_router.merge(crate::bootstrap_pins::router(cert_bytes, dir_bytes));
+
     let listener = TcpListener::bind((cfg.bind.as_str(), cfg.port)).await?;
     let local_addr = listener.local_addr()?;
     Ok(Prepared {
@@ -167,6 +180,16 @@ pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
     let client_pins = cfg.data_dir.join("client-pins");
     pki::export_client_pin(&layout, &client_pins)?;
     bootstrap::export_client_pin_d5(&layout, &client_pins)?;
+
+    // Connection code (design 2026-07-10 §3): the operator copies this by hand
+    // into `install-client`. The fingerprint commits to the exact pin bytes; the
+    // address half is untrusted transport info. Computed from the same
+    // `client-pins/*.der` the bootstrap endpoint serves, so they always agree.
+    let cert_pin = std::fs::read(client_pins.join("server_cert.der"))?;
+    let dir_pin = std::fs::read(client_pins.join("directory_pub.der"))?;
+    let fp = maxsecu_crypto::pin_fingerprint(&cert_pin, &dir_pin);
+    let code_addr = cfg.public_addr.as_deref().unwrap_or("127.0.0.1");
+    eprintln!("  connection code: {code_addr}:{}#{fp}", cfg.port);
 
     let profile_label = match cfg.profile {
         Profile::Dev => "DEV / ephemeral MemoryStore",

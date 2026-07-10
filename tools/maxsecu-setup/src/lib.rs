@@ -19,6 +19,7 @@
 //! keys on the wire. On a 409 (recovery already registered) it writes NOTHING and
 //! the caller exits non-zero.
 
+pub mod fetch;
 pub mod setup;
 
 pub use setup::{run, SetupError, SetupOpts, SetupReport};
