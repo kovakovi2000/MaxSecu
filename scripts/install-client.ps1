@@ -55,6 +55,15 @@ param(
     [Parameter(ParameterSetName = 'Install')]
     [string] $Fingerprint = '',
 
+    # Unattended recovery passphrase. When supplied (or via $env:SETUP_RECOVERY_PW),
+    # the interactive Read-Host prompt is skipped so the client can be installed
+    # non-interactively (e.g. by scripts\test-full-install.ps1). Prefer the env var:
+    # a -RecoveryPassphrase value is visible in shell history and process listings for
+    # the life of the process, whereas the env var isn't captured in command-line args.
+    # Leave both empty for the normal interactive install, which prompts without echoing.
+    [Parameter(ParameterSetName = 'Install')]
+    [string] $RecoveryPassphrase = '',
+
     # Tear the CLIENT down to zero and exit (no build): delete dist\ (both the admin
     # app and the handout ZIP), the recovery + registration secrets in the repo root
     # (recovery_key.blob / recovery_pin.bin / register.key), and the recovery pin
@@ -272,16 +281,23 @@ if ((Test-Path $RecoveryBlob) -and (Test-Path $RecoveryPin) -and (Test-Path $Reg
     Write-Host "  $RecoveryPin"
     Write-Host "  $RegisterKey"
 } else {
-    # Prompt for the recovery passphrase without echoing it; hand it to the child
-    # process only via the SETUP_RECOVERY_PW env var (never printed, never persisted).
-    Write-Host 'Choose a RECOVERY passphrase. Write it down and keep it offline with'
-    Write-Host 'recovery_key.blob -- together they are the ONLY way to recover the account.'
-    $SecurePw = Read-Host -AsSecureString 'Recovery passphrase'
-    $Bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePw)
-    try {
-        $PlainPw = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($Bstr)
-    } finally {
-        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Bstr)
+    # Prefer a non-interactively supplied passphrase (param or env var); fall back to
+    # an interactive, non-echoed prompt. The plaintext is handed to the child process
+    # ONLY via the SETUP_RECOVERY_PW env var below (never printed, never persisted).
+    $PlainPw = $RecoveryPassphrase
+    if ([string]::IsNullOrEmpty($PlainPw)) { $PlainPw = $env:SETUP_RECOVERY_PW }
+    if ([string]::IsNullOrEmpty($PlainPw)) {
+        Write-Host 'Choose a RECOVERY passphrase. Write it down and keep it offline with'
+        Write-Host 'recovery_key.blob -- together they are the ONLY way to recover the account.'
+        $SecurePw = Read-Host -AsSecureString 'Recovery passphrase'
+        $Bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePw)
+        try {
+            $PlainPw = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($Bstr)
+        } finally {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Bstr)
+        }
+    } else {
+        Write-Host 'Using a non-interactively supplied recovery passphrase.' -ForegroundColor DarkYellow
     }
     if ([string]::IsNullOrEmpty($PlainPw)) {
         Fail 'Recovery passphrase cannot be empty.'
@@ -302,6 +318,7 @@ if ((Test-Path $RecoveryBlob) -and (Test-Path $RecoveryPin) -and (Test-Path $Reg
         # Scrub the passphrase from the environment and local variable.
         Remove-Item Env:\SETUP_RECOVERY_PW -ErrorAction SilentlyContinue
         $PlainPw = $null
+        $RecoveryPassphrase = $null
     }
 
     if ($SetupExit -eq 3) {
