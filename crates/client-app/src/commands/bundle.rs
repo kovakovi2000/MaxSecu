@@ -28,7 +28,7 @@ use crate::commands::feed::{file_type_name, hex};
 
 use tauri::State;
 
-use maxsecu_client_core::{DirectoryVerifier, MemoryTrustStore};
+use maxsecu_client_core::MemoryTrustStore;
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::{BundleBody, Manifest};
 use maxsecu_encoding::types::{FileType, StreamType};
@@ -90,9 +90,12 @@ pub(crate) async fn open_bundle_members_on(
     // it, and it rejects a malformed id before it is interpolated into the URL.
     let file_id = hex16(req_file_id)?;
     let pinned = load_directory_pub(&dir.0)?;
-    let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
+    // Offline-D5 hop (spec §3/§7): resolve the effective directory verifier over the
+    // (already-established) pinned connection; fail closed on a bad delegation.
+    let verifier =
+        crate::directory::build_delegated_verifier(&mut *sender, host, pinned, now).await?;
 
     let username = {
         let s = session.0.lock().await;

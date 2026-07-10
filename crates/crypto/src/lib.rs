@@ -12,6 +12,7 @@
 
 mod aead;
 mod dek;
+mod delegation;
 mod hash;
 mod hybrid;
 mod kdf;
@@ -27,6 +28,10 @@ pub use aead::{
     seal_stream_streaming, stream_digest, SealedStream,
 };
 pub use dek::{fingerprint, Dek};
+pub use delegation::{
+    parse as parse_delegation, sign as sign_delegation, verify as verify_delegation,
+    DirectoryDelegation, DELEGATION_BODY_LEN, DELEGATION_VERSION, DELEGATION_WIRE_LEN,
+};
 pub use hash::sha256;
 pub use hybrid::{
     deserialize_hybrid_wrap, generate_hybrid_keypair, generate_mlkem_keypair,
@@ -67,6 +72,11 @@ pub enum CryptoError {
     Argon2,
     /// A byte input had an unexpected length.
     BadLength,
+    /// A directory-delegation cert's signature was valid but `now` fell outside
+    /// its `[valid_from, valid_until]` window (spec §4). Distinct from
+    /// [`CryptoError::Signature`] so the client can tell "expired" from "invalid"
+    /// and fail closed accordingly.
+    DelegationExpired,
 }
 
 impl fmt::Display for CryptoError {
@@ -82,6 +92,7 @@ impl fmt::Display for CryptoError {
             BelowArgonFloor => write!(f, "Argon2id parameters below floor"),
             Argon2 => write!(f, "Argon2id failure"),
             BadLength => write!(f, "unexpected input length"),
+            DelegationExpired => write!(f, "delegation outside its validity window"),
         }
     }
 }

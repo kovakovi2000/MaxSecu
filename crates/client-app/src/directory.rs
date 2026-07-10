@@ -8,7 +8,7 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::client::conn::http1::SendRequest;
 
-use maxsecu_client_core::{DirectoryVerifier, TrustStore};
+use maxsecu_client_core::{DirectoryVerifier, TrustStore, VerifyError};
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::DirBinding;
 use maxsecu_encoding::RECOVERY_ID;
@@ -158,6 +158,178 @@ pub fn verify_author_binding(
         key_version: v.key_version,
         mlkem_pub: v.mlkem_pub,
     })
+}
+
+// ---- offline-D5 delegation hop (spec §3/§7) — THE client verify hop ----
+
+/// TTL (ms) for a cached directory-delegation document. Bounds how long a fetched
+/// cert is reused before re-GETting `/v1/bootstrap/delegation`; the cert's OWN
+/// `[valid_from, valid_until]` window is re-checked with the live clock on EVERY
+/// use (see [`build_delegated_verifier_cached`]), so a cached-but-now-expired cert
+/// still fails closed regardless of this TTL.
+const DELEGATION_CACHE_TTL_MS: u64 = 60_000;
+
+/// A previously-fetched delegation document that CROSS-CHECKED against the pinned
+/// D5 and verified at insert time. Keyed by `host` so a reconnect to a different
+/// server never reuses another server's delegation.
+struct CachedDelegation {
+    host: String,
+    directory_pub: [u8; 32],
+    delegation_bytes: Vec<u8>,
+    fetched_at_ms: u64,
+}
+
+/// Session-global cache of the last good delegation document. Only a successfully
+/// cross-checked + verified delegation is ever stored; every read re-runs the full
+/// cross-check + `verify_delegation` with the live clock (never trusts the cached
+/// result blindly), so freshness here is a network optimization, not a trust
+/// shortcut. A plain `Mutex` held only across trivial map ops (never an `.await`).
+struct DelegationCache {
+    inner: std::sync::Mutex<Option<CachedDelegation>>,
+}
+
+impl DelegationCache {
+    const fn new() -> DelegationCache {
+        DelegationCache {
+            inner: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The cached `(directory_pub, delegation_bytes)` for `host` if still within the
+    /// TTL. Returns the RAW bytes for re-verification — never a trust decision.
+    fn get(&self, host: &str, now_ms: u64) -> Option<([u8; 32], Vec<u8>)> {
+        let g = self.inner.lock().unwrap();
+        g.as_ref()
+            .filter(|c| c.host == host)
+            .filter(|c| now_ms.saturating_sub(c.fetched_at_ms) < DELEGATION_CACHE_TTL_MS)
+            .map(|c| (c.directory_pub, c.delegation_bytes.clone()))
+    }
+
+    fn put(&self, host: &str, directory_pub: [u8; 32], delegation_bytes: Vec<u8>, now_ms: u64) {
+        *self.inner.lock().unwrap() = Some(CachedDelegation {
+            host: host.to_owned(),
+            directory_pub,
+            delegation_bytes,
+            fetched_at_ms: now_ms,
+        });
+    }
+}
+
+static DELEGATION_CACHE: DelegationCache = DelegationCache::new();
+
+/// Decode a `GET /v1/bootstrap/delegation` `200` body
+/// (`{directory_pub_b64, delegation_cert_b64}`, STANDARD base64) into the raw
+/// pinned-D5 bytes + the 113-byte cert wire form. Any malformed field fails closed
+/// as `untrusted` (never a panic; the server is untrusted transport).
+fn parse_delegation_doc(json: &serde_json::Value) -> Result<([u8; 32], Vec<u8>), UiError> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    let bad = || UiError::new("untrusted", "The server sent a malformed directory delegation.");
+    let dir_vec = B64
+        .decode(json["directory_pub_b64"].as_str().ok_or_else(bad)?)
+        .map_err(|_| bad())?;
+    let directory_pub: [u8; 32] = dir_vec.try_into().map_err(|_| bad())?;
+    let cert = B64
+        .decode(json["delegation_cert_b64"].as_str().ok_or_else(bad)?)
+        .map_err(|_| bad())?;
+    Ok((directory_pub, cert))
+}
+
+/// Cross-check the served `directory_pub` against the pinned D5, then build the
+/// delegated [`DirectoryVerifier`] whose effective key is the operational key the
+/// cert authorizes. **Fail closed** on any gap — a mismatched pin, an expired
+/// window, or an invalid/tampered/wrong-signer cert. NEVER falls back to direct-pin
+/// on a *bad* delegation (only an explicit `404` does, in the caller).
+///
+/// The served `directory_pub` is UNTRUSTED transport data: it is only ever COMPARED
+/// to the compiled-in pin (mirrors the recovery-pin alarm in [`resolve_recovery_pin`]),
+/// never trusted on its own. `now_secs` is unix SECONDS (the delegation window's unit).
+fn build_from_delegation_bytes(
+    pinned_d5: [u8; 32],
+    served_dir_pub: [u8; 32],
+    delegation_bytes: &[u8],
+    now_secs: u64,
+) -> Result<DirectoryVerifier, UiError> {
+    if served_dir_pub != pinned_d5 {
+        return Err(UiError::new(
+            "untrusted",
+            "The server's directory key does not match this app's pinned key.",
+        ));
+    }
+    DirectoryVerifier::with_delegation(pinned_d5, delegation_bytes, now_secs).map_err(|e| match e {
+        VerifyError::DelegationExpired => {
+            UiError::new("untrusted", "The server's directory delegation has expired.")
+        }
+        _ => UiError::new("untrusted", "The server's directory delegation is invalid."),
+    })
+}
+
+/// THE client verification hop (offline-D5 ceremony, spec §3/§7). Fetch the server's
+/// delegation document, cross-check its `directory_pub` against the pinned D5, verify
+/// the cert against that pin, and return a [`DirectoryVerifier`] bound to the
+/// authorized OPERATIONAL key — so every downstream binding check runs against the
+/// operational key, not the pin. Fail closed on any bad delegation; only an explicit
+/// `404` (server runs no delegation model) falls back to direct-pin verification.
+///
+/// This is the ONE home for the hop: all ~8 command sites route their verifier build
+/// through here after establishing a pinned connection. Uses the session-global
+/// [`DELEGATION_CACHE`]; call [`build_delegated_verifier_cached`] with an explicit
+/// cache in unit tests.
+pub async fn build_delegated_verifier(
+    sender: &mut SendRequest<Full<Bytes>>,
+    host: &str,
+    pinned_d5: [u8; 32],
+    now_ms: u64,
+) -> Result<DirectoryVerifier, UiError> {
+    build_delegated_verifier_cached(sender, host, pinned_d5, now_ms, &DELEGATION_CACHE).await
+}
+
+/// [`build_delegated_verifier`] with an explicit delegation cache (unit-test seam).
+async fn build_delegated_verifier_cached(
+    sender: &mut SendRequest<Full<Bytes>>,
+    host: &str,
+    pinned_d5: [u8; 32],
+    now_ms: u64,
+    cache: &DelegationCache,
+) -> Result<DirectoryVerifier, UiError> {
+    // The delegation window is unix SECONDS; the binding-validity clock is ms.
+    let now_secs = now_ms / 1000;
+
+    // Cache HIT: reuse the fetched bytes but RE-VERIFY (cross-check + window) against
+    // the live clock — a cached cert that has since fallen out of its window fails
+    // closed here rather than being trusted.
+    if let Some((dir_pub, bytes)) = cache.get(host, now_ms) {
+        return build_from_delegation_bytes(pinned_d5, dir_pub, &bytes, now_secs);
+    }
+
+    let (status, json) = get_json(sender, "/v1/bootstrap/delegation", None, host).await?;
+    match status {
+        hyper::StatusCode::OK => {
+            let (dir_pub, bytes) = parse_delegation_doc(&json)?;
+            let verifier = build_from_delegation_bytes(pinned_d5, dir_pub, &bytes, now_secs)?;
+            // Cache ONLY after a successful cross-check + verify.
+            cache.put(host, dir_pub, bytes, now_ms);
+            Ok(verifier)
+        }
+        hyper::StatusCode::NOT_FOUND => {
+            // 404 = the server runs NO delegation model — a legacy/pre-F server, or a
+            // Prod server still awaiting its ceremony. Fall back to DIRECT-PIN
+            // verification against the pinned D5.
+            //
+            // SAFE (documented; spec §7): this cannot be abused to accept a forged
+            // Prod binding. A real Prod server (W2) ALWAYS serves a valid delegation
+            // and signs EVERY binding with its OPERATIONAL key — which does NOT verify
+            // against the pinned D5 in direct-pin mode, so a served/forged Prod binding
+            // fails closed downstream. This branch only ever succeeds for a genuine
+            // legacy/dev server whose bindings ARE signed by the pinned key. It is a
+            // fallback of last resort, never taken while a delegation is present.
+            Ok(DirectoryVerifier::new(pinned_d5))
+        }
+        _ => Err(UiError::new(
+            "untrusted",
+            "The server's directory delegation is unavailable.",
+        )),
+    }
 }
 
 /// The recovery wrap-target keys: an X25519 `enc_pub` plus an OPTIONAL ML-KEM-768
@@ -741,5 +913,234 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.code, "untrusted");
+    }
+
+    // ---- offline-D5 delegation hop (spec §3/§7) — the client verify hop ----
+
+    /// A `GET /v1/bootstrap/delegation` `200` body shape (STANDARD base64).
+    fn delegation_doc(dir_pub: &[u8; 32], cert: &[u8]) -> serde_json::Value {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        serde_json::json!({
+            "directory_pub_b64": B64.encode(dir_pub),
+            "delegation_cert_b64": B64.encode(cert),
+        })
+    }
+
+    /// Sign a delegation authorizing `op_pub` for `[from, until]` seconds under `d5`.
+    fn delegation_cert(d5: &SigningKey, op_pub: &[u8; 32], from: u64, until: u64) -> Vec<u8> {
+        maxsecu_crypto::sign_delegation(d5, op_pub, from, until)
+    }
+
+    // NOW is in ms (the binding clock); the delegation window is unix SECONDS.
+    const NOW_SECS: u64 = NOW / 1000;
+
+    #[tokio::test]
+    async fn hop_builds_operational_verifier_and_binds_effective_key_to_op_key() {
+        // Pinned D5 authorizes a SEPARATE operational key; the hop must select the
+        // operational key as the effective binding-signing key.
+        let d5 = SigningKey::generate();
+        let op = SigningKey::generate();
+        let pinned = d5.verifying_key().to_bytes();
+        let op_pub = op.verifying_key().to_bytes();
+        let cert = delegation_cert(&d5, &op_pub, NOW_SECS - 100, NOW_SECS + 100);
+
+        let addr = spawn_stub(hyper::StatusCode::OK, delegation_doc(&pinned, &cert)).await;
+        let mut sender = connect(&addr).await;
+        let cache = super::DelegationCache::new();
+        let verifier =
+            super::build_delegated_verifier_cached(&mut sender, "localhost", pinned, NOW, &cache)
+                .await
+                .unwrap();
+
+        // A binding signed by the OPERATIONAL key verifies…
+        let (bytes, sig) = signed_binding(&op);
+        let a = verify_author_binding(&verifier, &mut MemoryTrustStore::new(), &bytes, &sig, NOW)
+            .unwrap();
+        assert_eq!(a.sig_pub, [0x51; 32]);
+        // …and a binding signed by the PINNED D5 (not the op key) is refused, proving
+        // the effective key is really the operational key, not the pin.
+        let (bytes2, sig_pin) = signed_binding(&d5);
+        assert_eq!(
+            verify_author_binding(&verifier, &mut MemoryTrustStore::new(), &bytes2, &sig_pin, NOW)
+                .unwrap_err()
+                .code,
+            "untrusted"
+        );
+    }
+
+    #[tokio::test]
+    async fn hop_resolves_a_recipient_end_to_end_via_the_delegation() {
+        // Full happy path THROUGH the hop: fetch delegation, build the operational
+        // verifier, then resolve an op-signed binding — mirrors the fail-closed
+        // resolver tests but exercises the real hop.
+        let d5 = SigningKey::generate();
+        let op = SigningKey::generate();
+        let pinned = d5.verifying_key().to_bytes();
+        let op_pub = op.verifying_key().to_bytes();
+        let cert = delegation_cert(&d5, &op_pub, NOW_SECS - 100, NOW_SECS + 100);
+        let (binding_bytes, binding_sig) = signed_binding(&op);
+
+        let addr = spawn_router_stub(
+            delegation_doc(&pinned, &cert),
+            binding_json(&binding_bytes, &binding_sig),
+        )
+        .await;
+        let mut sender = connect(&addr).await;
+
+        let cache = super::DelegationCache::new();
+        let verifier =
+            super::build_delegated_verifier_cached(&mut sender, "localhost", pinned, NOW, &cache)
+                .await
+                .unwrap();
+        let author = resolve_recipient(
+            &mut sender,
+            "localhost",
+            "alice",
+            &verifier,
+            &mut MemoryTrustStore::new(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(author.user_id, [0x0A; 16]);
+        assert_eq!(author.sig_pub, [0x51; 32]);
+    }
+
+    #[tokio::test]
+    async fn hop_refuses_an_expired_delegation_never_falls_back() {
+        let d5 = SigningKey::generate();
+        let op = SigningKey::generate();
+        let pinned = d5.verifying_key().to_bytes();
+        // Window ended in the past → fail closed (NOT a direct-pin fallback).
+        let cert = delegation_cert(&d5, &op.verifying_key().to_bytes(), NOW_SECS - 200, NOW_SECS - 100);
+        let addr = spawn_stub(hyper::StatusCode::OK, delegation_doc(&pinned, &cert)).await;
+        let mut sender = connect(&addr).await;
+        let cache = super::DelegationCache::new();
+        let err =
+            super::build_delegated_verifier_cached(&mut sender, "localhost", pinned, NOW, &cache)
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, "untrusted");
+    }
+
+    #[tokio::test]
+    async fn hop_refuses_when_served_directory_pub_ne_pinned() {
+        // A 200 whose directory_pub does not equal the pinned D5 MUST refuse (a
+        // different-root server), even if the cert itself is well-formed.
+        let d5 = SigningKey::generate();
+        let op = SigningKey::generate();
+        let pinned = d5.verifying_key().to_bytes();
+        let cert = delegation_cert(&d5, &op.verifying_key().to_bytes(), NOW_SECS - 100, NOW_SECS + 100);
+        // Serve a DIFFERENT directory_pub than the client pins.
+        let served_dir = SigningKey::generate().verifying_key().to_bytes();
+        let addr = spawn_stub(hyper::StatusCode::OK, delegation_doc(&served_dir, &cert)).await;
+        let mut sender = connect(&addr).await;
+        let cache = super::DelegationCache::new();
+        let err =
+            super::build_delegated_verifier_cached(&mut sender, "localhost", pinned, NOW, &cache)
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, "untrusted");
+    }
+
+    #[tokio::test]
+    async fn hop_refuses_a_wrong_signer_delegation() {
+        // directory_pub == pinned (cross-check passes) but the cert is signed by an
+        // attacker key, not the pinned D5 → DelegationInvalid → refuse.
+        let d5 = SigningKey::generate();
+        let attacker = SigningKey::generate();
+        let op = SigningKey::generate();
+        let pinned = d5.verifying_key().to_bytes();
+        let cert = delegation_cert(&attacker, &op.verifying_key().to_bytes(), NOW_SECS - 100, NOW_SECS + 100);
+        let addr = spawn_stub(hyper::StatusCode::OK, delegation_doc(&pinned, &cert)).await;
+        let mut sender = connect(&addr).await;
+        let cache = super::DelegationCache::new();
+        let err =
+            super::build_delegated_verifier_cached(&mut sender, "localhost", pinned, NOW, &cache)
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, "untrusted");
+    }
+
+    #[tokio::test]
+    async fn hop_refuses_a_tampered_delegation() {
+        let d5 = SigningKey::generate();
+        let op = SigningKey::generate();
+        let pinned = d5.verifying_key().to_bytes();
+        let mut cert = delegation_cert(&d5, &op.verifying_key().to_bytes(), NOW_SECS - 100, NOW_SECS + 100);
+        cert[5] ^= 0x01; // flip a byte in the operational_pub region
+        let addr = spawn_stub(hyper::StatusCode::OK, delegation_doc(&pinned, &cert)).await;
+        let mut sender = connect(&addr).await;
+        let cache = super::DelegationCache::new();
+        let err =
+            super::build_delegated_verifier_cached(&mut sender, "localhost", pinned, NOW, &cache)
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, "untrusted");
+    }
+
+    #[tokio::test]
+    async fn hop_falls_back_to_direct_pin_on_404() {
+        // A 404 means the server runs NO delegation model (legacy/awaiting). The hop
+        // falls back to direct-pin verification against the pinned D5.
+        let d5 = SigningKey::generate();
+        let pinned = d5.verifying_key().to_bytes();
+        let addr = spawn_stub(hyper::StatusCode::NOT_FOUND, serde_json::Value::Null).await;
+        let mut sender = connect(&addr).await;
+        let cache = super::DelegationCache::new();
+        let verifier =
+            super::build_delegated_verifier_cached(&mut sender, "localhost", pinned, NOW, &cache)
+                .await
+                .unwrap();
+        // Direct-pin: a binding signed by the PINNED D5 verifies.
+        let (bytes, sig) = signed_binding(&d5);
+        let a = verify_author_binding(&verifier, &mut MemoryTrustStore::new(), &bytes, &sig, NOW)
+            .unwrap();
+        assert_eq!(a.enc_pub, [0xE1; 32]);
+    }
+
+    /// A two-route in-process stub: the delegation document on
+    /// `GET /v1/bootstrap/delegation`, and a fixed binding body on any other path
+    /// (the `/v1/directory/{username}` resolve). Lets one test drive the whole hop.
+    async fn spawn_router_stub(
+        delegation: serde_json::Value,
+        binding: serde_json::Value,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let delegation = delegation.clone();
+                let binding = binding.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let delegation = delegation.clone();
+                        let binding = binding.clone();
+                        async move {
+                            let body = if req.uri().path() == "/v1/bootstrap/delegation" {
+                                delegation
+                            } else {
+                                binding
+                            };
+                            let _ = req.into_body().collect().await;
+                            let resp = Response::builder()
+                                .status(hyper::StatusCode::OK)
+                                .body(Full::<Bytes>::from(body.to_string()))
+                                .unwrap();
+                            Ok::<_, Infallible>(resp)
+                        }
+                    });
+                    let _ = server_http1::Builder::new()
+                        .serve_connection(TokioIo::new(socket), svc)
+                        .await;
+                });
+            }
+        });
+        format!("127.0.0.1:{}", addr.port())
     }
 }

@@ -669,22 +669,14 @@ if [ "$pins_ready" -ne 1 ]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# 13b. Compute the pin fingerprint from the freshly built server binary. This is
-#      the load-bearing half of the connection code: it commits to the exact
-#      client-pins/*.der bytes so install-client can fetch them over the network
-#      and verify them without SSH. print-fingerprint is deterministic (reads
-#      <data_dir>/client-pins), so MAXSECU_DATA_DIR must point at the right dir.
-# --------------------------------------------------------------------------- #
-echo "==> Computing the pin fingerprint for the connection code"
-FP="$(MAXSECU_DATA_DIR="$DATA_DIR" "$SERVER_BIN" print-fingerprint)"
-if [ -z "$FP" ]; then
-	echo "error: could not compute the pin fingerprint (print-fingerprint returned" >&2
-	echo "       nothing). Check the server binary and $DATA_DIR/client-pins." >&2
-	exit 1
-fi
-
-# --------------------------------------------------------------------------- #
-# 14. Friendly summary. Never prints the DB password.
+# 13b. Offline-D5 inversion (design 2026-07-10 §§6,8): the final connection code
+#      is minted on the ADMIN PC (the directory root D5 originates there), NOT
+#      here. A Prod install starts AWAITING DELEGATION with enrollment CLOSED, so
+#      this script prints only what install-client needs to run the ceremony:
+#        * the CERT-ONLY fingerprint  (print-cert-fingerprint) — pins TLS while
+#          the server still has no directory_pub;
+#        * the one-time delegation token (print-token) — burned by the ceremony.
+#      Both read <data_dir>, so MAXSECU_DATA_DIR must point at the right dir.
 # --------------------------------------------------------------------------- #
 if [ "$PUBLIC" -eq 1 ]; then
 	PUBLIC_ADDRESS="$PUBLIC_IP:$PORT"
@@ -694,38 +686,105 @@ else
 	PUBLIC_ADDRESS="127.0.0.1:$PORT (local-only — re-run with --public to expose it)"
 	CONN_ADDR="127.0.0.1:$PORT"
 fi
-CONN_CODE="$CONN_ADDR#$FP"
 
-echo ""
-echo "============================================================"
-echo " MaxSecu server is installed and running."
-echo "============================================================"
-echo ""
-echo " 1. PUBLIC ADDRESS to give your users (type this on the app's"
-echo "    login / register screen):"
-echo ""
-echo "        $PUBLIC_ADDRESS"
-echo ""
-echo " 2. Connection code (give this to install-client):"
-echo ""
-echo "        $CONN_CODE"
-echo ""
-echo "    This single code replaces the old \"fetch the pins over SSH\" step:"
-echo "    install-client dials the server, downloads the pins, and trusts them"
-echo "    only if they hash to the fingerprint after the '#'. No SSH needed."
-echo ""
-echo " 3. NEXT STEP — on your Windows PC, in the repo folder, run:"
-echo ""
-echo "        powershell -ExecutionPolicy Bypass -File scripts\\install-client.ps1 -ConnectionCode $CONN_CODE"
-echo ""
-echo "    That builds your app + the shareable ZIP and fetches + verifies the"
-echo "    pins for you automatically — no SSH to this server required."
-echo ""
-echo " 4. To watch the server's live logs at any time:"
-echo ""
-echo "        journalctl -u maxsecu-server -f"
-echo ""
-echo "============================================================"
+echo "==> Reading the server-cert fingerprint (for the client to pin over TLS)"
+CERT_FP="$(MAXSECU_DATA_DIR="$DATA_DIR" "$SERVER_BIN" print-cert-fingerprint || true)"
+if [ -z "$CERT_FP" ]; then
+	echo "error: could not read the server-cert fingerprint (print-cert-fingerprint" >&2
+	echo "       returned nothing). Check the server binary and $DATA_DIR/client-pins." >&2
+	exit 1
+fi
+
+# The one-time delegation token is written during the Prod (awaiting-delegation)
+# startup. It may land a beat after server_cert.der, so retry briefly. An empty
+# result after the retries means the server is ALREADY delegated (token burned)
+# or this is a non-Prod (Dev/MemoryStore) run with no ceremony.
+echo "==> Reading the one-time delegation token"
+TOKEN=""
+for _ in $(seq 1 15); do
+	TOKEN="$(MAXSECU_DATA_DIR="$DATA_DIR" "$SERVER_BIN" print-token 2>/dev/null || true)"
+	if [ -n "$TOKEN" ]; then
+		break
+	fi
+	sleep 1
+done
+
+# --------------------------------------------------------------------------- #
+# 14. Friendly summary. Never prints the DB password.
+# --------------------------------------------------------------------------- #
+if [ -z "$TOKEN" ]; then
+	# No token → already delegated (or a non-Prod run). Enrollment is already
+	# open; the final connection code was minted on the admin PC during the
+	# ceremony. As a convenience, re-derive it here (print-fingerprint is valid
+	# once directory_pub.der has been pinned by the delegation).
+	FULL_FP="$(MAXSECU_DATA_DIR="$DATA_DIR" "$SERVER_BIN" print-fingerprint 2>/dev/null || true)"
+	echo ""
+	echo "============================================================"
+	echo " MaxSecu server is installed and running — ALREADY DELEGATED."
+	echo "============================================================"
+	echo ""
+	echo " A directory delegation is already installed and enrollment is OPEN."
+	echo " The one-time delegation token has been consumed (single use), so there"
+	echo " is nothing new to hand to install-client."
+	echo ""
+	echo " PUBLIC ADDRESS to give your users:"
+	echo ""
+	echo "        $PUBLIC_ADDRESS"
+	echo ""
+	if [ -n "$FULL_FP" ]; then
+		echo " Connection code (the one the admin PC minted, re-derived for reference):"
+		echo ""
+		echo "        $CONN_ADDR#$FULL_FP"
+		echo ""
+	fi
+	echo " To start over from a fresh awaiting-delegation state, run:  $0 --reset"
+	echo " then re-install; that regenerates a new one-time token."
+	echo ""
+	echo " To watch the server's live logs at any time:"
+	echo ""
+	echo "        journalctl -u maxsecu-server -f"
+	echo ""
+	echo "============================================================"
+else
+	echo ""
+	echo "============================================================"
+	echo " MaxSecu server is installed and running — AWAITING DELEGATION."
+	echo "============================================================"
+	echo ""
+	echo " Enrollment is CLOSED until you complete the one-time delegation"
+	echo " ceremony from your Windows admin PC. This server holds ONLY a"
+	echo " short-lived operational key — the directory root (D5) is generated"
+	echo " on your PC by install-client, never here. That is what makes the"
+	echo " admin PC (not this internet-facing server) the directory authority."
+	echo ""
+	echo " 1. PUBLIC ADDRESS to give your users (type this on the app's"
+	echo "    login / register screen):"
+	echo ""
+	echo "        $PUBLIC_ADDRESS"
+	echo ""
+	echo " 2. SERVER-CERT FINGERPRINT (lets install-client pin this server over TLS):"
+	echo ""
+	echo "        $CERT_FP"
+	echo ""
+	echo " 3. ONE-TIME DELEGATION TOKEN (single use — keep it secret until used):"
+	echo ""
+	echo "        $TOKEN"
+	echo ""
+	echo " 4. NEXT STEP — on your Windows admin PC, in the repo folder, run:"
+	echo ""
+	echo "        powershell -ExecutionPolicy Bypass -File scripts\\install-client.ps1 -ConnectionCode $CONN_ADDR#$CERT_FP -Token $TOKEN"
+	echo ""
+	echo "    install-client fetches + pins this server's cert, generates the"
+	echo "    directory root, uploads the delegation (which OPENS enrollment),"
+	echo "    and then prints the FINAL connection code to hand to your users."
+	echo "    No SSH to this server is required."
+	echo ""
+	echo " 5. To watch the server's live logs at any time:"
+	echo ""
+	echo "        journalctl -u maxsecu-server -f"
+	echo ""
+	echo "============================================================"
+fi
 
 if [ "$DROPBOX_ENABLED_THIS_RUN" -eq 1 ]; then
 	echo ""

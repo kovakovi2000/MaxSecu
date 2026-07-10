@@ -43,6 +43,29 @@ There are three pieces:
 You do Part 1 on the server, Part 2 on your Windows PC, and Part 3 whenever you
 want to add a new person.
 
+### Who's in charge — the trust model (short version)
+
+The security of the whole system rests on a master signing key called the
+**directory root**. Here's the important design choice: that key is created and
+kept **on your Windows admin PC**, never on the internet-facing server.
+
+The setup is automatic — you don't do anything special. When you run
+`install-server.sh` (Part 1) it comes up **awaiting delegation** with **sign-up
+closed**, and prints a one-time **delegation token**. When you then run
+`install-client.ps1` (Part 2) and paste that token in, your PC quietly performs a
+one-time **delegation ceremony**: it generates the directory root locally, hands
+the server a short-lived *operational* key it can use day-to-day, and flips
+sign-up **open**. The server can serve users with that operational key, but it can
+never mint a new one or extend its own authority — only your admin PC can, because
+only your PC holds the root. So even if the server were fully compromised, an
+attacker could not silently become the directory authority for your users.
+
+That short-lived key renews itself automatically: whenever you (the admin) sign in
+on your admin PC with your recovery passphrase, the app quietly renews the
+delegation in the background. On everyone else's PC this does nothing (they don't
+hold the root), so there's nothing for your users to manage. Just keep signing in
+periodically on the admin PC and the server stays delegated.
+
 ---
 
 ## Part 1 — Set up the server (do this once)
@@ -80,12 +103,24 @@ running permanently — even after a reboot. Because `--public` is set, it may p
 to show the public IP address it detected and ask you to confirm it is correct;
 just check it matches your VPS and continue.
 
-When it finishes, it prints a summary that includes a **connection code** — the
-address plus a short fingerprint, like `YOUR_SERVER_IP:8443#K7QF9M2ATBZ4C6XU...`.
-Copy that whole code; you'll paste it into Part 2. It lets your Windows PC fetch
-the server's security certificates over the network and confirm they're genuine,
-so no SSH file copy is needed. The server is now running on its own — you can
-close the SSH window.
+When it finishes, the server is **awaiting delegation** (sign-up is closed until
+you finish Part 2), and it prints a summary with three things you carry to your
+Windows PC:
+
+- your **public address** (like `YOUR_SERVER_IP:8443`),
+- a **server-cert fingerprint** (a short code that lets your PC pin this exact
+  server over the network — no SSH file copy needed), and
+- a **one-time delegation token** (single-use; keep it secret until you use it).
+
+To make this painless, the summary also prints a **ready-to-run command** for
+Part 2 with all three already filled in — something like:
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\install-client.ps1 -ConnectionCode YOUR_SERVER_IP:8443#K7QF9M2ATBZ4C6XU... -Token 9F3K...
+```
+
+Copy that whole line; you'll paste it into Part 2. The server is now running on
+its own — you can close the SSH window.
 
 > Want a different port, or Dropbox storage offload? See
 > [Optional settings (advanced)](#optional-settings-advanced) for the extra flags
@@ -99,15 +134,23 @@ Now switch back to your own Windows PC. You will build two things: the admin app
 for yourself, and the ZIP you hand out to everyone else.
 
 Open **PowerShell** in the project folder (the MaxSecu code, downloaded on your
-Windows PC) and run:
+Windows PC) and paste the **ready-to-run command** the server printed at the end of
+Part 1. It looks like this (your fingerprint and token will differ):
 
 ```
-powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -ConnectionCode "YOUR_CONNECTION_CODE"
+powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -ConnectionCode "YOUR_SERVER_IP:8443#K7QF9M2ATBZ4C6XU..." -Token "9F3K..."
 ```
 
-Replace `YOUR_CONNECTION_CODE` with the whole connection code the server printed
-at the end of Part 1 (it looks like `YOUR_SERVER_IP:8443#K7QF9M2ATBZ4C6XU...`).
-Keep the quotes — they stop PowerShell from choking on the `#`.
+The `-ConnectionCode` carries the address plus the server-cert fingerprint; the
+`-Token` is the one-time delegation token. Keep the quotes — they stop PowerShell
+from choking on the `#`. (If you don't pass `-Token`, the script asks you to paste
+the token before continuing.)
+
+This is the step that performs the one-time **delegation ceremony** described in
+[the trust model](#whos-in-charge--the-trust-model-short-version): your PC
+generates the directory root here, uploads the delegation (which **opens sign-up**
+on the server), and mints the final connection code for your users — all
+automatically. You don't decide anything; you just supply the token.
 
 > **Why `powershell -ExecutionPolicy Bypass -File`?** Windows blocks unsigned
 > `.ps1` scripts by default, so running `.\scripts\install-client.ps1` directly
@@ -119,12 +162,13 @@ Keep the quotes — they stop PowerShell from choking on the `#`.
 > See [Optional settings (advanced)](#optional-settings-advanced) if you'd rather
 > pass the address and fingerprint as separate flags.
 
-This builds the Windows app and fetches the security files from your server over
-the network, verifying them against the fingerprint in the connection code.
+This builds the Windows app, fetches the security files from your server over the
+network (verifying them against the fingerprint), and runs the delegation ceremony.
 Partway through, it asks you to **make up a recovery passphrase**
 — a password you invent. **Write it down and keep it somewhere safe and offline.**
-This passphrase protects your master recovery key (more on that at the end). If
-you lose it, it cannot be recovered for you.
+This passphrase protects your master recovery key **and** the directory root
+created in the ceremony (more on that at the end). If you lose it, it cannot be
+recovered for you.
 
 When it finishes, you'll have two things in the `dist` folder:
 
@@ -196,17 +240,21 @@ journalctl -u maxsecu-server -f           # watch what it's doing live (Ctrl+C t
 | The Windows script says `cargo` or `npm` is missing | Your PC needs two free developer tools. Install **Rust** (from rustup.rs, choose the MSVC option) and **Node.js LTS** (from nodejs.org), then run the script again. |
 | Windows warns "unknown publisher" when you open the app | This build isn't code-signed, which is normal for a self-built app. Click **More info**, then **Run anyway**. |
 | The server won't start | SSH in and run `journalctl -u maxsecu-server -e` to see the error message. |
+| "sign-up is closed" / users can't register | The delegation ceremony (Part 2) hasn't been completed yet, or it failed. Finish Part 2 on your admin PC — that opens sign-up. |
+| The client installer says the token is invalid or already used | The delegation token is single-use. If you re-ran `install-server.sh`, it printed a **new** token — use that one. If the server is already delegated it won't print a token at all (sign-up is already open); you don't need one. |
 
 ---
 
 ## Recovery — the most important thing to protect
 
-When you built your admin app, two things were created: a file named
-**`recovery_key.blob`** and the **recovery passphrase** you made up. Together they
-are the master key that can recover the whole system. Keep the file and the
-passphrase **offline** (for example on a USB stick in a drawer) and **never share
-them with anyone**. The app ZIP you hand out to other people does **not** contain
-them — that is deliberate. If you lose both, there is no way to recover.
+When you built your admin app, the ceremony created two files —
+**`recovery_key.blob`** (your account's master key) and **`d5_recovery.blob`** (a
+sealed backup of the **directory root**, the signing key that keeps your server
+delegated) — both locked with the **recovery passphrase** you made up. Together
+they are the master key that can recover the whole system. Keep **both files** and
+the passphrase **offline** (for example on a USB stick in a drawer) and **never
+share them with anyone**. The app ZIP you hand out to other people contains
+**neither** — that is deliberate. If you lose them, there is no way to recover.
 
 ---
 
@@ -332,11 +380,13 @@ directly fails with a "not digitally signed / cannot be loaded" error.
 
 | Option | What it does |
 |---|---|
-| `-ConnectionCode "addr:port#fp"` | **(primary)** The connection code the server printed. It carries the address, port, and a fingerprint of the security certificates; the installer splits it for you and trusts the fetched pins only if their hash matches. Provide this **or** the `-ServerAddr` + `-Fingerprint` pair below. |
+| `-ConnectionCode "addr:port#fp"` | **(primary)** The `-ConnectionCode` from the command the server printed. It carries the address, port, and the **server-cert fingerprint**; the installer splits it for you and trusts the fetched pins only if their hash matches. Provide this **or** the `-ServerAddr` + `-Fingerprint` pair below. |
+| `-Token "token"` | The **one-time delegation token** the server printed. Required on a first (awaiting-delegation) install — it authorizes the ceremony that opens sign-up. Omit it and you're prompted to paste it. Also settable via the `SETUP_DELEGATION_TOKEN` env var. Not needed if the server is already delegated. |
 | `-ServerAddr host/IP` | The public host/IP the app dials and the certificate is issued for. Manual alternative to `-ConnectionCode`; pair it with `-Fingerprint`. |
-| `-Fingerprint code` | The fingerprint part (the text after `#` in the connection code). Manual alternative to `-ConnectionCode`; pair it with `-ServerAddr`. |
+| `-Fingerprint code` | The server-cert fingerprint (the text after `#` in the connection code). Manual alternative to `-ConnectionCode`; pair it with `-ServerAddr`. |
 | `-Port N` | Server port. Must match the server's `--port` (default `8443`). Only needed with the manual `-ServerAddr`/`-Fingerprint` pair — `-ConnectionCode` already carries the port. |
-| `-Reset` | Tear the client down to zero and exit (no build): delete `dist\` and the recovery/registration files, so the next run starts fresh. No other arguments are required with it. See [Start over from scratch](#start-over-from-scratch-full-reset). |
+| `-RecoveryPassphrase "pw"` | Supply the recovery passphrase non-interactively (skips the prompt) so the install can run unattended. Prefer the `SETUP_RECOVERY_PW` env var — a flag value is visible in shell history and process listings. Omit both for the normal prompt (no echo). |
+| `-Reset` | Tear the client down to zero and exit (no build): delete `dist\`, the recovery/registration files, **and the directory root** (`d5_key.blob` / `d5_recovery.blob`), so the next run starts fresh. No other arguments are required with it. See [Start over from scratch](#start-over-from-scratch-full-reset). |
 
 Example — passing the address and fingerprint manually instead of a code:
 
@@ -405,10 +455,15 @@ deliberately carries **no** account data and **no** server pins.
 ## Full-install E2E test harness
 
 `scripts/test-full-install.ps1` provisions a throwaway WSL Ubuntu-22.04 server,
-installs the server (`install-server.sh --public`) and client (`install-client.ps1`)
-via their real scripts, runs the headless `maxsecu-live-smoke` oracle against the
-live pair, exercises the reset+reinstall path, re-runs the oracle, then unregisters
-the distro and resets the client.
+installs the server (`install-server.sh --public`), then drives the **real
+offline-D5 ceremony** unattended: it scrapes the server-cert fingerprint and the
+one-time delegation token from the install-server summary and runs
+`install-client.ps1 -ConnectionCode <addr:port#cert-fp> -Token <token>
+-RecoveryPassphrase <pw>`. It then asserts the delegation was installed — that the
+server now reports a directory fingerprint, i.e. **sign-up has opened** — runs the
+headless `maxsecu-live-smoke` oracle against the live pair, exercises the
+reset+reinstall path, re-runs the oracle, then unregisters the distro and resets
+the client.
 
     powershell -ExecutionPolicy Bypass -File scripts\test-full-install.ps1
     # options: -Port 8443  -KeepOnFailure  -Iterations 3
@@ -425,10 +480,11 @@ requires an out-of-band sink server that the single-server install does not depl
 
 ### Non-interactive client install
 
-`install-client.ps1` now accepts `-RecoveryPassphrase <pw>` (or the
-`SETUP_RECOVERY_PW` env var). When supplied it skips the interactive passphrase
-prompt so the harness (or any automation) can install unattended. The normal
-interactive install is unchanged -- omit the flag and it prompts without echoing.
+`install-client.ps1` accepts `-RecoveryPassphrase <pw>` (or the `SETUP_RECOVERY_PW`
+env var) and `-Token <token>` (or the `SETUP_DELEGATION_TOKEN` env var). When both
+are supplied it runs the entire offline-D5 ceremony without a single prompt, so the
+harness (or any automation) can install unattended. The normal interactive install
+is unchanged -- omit them and it prompts (passphrase without echoing).
 
 ---
 

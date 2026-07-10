@@ -13,6 +13,7 @@ pub mod feed;
 pub mod pool;
 pub mod recovery_login;
 pub mod register;
+pub mod renew;
 pub mod search;
 pub mod settings;
 pub mod share;

@@ -184,6 +184,7 @@ fn main() {
             maxsecu_client_app::commands::register::register_with_key,
             maxsecu_client_app::commands::startup::startup_mode,
             maxsecu_client_app::commands::admin::mint_registration_key,
+            maxsecu_client_app::commands::renew::renew_delegation,
             maxsecu_client_app::commands::recovery_login::request_recovery_challenge,
             maxsecu_client_app::commands::recovery_login::answer_recovery_challenge,
             maxsecu_client_app::commands::upload::stage_upload,

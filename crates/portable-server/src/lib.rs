@@ -10,6 +10,7 @@
 pub mod bootstrap;
 pub mod bootstrap_pins;
 pub mod config;
+pub mod delegation_setup;
 pub mod layout;
 pub mod pki;
 pub mod run;

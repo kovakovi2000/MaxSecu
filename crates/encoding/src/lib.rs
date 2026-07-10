@@ -208,4 +208,11 @@ pub mod labels {
     /// prefix of any other label, so an update signature can never be reinterpreted
     /// as a sink/checkpoint/grant/etc. attestation.
     pub const UPDATE_MANIFEST: &str = "MaxSecu-update-v1";
+    /// The offline **directory-delegation** cert (offline-D5 ceremony, spec §4):
+    /// the admin-held D5 root signs `version ‖ operational_pub ‖ valid_from ‖
+    /// valid_until`, authorizing the server's short-lived operational key to sign
+    /// directory bindings within a validity window. Distinct from and not a prefix
+    /// of any other label, so a delegation signature can never be reinterpreted as
+    /// a dirbinding/checkpoint/etc. attestation.
+    pub const DIRECTORY_DELEGATION: &str = "maxsecu/directory-delegation/v1";
 }

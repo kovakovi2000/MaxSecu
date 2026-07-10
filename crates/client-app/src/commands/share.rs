@@ -118,7 +118,6 @@ async fn reshare_inner(
     // Pinned trust anchors: the D5 directory root and the out-of-band sink pins.
     // Both are batch-wide prerequisites — a missing/malformed pin fails closed.
     let pinned = load_directory_pub(&dir.0)?;
-    let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
     let sink_pins = load_sink_pins(&dir.0)?;
@@ -129,6 +128,10 @@ async fn reshare_inner(
     // Step 1: ONE reauth for the whole batch (one channel, one token).
     let server = server_of(&dir.0)?;
     let (mut sender, host, token) = reauth(&dir.0, &server, session, connect_lock).await?;
+    // Offline-D5 hop (spec §3/§7): resolve the effective directory verifier over the
+    // pinned connection; fail closed on a bad delegation before any binding is trusted.
+    let verifier =
+        crate::directory::build_delegated_verifier(&mut sender, &host, pinned, now).await?;
 
     // Step 2: fetch the file's own view once (same call the viewer makes).
     let (status, view_json) = get_json(
@@ -574,11 +577,14 @@ pub async fn resolve_recipient(
     dir: State<'_, AppDir>,
 ) -> Result<ResolvedRecipientDto, UiError> {
     let pinned = load_directory_pub(&dir.0)?;
-    let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
     let server = server_of(&dir.0)?;
     let (mut sender, host, _exporter) = open_conn(&dir.0, &server).await?;
+    // Offline-D5 hop (spec §3/§7): resolve the effective directory verifier over the
+    // pinned connection; fail closed on a bad delegation before resolving the recipient.
+    let verifier =
+        crate::directory::build_delegated_verifier(&mut sender, &host, pinned, now).await?;
     let author = crate::directory::resolve_recipient(
         &mut sender,
         &host,

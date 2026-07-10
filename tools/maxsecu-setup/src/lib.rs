@@ -22,4 +22,8 @@
 pub mod fetch;
 pub mod setup;
 
-pub use setup::{run, SetupError, SetupOpts, SetupReport};
+pub use setup::{
+    renew, restore, CeremonyOpts, CeremonyReport, RenewOpts, RenewOutcome, RestoreOpts,
+    RestoreReport, SetupError, SetupOpts, SetupReport,
+};
+pub use setup::run;

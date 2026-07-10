@@ -95,6 +95,7 @@ impl Default for ConnectLock {
 #[tauri::command]
 pub async fn unlock_keystore(
     password: String,
+    app: tauri::AppHandle,
     dir: tauri::State<'_, AppDir>,
     session: tauri::State<'_, Session>,
 ) -> Result<(), UiError> {
@@ -105,6 +106,17 @@ pub async fn unlock_keystore(
     // sanitized codes (no_keystore / unauthorized) — no `?`-From needed.
     let id = keystore::unlock(&dir.0, password.as_str())?;
     session.0.lock().await.identity = Some(id);
+
+    // Best-effort offline-D5 delegation auto-renew (spec §7). Spawned DETACHED so
+    // it never blocks the unlock returning. On a non-admin device (no `d5_key.blob`)
+    // or when the login passphrase is not the recovery passphrase (the D5 won't
+    // unseal) this is a SILENT no-op; every outcome is only logged, never surfaced,
+    // and a failure can never weaken trust (the existing delegation stands and the
+    // verify-hop keeps failing closed on an expired one).
+    let pw = zeroize::Zeroizing::new(password.as_str().to_owned());
+    tauri::async_runtime::spawn(async move {
+        crate::commands::renew::auto_renew_on_login(app, pw).await;
+    });
     Ok(())
 }
 

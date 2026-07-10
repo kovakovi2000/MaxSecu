@@ -106,6 +106,18 @@ pub enum VerifyError {
     /// signal (`SplitView`/`Regression`) stays distinguishable from a benign
     /// missing/stale inclusion proof — detecting equivocation is the gate's point.
     NotInLog(crate::transparency::KtError),
+    /// The offline-D5 **directory delegation** cert did not verify against the
+    /// pinned D5 root — a bad signature, wrong signer, tampered bytes, or a
+    /// malformed/short cert (offline-D5 ceremony, spec §3/§7). The client cannot
+    /// establish the server's operational signing key, so every served binding is
+    /// treated as absent — fail closed. Distinct from [`Self::DelegationExpired`]
+    /// so "forged/tampered" stays distinguishable from "out of window".
+    DelegationInvalid,
+    /// The directory delegation cert verified against the pinned D5 but `now` is
+    /// outside its `[valid_from, valid_until]` window (spec §3): the operational
+    /// key's authority has lapsed (or is not yet in effect). Fail closed until the
+    /// admin renews the delegation; never fall back to direct-pin on this.
+    DelegationExpired,
 }
 
 /// A recipient that passed the **full** §7.2 rule (binding steps 2–4 plus the
@@ -125,17 +137,49 @@ pub struct AuthorizedRecipient {
     pub mlkem_pub: Option<[u8; 1184]>,
 }
 
-/// Verifies directory bindings against the **pinned** directory-signing public
-/// key (§7.3) — the trust root compiled into the client binary.
+/// Verifies directory bindings against the **effective** directory-signing public
+/// key (§7.3). `dir_pub` is the key that actually signs bindings: in the direct-pin
+/// / dev / legacy case it is the pinned D5 root ([`Self::new`]); under the offline-D5
+/// ceremony (spec §3/§7) it is the **operational key** authorized by a D5-signed
+/// delegation cert ([`Self::with_delegation`]). Every signature check ([`Self::check_signature`])
+/// runs against this one key, so all callers inherit the delegation hop unchanged.
+#[derive(Debug)]
 pub struct DirectoryVerifier {
     dir_pub: [u8; 32],
 }
 
 impl DirectoryVerifier {
-    /// `pinned_dir_pub` is the directory-signing public key shipped in the build.
+    /// Direct-pin construction: the effective key IS the pinned D5 root. Used for
+    /// the dev/in-process profile (where the operational key == the pinned dev-D5),
+    /// a legacy server with no delegation model, and all client-core unit tests.
     pub fn new(pinned_dir_pub: [u8; 32]) -> DirectoryVerifier {
         DirectoryVerifier {
             dir_pub: pinned_dir_pub,
+        }
+    }
+
+    /// The offline-D5 delegation hop (spec §3/§7). Verify `delegation_bytes` against
+    /// the `pinned_d5` root and, on success, set the effective signing key to the
+    /// authorized **operational** public key it carries — so subsequent
+    /// [`Self::verify_binding`] calls check served bindings against the operational
+    /// key, not the pinned D5. **Fail closed** on any gap: a window failure maps to
+    /// [`VerifyError::DelegationExpired`]; a bad signature / wrong signer / tampered
+    /// or malformed cert maps to [`VerifyError::DelegationInvalid`]. `now_secs` is
+    /// unix SECONDS (the delegation window's unit), NOT the `now_ms` used by the
+    /// binding-validity check.
+    pub fn with_delegation(
+        pinned_d5: [u8; 32],
+        delegation_bytes: &[u8],
+        now_secs: u64,
+    ) -> Result<DirectoryVerifier, VerifyError> {
+        match maxsecu_crypto::verify_delegation(&pinned_d5, delegation_bytes, now_secs) {
+            Ok(operational_pub) => Ok(DirectoryVerifier {
+                dir_pub: operational_pub,
+            }),
+            Err(maxsecu_crypto::CryptoError::DelegationExpired) => {
+                Err(VerifyError::DelegationExpired)
+            }
+            Err(_) => Err(VerifyError::DelegationInvalid),
         }
     }
 
@@ -604,6 +648,130 @@ mod tests {
             v.authorize_recipient(&b, &sig, NOW, &mut MemoryTrustStore::new(), &tombstones),
             Err(VerifyError::Revoked)
         );
+    }
+
+    // ---- offline-D5 delegation hop (spec §3/§7) ----
+
+    // Delegation windows are unix SECONDS (distinct from the ms binding clock).
+    const NOW_SECS: u64 = 1_719_500_000;
+
+    /// Build a D5-signed delegation authorizing `op` for `[from, until]` seconds.
+    fn delegation(d5: &SigningKey, op_pub: &[u8; 32], from: u64, until: u64) -> Vec<u8> {
+        maxsecu_crypto::sign_delegation(d5, op_pub, from, until)
+    }
+
+    #[test]
+    fn with_delegation_effective_key_is_the_operational_key() {
+        let d5 = SigningKey::generate();
+        let op = SigningKey::generate();
+        let op_pub = op.verifying_key().to_bytes();
+        let cert = delegation(&d5, &op_pub, NOW_SECS - 100, NOW_SECS + 100);
+
+        let v = DirectoryVerifier::with_delegation(d5.verifying_key().to_bytes(), &cert, NOW_SECS)
+            .unwrap();
+
+        // A binding signed by the OPERATIONAL key (not the pinned D5) verifies.
+        let b = binding(1, 0xE1, 0x51, 1);
+        let sig = op.sign_canonical(labels::DIRBINDING, &b);
+        let verified = v
+            .verify_binding(&b, &sig, NOW, &mut MemoryTrustStore::new())
+            .unwrap();
+        assert_eq!(verified.enc_pub, [0xE1; 32]);
+        assert_eq!(verified.sig_pub, [0x51; 32]);
+    }
+
+    #[test]
+    fn with_delegation_rejects_a_binding_signed_by_the_pin_not_the_op_key() {
+        // Proves the effective key is really the operational key: a binding signed
+        // by the pinned D5 itself (which authorized the delegation) does NOT verify
+        // once the hop selects the operational key.
+        let d5 = SigningKey::generate();
+        let op = SigningKey::generate();
+        let cert = delegation(
+            &d5,
+            &op.verifying_key().to_bytes(),
+            NOW_SECS - 100,
+            NOW_SECS + 100,
+        );
+        let v = DirectoryVerifier::with_delegation(d5.verifying_key().to_bytes(), &cert, NOW_SECS)
+            .unwrap();
+
+        let b = binding(1, 0xE1, 0x51, 1);
+        let sig_d5 = d5.sign_canonical(labels::DIRBINDING, &b); // signed by the pin
+        assert_eq!(
+            v.verify_binding(&b, &sig_d5, NOW, &mut MemoryTrustStore::new()),
+            Err(VerifyError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn with_delegation_expired_window_fails_closed() {
+        let d5 = SigningKey::generate();
+        let op = SigningKey::generate();
+        // Window ended in the past.
+        let cert = delegation(
+            &d5,
+            &op.verifying_key().to_bytes(),
+            NOW_SECS - 200,
+            NOW_SECS - 100,
+        );
+        assert!(matches!(
+            DirectoryVerifier::with_delegation(d5.verifying_key().to_bytes(), &cert, NOW_SECS),
+            Err(VerifyError::DelegationExpired)
+        ));
+        // …and not-yet-valid is the same fail-closed error.
+        let future = delegation(
+            &d5,
+            &op.verifying_key().to_bytes(),
+            NOW_SECS + 100,
+            NOW_SECS + 200,
+        );
+        assert!(matches!(
+            DirectoryVerifier::with_delegation(d5.verifying_key().to_bytes(), &future, NOW_SECS),
+            Err(VerifyError::DelegationExpired)
+        ));
+    }
+
+    #[test]
+    fn with_delegation_wrong_signer_is_invalid() {
+        // The cert is validly formed but signed by an attacker key, NOT the pinned
+        // D5 the client verifies against ⇒ DelegationInvalid (never accepted).
+        let real_d5 = SigningKey::generate();
+        let attacker = SigningKey::generate();
+        let op = SigningKey::generate();
+        let cert = delegation(
+            &attacker,
+            &op.verifying_key().to_bytes(),
+            NOW_SECS - 100,
+            NOW_SECS + 100,
+        );
+        assert!(matches!(
+            DirectoryVerifier::with_delegation(real_d5.verifying_key().to_bytes(), &cert, NOW_SECS),
+            Err(VerifyError::DelegationInvalid)
+        ));
+    }
+
+    #[test]
+    fn with_delegation_tampered_cert_is_invalid() {
+        let d5 = SigningKey::generate();
+        let op = SigningKey::generate();
+        let mut cert = delegation(
+            &d5,
+            &op.verifying_key().to_bytes(),
+            NOW_SECS - 100,
+            NOW_SECS + 100,
+        );
+        // Flip a byte inside the operational_pub region — signature no longer holds.
+        cert[5] ^= 0x01;
+        assert!(matches!(
+            DirectoryVerifier::with_delegation(d5.verifying_key().to_bytes(), &cert, NOW_SECS),
+            Err(VerifyError::DelegationInvalid)
+        ));
+        // A truncated/short cert is also invalid (not a panic).
+        assert!(matches!(
+            DirectoryVerifier::with_delegation(d5.verifying_key().to_bytes(), &[0u8; 8], NOW_SECS),
+            Err(VerifyError::DelegationInvalid)
+        ));
     }
 
     // ---- §7.4 first-contact key-transparency gate ----

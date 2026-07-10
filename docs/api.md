@@ -114,6 +114,55 @@ Claims a username and publishes **public** key material. Creates an **unsigned**
 ### 5.2 `GET /v1/users/{user_id}/status`
 Self-service enrollment status so the client knows when its binding is live. `{ "signed": false, "enrolled_at": …, "signed_at": null }`.
 
+### 5.3 Offline-D5 directory delegation (ceremony + renewal, `docs/superpowers/specs/2026-07-10-offline-d5-ceremony-design.md`)
+
+In the **Prod** (Postgres) profile the internet-facing server no longer holds the directory root. The admin-held **D5 root** (offline) signs a short-lived **delegation cert** authorizing the server's **operational key** to sign enrollment bindings within a validity window. `POST /v1/users` enrollment is **CLOSED (403)** unless a currently-valid delegation is installed (re-checked at request time against the live clock, so it auto-re-closes after `valid_until`). The **Dev** (MemoryStore) profile keeps the self-generated dev-D5 with a self-issued delegation and is always open (no ceremony).
+
+**Delegation cert wire format** (`maxsecu-crypto`, spec §4; **113 bytes**, fixed little-endian):
+```text
+version:         u8        = 1
+operational_pub: [u8; 32]  (Ed25519 key the server signs bindings with)
+valid_from:      u64 LE    (unix seconds, inclusive)
+valid_until:     u64 LE    (unix seconds, inclusive)
+signature:       [u8; 64]  (Ed25519 by D5 over the 49-byte body under
+                            the `maxsecu/directory-delegation/v1` label)
+```
+The **issuer is implicit** — the signature verifies against the pinned `directory_pub` (D5); there is no issuer field. Verification checks the signature FIRST, then the window inclusively. The server additionally enforces a **sane window** on install: `valid_until > now`, window length ≤ **366 days**, and `valid_from ≤ now + 24h` skew.
+
+#### 5.3.1 `GET /v1/bootstrap/operational-key` (public)
+Returns the server's operational public key so the admin PC can sign a delegation over it. Works while awaiting. `404` if the delegation model is not active (legacy path).
+```jsonc
+// res 200
+{ "operational_pub_b64": "…32B Ed25519…" }
+```
+
+#### 5.3.2 `POST /v1/bootstrap/delegation` (one-time-token gated, TOFU)
+The initial ceremony install. The server verifies the posted cert against the **posted** `directory_pub` (TOFU-pinned here), requires the extracted `operational_pub` to equal its own and a sane window, then **pins** the D5, installs the delegation, **opens enrollment**, and **burns the one-time token** (single-use). Any verification failure leaves the server **awaiting** (token NOT burned).
+```jsonc
+// req  (token printed by install-server.sh)
+{ "token": "…hex…", "directory_pub_b64": "…32B D5 pub…", "delegation_cert_b64": "…113B cert…" }
+// res 201 → { "status": "delegated", "valid_until": 1712345678 }
+// 403 bad/absent token · 409 already delegated (token burned) · 400 malformed/invalid cert · 404 model inactive
+```
+
+#### 5.3.3 `GET /v1/bootstrap/delegation` (public)
+Serves the currently-installed `{directory_pub, delegation_cert}` so a client can perform its verify-hop (pinned D5 → delegation → operational_pub → binding). `404` while awaiting.
+```jsonc
+// res 200
+{ "directory_pub_b64": "…32B…", "delegation_cert_b64": "…113B…" }
+```
+
+#### 5.3.4 `POST /v1/admin/delegation` (AdminSession-gated — renewal)
+Admin-authenticated renewal (auto-renew on login / manual `renew-delegation`). Verifies a fresh cert against the **already-pinned** D5, requires the extracted `operational_pub` to equal the current one (op-key rotation is out of scope → `400`), then **replaces** the stored delegation. Does **not** change the pinned D5. `AdminSession` supplies `401`/`403` for auth failures.
+```jsonc
+// req  (Authorization: MaxSecu-Session <hex>)
+{ "delegation_cert_b64": "…113B cert…" }
+// res 200 → { "status": "renewed", "valid_until": 1720000000 }
+// 409 while awaiting (nothing to renew) · 400 invalid cert / op-key rotation · 404 model inactive
+```
+
+> **Enrollment-binding signer (invariant 2):** in Prod, enrollment bindings (`GET /v1/directory/{username}`) are signed by the **operational key**, so the `AdminSession` gate and the client verify bindings against `operational_pub` (extracted from the delegation), not directly against the pinned D5. In Dev the dev-D5 is both signer and root, so the two coincide byte-for-byte.
+
 ---
 
 ## 6. Directory (`DESIGN.md` §7 — Phase 2)
