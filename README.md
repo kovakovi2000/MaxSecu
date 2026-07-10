@@ -297,6 +297,32 @@ Example — custom port with Dropbox offload:
 > you already handed out pinned the old certificate and will stop connecting, so
 > rebuild and redistribute the client ZIP (Part 2) afterwards.
 
+### Upgrade a running server — `upgrade-server.sh`
+
+To apply a code update to a server that's already installed **without losing any
+data and without making clients re-pin**, don't re-run the installer — use the
+upgrade script. SSH into the server and run:
+
+```
+cd ~/maxsecu
+./scripts/upgrade-server.sh
+```
+
+It pulls the latest code, rebuilds the server binary **while the old one keeps
+serving** (so a build failure never takes production down), then restarts the
+service — a one-second blip. Your database, blobs, TLS certificate, client pins,
+and Dropbox login are all left exactly in place, and the server fingerprint is
+unchanged, so existing clients keep working with no re-pin.
+
+| Option | What it does |
+|---|---|
+| `--no-pull` | Rebuild the current checkout instead of `git pull`-ing first. |
+| `--no-backup` | Skip the quick `pg_dump` safety backup taken before the restart. |
+| `--capacity-gb N` | Also set the local cache capacity to N GB (via a systemd drop-in), without editing the unit by hand. |
+
+> This never deletes data — only `install-server.sh --reset` does that. Do **not**
+> use `--reset` to upgrade.
+
 ### Client — `install-client.ps1`
 
 Run it in PowerShell on your Windows PC, always via
