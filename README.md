@@ -102,12 +102,19 @@ Open **PowerShell** in the project folder (the MaxSecu code, downloaded on your
 Windows PC) and run:
 
 ```
-./scripts/install-client.ps1 -ConnectionCode YOUR_CONNECTION_CODE
+powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -ConnectionCode "YOUR_CONNECTION_CODE"
 ```
 
 Replace `YOUR_CONNECTION_CODE` with the whole connection code the server printed
 at the end of Part 1 (it looks like `YOUR_SERVER_IP:8443#K7QF9M2ATBZ4C6XU...`).
-Wrap it in quotes if your shell dislikes the `#`.
+Keep the quotes — they stop PowerShell from choking on the `#`.
+
+> **Why `powershell -ExecutionPolicy Bypass -File`?** Windows blocks unsigned
+> `.ps1` scripts by default, so running `.\scripts\install-client.ps1` directly
+> fails with a "not digitally signed / cannot be loaded" security error. Launching
+> it this way runs the script for that one command only, without changing your
+> machine's execution policy. (The same applies to every `install-client.ps1`
+> command below.)
 
 > See [Optional settings (advanced)](#optional-settings-advanced) if you'd rather
 > pass the address and fingerprint as separate flags.
@@ -243,7 +250,7 @@ When it's done, reinstall from [Part 1](#part-1--set-up-the-server-do-this-once)
 In PowerShell, from the project folder, run:
 
 ```
-./scripts/install-client.ps1 -Reset
+powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -Reset
 ```
 
 That deletes the built apps (`dist\`), the recovery + registration files
@@ -291,7 +298,10 @@ Example — custom port with Dropbox offload:
 
 ### Client — `install-client.ps1`
 
-Run it in PowerShell on your Windows PC.
+Run it in PowerShell on your Windows PC, always via
+`powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 ...` —
+Windows blocks unsigned `.ps1` scripts by default, so invoking the script
+directly fails with a "not digitally signed / cannot be loaded" error.
 
 | Option | What it does |
 |---|---|
@@ -304,7 +314,7 @@ Run it in PowerShell on your Windows PC.
 Example — passing the address and fingerprint manually instead of a code:
 
 ```
-./scripts/install-client.ps1 -ServerAddr 123.123.123.123 -Port 9443 -Fingerprint K7QF9M2ATBZ4C6XU...
+powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -ServerAddr 123.123.123.123 -Port 9443 -Fingerprint K7QF9M2ATBZ4C6XU...
 ```
 
 ---
