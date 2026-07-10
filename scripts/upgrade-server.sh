@@ -11,7 +11,8 @@
 #
 # What it does:
 #   1. (optional) pg_dump the metadata database as a quick safety backup.
-#   2. (optional) `git pull --ff-only` in this repo.
+#   2. (optional) `git pull --ff-only` when this folder is a git checkout; if it
+#      isn't (you copied the files in by hand), that step is skipped.
 #   3. Rebuild the release server binary WHILE the old one keeps serving, so a
 #      build failure leaves the running server completely untouched.
 #   4. (optional) set the local cache capacity via a systemd drop-in.
@@ -202,26 +203,30 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 5. Optional git pull (fast-forward only, so a diverged/dirty tree fails loudly
-#    instead of silently merging). Runs as the repo-owning user.
+# 5. Optional git pull. Git is used only when this folder IS a git checkout and
+#    git is installed; otherwise (e.g. you copied the files in by hand) we skip
+#    the pull and just build what is already on disk. A fast-forward-only pull
+#    means a diverged/dirty tree fails loudly instead of silently merging.
 # --------------------------------------------------------------------------- #
-if [ "$DO_PULL" -eq 1 ]; then
+if [ "$DO_PULL" -eq 0 ]; then
+	echo "==> Skipping git pull (--no-pull); building the files already in place"
+elif ! run_as_user "command -v git >/dev/null 2>&1 && git -C '$ROOT' rev-parse --is-inside-work-tree >/dev/null 2>&1"; then
+	echo "==> Not a git checkout (or git not installed) — skipping pull, using the files already in place"
+else
 	echo "==> Updating the source (git pull --ff-only)"
-	BEFORE="$(run_as_user "cd '$ROOT' && git rev-parse --short HEAD" | tr -d '\r')"
-	if ! run_as_user "cd '$ROOT' && git pull --ff-only"; then
+	BEFORE="$(run_as_user "git -C '$ROOT' rev-parse --short HEAD" | tr -d '\r')"
+	if ! run_as_user "git -C '$ROOT' pull --ff-only"; then
 		echo "error: 'git pull --ff-only' failed. The running server was NOT touched." >&2
 		echo "       Resolve the repo state (or re-run with --no-pull to build the" >&2
-		echo "       current checkout), then run this script again." >&2
+		echo "       files already in place), then run this script again." >&2
 		exit 1
 	fi
-	AFTER="$(run_as_user "cd '$ROOT' && git rev-parse --short HEAD" | tr -d '\r')"
+	AFTER="$(run_as_user "git -C '$ROOT' rev-parse --short HEAD" | tr -d '\r')"
 	if [ "$BEFORE" = "$AFTER" ]; then
 		echo "    already up to date at $AFTER"
 	else
 		echo "    updated $BEFORE -> $AFTER"
 	fi
-else
-	echo "==> Skipping git pull (--no-pull); building the current checkout"
 fi
 
 # --------------------------------------------------------------------------- #

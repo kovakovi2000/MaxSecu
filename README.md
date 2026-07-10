@@ -391,8 +391,9 @@ deliberately carries **no** account data and **no** server pins.
 
 | Option | What it does |
 |---|---|
-| *(no arguments)* | Rebuild the client and write `dist\MaxSecuClient-upgrade.zip`. |
+| *(no arguments)* | Rebuild the client and write `dist\MaxSecuClient-upgrade.zip` (pulls first if this is a git checkout). |
 | `-SkipBuild` | Reuse the already-compiled client + UI (fast; skip if the code hasn't changed). |
+| `-NoPull` | Don't `git pull` first; build the files already in place. |
 | `-Out <path>` | Output ZIP path (default `dist\MaxSecuClient-upgrade.zip`). |
 
 > Only for a **code** update. If your server **address or certificate** changed,

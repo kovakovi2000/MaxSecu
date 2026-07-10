@@ -33,6 +33,10 @@
     Reuse the already-compiled client binary + UI instead of rebuilding them
     (fast; use when the code hasn't changed since your last build).
 
+.PARAMETER NoPull
+    Do NOT `git pull` first; build the files already in place. A pull is only
+    attempted anyway when this folder is a git checkout and git is installed.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\scripts\build-upgrade-zip.ps1
 
@@ -42,7 +46,8 @@
 [CmdletBinding()]
 param(
     [string] $Out = '',
-    [switch] $SkipBuild
+    [switch] $SkipBuild,
+    [switch] $NoPull
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,6 +93,32 @@ if (-not $SkipBuild) {
     if ($null -eq $npm) { $missing += 'npm' }
     if ($missing.Count -gt 0) {
         Fail "Missing required tools: $($missing -join ', '). Install them, or pass -SkipBuild to reuse the already-built client."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 1b. Optionally refresh the source with git. Git is used only when this folder
+#     IS a git checkout and git is installed; otherwise (e.g. you copied the
+#     files in by hand) we just build what is already on disk. A pull that does
+#     not fast-forward is a warning, not a failure — the ZIP is regenerable.
+# ---------------------------------------------------------------------------
+if ($NoPull) {
+    Write-Section 'Skipping git pull (-NoPull); building the files already in place'
+} else {
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    $isRepo = $false
+    if ($null -ne $git) {
+        & git -C $Root rev-parse --is-inside-work-tree *> $null
+        $isRepo = ($LASTEXITCODE -eq 0)
+    }
+    if ($isRepo) {
+        Write-Section 'Updating the source (git pull --ff-only)'
+        & git -C $Root pull --ff-only
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'git pull did not fast-forward; building the files as they are now.' -ForegroundColor DarkYellow
+        }
+    } else {
+        Write-Section 'Not a git checkout (or git not installed) — building the files already in place'
     }
 }
 
