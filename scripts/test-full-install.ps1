@@ -5,9 +5,10 @@
     Provisions a throwaway WSL Ubuntu-22.04 distro, installs the server via the real
     install-server.sh, builds the client via install-client.ps1, runs the headless
     live-smoke oracle against the live pair, then exercises the reset+reinstall path
-    and re-runs the oracle, and finally tears everything down. Fail-fast with a
-    try/finally that always unregisters the distro and resets the client.
-.PARAMETER Port           Server listen port (default 8443).
+    and re-runs the oracle, and finally tears everything down. Fail-fast; on
+    completion OR failure it tears down (unregisters the distro + resets the client)
+    unless -KeepOnFailure is set, which leaves the distro up for debugging.
+.PARAMETER Port           Server listen port (default 18443).
 .PARAMETER KeepOnFailure  Skip teardown on failure (for debugging).
 .PARAMETER Iterations     Number of back-to-back clean passes (default 1).
 #>
@@ -77,11 +78,16 @@ function Provision-Wsl {
         Move-Item -Force $tmp $RootFsCache
     }
 
+    # Defensively drop any leftover registration of this name (e.g. from a prior
+    # iteration whose teardown could not unregister it) so --import can't fail on a
+    # name clash with a confusing error.
+    & wsl.exe --unregister $Distro 2>$null
     & wsl.exe --import $Distro $installDir $RootFsCache --version 2
     if ($LASTEXITCODE -ne 0) { Die "wsl --import failed" }
 
     # Enable systemd (needed for the maxsecu-server systemd unit + postgresql).
     & wsl.exe -d $Distro -- bash -lc "printf '[boot]\nsystemd=true\n' | tee /etc/wsl.conf >/dev/null"
+    if ($LASTEXITCODE -ne 0) { Die "failed to write /etc/wsl.conf in the distro" }
     & wsl.exe --terminate $Distro
     Start-Sleep -Seconds 2
 
@@ -128,14 +134,17 @@ function Wait-ServerReachable([int]$port) {
     # repeatedly (that adds socket contention and prolongs the flap); nudge once,
     # late, only in case the unit gave up after hitting systemd's start-limit.
     $consecutive = 0
+    $nudged = $false
     for ($i = 0; $i -lt 90; $i++) {
         $ok = $false
+        $c = $null
         try {
             $c = New-Object System.Net.Sockets.TcpClient
             $c.Connect('127.0.0.1', $port)
-            $c.Close()
             $ok = $true
-        } catch { }
+        } catch { } finally {
+            if ($c) { $c.Dispose() }
+        }
         if ($ok) {
             $consecutive++
             if ($consecutive -ge 3) {
@@ -144,7 +153,10 @@ function Wait-ServerReachable([int]$port) {
             }
         } else {
             $consecutive = 0
-            if ($i -eq 30) {
+            # First unresponsive tick at/after ~60s: nudge a unit that gave up after
+            # systemd's start-limit. Fire once, on elapsed time, not an exact index.
+            if ($i -ge 30 -and -not $nudged) {
+                $nudged = $true
                 Invoke-WslCmd "systemctl reset-failed maxsecu-server 2>/dev/null; systemctl restart maxsecu-server 2>/dev/null; true" | Out-Null
             }
         }
@@ -227,7 +239,6 @@ function Teardown {
     Write-Host "  teardown complete"
 }
 
-$failed = $false
 try {
     # Guarantee a clean client state regardless of what a prior run (or prior local
     # work) left in the repo root — otherwise install-client.ps1's resumability would
@@ -255,7 +266,6 @@ try {
     Write-Host "`nALL PASSES GREEN ($Iterations)" -ForegroundColor Green
 }
 catch {
-    $failed = $true
     Write-Host "`nHARNESS FAILED: $_" -ForegroundColor Red
     Write-Host "  at: $($_.InvocationInfo.PositionMessage)" -ForegroundColor DarkRed
     Write-Host "  stack: $($_.ScriptStackTrace)" -ForegroundColor DarkRed
