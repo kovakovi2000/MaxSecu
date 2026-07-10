@@ -50,7 +50,7 @@ function Provision-Wsl {
     if (-not (Test-Path $RootFsCache)) {
         Write-Host "  Downloading Ubuntu 22.04 rootfs (one-time cache)..."
         New-Item -ItemType Directory -Path (Split-Path $RootFsCache) -Force | Out-Null
-        $url = 'https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz'
+        $url = 'https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz'
         $tmp = "$RootFsCache.partial"
         if (Test-Path $tmp) { Remove-Item -Force $tmp }
         Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
