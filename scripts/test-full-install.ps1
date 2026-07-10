@@ -13,7 +13,11 @@
 #>
 [CmdletBinding()]
 param(
-    [int]    $Port = 8443,
+    # Default off the common 8443 so the WSL server doesn't collide with a host
+    # service on that port. Under WSL2 mirrored networking the distro shares the
+    # host's stack, so a host listener on 8443 makes the server's 0.0.0.0:8443 bind
+    # fail with EADDRINUSE. Override with -Port if 18443 is also taken.
+    [int]    $Port = 18443,
     [switch] $KeepOnFailure,
     [int]    $Iterations = 1
 )
@@ -108,10 +112,14 @@ function Install-Server([string]$mode) {
         Invoke-WslCmd "cd ~/maxsecu && ./scripts/install-server.sh --reset --port $Port"
         return $null
     }
-    $wslIp = (Invoke-WslCmd "hostname -I | awk '{print `$1}'").Trim()
-    if (-not $wslIp) { Die "could not determine WSL IP" }
-    Write-Host "  WSL IP: $wslIp"
-    $log = Invoke-WslCmd "cd ~/maxsecu && ./scripts/install-server.sh --public $wslIp --port $Port --no-dropbox"
+    # Pin the cert SAN to 127.0.0.1 and dial 127.0.0.1 (not the distro's own
+    # `hostname -I` address). Under WSL2 the Windows host reaches the distro's
+    # service on 127.0.0.1 in BOTH networking modes (NAT localhost-forwarding and
+    # mirrored hostAddressLoopback); in mirrored mode the distro's `hostname -I`
+    # address is actually the host's mirrored LAN IP and loops back to the host,
+    # so it is unreachable as a server address. The server still binds 0.0.0.0; only
+    # the cert SAN + dial address are 127.0.0.1. Protocol path is otherwise identical.
+    $log = Invoke-WslCmd "cd ~/maxsecu && ./scripts/install-server.sh --public 127.0.0.1 --port $Port --no-dropbox"
     $m = [regex]::Match($log, '(?m)^\s*([0-9.]+:[0-9]+#\S+)\s*$')
     if (-not $m.Success) { Die "could not parse the connection code from install-server output" }
     $code = $m.Groups[1].Value
