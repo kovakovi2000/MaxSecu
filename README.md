@@ -309,6 +309,36 @@ Example — passing the address and fingerprint manually instead of a code:
 
 ---
 
+## Full-install E2E test harness
+
+`scripts/test-full-install.ps1` provisions a throwaway WSL Ubuntu-22.04 server,
+installs the server (`install-server.sh --public`) and client (`install-client.ps1`)
+via their real scripts, runs the headless `maxsecu-live-smoke` oracle against the
+live pair, exercises the reset+reinstall path, re-runs the oracle, then unregisters
+the distro and resets the client.
+
+    powershell -ExecutionPolicy Bypass -File scripts\test-full-install.ps1
+    # options: -Port 8443  -KeepOnFailure  -Iterations 3
+
+Requirements: WSL2 with virtualization enabled; the Rust MSVC + Node toolchains
+(the same the normal client install needs). The Ubuntu rootfs is downloaded once
+and cached under %LOCALAPPDATA%\maxsecu-test.
+
+What the oracle asserts (the stock single-server surface): admin enroll -> blog
+upload -> view-back -> admin mints a key -> second user enrolls (User role, not Admin)
+-> the second user sees the admin's card in the feed -> the second user uploads and
+views back its own blog. User-to-user `reshare` is intentionally NOT covered: it
+requires an out-of-band sink server that the single-server install does not deploy.
+
+### Non-interactive client install
+
+`install-client.ps1` now accepts `-RecoveryPassphrase <pw>` (or the
+`SETUP_RECOVERY_PW` env var). When supplied it skips the interactive passphrase
+prompt so the harness (or any automation) can install unattended. The normal
+interactive install is unchanged -- omit the flag and it prompts without echoing.
+
+---
+
 ## For developers
 
 Build, test, and internal design notes have moved to
