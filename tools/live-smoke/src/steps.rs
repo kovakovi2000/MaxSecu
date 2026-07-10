@@ -166,6 +166,21 @@ async fn mint_key(c: &mut Conn, host: &str, admin_token: &str) -> Result<String,
         .ok_or_else(|| "no registration_key in mint response".to_owned())
 }
 
+/// As the logged-in caller (`token`), list the feed and assert `want_fid_hex` appears.
+async fn assert_feed_contains(c: &mut Conn, host: &str, token: &str, want_fid_hex: &str) -> Result<(), String> {
+    let (st, json) = net::get(c, "/v1/files?limit=200", host, Some(token)).await?;
+    if st != hyper::StatusCode::OK {
+        return Err(format!("feed GET status {st}"));
+    }
+    let found = json["files"].as_array().map(|a| {
+        a.iter().any(|f| f["file_id"].as_str() == Some(want_fid_hex))
+    }).unwrap_or(false);
+    if !found {
+        return Err(format!("user2 feed does not contain admin file {want_fid_hex}"));
+    }
+    Ok(())
+}
+
 /// Assert `username`'s published binding has User but NOT Admin (i.e. an ordinary user).
 async fn assert_user_not_admin(c: &mut Conn, host: &str, username: &str) -> Result<(), String> {
     let (st, body) = net::get(c, &format!("/v1/directory/{username}"), host, None).await?;
@@ -212,19 +227,39 @@ pub async fn run(server: &str, host: &str, client_dir: &Path) -> Result<(), Stri
             return Err(format!("view-back mismatch: {} bytes decrypted, expected {}", got.len(), BLOG_BODY.len()));
         }
         eprintln!("live-smoke: admin upload + view-back OK ({} bytes)", got.len());
-        Ok::<(), String>(())
+        Ok::<[u8; 16], String>(file_id)
     }
     .await;
     let _ = std::fs::remove_dir_all(&admin_dir);
-    round_trip?;
+    let admin_file_id = round_trip?;
 
     // ---- Admin mints a key; user2 enrolls with it → User role, not Admin ----
     let minted = mint_key(&mut c2, host, &admin_token).await?;
     let mut c3 = net::open(&t).await?;
     let (user_dir, user_uid) = enroll(&mut c3, host, "user", "smokeuser", &minted).await?;
-    let _ = (&user_dir, &user_uid); // consumed by Task 6 (feed visibility + user2 round-trip)
     assert_user_not_admin(&mut c3, host, "smokeuser").await?;
     eprintln!("live-smoke: admin-mint + user2 enroll (User role) OK");
+
+    // ---- user2 logs in, sees the admin's card in the feed (cross-user visibility),
+    // then uploads its OWN blog and views it back (a second independent user works) ----
+    let user2_flow = async {
+        let mut c4 = net::open(&t).await?;
+        let (user_id, user_token) = login(&mut c4, host, &user_dir, "smokeuser").await?;
+        assert_feed_contains(&mut c4, host, &user_token, &net::hex(&admin_file_id)).await?;
+        eprintln!("live-smoke: cross-user feed visibility OK");
+
+        const USER_BODY: &[u8] = b"live-smoke user2 post: a second independent account round-trips too.";
+        let user_fid = upload_blog(&mut c4, host, &user_id, &user_uid, &user_token, USER_BODY, "User2Diary").await?;
+        let got2 = view_own_blog(&mut c4, host, &user_id, &user_uid, &user_token, user_fid).await?;
+        if got2 != USER_BODY {
+            return Err(format!("user2 view-back mismatch: {} bytes", got2.len()));
+        }
+        eprintln!("live-smoke: user2 upload + view-back OK ({} bytes)", got2.len());
+        Ok::<(), String>(())
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&user_dir);
+    user2_flow?;
 
     Ok(())
 }
