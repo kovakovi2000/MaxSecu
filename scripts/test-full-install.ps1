@@ -32,6 +32,9 @@ $Distro = "maxsecu-test-$Stamp"
 $WorkDir = Join-Path $env:TEMP "maxsecu-test-$Stamp"
 $RootFsCache = Join-Path $env:LOCALAPPDATA 'maxsecu-test\ubuntu-22.04-rootfs.tar.gz'
 $RecoveryPw = "livesmoke-recovery-$Stamp!"
+# Holds an open `wsl` session so WSL2 doesn't idle-terminate the distro (which would
+# kill the server) between our wsl calls during the long Windows-side client build.
+$KeepAlive = $null
 
 function Phase($t) { Write-Host "`n==== $t ====" -ForegroundColor Cyan }
 function Die($t)   { Write-Host "FAIL: $t" -ForegroundColor Red; throw $t }
@@ -92,6 +95,13 @@ function Provision-Wsl {
     }
     if (-not $ok) { Die "systemd did not come up in the distro" }
     Write-Host "  distro up (systemd: $state)"
+
+    # Keep the distro alive for the whole run. WSL2 idle-terminates a distro when no
+    # wsl session is attached; during the multi-minute Windows-side client build there
+    # are no wsl calls, so without this the distro (and the server) would be shut down
+    # and the client's fetch-pins would get connection-refused.
+    $script:KeepAlive = Start-Process -FilePath 'wsl.exe' `
+        -ArgumentList @('-d', $Distro, '--', 'sleep', 'infinity') -WindowStyle Hidden -PassThru
 }
 
 function Copy-Source {
@@ -112,20 +122,35 @@ function Copy-Source {
 # start-limit. Poll, and every ~10s clear any failed state and restart to guarantee
 # recovery, so the client's fetch-pins never runs against a momentarily-down server.
 function Wait-ServerReachable([int]$port) {
-    for ($i = 0; $i -lt 45; $i++) {
+    # Require SUSTAINED reachability (3 consecutive connects ~2s apart): a single
+    # momentary connect can succeed during a brief up-window mid-flap and then the
+    # server cycles down again before the client's fetch-pins runs. Do NOT restart
+    # repeatedly (that adds socket contention and prolongs the flap); nudge once,
+    # late, only in case the unit gave up after hitting systemd's start-limit.
+    $consecutive = 0
+    for ($i = 0; $i -lt 90; $i++) {
+        $ok = $false
         try {
             $c = New-Object System.Net.Sockets.TcpClient
             $c.Connect('127.0.0.1', $port)
             $c.Close()
-            Write-Host "  server reachable on 127.0.0.1:$port"
-            return
+            $ok = $true
         } catch { }
-        if (($i % 5) -eq 4) {
-            Invoke-WslCmd "systemctl reset-failed maxsecu-server 2>/dev/null; systemctl restart maxsecu-server 2>/dev/null; true" | Out-Null
+        if ($ok) {
+            $consecutive++
+            if ($consecutive -ge 3) {
+                Write-Host "  server reachable + stable on 127.0.0.1:$port"
+                return
+            }
+        } else {
+            $consecutive = 0
+            if ($i -eq 30) {
+                Invoke-WslCmd "systemctl reset-failed maxsecu-server 2>/dev/null; systemctl restart maxsecu-server 2>/dev/null; true" | Out-Null
+            }
         }
         Start-Sleep -Seconds 2
     }
-    Die "server did not become reachable on 127.0.0.1:$port within timeout"
+    Die "server did not become stably reachable on 127.0.0.1:$port within timeout"
 }
 
 # mode: 'install' (returns the connection code) or 'reset' (returns $null).
@@ -171,6 +196,10 @@ function Run-Smoke([string]$code) {
 
 function Teardown {
     Phase "Teardown"
+    if ($script:KeepAlive) {
+        Stop-Process -Id $script:KeepAlive.Id -Force -ErrorAction SilentlyContinue
+        $script:KeepAlive = $null
+    }
     try { & wsl.exe --terminate $Distro 2>$null } catch {}
     Start-Sleep -Seconds 1
     $unreg = $false
