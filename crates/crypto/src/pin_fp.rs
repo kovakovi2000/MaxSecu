@@ -114,7 +114,7 @@ mod tests {
         assert_eq!(fp.len(), 32, "fingerprint must be exactly 32 chars");
         for ch in fp.chars() {
             assert!(
-                ('A'..='Z').contains(&ch) || ('2'..='7').contains(&ch),
+                ch.is_ascii_uppercase() || ('2'..='7').contains(&ch),
                 "char {ch:?} not in RFC4648 base32 alphabet [A-Z2-7]"
             );
         }
