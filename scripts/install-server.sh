@@ -18,6 +18,9 @@
 #                   omitted it is auto-detected (https://api.ipify.org) and echoed
 #                   for you to confirm.
 #   --port N        Listen port (default 8443).
+#   --capacity-gb N Local hot-store cache capacity in GB before the cold tier
+#                   offloads (default 200). Prompted interactively; a
+#                   non-interactive run defaults to 200 without asking.
 #   --dropbox       Force the Dropbox cold-tier setup prompt ON (needs a TTY: you
 #                   paste the App key/secret + a browser authorization code, which
 #                   the installer exchanges for a refresh token). --no-dropbox
@@ -32,12 +35,15 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 usage() {
 	cat <<'EOF'
-Usage: install-server.sh [--public [IP]] [--port N]
+Usage: install-server.sh [--public [IP]] [--port N] [--capacity-gb N]
 
   --public [IP]   Make the server reachable from the internet. Binds 0.0.0.0 and
                   puts the public IP in the TLS certificate. If you omit IP it is
                   auto-detected and shown for you to confirm.
   --port N        Listen port (default 8443).
+  --capacity-gb N Local hot-store cache capacity in GB before the cold tier
+                  offloads (default 200). Interactively you are prompted; in a
+                  non-interactive run it defaults to 200 without asking.
   --dropbox       Force the Dropbox cold-tier setup prompt ON. You must run in a
                   terminal (TTY): you paste the App key + secret and a one-time
                   browser authorization code, and the installer exchanges it for a
@@ -58,6 +64,10 @@ EOF
 PUBLIC=0
 PUBLIC_IP=""
 PORT=8443
+# Local hot-store cache capacity in GB. Empty = "not set on the command line":
+# resolved later to an interactive prompt (default 200) or a silent 200 in a
+# non-interactive run.
+CAPACITY_GB=""
 # Dropbox cold-tier: -1 = decide interactively (default), 1 = forced on, 0 = forced off.
 DROPBOX_FORCE=-1
 # --reset / --uninstall: tear everything down and exit instead of installing.
@@ -91,6 +101,18 @@ while [ $# -gt 0 ]; do
 			exit 2
 		fi
 		PORT="$2"
+		shift 2
+		;;
+	--capacity-gb=*)
+		CAPACITY_GB="${1#*=}"
+		shift
+		;;
+	--capacity-gb)
+		if [ $# -lt 2 ]; then
+			echo "error: --capacity-gb needs a value" >&2
+			exit 2
+		fi
+		CAPACITY_GB="$2"
 		shift 2
 		;;
 	--dropbox)
@@ -524,6 +546,43 @@ if [ "$want_dropbox" -eq 1 ]; then
 fi
 
 # --------------------------------------------------------------------------- #
+# 9d. Resolve the local hot-store cache capacity (GB). A --capacity-gb value is
+#     honoured as given; otherwise an interactive run prompts (default 200) and a
+#     non-interactive run silently defaults to 200 so it never hangs. The value
+#     is validated as a positive whole number and converted to the byte count the
+#     server reads from MAXSECU_CACHE_CAPACITY_BYTES (decimal GB, matching the
+#     server's 200_000_000_000 default).
+# --------------------------------------------------------------------------- #
+if [ -z "$CAPACITY_GB" ]; then
+	if [ -t 0 ]; then
+		printf 'Local cache capacity in GB before cold-tier offload [200]: '
+		read -r reply || reply=""
+		if [ -z "$reply" ]; then
+			CAPACITY_GB=200
+		else
+			CAPACITY_GB="$reply"
+		fi
+	else
+		CAPACITY_GB=200
+	fi
+fi
+
+# Must be a positive whole number of GB. 200 -> 200000000000 fits comfortably in
+# 64-bit shell arithmetic; a pathologically huge N could overflow, but that is far
+# beyond any real disk so it is not guarded here.
+case "$CAPACITY_GB" in
+'' | *[!0-9]*)
+	echo "error: --capacity-gb must be a positive whole number of GB (got '$CAPACITY_GB')" >&2
+	exit 2
+	;;
+esac
+if [ "$CAPACITY_GB" -lt 1 ]; then
+	echo "error: --capacity-gb must be at least 1 GB (got '$CAPACITY_GB')" >&2
+	exit 2
+fi
+CAP_BYTES=$((CAPACITY_GB * 1000000000))
+
+# --------------------------------------------------------------------------- #
 # 10. Write the systemd unit. It holds the DB password, so it is root:root 0600
 #     and the password is never printed to the terminal.
 # --------------------------------------------------------------------------- #
@@ -557,6 +616,7 @@ trap 'rm -f "$UNIT_TMP"' EXIT
 	fi
 	echo "Environment=MAXSECU_PORT=$PORT"
 	echo "Environment=MAXSECU_DATA_DIR=$DATA_DIR"
+	echo "Environment=MAXSECU_CACHE_CAPACITY_BYTES=$CAP_BYTES"
 	# Optional Dropbox cold-tier creds. Leading '-' => an absent file is ignored,
 	# so no-Dropbox installs and re-runs are unaffected and never clobbered.
 	echo "EnvironmentFile=-$DROPBOX_ENV_PATH"

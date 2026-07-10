@@ -131,9 +131,12 @@ impl LauncherConfig {
                             // Optional pre-minted access token; empty is treated as absent.
                             access_token: env("MAXSECU_DROPBOX_ACCESS_TOKEN")
                                 .filter(|s| !s.is_empty()),
-                            root: env("MAXSECU_DROPBOX_ROOT")
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or_else(|| "/maxsecu".to_owned()),
+                            // Normalize the root to exactly one leading '/', no
+                            // trailing '/': a slashless root makes Dropbox's
+                            // list_folder reject the path with a 400.
+                            root: normalize_dropbox_root(
+                                env("MAXSECU_DROPBOX_ROOT").as_deref().unwrap_or(""),
+                            ),
                         }
                     }
                     _ => ColdTierCfg::Off,
@@ -178,6 +181,22 @@ impl LauncherConfig {
     /// environment. Wired into the launcher in Task 5.
     pub fn from_env() -> LauncherConfig {
         Self::from_parts(|k| std::env::var(k).ok())
+    }
+}
+
+/// Normalize a `MAXSECU_DROPBOX_ROOT` value into a canonical Dropbox app-folder
+/// root: trimmed of surrounding whitespace, exactly one leading `/`, and no
+/// trailing `/`(s) (a leading `//` collapses to `/`). Dropbox's `list_folder`
+/// rejects a path lacking a leading slash with a `400` (distinct from the `409`
+/// for a missing folder), so a root such as `maxsecu` would 400 every upload's
+/// finalize completeness check — this makes such inputs canonical. An empty or
+/// whitespace-only value falls back to the default `/maxsecu`.
+fn normalize_dropbox_root(raw: &str) -> String {
+    let stripped = raw.trim().trim_matches('/');
+    if stripped.is_empty() {
+        "/maxsecu".to_owned()
+    } else {
+        format!("/{stripped}")
     }
 }
 
@@ -376,6 +395,55 @@ mod tests {
                 root: "/maxsecu".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn dropbox_root_is_normalized_to_a_single_leading_slash() {
+        // Every one of these variants must normalize to the same `/maxsecu`.
+        for raw in [
+            "maxsecu",
+            "/maxsecu/",
+            "maxsecu/",
+            "//maxsecu",
+            "  /maxsecu  ",
+            "/maxsecu",
+        ] {
+            let c = LauncherConfig::from_parts(env(&[
+                ("MAXSECU_COLD_TIER", "dropbox"),
+                ("MAXSECU_DROPBOX_APP_KEY", "key"),
+                ("MAXSECU_DROPBOX_APP_SECRET", "secret"),
+                ("MAXSECU_DROPBOX_REFRESH_TOKEN", "refresh"),
+                ("MAXSECU_DROPBOX_ROOT", raw),
+            ]));
+            match c.cold_tier {
+                ColdTierCfg::Dropbox { root, .. } => {
+                    assert_eq!(root, "/maxsecu", "root {raw:?} must normalize to /maxsecu")
+                }
+                other => panic!("expected Dropbox cold tier, got {other:?}"),
+            }
+        }
+
+        // An empty / whitespace-only root falls back to the default `/maxsecu`.
+        for raw in ["", "   ", "/"] {
+            let c = LauncherConfig::from_parts(env(&[
+                ("MAXSECU_COLD_TIER", "dropbox"),
+                ("MAXSECU_DROPBOX_APP_KEY", "key"),
+                ("MAXSECU_DROPBOX_APP_SECRET", "secret"),
+                ("MAXSECU_DROPBOX_REFRESH_TOKEN", "refresh"),
+                ("MAXSECU_DROPBOX_ROOT", raw),
+            ]));
+            match c.cold_tier {
+                ColdTierCfg::Dropbox { root, .. } => {
+                    assert_eq!(root, "/maxsecu", "root {raw:?} must default to /maxsecu")
+                }
+                other => panic!("expected Dropbox cold tier, got {other:?}"),
+            }
+        }
+
+        // A nested root keeps its interior slashes, gains a single leading slash,
+        // loses trailing slashes.
+        assert_eq!(normalize_dropbox_root("app/data/"), "/app/data");
+        assert_eq!(normalize_dropbox_root("///a//"), "/a");
     }
 
     #[test]

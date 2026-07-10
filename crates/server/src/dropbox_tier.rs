@@ -219,16 +219,30 @@ fn guard_blob_ref(blob_ref: &str) -> Result<(), BlobError> {
     Ok(())
 }
 
+/// Defense in depth: guarantee a Dropbox path begins with a leading `/`. Dropbox
+/// rejects a path lacking a leading slash with a `400` (distinct from the `409`
+/// for a missing folder), so a mis-set root (one without a leading slash) would
+/// otherwise 400 every list_folder/upload. The config layer already normalizes
+/// the root, but this belt-and-braces makes the path builders never emit a
+/// slashless path regardless of how `root` was constructed.
+fn ensure_leading_slash(path: String) -> String {
+    if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    }
+}
+
 /// The Dropbox path of one chunk: `{root}/{blob_ref}/{index}`.
 fn chunk_path(root: &str, blob_ref: &str, index: u64) -> Result<String, BlobError> {
     guard_blob_ref(blob_ref)?;
-    Ok(format!("{root}/{blob_ref}/{index}"))
+    Ok(ensure_leading_slash(format!("{root}/{blob_ref}/{index}")))
 }
 
 /// The Dropbox folder path of a whole stream: `{root}/{blob_ref}`.
 fn stream_path(root: &str, blob_ref: &str) -> Result<String, BlobError> {
     guard_blob_ref(blob_ref)?;
-    Ok(format!("{root}/{blob_ref}"))
+    Ok(ensure_leading_slash(format!("{root}/{blob_ref}")))
 }
 
 /// Dropbox's RPC/content error shape for a missing path is a `409` with a JSON
@@ -246,6 +260,47 @@ fn is_path_not_found(status: u16, body: &[u8]) -> bool {
             .and_then(|s| s.as_str())
             .is_some_and(|s| s.contains("not_found")),
         Err(_) => false,
+    }
+}
+
+/// Extract a human-readable detail from a Dropbox non-2xx response body, for the
+/// server's INTERNAL log only (never a client response — no oracle/side-channel
+/// concern). If the body is JSON carrying an `error_summary` string (Dropbox's
+/// standard error shape), that summary is used; otherwise a truncated (<=200
+/// byte), single-line sanitized snippet of the raw text (control chars — incl.
+/// newlines/tabs — collapsed to spaces). An empty body yields `""`.
+fn dropbox_err_detail(body: &[u8]) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(s) = v.get("error_summary").and_then(|s| s.as_str()) {
+            return s.to_owned();
+        }
+    }
+    // Non-JSON (or JSON without error_summary): a sanitized single-line snippet,
+    // truncated at a char boundary so the byte length never exceeds 200.
+    let text = String::from_utf8_lossy(body);
+    let mut out = String::new();
+    for c in text.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if out.len() + c.len_utf8() > 200 {
+            break;
+        }
+        out.push(c);
+    }
+    out.trim().to_owned()
+}
+
+/// Build the `BlobError` detail string for a Dropbox non-2xx status, appending
+/// [`dropbox_err_detail`] when the body carries one (so the operator log shows
+/// e.g. `dropbox http 400: path/malformed_path/..` instead of a bare status).
+fn dropbox_http_msg(status: u16, body: &[u8]) -> String {
+    let detail = dropbox_err_detail(body);
+    if detail.is_empty() {
+        format!("dropbox http {status}")
+    } else {
+        format!("dropbox http {status}: {detail}")
     }
 }
 
@@ -446,7 +501,10 @@ impl<H: DropboxHttp> DropboxTier<H> {
         if resp.status == 200 || is_path_not_found(resp.status, &resp.body) {
             Ok(())
         } else {
-            Err(BlobError::new(op, format!("dropbox http {}", resp.status)))
+            Err(BlobError::new(
+                op,
+                dropbox_http_msg(resp.status, &resp.body),
+            ))
         }
     }
 }
@@ -477,7 +535,7 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
         } else {
             Err(BlobError::new(
                 "dropbox_put_chunk",
-                format!("dropbox http {}", resp.status),
+                dropbox_http_msg(resp.status, &resp.body),
             ))
         }
     }
@@ -502,7 +560,7 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
         } else {
             Err(BlobError::new(
                 "dropbox_get_chunk",
-                format!("dropbox http {}", resp.status),
+                dropbox_http_msg(resp.status, &resp.body),
             ))
         }
     }
@@ -525,7 +583,7 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
         if resp.status != 200 {
             return Err(BlobError::new(
                 "dropbox_chunk_count",
-                format!("dropbox http {}", resp.status),
+                dropbox_http_msg(resp.status, &resp.body),
             ));
         }
         let mut v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
@@ -549,7 +607,7 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
             if resp.status != 200 {
                 return Err(BlobError::new(
                     "dropbox_chunk_count",
-                    format!("dropbox http {}", resp.status),
+                    dropbox_http_msg(resp.status, &resp.body),
                 ));
             }
             v = serde_json::from_slice(&resp.body).map_err(|e| {
@@ -590,7 +648,7 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
         } else {
             Err(BlobError::new(
                 "dropbox_has_chunk",
-                format!("dropbox http {}", resp.status),
+                dropbox_http_msg(resp.status, &resp.body),
             ))
         }
     }
@@ -625,7 +683,7 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
         if resp.status != 200 {
             return Err(BlobError::new(
                 "dropbox_broker_direct_link",
-                format!("dropbox http {}", resp.status),
+                dropbox_http_msg(resp.status, &resp.body),
             ));
         }
         let v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
@@ -881,6 +939,32 @@ mod tests {
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
         });
         (t, ())
+    }
+
+    #[test]
+    fn dropbox_err_detail_extracts_summary_snippet_or_empty() {
+        // JSON body with an error_summary → the summary is extracted verbatim.
+        let json = serde_json::json!({
+            "error_summary": "path/malformed_path/..",
+            "error": { ".tag": "path" }
+        })
+        .to_string()
+        .into_bytes();
+        assert_eq!(dropbox_err_detail(&json), "path/malformed_path/..");
+
+        // Non-JSON body → a truncated (<=200 byte), single-line sanitized snippet.
+        let mut text = b"Bad Request\r\nline two\ttabbed".to_vec();
+        let detail = dropbox_err_detail(&text);
+        assert!(detail.len() <= 200);
+        assert!(!detail.contains('\n') && !detail.contains('\r') && !detail.contains('\t'));
+        assert!(detail.contains("Bad Request"));
+
+        // Non-JSON body longer than 200 bytes → truncated to <=200 bytes.
+        text = vec![b'x'; 500];
+        assert!(dropbox_err_detail(&text).len() <= 200);
+
+        // Empty body → "".
+        assert_eq!(dropbox_err_detail(&[]), "");
     }
 
     const REF: &str = "aabbccddeeff00112233445566778899/1/1";

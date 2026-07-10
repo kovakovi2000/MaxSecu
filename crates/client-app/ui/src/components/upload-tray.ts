@@ -90,6 +90,7 @@ export class UploadTray extends HTMLElement {
       this.starts.delete(m.job_id);
       badge.setAttribute("label", `Failed: ${m.code}`);
       this.addRetry(li, m.job_id);
+      this.addDismiss(li);
     }
   }
 
@@ -118,6 +119,25 @@ export class UploadTray extends HTMLElement {
       } catch {
         btn.disabled = false; // a fresh `failed` event will refresh the label
       }
+    });
+    li.appendChild(btn);
+  }
+
+  private addDismiss(li: HTMLLIElement) {
+    if (li.querySelector("button.ut-dismiss")) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "ut-dismiss";
+    btn.textContent = "Dismiss";
+    // The `failed` event carries only job_id + code (no file_id_hex), so there
+    // is no reliable id to reach the backend `dismiss_pending_upload` with — a
+    // failed active job is not a retained "pending" upload. So Dismiss just
+    // clears the stuck row locally so the user is never left with an
+    // un-removable failure.
+    btn.setAttribute("aria-label", "Dismiss failed upload");
+    btn.addEventListener("click", () => {
+      li.remove();
+      this.maybeHideTray();
     });
     li.appendChild(btn);
   }

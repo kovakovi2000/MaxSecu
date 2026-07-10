@@ -282,6 +282,7 @@ Run it in a terminal on the VPS. Flags can be combined.
 |---|---|
 | `--public [IP]` | Make the server reachable from the internet. Binds `0.0.0.0` and bakes the public IP into the TLS certificate. If you omit the IP it is auto-detected and shown for you to confirm. Without `--public` the server is local-only (`127.0.0.1`), useful only for testing. |
 | `--port N` | Listen port (default `8443`). If you change this, give users `YOUR_SERVER_IP:N` **and** pass the matching `-Port N` to the client installer below. |
+| `--capacity-gb N` | Local disk cache size in GB before the cold tier starts offloading (default `200`). Interactively you're prompted; a non-interactive run silently uses `200`. Only matters with `--dropbox` on. |
 | `--dropbox` | Turn on **Dropbox cold-tier offload** — idle/overflow files are moved to your Dropbox to save disk. Needs a real terminal: it asks for your Dropbox App key + secret, prints a URL for you to click **Allow** on, and you paste the one-time code back (paste it promptly — it expires within a minute or two). Safe to run again later to add Dropbox to an existing server. |
 | `--no-dropbox` | Skip the Dropbox prompt entirely (also the behavior when there's no terminal). |
 | `--reset` | Tear the server down to zero and exit (does **not** reinstall): stop + remove the service, drop the database + role, delete the data dir + TLS cert, remove the saved Dropbox login, close the firewall port. See [Start over from scratch](#start-over-from-scratch-full-reset). Combine with `--port N` if you installed on a custom port. |

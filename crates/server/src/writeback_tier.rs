@@ -427,7 +427,26 @@ impl BlobStore for WriteBackTier {
     async fn chunk_count(&self, blob_ref: &str) -> Result<u64, BlobError> {
         // A chunk in both tiers (re-cached) is counted once: local + cold − overlap.
         let local = self.local.chunk_count(blob_ref).await?;
-        let cold = self.cold.chunk_count(blob_ref).await?;
+        // Fail-safe: a cold-tier count error (e.g. Dropbox transiently 400/500ing on
+        // list_folder) must NOT fail the finalize completeness check. Fall back to
+        // the LOCAL count only. This can only ever UNDER-count (it never sees
+        // cold-only chunks), so finalize stays fail-closed — it requires an EXACT
+        // match with the expected chunk total, so an under-count can never falsely
+        // report "complete"; it just leaves the upload retryable. For a fresh upload
+        // every chunk is still local, so the local count is exact and the upload
+        // finalizes even while the cold tier is entirely down. On this path there is
+        // NO cold count, so overlap must not be subtracted (overlap only corrects a
+        // double-count when BOTH tiers contributed) — we return the bare local count.
+        let cold = match self.cold.chunk_count(blob_ref).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "maxsecu: cold-tier chunk_count failed for {blob_ref}; \
+                     falling back to local count only: {e}"
+                );
+                return Ok(local);
+            }
+        };
         let overlap = self.index.lock().unwrap().overlap_count(blob_ref);
         Ok((local + cold).saturating_sub(overlap))
     }
@@ -724,6 +743,53 @@ mod tests {
         t.put_chunk(REF, 2, vec![0xD2; 10]).await.unwrap(); // offload of idx 0 fails
         assert!(local.get_chunk(REF, 0).await.unwrap().is_some()); // kept — no loss
         assert_eq!(local.chunk_count(REF).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn fresh_upload_succeeds_when_cold_chunk_count_errors() {
+        // A cold tier whose chunk_count ALWAYS errors (models Dropbox transiently
+        // 400ing on list_folder). A fresh multi-chunk upload is entirely local, so
+        // WriteBackTier::chunk_count must fall back to the EXACT local count and let
+        // finalize's `chunk_count == expected` completeness check pass — an upload
+        // must not be blocked just because the cold tier's count is unavailable.
+        struct CountErrCold;
+        #[async_trait]
+        impl ColdTier for CountErrCold {
+            async fn put_chunk(&self, _r: &str, _i: u64, _b: Vec<u8>) -> Result<(), BlobError> {
+                Ok(())
+            }
+            async fn get_chunk(&self, _r: &str, _i: u64) -> Result<Option<Vec<u8>>, BlobError> {
+                Ok(None)
+            }
+            async fn chunk_count(&self, _r: &str) -> Result<u64, BlobError> {
+                Err(BlobError::new(
+                    "dropbox_chunk_count",
+                    "dropbox http 400: path/malformed",
+                ))
+            }
+            async fn delete_stream(&self, _r: &str) -> Result<(), BlobError> {
+                Ok(())
+            }
+            async fn delete_chunk(&self, _r: &str, _i: u64) -> Result<(), BlobError> {
+                Ok(())
+            }
+            async fn has_chunk(&self, _r: &str, _i: u64) -> Result<bool, BlobError> {
+                Ok(false)
+            }
+        }
+        let local = Arc::new(MemoryBlobStore::new());
+        let t = WriteBackTier::new(
+            local.clone(),
+            Arc::new(CountErrCold),
+            1_000_000, // capacity never bites — all three chunks stay local
+            Duration::from_secs(30 * 24 * 3600),
+        );
+        t.put_chunk(REF, 0, vec![0xF0; 10]).await.unwrap();
+        t.put_chunk(REF, 1, vec![0xF1; 10]).await.unwrap();
+        t.put_chunk(REF, 2, vec![0xF2; 10]).await.unwrap();
+        // Cold count errors → fall back to the exact local count (3), so finalize's
+        // completeness check passes and the upload finalizes even while cold is down.
+        assert_eq!(t.chunk_count(REF).await.unwrap(), 3);
     }
 
     #[tokio::test]
