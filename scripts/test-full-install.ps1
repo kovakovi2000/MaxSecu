@@ -33,10 +33,13 @@ function Phase($t) { Write-Host "`n==== $t ====" -ForegroundColor Cyan }
 function Die($t)   { Write-Host "FAIL: $t" -ForegroundColor Red; throw $t }
 
 # Run a command inside the distro as the default user; throws on non-zero exit.
-function Wsl($cmd) {
+# NB: the executable is invoked as `wsl.exe` (never bare `wsl`) throughout this
+# script — PowerShell resolves functions before executables, so a function named
+# `Wsl` + a bare `& wsl` would recurse into the function until the stack overflows.
+function Invoke-WslCmd($cmd) {
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    $out = & wsl -d $Distro -- bash -lc $cmd 2>&1 | Out-String
+    $out = & wsl.exe -d $Distro -- bash -lc $cmd 2>&1 | Out-String
     $code = $LASTEXITCODE
     $ErrorActionPreference = $prev
     foreach ($line in ($out -split "`r?`n")) { if ($line) { Write-Host "  [wsl] $line" } }
@@ -67,19 +70,19 @@ function Provision-Wsl {
         Move-Item -Force $tmp $RootFsCache
     }
 
-    & wsl --import $Distro $installDir $RootFsCache --version 2
+    & wsl.exe --import $Distro $installDir $RootFsCache --version 2
     if ($LASTEXITCODE -ne 0) { Die "wsl --import failed" }
 
     # Enable systemd (needed for the maxsecu-server systemd unit + postgresql).
-    & wsl -d $Distro -- bash -lc "printf '[boot]\nsystemd=true\n' | tee /etc/wsl.conf >/dev/null"
-    & wsl --terminate $Distro
+    & wsl.exe -d $Distro -- bash -lc "printf '[boot]\nsystemd=true\n' | tee /etc/wsl.conf >/dev/null"
+    & wsl.exe --terminate $Distro
     Start-Sleep -Seconds 2
 
     # Wait for systemd to reach running/degraded (degraded is fine — some units inactive).
     $ok = $false
     $state = ''
     for ($i = 0; $i -lt 60; $i++) {
-        $state = (& wsl -d $Distro -- bash -lc 'systemctl is-system-running 2>/dev/null')
+        $state = (& wsl.exe -d $Distro -- bash -lc 'systemctl is-system-running 2>/dev/null')
         if ($state -match 'running|degraded') { $ok = $true; break }
         Start-Sleep -Seconds 2
     }
@@ -93,22 +96,22 @@ function Copy-Source {
     $exclude = @('target', 'node_modules', 'dist', '.git', 'webview', 'tmp')
     & robocopy $Root $stage /MIR /XD @exclude /NFL /NDL /NJH /NJS /NP | Out-Null
     if ($LASTEXITCODE -ge 8) { Die "robocopy of source failed ($LASTEXITCODE)" }
-    $wslStage = (& wsl -d $Distro -- wslpath -a ($stage -replace '\\','/'))
+    $wslStage = (& wsl.exe -d $Distro -- wslpath -a ($stage -replace '\\','/'))
     if ($LASTEXITCODE -ne 0) { Die "wslpath translation failed" }
-    Wsl "rm -rf ~/maxsecu && cp -r '$($wslStage.Trim())' ~/maxsecu && chmod +x ~/maxsecu/scripts/*.sh"
+    Invoke-WslCmd "rm -rf ~/maxsecu && cp -r '$($wslStage.Trim())' ~/maxsecu && chmod +x ~/maxsecu/scripts/*.sh"
 }
 
 # mode: 'install' (returns the connection code) or 'reset' (returns $null).
 function Install-Server([string]$mode) {
     Phase "Install server ($mode)"
     if ($mode -eq 'reset') {
-        Wsl "cd ~/maxsecu && ./scripts/install-server.sh --reset --port $Port"
+        Invoke-WslCmd "cd ~/maxsecu && ./scripts/install-server.sh --reset --port $Port"
         return $null
     }
-    $wslIp = (Wsl "hostname -I | awk '{print `$1}'").Trim()
+    $wslIp = (Invoke-WslCmd "hostname -I | awk '{print `$1}'").Trim()
     if (-not $wslIp) { Die "could not determine WSL IP" }
     Write-Host "  WSL IP: $wslIp"
-    $log = Wsl "cd ~/maxsecu && ./scripts/install-server.sh --public $wslIp --port $Port --no-dropbox"
+    $log = Invoke-WslCmd "cd ~/maxsecu && ./scripts/install-server.sh --public $wslIp --port $Port --no-dropbox"
     $m = [regex]::Match($log, '(?m)^\s*([0-9.]+:[0-9]+#\S+)\s*$')
     if (-not $m.Success) { Die "could not parse the connection code from install-server output" }
     $code = $m.Groups[1].Value
@@ -136,11 +139,11 @@ function Run-Smoke([string]$code) {
 
 function Teardown {
     Phase "Teardown"
-    try { & wsl --terminate $Distro 2>$null } catch {}
+    try { & wsl.exe --terminate $Distro 2>$null } catch {}
     Start-Sleep -Seconds 1
     $unreg = $false
     for ($i = 0; $i -lt 5; $i++) {
-        & wsl --unregister $Distro 2>$null
+        & wsl.exe --unregister $Distro 2>$null
         if ($LASTEXITCODE -eq 0) { $unreg = $true; break }
         Start-Sleep -Seconds 2
     }
@@ -193,6 +196,8 @@ try {
 catch {
     $failed = $true
     Write-Host "`nHARNESS FAILED: $_" -ForegroundColor Red
+    Write-Host "  at: $($_.InvocationInfo.PositionMessage)" -ForegroundColor DarkRed
+    Write-Host "  stack: $($_.ScriptStackTrace)" -ForegroundColor DarkRed
     if ($KeepOnFailure) {
         Write-Host "-KeepOnFailure set: leaving distro '$Distro' and '$WorkDir' for debugging." -ForegroundColor Yellow
         Write-Host "  Server logs:  wsl -d $Distro -- journalctl -u maxsecu-server -e" -ForegroundColor Yellow
