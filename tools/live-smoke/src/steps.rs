@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use maxsecu_client_app::commands::register::register_with_key_exchange;
 use maxsecu_client_app::config::RouteMode;
 use maxsecu_client_app::directory::resolve_recovery_pin;
@@ -12,7 +14,9 @@ use maxsecu_client_core::{
     build_upload, verify_and_open, Identity, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_crypto::EncPublicKey;
-use maxsecu_encoding::types::{FileType, Id, RecipientType, StreamType, Timestamp};
+use maxsecu_encoding::decode;
+use maxsecu_encoding::structs::DirBinding;
+use maxsecu_encoding::types::{FileType, Id, RecipientType, Role, StreamType, Timestamp};
 
 use crate::net::{self, Conn};
 
@@ -150,6 +154,37 @@ async fn view_own_blog(
     Ok(content.plaintext.clone())
 }
 
+/// Admin mints a fresh single-use registration key over `c` with `admin_token`.
+async fn mint_key(c: &mut Conn, host: &str, admin_token: &str) -> Result<String, String> {
+    let (st, res) = net::post(c, "/v1/registration-keys", host, Some(admin_token), serde_json::json!({})).await?;
+    if st != hyper::StatusCode::CREATED {
+        return Err(format!("mint registration key status {st}"));
+    }
+    res["registration_key"]
+        .as_str()
+        .map(|s| s.to_owned())
+        .ok_or_else(|| "no registration_key in mint response".to_owned())
+}
+
+/// Assert `username`'s published binding has User but NOT Admin (i.e. an ordinary user).
+async fn assert_user_not_admin(c: &mut Conn, host: &str, username: &str) -> Result<(), String> {
+    let (st, body) = net::get(c, &format!("/v1/directory/{username}"), host, None).await?;
+    if st != hyper::StatusCode::OK {
+        return Err(format!("directory GET {username} status {st}"));
+    }
+    let bytes = B64
+        .decode(body["binding_b64"].as_str().ok_or("no binding_b64")?)
+        .map_err(|e| format!("b64: {e}"))?;
+    let binding: DirBinding = decode(&bytes).map_err(|e| format!("decode binding: {e}"))?;
+    if !binding.roles.roles().contains(&Role::User) {
+        return Err(format!("{username} is missing the User role"));
+    }
+    if binding.roles.roles().contains(&Role::Admin) {
+        return Err(format!("{username} unexpectedly has the Admin role"));
+    }
+    Ok(())
+}
+
 pub async fn run(server: &str, host: &str, client_dir: &Path) -> Result<(), String> {
     let admin_key = std::fs::read_to_string(client_dir.join("register.key"))
         .map_err(|e| format!("read admin register.key: {e}"))?
@@ -182,5 +217,14 @@ pub async fn run(server: &str, host: &str, client_dir: &Path) -> Result<(), Stri
     .await;
     let _ = std::fs::remove_dir_all(&admin_dir);
     round_trip?;
+
+    // ---- Admin mints a key; user2 enrolls with it → User role, not Admin ----
+    let minted = mint_key(&mut c2, host, &admin_token).await?;
+    let mut c3 = net::open(&t).await?;
+    let (user_dir, user_uid) = enroll(&mut c3, host, "user", "smokeuser", &minted).await?;
+    let _ = (&user_dir, &user_uid); // consumed by Task 6 (feed visibility + user2 round-trip)
+    assert_user_not_admin(&mut c3, host, "smokeuser").await?;
+    eprintln!("live-smoke: admin-mint + user2 enroll (User role) OK");
+
     Ok(())
 }
