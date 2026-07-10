@@ -317,6 +317,34 @@ Example — passing the address and fingerprint manually instead of a code:
 powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -ServerAddr 123.123.123.123 -Port 9443 -Fingerprint K7QF9M2ATBZ4C6XU...
 ```
 
+### Rebuild only the users' ZIP — `build-user-zip.ps1`
+
+Once the server and your admin account already exist and you just want to
+(re)build the handout ZIP for users, use this instead of a full `install-client`:
+
+```
+powershell -ExecutionPolicy Bypass -File .\scripts\build-user-zip.ps1
+```
+
+It rebuilds the client and writes a clean `dist\MaxSecuClient-share.zip` (client +
+UI + the pinned server certs + `START-HERE.txt`, and nothing else). It **never**
+runs `maxsecu-setup`, never touches your recovery account / master key /
+`register.key`, and never touches your admin login — so it is safe to run any time.
+
+| Option | What it does |
+|---|---|
+| *(no arguments)* | Rebuilds, reusing the pins from your existing `dist\MaxSecuClient\config`. |
+| `-ConnectionCode "addr:port#fp"` | Re-fetch + verify the pins from the server (use if the server cert changed). |
+| `-Pins <dir>` | Reuse `server_cert.der` + `directory_pub.der` from a folder (offline). |
+| `-SkipBuild` | Reuse the already-compiled client + UI (fast; skip if the code hasn't changed). |
+| `-Out <path>` | Output ZIP path (default `dist\MaxSecuClient-share.zip`). |
+
+Hand each new user the ZIP plus a one-time registration key you mint in the admin
+app (Admin screen → mint a registration key).
+
+Requires that you have run `install-client.ps1` at least once (that creates the
+recovery account and embeds its pin, which this script reuses).
+
 ---
 
 ## Full-install E2E test harness
