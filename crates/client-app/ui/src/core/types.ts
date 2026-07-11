@@ -82,6 +82,10 @@ export interface ReshareOutcome {
   username: string;
   ok: boolean;
   code: string | null; // sanitized failure code, null on success
+  // For a "key_changed" outcome only: previously-pinned vs newly-served short
+  // fingerprints, so the UI can warn + confirm. Absent otherwise.
+  old_fingerprint?: string;
+  new_fingerprint?: string;
 }
 
 // The background reshare feedback channel (T4 spec §6), emitted over

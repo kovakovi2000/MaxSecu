@@ -3,6 +3,8 @@ import { serial } from "../core/serial.ts";
 import { getUsername } from "../core/session.ts";
 import { toast } from "../core/toast.ts";
 import type { Contact, ResolvedRecipient, ReshareOutcome } from "../core/types.ts";
+import { confirmModal } from "../core/confirm.ts";
+import { isKeyChange, keyChangeMessage } from "./share-keychange.ts";
 import "./state-badge.ts";
 
 // <share-dialog> — the T4 multi-recipient sharing picker, now a tickable
@@ -48,6 +50,10 @@ export class ShareDialog extends HTMLElement {
   private invoker: HTMLElement | null = null;
   private rows: Row[] = [];
   private alreadySharedIds = new Set<string>();
+  // Usernames whose changed security key the user confirmed this dialog session.
+  // A confirmed change is re-shared with the username in this set so the server
+  // re-pins the new key. Reset per openFor().
+  private acceptedKeyChanges = new Set<string>();
   private counter = 0;
   private keydownHandler = (e: KeyboardEvent) => this.onKeydown(e);
 
@@ -110,6 +116,7 @@ export class ShareDialog extends HTMLElement {
     this.invoker = invoker;
     this.rows = [];
     this.alreadySharedIds = new Set();
+    this.acceptedKeyChanges = new Set();
     this.renderRows();
     this.updateShareEnabled();
     (this.querySelector("#sd-status") as HTMLElement).textContent = "";
@@ -310,10 +317,17 @@ export class ShareDialog extends HTMLElement {
     try {
       const outcomes = await serial(() =>
         call<ReshareOutcome[]>(this.shareCommand(), {
-          req: { file_id: this.fileId, recipient_usernames: usernames },
+          req: {
+            file_id: this.fileId,
+            recipient_usernames: usernames,
+            accepted_key_changes: Array.from(this.acceptedKeyChanges),
+          },
         }),
       );
       this.applyOutcomes(outcomes);
+      this.renderRows();
+      this.updateShareEnabled();
+      await this.handleKeyChanges(outcomes);
     } catch (x) {
       const msg = errMessage(x, "Could not share this item right now.");
       for (const r of this.rows) {
@@ -329,6 +343,26 @@ export class ShareDialog extends HTMLElement {
     this.updateShareEnabled();
   }
 
+  /** For any key_changed outcomes, prompt one at a time; a confirmed change is
+   * remembered and that recipient is re-shared (now accepted → server re-pins).
+   * Only share() kicks off this loop; retryRow() never does (the username is
+   * already in acceptedKeyChanges on retry, so a second key_changed cannot
+   * recur → no infinite recursion). */
+  private async handleKeyChanges(outcomes: ReshareOutcome[]) {
+    const changes = outcomes.filter(isKeyChange);
+    for (const o of changes) {
+      const ok = await confirmModal({
+        title: "Security key changed",
+        message: keyChangeMessage(o),
+        confirmLabel: "Share anyway",
+      });
+      if (!ok) continue;
+      this.acceptedKeyChanges.add(o.username);
+      const row = this.rows.find((r) => r.username === o.username);
+      if (row) await this.retryRow(row.key);
+    }
+  }
+
   private async retryRow(key: string) {
     const row = this.rows.find((r) => r.key === key);
     if (!row) return;
@@ -337,7 +371,11 @@ export class ShareDialog extends HTMLElement {
     try {
       const outcomes = await serial(() =>
         call<ReshareOutcome[]>(this.shareCommand(), {
-          req: { file_id: this.fileId, recipient_usernames: [row.username] },
+          req: {
+            file_id: this.fileId,
+            recipient_usernames: [row.username],
+            accepted_key_changes: Array.from(this.acceptedKeyChanges),
+          },
         }),
       );
       this.applyOutcomes(outcomes);
@@ -359,6 +397,10 @@ export class ShareDialog extends HTMLElement {
         row.alreadyShared = true;
         row.message = undefined;
         row.code = null;
+      } else if (o.code === "key_changed") {
+        row.status = "share-failed";
+        row.code = "key_changed";
+        row.message = "Security key changed — confirm to continue.";
       } else {
         row.status = "share-failed";
         row.code = o.code ?? null;
