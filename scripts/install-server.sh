@@ -712,6 +712,18 @@ done
 # --------------------------------------------------------------------------- #
 # 14. Friendly summary. Never prints the DB password.
 # --------------------------------------------------------------------------- #
+# Prod-readiness checklist values, shared by both final banners below.
+if [ "$PUBLIC" -eq 1 ]; then
+	CERT_SAN_ADDR="$PUBLIC_IP"
+else
+	CERT_SAN_ADDR="127.0.0.1"
+fi
+if [ "$DROPBOX_ENABLED_THIS_RUN" -eq 1 ]; then
+	DROPBOX_STATUS="ENABLED"
+else
+	DROPBOX_STATUS="off"
+fi
+
 if [ -z "$TOKEN" ]; then
 	# No token → already delegated (or a non-Prod run). Enrollment is already
 	# open; the final connection code was minted on the admin PC during the
@@ -743,6 +755,16 @@ if [ -z "$TOKEN" ]; then
 	echo " To watch the server's live logs at any time:"
 	echo ""
 	echo "        journalctl -u maxsecu-server -f"
+	echo ""
+	echo " PROD-READINESS:"
+	echo ""
+	echo "        ✓ release build"
+	echo "        ✓ TLS cert for $CERT_SAN_ADDR"
+	if [ "$PUBLIC" -eq 1 ] && command -v ufw >/dev/null 2>&1; then
+		echo "        ✓ firewall ${PORT}/tcp open"
+	fi
+	echo "        ✓ systemd service enabled"
+	echo "        Dropbox cold-tier: $DROPBOX_STATUS"
 	echo ""
 	echo "============================================================"
 else
@@ -782,6 +804,21 @@ else
 	echo " 5. To watch the server's live logs at any time:"
 	echo ""
 	echo "        journalctl -u maxsecu-server -f"
+	echo ""
+	echo " PROD-READINESS:"
+	echo ""
+	echo "        ✓ release build"
+	echo "        ✓ TLS cert for $CERT_SAN_ADDR"
+	if [ "$PUBLIC" -eq 1 ] && command -v ufw >/dev/null 2>&1; then
+		echo "        ✓ firewall ${PORT}/tcp open"
+	fi
+	echo "        ✓ systemd service enabled"
+	echo "        Dropbox cold-tier: $DROPBOX_STATUS"
+	echo ""
+	echo " AWAITING DELEGATION (enrollment CLOSED) is the EXPECTED state right"
+	echo " after a fresh prod install — this is NOT an error. Enrollment opens"
+	echo " automatically once the admin PC uploads the delegation via install-client"
+	echo " (step 4 above)."
 	echo ""
 	echo "============================================================"
 fi

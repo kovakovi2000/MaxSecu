@@ -7,6 +7,30 @@ use maxsecu_client_app::config::SettingsConfig;
 use tauri::Manager;
 
 fn main() {
+    // Verify subcommand: `--print-recovery-pin-fp`. Runs headlessly and exits
+    // BEFORE any app-dir / temp-dir / Tauri setup (no window). Prints exactly two
+    // lines the installer parses: the SHA-256 of the embedded recovery pin (equals
+    // `Get-FileHash recovery_pin.bin` byte-for-byte, since the pin is an
+    // include_bytes! of that file) and whether that pin is the NON-SECURE test pin.
+    if std::env::args().any(|a| a == "--print-recovery-pin-fp") {
+        use std::fmt::Write as _;
+        let digest = maxsecu_crypto::sha256(maxsecu_client_app::recovery_pin::embedded_pin());
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            let _ = write!(hex, "{b:02x}");
+        }
+        println!("recovery-pin-sha256: {hex}");
+        println!(
+            "recovery-pin-is-test: {}",
+            maxsecu_client_app::recovery_pin::embedded_pin_is_test_pin()
+        );
+        std::process::exit(0);
+    }
+
+    // Fail closed at startup if a release binary somehow embedded the NON-SECURE
+    // test pin (build.rs is the primary guard; this is the runtime backstop).
+    maxsecu_client_app::recovery_pin::assert_shippable();
+
     // Portable layout: keystore/config/pinned-cert live beside the exe so the
     // folder travels (stack.md §5.2). Fall back to "." if the path is unknown.
     let app_dir = std::env::current_exe()

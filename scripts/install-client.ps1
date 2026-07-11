@@ -274,6 +274,15 @@ if ($null -eq (Get-Command cargo -ErrorAction SilentlyContinue)) {
 }
 
 Write-Host "Fetching the server cert from ${ServerAddr}:${Port} and verifying against the fingerprint ..."
+# NOTE: this step builds the maxsecu-setup TOOL, which pulls in a throwaway copy of
+# the client-app compiled with a NON-SECURE test pin, so a cargo warning like
+#   recovery_pin: NON-SECURE test pin (unpinned-dev) -- do not ship
+# may scroll past below. It belongs to the SETUP TOOL's build, NOT to your shipped
+# client. The client you distribute is built later and cryptographically VERIFIED at
+# the end of this script (real recovery pin, no test pin).
+Write-Host 'NOTE: a "recovery_pin: NON-SECURE test pin (unpinned-dev)" cargo warning may scroll' -ForegroundColor DarkGray
+Write-Host '      past below -- it is from the setup TOOL''s throwaway build, NOT your shipped' -ForegroundColor DarkGray
+Write-Host '      client. The shipped client is cryptographically verified at the end of this script.' -ForegroundColor DarkGray
 & cargo run --release --manifest-path (Join-Path $Root 'tools\maxsecu-setup\Cargo.toml') -- fetch-pins `
     --server "${ServerAddr}:${Port}" `
     --host "$ServerAddr" `
@@ -372,6 +381,14 @@ if ((Test-Path $RecoveryBlob) -and (Test-Path $RecoveryPin) -and (Test-Path $Reg
     $env:SETUP_CONNECT_ADDR     = $ConnectAddr
     $env:SETUP_DIR_PUB_OUT      = $DirPub
     try {
+        # NOTE: like the fetch-pins step, this builds the maxsecu-setup TOOL, so a
+        #   recovery_pin: NON-SECURE test pin (unpinned-dev) -- do not ship
+        # cargo warning may scroll past. It belongs to the setup TOOL's throwaway build,
+        # NOT to your shipped client, which is built later and cryptographically verified
+        # at the end of this script.
+        Write-Host 'NOTE: a "recovery_pin: NON-SECURE test pin (unpinned-dev)" cargo warning may scroll' -ForegroundColor DarkGray
+        Write-Host '      past below -- it is from the setup TOOL''s throwaway build, NOT your shipped' -ForegroundColor DarkGray
+        Write-Host '      client. The shipped client is cryptographically verified at the end of this script.' -ForegroundColor DarkGray
         # Capture STDOUT so we can lift the machine-parseable "CONNECTION-CODE <code>"
         # line the ceremony prints; STDERR (progress) still streams to the console.
         $SetupOut = & cargo run --release --manifest-path (Join-Path $Root 'tools\maxsecu-setup\Cargo.toml') -- `
@@ -495,6 +512,55 @@ $UiDist = Join-Path $Root 'crates\client-app\ui\dist'
 if (-not (Test-Path $UiDist)) {
     Fail "UI dist folder not found at $UiDist after the UI build."
 }
+
+# ---------------------------------------------------------------------------
+# 7b. Verify the SHIPPED client embedded the real recovery pin (not the test pin)
+# ---------------------------------------------------------------------------
+# Prove the binary we just built embedded YOUR real recovery_pin.bin and not the
+# NON-SECURE test pin. The client's headless --print-recovery-pin-fp subcommand
+# prints sha256(embedded_pin) + whether it is the test pin, then exits; because the
+# pin is include_bytes! of recovery_pin.bin, that hash equals the file's SHA-256.
+Write-Section 'Verifying the shipped client embedded your real recovery pin'
+
+# Capture the subcommand's stdout via Start-Process -Wait with a redirected output
+# file, NOT the '&' call operator. The client is a GUI-subsystem (windowless)
+# binary (main.rs: #![windows_subsystem = "windows"]); the verify subcommand exits
+# before any window, but '&' does not reliably WAIT for a GUI-subsystem process, so
+# capture can race and come back empty. Start-Process -Wait blocks on the process
+# handle and -RedirectStandardOutput deterministically writes the two lines to a
+# file. stdout/stderr go to SEPARATE files (PowerShell forbids the same path for both).
+$FpOutFile = Join-Path $TmpDir 'recovery-pin-fp.out'
+$FpErrFile = Join-Path $TmpDir 'recovery-pin-fp.err'
+$FpProc = Start-Process -FilePath $ClientExe -ArgumentList '--print-recovery-pin-fp' `
+    -Wait -PassThru -NoNewWindow `
+    -RedirectStandardOutput $FpOutFile -RedirectStandardError $FpErrFile
+if ($null -eq $FpProc -or $FpProc.ExitCode -ne 0) {
+    $ec = if ($null -eq $FpProc) { '<not started>' } else { $FpProc.ExitCode }
+    Fail "The shipped client failed to report its embedded recovery pin (--print-recovery-pin-fp exit code $ec). Do not distribute this build."
+}
+
+$FpText = if (Test-Path $FpOutFile) { Get-Content -Raw $FpOutFile } else { '' }
+$shaMatch   = [regex]::Match($FpText, '(?im)^\s*recovery-pin-sha256:\s*([0-9a-f]{64})\s*$')
+$isTestMatch = [regex]::Match($FpText, '(?im)^\s*recovery-pin-is-test:\s*(true|false)\s*$')
+if (-not $shaMatch.Success -or -not $isTestMatch.Success) {
+    Fail "Could not parse the recovery-pin fingerprint from the shipped client's output. Do not distribute this build.`nOutput was:`n$FpText"
+}
+$EmbeddedSha = $shaMatch.Groups[1].Value.ToLowerInvariant()
+$IsTestPin   = $isTestMatch.Groups[1].Value.ToLowerInvariant()
+
+if (-not (Test-Path $RecoveryPin)) {
+    Fail "recovery_pin.bin not found at $RecoveryPin -- cannot verify the shipped client's embedded pin."
+}
+$ExpectedSha = (Get-FileHash -Path $RecoveryPin -Algorithm SHA256).Hash.ToLowerInvariant()
+
+if ($IsTestPin -ne 'false') {
+    Fail "The shipped client embedded the NON-SECURE test pin (recovery-pin-is-test: $IsTestPin). Do not distribute this build; re-run the ceremony so your real recovery_pin.bin is embedded."
+}
+if ($EmbeddedSha -ne $ExpectedSha) {
+    Fail "The shipped client did NOT embed your real recovery pin (embedded sha256 $EmbeddedSha != recovery_pin.bin sha256 $ExpectedSha). Do not distribute this build."
+}
+
+Write-Host "  VERIFIED - real recovery pin embedded (sha256 $($EmbeddedSha.Substring(0,12))...); no test pin present." -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
 # 8. Lay out the admin working client (dist\MaxSecuClient)
@@ -636,6 +702,10 @@ Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
 # ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host '================ MAXSECU CLIENT BUILD COMPLETE ================' -ForegroundColor Green
+Write-Host ''
+Write-Host 'PROD-READY [OK] -- shipped client cryptographically verified: real recovery pin' -ForegroundColor Green
+Write-Host '                embedded (no test pin), delegation installed / enrollment OPEN,' -ForegroundColor Green
+Write-Host '                and the server + directory pins are committed into the connection code.' -ForegroundColor Green
 Write-Host ''
 Write-Host 'DELEGATION INSTALLED -- enrollment is now OPEN on the server.' -ForegroundColor Green
 Write-Host 'The directory root (D5) was generated on THIS PC; the server holds only a'
