@@ -1,10 +1,12 @@
 //! Build an **authenticated** [`TombstoneSet`] from the server-served control log,
-//! made safe by the sink-anchored head (T4 / spec §9 TombstoneSet checklist).
+//! made safe by the pinned-D5 issuer authority and, WHEN a sink is pinned, the
+//! sink-anchored head (T4 / spec §9 TombstoneSet checklist).
 //!
 //! `GET /v1/revocations` is served by the UNTRUSTED app server: the record bytes,
 //! their issuer signatures, and the advisory chain heads all come from an operator
-//! who could roll back, fork, or withhold a fresh tombstone. Two independent facts
-//! make the served set usable anyway, and only together:
+//! who could roll back, fork, or withhold a fresh tombstone. Issuer authority makes
+//! the served set usable; the sink-anchored head is an OPTIONAL second fact that,
+//! when present, additionally pins the tip:
 //!
 //! * the **anchored head** — when a sink is pinned, it is fetched out of band from
 //!   that sink in Task 4 ([`crate::sink::fetch_anchored_head`]) and passed in here,
@@ -24,8 +26,9 @@
 //! unverifiable revocation state is never silently treated as "nothing revoked".
 //!
 //! No identity or secret material is involved — this verifies PUBLIC records under
-//! the pinned D5 plus the sink-anchored head. The returned [`TombstoneSet`] never
-//! crosses the command seam; it feeds the reshare recipient check (Task 8).
+//! the pinned D5, plus the sink-anchored head when a sink is pinned. The returned
+//! [`TombstoneSet`] never crosses the command seam; it feeds the reshare recipient
+//! check (Task 8).
 
 use std::collections::HashMap;
 
@@ -100,13 +103,10 @@ pub(crate) async fn build_tombstones(
     // 4. Synchronous chain + authority verify. With a pinned sink, verify against
     //    the anchored head; without one (opt-in sink), verify UNANCHORED. The closure
     //    only reads the pre-resolved map. Every failure is fail-closed.
+    let issuer = |id: Id| resolved.get(&id.0).cloned();
     match anchored_head {
-        Some(head) => TombstoneSet::verify_authenticated(&records, head, &|id: Id| {
-            resolved.get(&id.0).cloned()
-        }),
-        None => TombstoneSet::verify_authenticated_unanchored(&records, &|id: Id| {
-            resolved.get(&id.0).cloned()
-        }),
+        Some(head) => TombstoneSet::verify_authenticated(&records, head, &issuer),
+        None => TombstoneSet::verify_authenticated_unanchored(&records, &issuer),
     }
     .map_err(map_tombstone_err)
 }
