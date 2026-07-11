@@ -1198,6 +1198,151 @@ async fn phase5_revocation_exit_gates_over_real_tls() {
     );
 }
 
+/// GET `/v1/files` with a session token and collect the hex `file_id`s the caller
+/// can actually see (the caller-scoped listing — api.md §8.6 / Part 1). Returns the
+/// set of `json["files"][*]["file_id"]` strings.
+async fn list_file_ids(conn: &mut Conn, token: &str) -> Vec<String> {
+    let (st, body) = get_json(conn, "/v1/files", token).await;
+    assert_eq!(st, StatusCode::OK, "GET /v1/files");
+    body["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["file_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Part 1 exit gate: the feed (`GET /v1/files`) is scoped to files the caller holds
+/// a wrap for. An unshared post is invisible to a second user; the owner sees their
+/// own post; once the owner shares it, the second user's feed lists it. Drives the
+/// real stack over loopback TLS through two enrolled users' sessions.
+#[tokio::test]
+async fn feed_lists_a_post_only_after_it_is_shared() {
+    let blob_dir = std::env::temp_dir().join(format!(
+        "mxsfeed_{}",
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
+    let store = MemoryStore::new();
+    for code in ["v-alice", "v-bob"] {
+        store.add_reg_key(sha256(code.as_bytes()));
+    }
+    let signer = Arc::new(SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
+    let state = AppState {
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer),
+        ),
+        blobs: Arc::new(FsBlobStore::new(&blob_dir)),
+        audit: Arc::new(NullAuditSink),
+        direct_links_enabled: false,
+        max_file_bytes: None,
+    };
+    let pki = test_pki();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve(
+        listener,
+        pki.server_config.clone(),
+        maxsecu_server::router(state),
+    ));
+
+    // A (owner) and B (second user), each on its own channel-bound connection.
+    let mut c_a = connect(addr, pki.client_config.clone()).await;
+    let mut c_b = connect(addr, pki.client_config.clone()).await;
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let a_id = register(&mut c_a, "alice", "v-alice", &a).await;
+    let b_id = register(&mut c_a, "bob", "v-bob", &b).await;
+    let a_tok = login(&mut c_a, "alice", &a).await;
+    let b_tok = login(&mut c_b, "bob", &b).await;
+
+    // ---- A uploads + finalizes a listed post (self + recovery wraps only) ----
+    let file_id = Id(maxsecu_crypto::random_array::<16>());
+    let file_hex = hex(&file_id.0);
+    let (_rsk, recovery_pub) = generate_enc_keypair();
+    let params = UploadParams {
+        owner: &a,
+        owner_id: Id(a_id),
+        owner_key_version: 1,
+        file_id,
+        file_type: FileType::Blog,
+        chunk_size: 4096,
+        recovery_pub,
+        recovery_mlkem_pub: None,
+        created_at: Timestamp(TS),
+    };
+    let bundle: UploadBundle = build_upload(&params, &small_streams()).unwrap();
+    let body = serde_json::json!({
+        "file_id": file_hex,
+        "file_type": "blog",
+        "genesis_b64": B64.encode(encode(&bundle.genesis)),
+        "genesis_sig_b64": B64.encode(bundle.genesis_sig),
+        "manifest_b64": B64.encode(encode(&bundle.manifest)),
+        "manifest_sig_b64": B64.encode(bundle.manifest_sig),
+        "streams": stream_specs(&bundle.streams),
+        "wraps": bundle.wraps.iter().map(wrap_json).collect::<Vec<_>>(),
+    });
+    let (st, _) = post(&mut c_a, "/v1/files", Some(&a_tok), body).await;
+    assert_eq!(st, StatusCode::CREATED, "stage v1");
+    upload_chunks_and_finalize(&mut c_a, &a_tok, &file_hex, 1, &bundle.streams).await;
+
+    // ---- (a) B's feed does NOT list A's unshared post ----
+    let before = list_file_ids(&mut c_b, &b_tok).await;
+    assert!(
+        !before.contains(&file_hex),
+        "an unshared post is hidden from B (feed is caller-scoped)"
+    );
+
+    // ---- (b) A's OWN feed DOES list it (A holds a self-wrap) ----
+    let a_feed = list_file_ids(&mut c_a, &a_tok).await;
+    assert!(
+        a_feed.contains(&file_hex),
+        "the owner sees their own post"
+    );
+
+    // ---- A shares the post to B (POST a B-recipient wrap) ----
+    let dek_commit = bundle.manifest.dek_commit.0;
+    let owner_wrap = bundle
+        .wraps
+        .iter()
+        .find(|x| x.recipient_type == RecipientType::User)
+        .unwrap();
+    let dek = unwrap_self(a.enc_secret(), &owner_wrap.wrapped_dek, file_id, 1, Id(a_id));
+    let to_b = build_reshare(
+        &ReshareParams {
+            granter: &a,
+            granter_id: Id(a_id),
+            file_id,
+            version: 1,
+            dek_commit,
+            recipient_id: Id(b_id),
+            recipient_enc_pub: EncPublicKey::from_bytes(b.enc_pub_bytes()),
+            suite: Suite::V1,
+            recipient_mlkem_pub: None,
+            created_at: Timestamp(TS),
+        },
+        &dek,
+        &empty_tombstones(),
+    )
+    .unwrap();
+    let (st, _) = post(
+        &mut c_a,
+        &format!("/v1/files/{file_hex}/wraps"),
+        Some(&a_tok),
+        wrap_json(&to_b),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "A shares to B");
+
+    // ---- (c) Now B's feed lists the shared post ----
+    let after = list_file_ids(&mut c_b, &b_tok).await;
+    assert!(
+        after.contains(&file_hex),
+        "a shared post appears in B's feed"
+    );
+}
+
 /// `DownloadBundle` is not `Clone`; rebuild for tampering.
 fn clone_bundle(b: &DownloadBundle) -> DownloadBundle {
     DownloadBundle {
