@@ -138,6 +138,24 @@ impl TofuStore {
         }
     }
 
+    /// Overwrite the pinned fingerprint for `username` (persisted atomically).
+    /// Used ONLY on an EXPLICIT user-confirmed key change — never on the silent
+    /// `check_or_pin` path (which retains the old pin on a `Changed`). After this,
+    /// the new key `Match`es and the old key would itself trip the alarm.
+    pub fn repin(
+        &mut self,
+        username: &str,
+        enc_pub: &[u8; 32],
+        sig_pub: &[u8; 32],
+    ) -> Result<(), UiError> {
+        let fp = key_fingerprint(enc_pub, sig_pub);
+        let mut candidate = self.map.clone();
+        candidate.insert(username.to_owned(), fp);
+        self.persist(&candidate)?; // atomic write first; commit RAM only on success
+        self.map = candidate;
+        Ok(())
+    }
+
     /// The pinned fingerprint for `username`, if any (for the display form).
     pub fn pinned_fingerprint(&self, username: &str) -> Option<[u8; 32]> {
         self.map.get(username).copied()
@@ -290,6 +308,45 @@ mod tests {
         // A Changed result did NOT overwrite the pin: the original key still Matches.
         assert_eq!(
             store.check_or_pin("alice", &ENC_A, &SIG_A).unwrap(),
+            TofuOutcome::Match
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repin_overwrites_and_persists() {
+        let dir = tmp_dir();
+        let id = Identity::generate();
+        let mut store = TofuStore::open(&dir, &id).unwrap();
+
+        // First-sighting pin of key A.
+        assert_eq!(
+            store.check_or_pin("alice", &ENC_A, &SIG_A).unwrap(),
+            TofuOutcome::Pinned
+        );
+        // Key B would normally be a Changed (blocked) result.
+        assert_eq!(
+            store.check_or_pin("alice", &ENC_B, &SIG_B).unwrap(),
+            TofuOutcome::Changed
+        );
+
+        // An explicit repin to B overwrites the pin (user-confirmed key change).
+        store.repin("alice", &ENC_B, &SIG_B).unwrap();
+        // Now B Matches and A would be the Changed one.
+        assert_eq!(
+            store.check_or_pin("alice", &ENC_B, &SIG_B).unwrap(),
+            TofuOutcome::Match
+        );
+        assert_eq!(
+            store.check_or_pin("alice", &ENC_A, &SIG_A).unwrap(),
+            TofuOutcome::Changed
+        );
+
+        // Persisted across reopen.
+        let mut reopened = TofuStore::open(&dir, &id).unwrap();
+        assert_eq!(
+            reopened.check_or_pin("alice", &ENC_B, &SIG_B).unwrap(),
             TofuOutcome::Match
         );
 
