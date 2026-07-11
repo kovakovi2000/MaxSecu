@@ -351,6 +351,7 @@ export class ShareDialog extends HTMLElement {
   private async handleKeyChanges(outcomes: ReshareOutcome[]) {
     const changes = outcomes.filter(isKeyChange);
     for (const o of changes) {
+      if (this.acceptedKeyChanges.has(o.username)) continue; // already confirmed — don't re-prompt
       const ok = await confirmModal({
         title: "Security key changed",
         message: keyChangeMessage(o),
@@ -368,8 +369,9 @@ export class ShareDialog extends HTMLElement {
     if (!row) return;
     row.status = "sharing";
     this.renderRows();
+    let outcomes: ReshareOutcome[];
     try {
-      const outcomes = await serial(() =>
+      outcomes = await serial(() =>
         call<ReshareOutcome[]>(this.shareCommand(), {
           req: {
             file_id: this.fileId,
@@ -383,8 +385,15 @@ export class ShareDialog extends HTMLElement {
       row.status = "share-failed";
       row.message = errMessage(x, "Could not share this item right now.");
       row.code = null;
+      this.renderRows();
+      return;
     }
     this.renderRows();
+    // Re-open the confirm if this retry hit key_changed (e.g. the Retry button on
+    // a previously-cancelled key-change row). The acceptedKeyChanges guard in
+    // handleKeyChanges prevents recursion: on confirm the username is added
+    // before the inner retryRow, so any follow-up key_changed is skipped.
+    await this.handleKeyChanges(outcomes);
   }
 
   private applyOutcomes(outcomes: ReshareOutcome[]) {
