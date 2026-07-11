@@ -382,6 +382,12 @@ pub struct ContactDto {
 pub struct ReshareRequest {
     pub file_id: String,
     pub recipient_usernames: Vec<String>,
+    /// Usernames the user has EXPLICITLY confirmed trusting a new key for (a
+    /// user-confirmed key change). A recipient here whose key changed is re-pinned
+    /// and shared to; anyone NOT here whose key changed yields a `key_changed`
+    /// outcome instead (warn + confirm). Absent ⇒ empty (default fail-closed).
+    #[serde(default)]
+    pub accepted_key_changes: Vec<String>,
 }
 
 /// The outcome of `request_recovery_challenge` — an opaque status handle plus the
@@ -425,6 +431,12 @@ pub struct ReshareOutcomeDto {
     pub username: String,
     pub ok: bool,
     pub code: Option<String>, // sanitized failure code, None on success
+    /// For a `key_changed` outcome only: the previously-pinned short fingerprint
+    /// and the newly-served one, so the UI can show a warn+confirm. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_fingerprint: Option<String>,
 }
 
 #[cfg(test)]
@@ -569,6 +581,8 @@ mod reshare_dto_tests {
         let req: ReshareRequest = serde_json::from_str(j).unwrap();
         assert_eq!(req.file_id, "ab");
         assert_eq!(req.recipient_usernames, vec!["bob", "carol"]);
+        // A payload with no `accepted_key_changes` field deserializes (serde default).
+        assert!(req.accepted_key_changes.is_empty());
     }
 
     #[test]
@@ -577,9 +591,14 @@ mod reshare_dto_tests {
             username: "bob".into(),
             ok: true,
             code: None,
+            old_fingerprint: None,
+            new_fingerprint: None,
         };
         let s = serde_json::to_string(&ok).unwrap();
         assert!(s.contains("\"code\":null"), "got {s}");
+        // The fingerprint fields are absent from JSON when None (skip_serializing_if).
+        assert!(!s.contains("old_fingerprint"), "got {s}");
+        assert!(!s.contains("new_fingerprint"), "got {s}");
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["username"], "bob");
         assert_eq!(v["ok"], true);
@@ -589,6 +608,8 @@ mod reshare_dto_tests {
             username: "carol".into(),
             ok: false,
             code: Some("not_found".into()),
+            old_fingerprint: None,
+            new_fingerprint: None,
         };
         let s = serde_json::to_string(&failed).unwrap();
         assert!(s.contains("\"code\":\"not_found\""), "got {s}");
@@ -596,5 +617,21 @@ mod reshare_dto_tests {
         assert_eq!(v["username"], "carol");
         assert_eq!(v["ok"], false);
         assert_eq!(v["code"], "not_found");
+    }
+
+    #[test]
+    fn reshare_outcome_dto_key_changed_carries_fingerprints() {
+        let changed = ReshareOutcomeDto {
+            username: "alice".into(),
+            ok: false,
+            code: Some("key_changed".into()),
+            old_fingerprint: Some("A1B2 C3D4 E5F6 0718".into()),
+            new_fingerprint: Some("99AA BBCC DDEE FF00".into()),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(v["code"], "key_changed");
+        assert_eq!(v["old_fingerprint"], "A1B2 C3D4 E5F6 0718");
+        assert_eq!(v["new_fingerprint"], "99AA BBCC DDEE FF00");
     }
 }

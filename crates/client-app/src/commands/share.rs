@@ -17,8 +17,9 @@
 //! never aborts the batch or rolls back the others. The sanitized per-recipient
 //! failure codes are: "untrusted" (unresolvable / bad binding), "revoked",
 //! "pq_key_missing", "verify_failed" (DEK-commitment mismatch), "recovery_recipient",
-//! "wrap_failed", "share_failed" (a non-201 POST), "server_untrusted" (the
-//! recipient's TOFU-pinned key CHANGED — trust-alarm B, [`crate::tofu`]), "locked"
+//! "wrap_failed", "share_failed" (a non-201 POST), "key_changed" (the recipient's
+//! TOFU-pinned key CHANGED and was NOT user-confirmed — trust-alarm B,
+//! [`crate::tofu`]; the outcome carries the old + new short fingerprints), "locked"
 //! (the identity was momentarily absent mid-batch — see [`run_reshare_batch`]), or a
 //! transport error code. Re-sharing is idempotent server-side (`Store::add_wrap` replaces the row),
 //! so retrying just the failed rows is always safe.
@@ -223,6 +224,7 @@ async fn reshare_inner(
         &mut tofu,
         contacts.as_mut(),
         &req.recipient_usernames,
+        &req.accepted_key_changes,
         &verifier,
         &mut trust,
         now,
@@ -283,6 +285,8 @@ fn aggregate_bundle_outcomes(
                 username: uname.clone(),
                 ok: code.is_none(),
                 code,
+                old_fingerprint: None,
+                new_fingerprint: None,
             }
         })
         .collect()
@@ -327,6 +331,7 @@ pub async fn reshare_bundle(
         let sub = ReshareRequest {
             file_id: hex(target),
             recipient_usernames: req.recipient_usernames.clone(),
+            accepted_key_changes: req.accepted_key_changes.clone(),
         };
         let outcomes = match reshare_inner(&sub, &dir, &session, &connect_lock, &emit).await {
             Ok(o) => o,
@@ -337,6 +342,8 @@ pub async fn reshare_bundle(
                     username: u.clone(),
                     ok: false,
                     code: Some(e.code.clone()),
+                    old_fingerprint: None,
+                    new_fingerprint: None,
                 })
                 .collect(),
         };
@@ -380,6 +387,7 @@ async fn run_reshare_batch(
     tofu: &mut TofuStore,
     mut contacts: Option<&mut crate::contacts::ContactStore>,
     recipients: &[String],
+    accepted_key_changes: &[String],
     verifier: &DirectoryVerifier,
     trust: &mut (dyn TrustStore + Send),
     now_ms: u64,
@@ -402,31 +410,80 @@ async fn run_reshare_batch(
             {
                 Ok(a) => a,
                 Err(e) => {
-                    push_outcome(&mut outcomes, emit, file_id_hex, uname, false, Some(e.code));
+                    push_outcome(
+                        &mut outcomes,
+                        emit,
+                        file_id_hex,
+                        uname,
+                        false,
+                        Some(e.code),
+                        None,
+                        None,
+                    );
                     continue;
                 }
             };
 
         // (sync, no await) Trust-alarm layer B: TOFU-pin the resolved+verified key.
         // A first sighting pins WITHOUT blocking; the SAME key Matches; a CHANGED key
-        // for a pinned username is fail-closed `server_untrusted` — no wrap, no POST
-        // for this recipient (per-recipient isolation; the pin is NOT overwritten). A
-        // store-write error is likewise fail-closed rather than silently unpinned.
+        // for a pinned username is handled here. If the user has EXPLICITLY confirmed
+        // the change (`accepted_key_changes`), re-pin and PROCEED to the wrap/POST;
+        // otherwise surface a per-recipient `key_changed` outcome carrying the old +
+        // new short fingerprints (warn + confirm) — no wrap, no POST for this
+        // recipient (per-recipient isolation; the pin is NOT overwritten). A
+        // store-write error is fail-closed rather than silently unpinned.
         match tofu.check_or_pin(uname, &author.enc_pub, &author.sig_pub) {
             Ok(TofuOutcome::Pinned) | Ok(TofuOutcome::Match) => {}
             Ok(TofuOutcome::Changed) => {
+                if accepted_key_changes.iter().any(|u| u == uname) {
+                    // User explicitly confirmed this key change → re-pin and proceed.
+                    if let Err(e) = tofu.repin(uname, &author.enc_pub, &author.sig_pub) {
+                        push_outcome(
+                            &mut outcomes,
+                            emit,
+                            file_id_hex,
+                            uname,
+                            false,
+                            Some(e.code),
+                            None,
+                            None,
+                        );
+                        continue;
+                    }
+                    // fall through to the wrap/POST below (no `continue`).
+                } else {
+                    // Not confirmed → surface a warn+confirm outcome with both prints.
+                    let old_fp = tofu
+                        .pinned_fingerprint(uname)
+                        .map(|fp| crate::tofu::short_fingerprint(&fp));
+                    let new_fp = crate::tofu::short_fingerprint(&crate::tofu::key_fingerprint(
+                        &author.enc_pub,
+                        &author.sig_pub,
+                    ));
+                    push_outcome(
+                        &mut outcomes,
+                        emit,
+                        file_id_hex,
+                        uname,
+                        false,
+                        Some("key_changed".to_owned()),
+                        old_fp,
+                        Some(new_fp),
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
                 push_outcome(
                     &mut outcomes,
                     emit,
                     file_id_hex,
                     uname,
                     false,
-                    Some("server_untrusted".to_owned()),
+                    Some(e.code),
+                    None,
+                    None,
                 );
-                continue;
-            }
-            Err(e) => {
-                push_outcome(&mut outcomes, emit, file_id_hex, uname, false, Some(e.code));
                 continue;
             }
         }
@@ -474,7 +531,16 @@ async fn run_reshare_batch(
         let wrap = match built {
             Ok(w) => w,
             Err(code) => {
-                push_outcome(&mut outcomes, emit, file_id_hex, uname, false, Some(code));
+                push_outcome(
+                    &mut outcomes,
+                    emit,
+                    file_id_hex,
+                    uname,
+                    false,
+                    Some(code),
+                    None,
+                    None,
+                );
                 continue;
             }
         };
@@ -493,7 +559,7 @@ async fn run_reshare_batch(
                 if let Some(c) = contacts.as_deref_mut() {
                     let _ = c.upsert(uname, author.user_id, fp);
                 }
-                push_outcome(&mut outcomes, emit, file_id_hex, uname, true, None);
+                push_outcome(&mut outcomes, emit, file_id_hex, uname, true, None, None, None);
             }
             Ok(_) => {
                 push_outcome(
@@ -503,10 +569,21 @@ async fn run_reshare_batch(
                     uname,
                     false,
                     Some("share_failed".to_owned()),
+                    None,
+                    None,
                 );
             }
             Err(e) => {
-                push_outcome(&mut outcomes, emit, file_id_hex, uname, false, Some(e.code));
+                push_outcome(
+                    &mut outcomes,
+                    emit,
+                    file_id_hex,
+                    uname,
+                    false,
+                    Some(e.code),
+                    None,
+                    None,
+                );
             }
         }
     }
@@ -516,6 +593,7 @@ async fn run_reshare_batch(
 
 /// Record one recipient's terminal outcome (append to the result Vec AND emit the
 /// `Recipient` phase). Centralized so every path produces exactly one row + event.
+#[allow(clippy::too_many_arguments)]
 fn push_outcome(
     outcomes: &mut Vec<ReshareOutcomeDto>,
     emit: &impl Fn(SharePhase),
@@ -523,6 +601,8 @@ fn push_outcome(
     username: &str,
     ok: bool,
     code: Option<String>,
+    old_fingerprint: Option<String>,
+    new_fingerprint: Option<String>,
 ) {
     emit(SharePhase::Recipient {
         file_id: file_id_hex.to_owned(),
@@ -534,6 +614,8 @@ fn push_outcome(
         username: username.to_owned(),
         ok,
         code,
+        old_fingerprint,
+        new_fingerprint,
     });
 }
 
@@ -881,6 +963,7 @@ mod tests {
             &mut empty_tofu(),
             Some(&mut empty_contacts()),
             &recipients,
+            &[],
             &verifier,
             &mut trust,
             NOW,
@@ -1016,6 +1099,7 @@ mod tests {
             &mut empty_tofu(),
             Some(&mut empty_contacts()),
             &recipients,
+            &[],
             &verifier,
             &mut trust,
             NOW,
@@ -1104,6 +1188,7 @@ mod tests {
             &mut tofu,
             Some(&mut empty_contacts()),
             &recipients,
+            &[],
             &verifier,
             &mut trust,
             NOW,
@@ -1112,11 +1197,110 @@ mod tests {
         .await;
 
         assert_eq!(outcomes.len(), 2, "one outcome per entered username");
-        // alice: changed pinned key → blocked, fail-closed, no share.
+        // alice: changed pinned key (not confirmed) → blocked with a `key_changed`
+        // warn+confirm outcome carrying BOTH the old and new short fingerprints.
         assert_eq!(outcomes[0].username, "alice");
         assert!(!outcomes[0].ok, "a changed pinned key blocks the share");
-        assert_eq!(outcomes[0].code.as_deref(), Some("server_untrusted"));
+        assert_eq!(outcomes[0].code.as_deref(), Some("key_changed"));
+        assert!(
+            outcomes[0].old_fingerprint.is_some(),
+            "key_changed carries the previously-pinned fingerprint"
+        );
+        assert!(
+            outcomes[0].new_fingerprint.is_some(),
+            "key_changed carries the newly-served fingerprint"
+        );
         // carol: first sighting → pinned WITHOUT blocking → the share still succeeds.
+        assert_eq!(outcomes[1].username, "carol");
+        assert!(outcomes[1].ok, "a first-sighting peer is not blocked");
+        assert!(outcomes[1].code.is_none());
+    }
+
+    /// The user-confirmed key-change path (spec §Part 3): a username whose pinned
+    /// key CHANGED but is listed in `accepted_key_changes` is RE-PINNED and shared
+    /// to (ok:true, no code) — mirroring the changed-key test setup but passing the
+    /// acceptance. A first-sighting peer (carol) still succeeds.
+    #[tokio::test]
+    async fn accepted_key_change_repins_and_shares() {
+        let d5 = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+        let mut trust = MemoryTrustStore::new();
+
+        let (_alice_sk, alice_pk) = generate_enc_keypair();
+        let dek = Dek::generate();
+        let tombstones = empty_tombstones();
+        let session = session_with_identity();
+
+        let file_id_hex: String = FILE_ID.iter().map(|b| format!("{b:02x}")).collect();
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/v1/directory/alice".to_owned(),
+            (
+                hyper::StatusCode::OK,
+                alice_binding(&d5, alice_pk.to_bytes()),
+            ),
+        );
+        routes.insert(
+            "/v1/directory/carol".to_owned(),
+            (
+                hyper::StatusCode::OK,
+                alice_binding(&d5, alice_pk.to_bytes()),
+            ),
+        );
+        routes.insert(
+            format!("/v1/files/{file_id_hex}/wraps"),
+            (hyper::StatusCode::CREATED, "{}".to_owned()),
+        );
+        let addr = spawn_router(routes).await;
+        let mut sender = connect(&addr).await;
+
+        // Pre-pin "alice" to a DIFFERENT key than the server will serve → Changed;
+        // "carol" left UNPINNED → a first sighting.
+        let mut tofu = empty_tofu();
+        assert_eq!(
+            tofu.check_or_pin("alice", &[0x00; 32], &[0x51; 32]).unwrap(),
+            TofuOutcome::Pinned
+        );
+
+        let recipients = vec!["alice".to_owned(), "carol".to_owned()];
+        let accepted = vec!["alice".to_owned()];
+        let outcomes = run_reshare_batch(
+            &mut sender,
+            "localhost",
+            "tok",
+            &file_id_hex,
+            FILE_ID,
+            1,
+            dek.commit(),
+            Suite::V1,
+            GRANTER_ID,
+            &dek,
+            &tombstones,
+            &session,
+            &mut tofu,
+            Some(&mut empty_contacts()),
+            &recipients,
+            &accepted,
+            &verifier,
+            &mut trust,
+            NOW,
+            &|_| {},
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 2, "one outcome per entered username");
+        // alice: the confirmed key change re-pins and shares.
+        assert_eq!(outcomes[0].username, "alice");
+        assert!(outcomes[0].ok, "an accepted key change re-pins and shares");
+        assert_eq!(outcomes[0].code, None);
+        // The re-pin persisted: the new key now Matches, the old key would trip.
+        assert_eq!(
+            tofu.check_or_pin("alice", &alice_pk.to_bytes(), &[0x51; 32])
+                .unwrap(),
+            TofuOutcome::Match
+        );
+        // carol: first sighting → still succeeds.
         assert_eq!(outcomes[1].username, "carol");
         assert!(outcomes[1].ok, "a first-sighting peer is not blocked");
         assert!(outcomes[1].code.is_none());
@@ -1207,6 +1391,7 @@ mod tests {
             &mut empty_tofu(),
             Some(&mut contacts),
             &recipients,
+            &[],
             &verifier,
             &mut trust,
             NOW,
@@ -1268,11 +1453,15 @@ mod tests {
                     username: "a".into(),
                     ok: true,
                     code: None,
+                    old_fingerprint: None,
+                    new_fingerprint: None,
                 },
                 ReshareOutcomeDto {
                     username: "b".into(),
                     ok: true,
                     code: None,
+                    old_fingerprint: None,
+                    new_fingerprint: None,
                 },
             ],
             vec![
@@ -1280,11 +1469,15 @@ mod tests {
                     username: "a".into(),
                     ok: true,
                     code: None,
+                    old_fingerprint: None,
+                    new_fingerprint: None,
                 },
                 ReshareOutcomeDto {
                     username: "b".into(),
                     ok: false,
                     code: Some("share_failed".into()),
+                    old_fingerprint: None,
+                    new_fingerprint: None,
                 },
             ],
         ];
@@ -1308,11 +1501,15 @@ mod tests {
                 username: "a".into(),
                 ok: false,
                 code: Some("untrusted".into()),
+                old_fingerprint: None,
+                new_fingerprint: None,
             }],
             vec![ReshareOutcomeDto {
                 username: "a".into(),
                 ok: false,
                 code: Some("share_failed".into()),
+                old_fingerprint: None,
+                new_fingerprint: None,
             }],
         ];
         let agg = aggregate_bundle_outcomes(&per_target, &recipients);
@@ -1350,7 +1547,7 @@ mod tests {
         let outcomes = run_reshare_batch(
             &mut sender, "localhost", "tok", &file_id_hex, FILE_ID, 1,
             dek.commit(), Suite::V1, GRANTER_ID, &dek, &tombstones, &session,
-            &mut empty_tofu(), Some(&mut contacts), &recipients,
+            &mut empty_tofu(), Some(&mut contacts), &recipients, &[],
             &verifier, &mut trust, NOW, &|_| {},
         )
         .await;
