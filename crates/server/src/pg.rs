@@ -973,10 +973,17 @@ impl Store for PgStore {
             "SELECT file_id, file_type, current_version, updated_at FROM files \
              WHERE current_version >= 1 AND listed = true \
              AND ($1::smallint IS NULL OR file_type = $1) \
+             AND EXISTS ( \
+                 SELECT 1 FROM file_key_wraps w \
+                 WHERE w.file_id = files.file_id \
+                   AND w.file_version = files.current_version \
+                   AND w.recipient_id = $3 \
+             ) \
              ORDER BY updated_at DESC, file_id LIMIT $2",
         )
         .bind(filter.file_type)
         .bind(filter.limit as i64)
+        .bind(&filter.caller_id[..])
         .fetch_all(&self.pool)
         .await
         .map_err(store_err(op))?;

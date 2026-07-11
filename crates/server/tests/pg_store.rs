@@ -1069,6 +1069,18 @@ async fn listing_filters_by_type_in_postgres() {
     assert_eq!(blogs.len(), 1);
     assert_eq!(blogs[0].file_id, blog);
 
+    // A caller with no wrap for these files sees nothing (caller-scoped listing).
+    let stranger = db
+        .store
+        .list_files(ListFilter {
+            file_type: None,
+            limit: 50,
+            caller_id: [0x77u8; 16],
+        })
+        .await
+        .unwrap();
+    assert!(stranger.is_empty(), "pg listing is caller-scoped");
+
     db.teardown().await;
 }
 
