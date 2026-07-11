@@ -243,7 +243,7 @@ pub async fn decrypt_card(
 ) -> Result<crate::dto::CardDto, UiError> {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
-    use maxsecu_client_core::{DirectoryVerifier, MemoryTrustStore};
+    use maxsecu_client_core::MemoryTrustStore;
     use maxsecu_encoding::decode;
     use maxsecu_encoding::structs::Manifest;
     use maxsecu_encoding::types::StreamType;
@@ -257,7 +257,6 @@ pub async fn decrypt_card(
         }
     }
     let pinned = crate::config::load_directory_pub(&dir.0)?;
-    let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
 
@@ -334,6 +333,10 @@ pub async fn decrypt_card(
     // returns to the pool on `chan` drop at the end of the command.
     let host = chan.host.clone();
     let token = chan.token.clone();
+    // Offline-D5 hop (spec §3/§7): resolve the effective directory verifier over the
+    // pooled pinned channel; fail closed on a bad delegation before any author verify.
+    let verifier =
+        crate::directory::build_delegated_verifier(&mut chan.sender, &host, pinned, now).await?;
     let view = crate::download::parse_file_view(&view_json)?;
     if req.version.is_none() {
         // NB: keyed on the UNVERIFIED envelope `view.version`; if it diverges from the

@@ -128,7 +128,7 @@ mod tests {
 use tauri::{Emitter, State};
 
 use maxsecu_client_core::{
-    verify_and_open, verify_and_open_headers, DirectoryVerifier, Identity, MemoryTrustStore,
+    verify_and_open, verify_and_open_headers, Identity, MemoryTrustStore,
     VerifyContext,
 };
 use maxsecu_encoding::decode;
@@ -196,7 +196,6 @@ async fn open_content_inner(
         }
     }
     let pinned = load_directory_pub(&dir.0)?;
-    let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
 
@@ -208,6 +207,10 @@ async fn open_content_inner(
 
     let server = server_of(&dir.0)?;
     let (mut sender, host, token) = reauth(&dir.0, &server, session, connect_lock).await?;
+    // Offline-D5 hop (spec §3/§7): resolve the effective directory verifier over the
+    // pinned connection BEFORE any binding is verified — fail closed on a bad delegation.
+    let verifier =
+        crate::directory::build_delegated_verifier(&mut sender, &host, pinned, now).await?;
 
     emit(FetchPhase::Fetching {
         file_id: req.file_id.clone(),

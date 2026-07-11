@@ -13,7 +13,7 @@ use hyper::body::Bytes;
 use hyper::client::conn::http1::SendRequest;
 use tauri::State;
 
-use maxsecu_client_core::{open_content_decryptor, DirectoryVerifier, MemoryTrustStore};
+use maxsecu_client_core::{open_content_decryptor, MemoryTrustStore};
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::Manifest;
 use maxsecu_encoding::types::{FileType, StreamType};
@@ -191,7 +191,6 @@ pub async fn download_content(
     let file_id_hex = hex(&file_id);
 
     let pinned = load_directory_pub(&dir.0)?;
-    let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
 
@@ -203,6 +202,10 @@ pub async fn download_content(
 
     let server = server_of(&dir.0)?;
     let (mut sender, host, token) = reauth(&dir.0, &server, &session, &connect_lock).await?;
+    // Offline-D5 hop (spec §3/§7): build the effective directory verifier over the
+    // pinned connection; fail closed on a bad/expired delegation before any decode.
+    let verifier =
+        crate::directory::build_delegated_verifier(&mut sender, &host, pinned, now).await?;
 
     let (status, view_json) = get_json(
         &mut sender,

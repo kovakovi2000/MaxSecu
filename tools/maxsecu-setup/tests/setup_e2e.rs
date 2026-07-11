@@ -63,8 +63,11 @@ fn state_with_admin_gate() -> AppState<MemoryStore> {
     let dir_pub = signer.verifying_key().to_bytes();
     AppState {
         auth: Arc::new(
-            AuthService::new(MemoryStore::new(), AuthConfig::default().with_directory_pub(dir_pub))
-                .with_dir_signer(signer),
+            AuthService::new(
+                MemoryStore::new(),
+                AuthConfig::default().with_directory_pub(dir_pub),
+            )
+            .with_dir_signer(signer),
         ),
         blobs: Arc::new(MemoryBlobStore::new()),
         audit: Arc::new(NullAuditSink),
@@ -77,7 +80,11 @@ async fn start() -> (std::net::SocketAddr, CertificateDer<'static>) {
     let (server_config, cert_der) = test_pki();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, server_config, router(state_with_admin_gate())));
+    tokio::spawn(serve(
+        listener,
+        server_config,
+        router(state_with_admin_gate()),
+    ));
     (addr, cert_der)
 }
 
@@ -167,13 +174,19 @@ async fn setup_bootstraps_recovery_first_key_and_pin_then_409_on_rerun() {
         pin_out: dir.join("recovery_pin.bin"),
         first_key_out: dir.join("first_registration_key.txt"),
         passphrase: Zeroizing::new("correct horse battery staple 9!".to_owned()),
+        ceremony: None,
     };
 
     // ---- FIRST run: writes all three artifacts, returns Ok. ----
-    let report = run(&transport, &opts).await.expect("first setup run succeeds");
+    let report = run(&transport, &opts)
+        .await
+        .expect("first setup run succeeds");
     assert!(opts.out.exists(), "sealed recovery key blob written");
     assert!(opts.pin_out.exists(), "recovery_pin.bin written");
-    assert!(opts.first_key_out.exists(), "first registration key written");
+    assert!(
+        opts.first_key_out.exists(),
+        "first registration key written"
+    );
 
     // Sealed blob is NOT the bare key: it must unlock with the passphrase and yield
     // the SAME recovery identity that was registered (enc pub matches the report).
@@ -185,7 +198,10 @@ async fn setup_bootstraps_recovery_first_key_and_pin_then_409_on_rerun() {
         report.recovery_enc_pub,
         "sealed blob is the registered recovery identity"
     );
-    assert!(recovered.mlkem_pub_bytes().is_some(), "recovery account is hybrid (PQ)");
+    assert!(
+        recovered.mlkem_pub_bytes().is_some(),
+        "recovery account is hybrid (PQ)"
+    );
 
     // ---- the emitted pin equals canonical_pin of the server's STORED recovery key. ----
     let mut c = open(&transport).await;
@@ -241,8 +257,11 @@ async fn setup_bootstraps_recovery_first_key_and_pin_then_409_on_rerun() {
         pin_out: dir2.join("recovery_pin.bin"),
         first_key_out: dir2.join("first_registration_key.txt"),
         passphrase: Zeroizing::new("correct horse battery staple 9!".to_owned()),
+        ceremony: None,
     };
-    let err = run(&transport, &opts2).await.expect_err("second run must fail");
+    let err = run(&transport, &opts2)
+        .await
+        .expect_err("second run must fail");
     assert!(
         matches!(err, SetupError::AlreadyRegistered),
         "second run is AlreadyRegistered (409), got {err:?}"
@@ -276,6 +295,7 @@ async fn post_register_write_failure_is_io_error_but_registration_commits() {
         pin_out: dir.join("recovery_pin.bin"),
         first_key_out: dir.join("first_registration_key.txt"),
         passphrase: Zeroizing::new("correct horse battery staple 9!".to_owned()),
+        ceremony: None,
     };
 
     let err = run(&transport, &opts)
@@ -286,7 +306,10 @@ async fn post_register_write_failure_is_io_error_but_registration_commits() {
         "write failure surfaces as Io, got {err:?}"
     );
     // The failing first write aborts before the other two artifacts are touched.
-    assert!(!opts.pin_out.exists(), "no pin written once the out-write failed");
+    assert!(
+        !opts.pin_out.exists(),
+        "no pin written once the out-write failed"
+    );
     assert!(
         !opts.first_key_out.exists(),
         "no first key written once the out-write failed"
@@ -309,6 +332,7 @@ async fn post_register_write_failure_is_io_error_but_registration_commits() {
         pin_out: dir2.join("recovery_pin.bin"),
         first_key_out: dir2.join("first_registration_key.txt"),
         passphrase: Zeroizing::new("correct horse battery staple 9!".to_owned()),
+        ceremony: None,
     };
     let err2 = run(&transport, &opts2)
         .await

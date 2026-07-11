@@ -165,7 +165,23 @@ function Wait-ServerReachable([int]$port) {
     Die "server did not become stably reachable on 127.0.0.1:$port within timeout"
 }
 
-# mode: 'install' (returns the connection code) or 'reset' (returns $null).
+# mode: 'install' (returns a hashtable of ceremony inputs) or 'reset' (returns $null).
+#
+# Offline-D5 change: install-server no longer prints a ready-to-run connection code
+# (that final user-facing code is minted on the ADMIN PC by install-client's ceremony).
+# A fresh install now comes up AWAITING DELEGATION with enrollment CLOSED and prints,
+# under labeled headers, a SERVER-CERT FINGERPRINT and a ONE-TIME DELEGATION TOKEN,
+# plus a ready-to-run install-client command line of the form:
+#
+#     powershell ... -File scripts\install-client.ps1 -ConnectionCode <addr:port#CERT_FP> -Token <token>
+#
+# We lift both the cert-only connection code (addr:port#CERT_FP) and the token from
+# that emitted command line (a single authoritative line carrying both), and hand them
+# to install-client so its ceremony can pin TLS, generate D5, and upload the delegation
+# that OPENS enrollment. The returned hashtable has:
+#   ConnCode - "addr:port#CERT_FP" for install-client -ConnectionCode
+#   Token    - the one-time delegation token for install-client -Token
+#   Addr     - "addr:port" (fingerprint stripped) for the live-smoke oracle's --server
 function Install-Server([string]$mode) {
     Phase "Install server ($mode)"
     if ($mode -eq 'reset') {
@@ -180,24 +196,80 @@ function Install-Server([string]$mode) {
     # so it is unreachable as a server address. The server still binds 0.0.0.0; only
     # the cert SAN + dial address are 127.0.0.1. Protocol path is otherwise identical.
     $log = Invoke-WslCmd "cd ~/maxsecu && ./scripts/install-server.sh --public 127.0.0.1 --port $Port --no-dropbox"
-    $m = [regex]::Match($log, '(?m)^\s*([0-9.]+:[0-9]+#\S+)\s*$')
-    if (-not $m.Success) { Die "could not parse the connection code from install-server output" }
-    $code = $m.Groups[1].Value
-    Write-Host "  connection code: $code"
+
+    # Primary: lift BOTH values from the single emitted install-client command line
+    # (-ConnectionCode <addr:port#CERT_FP> -Token <token>). CERT_FP and the token are
+    # single tokens (no whitespace), so `\S+` bounded by `-Token` splits them cleanly.
+    $connCode = ''
+    $token    = ''
+    $m = [regex]::Match($log, '-ConnectionCode\s+(\S+)\s+-Token\s+(\S+)')
+    if ($m.Success) {
+        $connCode = $m.Groups[1].Value.Trim()
+        $token    = $m.Groups[2].Value.Trim()
+    } else {
+        # Fallback: scrape the two labeled headers independently. Each prints its value
+        # alone on the next non-empty (indented) line after the header line.
+        $fp = [regex]::Match($log, '(?ms)SERVER-CERT FINGERPRINT[^\r\n]*\r?\n\s*\r?\n\s*(\S+)')
+        $tk = [regex]::Match($log, '(?ms)ONE-TIME DELEGATION TOKEN[^\r\n]*\r?\n\s*\r?\n\s*(\S+)')
+        if ($fp.Success -and $tk.Success) {
+            $connCode = "127.0.0.1:$Port#" + $fp.Groups[1].Value.Trim()
+            $token    = $tk.Groups[1].Value.Trim()
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($connCode) -or [string]::IsNullOrWhiteSpace($token)) {
+        Die "could not parse the cert connection code + delegation token from install-server output (is the server AWAITING DELEGATION? a re-run of an already-delegated server prints no token)"
+    }
+    $addr = ($connCode -split '#')[0]
+    Write-Host "  cert connection code: $connCode"
+    Write-Host "  delegation token    : (scraped, $($token.Length) chars)"
     Wait-ServerReachable $Port
-    return $code
+    return @{ ConnCode = $connCode; Token = $token; Addr = $addr }
 }
 
-function Build-Client([string]$code) {
-    Phase "Build client"
+# Assert the ceremony actually installed the delegation, so enrollment is now OPEN.
+# Positive proof: on the server, `print-fingerprint` returns the full pin fingerprint
+# ONLY once directory_pub.der has been pinned by the delegation (before that the server
+# is awaiting and has no directory pin). `print-token` also flips to empty once the
+# one-time token is burned. We assert the fingerprint is non-empty. Data dir + binary
+# match install-server.sh's defaults for this layout: ~/maxsecu-server-data and the
+# release binary under the copied source tree.
+function Confirm-EnrollmentOpen {
+    Phase "Confirm enrollment OPENED (delegation installed)"
+    # print-fingerprint reads <data_dir>/client-pins/directory_pub.der (written when
+    # the delegation is installed) off the filesystem -- no DATABASE_URL needed. Retry
+    # a few times in case the server writes that pin a beat after acknowledging the
+    # ceremony's delegation upload, so a momentary lag can't produce a false failure.
+    $fp = ''
+    for ($i = 0; $i -lt 10; $i++) {
+        $fp = (Invoke-WslCmd "cd ~/maxsecu && MAXSECU_DATA_DIR=`"`$HOME/maxsecu-server-data`" ./target/release/maxsecu-portable-server print-fingerprint 2>/dev/null || true").Trim()
+        if (-not [string]::IsNullOrWhiteSpace($fp)) { break }
+        Start-Sleep -Seconds 1
+    }
+    if ([string]::IsNullOrWhiteSpace($fp)) {
+        Die "server still reports no directory pin after the ceremony -- delegation was NOT installed / enrollment is still CLOSED"
+    }
+    Write-Host "  server now holds a directory delegation (fingerprint present) -- enrollment OPEN"
+}
+
+function Build-Client($srv) {
+    Phase "Build client (offline-D5 ceremony)"
+    # install-client runs the whole offline-D5 ceremony non-interactively here: it pins
+    # the server cert against the CERT-only fingerprint in -ConnectionCode, generates the
+    # directory root (D5) on THIS host, uploads the delegation with the one-time -Token
+    # (which OPENS enrollment on the awaiting server), mints the final user-facing code,
+    # and builds the admin app + share ZIP. -RecoveryPassphrase seals D5 + the recovery
+    # account non-interactively. The token is also accepted via $env:SETUP_DELEGATION_TOKEN;
+    # we pass it as -Token for a self-contained call.
     & powershell -ExecutionPolicy Bypass -File (Join-Path $Root 'scripts\install-client.ps1') `
-        -ConnectionCode $code -RecoveryPassphrase $RecoveryPw
-    if ($LASTEXITCODE -ne 0) { Die "install-client.ps1 failed ($LASTEXITCODE)" }
+        -ConnectionCode $srv.ConnCode -Token $srv.Token -RecoveryPassphrase $RecoveryPw
+    if ($LASTEXITCODE -ne 0) { Die "install-client.ps1 (offline-D5 ceremony) failed ($LASTEXITCODE)" }
 }
 
-function Run-Smoke([string]$code) {
+function Run-Smoke($srv) {
     Phase "Run live-smoke oracle"
-    $addr = ($code -split '#')[0]
+    # Only the addr:port matters to the oracle -- it reads the pinned server_cert.der +
+    # directory_pub.der from --client-dir/config, not from the connection-code fingerprint.
+    $addr = $srv.Addr
     $ip = ($addr -split ':')[0]
     $clientDir = Join-Path $Root 'dist\MaxSecuClient'
     $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
@@ -250,16 +322,18 @@ try {
         Phase "PASS $iter of $Iterations"
         Provision-Wsl
         Copy-Source
-        $code = Install-Server 'install'
-        Build-Client $code
-        Run-Smoke $code
+        $srv = Install-Server 'install'
+        Build-Client $srv
+        Confirm-EnrollmentOpen
+        Run-Smoke $srv
 
         Phase "Reset + reinstall path"
         Install-Server 'reset' | Out-Null
         & powershell -ExecutionPolicy Bypass -File (Join-Path $Root 'scripts\install-client.ps1') -Reset | Out-Null
-        $code2 = Install-Server 'install'
-        Build-Client $code2
-        Run-Smoke $code2
+        $srv2 = Install-Server 'install'
+        Build-Client $srv2
+        Confirm-EnrollmentOpen
+        Run-Smoke $srv2
 
         Teardown
     }

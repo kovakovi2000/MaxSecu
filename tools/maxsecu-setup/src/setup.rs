@@ -21,12 +21,18 @@ use zeroize::Zeroizing;
 
 use maxsecu_client_app::recovery_pin::canonical_pin;
 use maxsecu_client_app::transport::Transport;
-use maxsecu_client_core::{keyblob, password, Identity, ARGON2_DESKTOP_TARGET};
-use maxsecu_crypto::{deserialize_hybrid_wrap, unwrap_dek_hybrid, HybridEncSecretKey};
+use maxsecu_client_core::{keyblob, password, seedblob, Identity, ARGON2_DESKTOP_TARGET};
+use maxsecu_crypto::{
+    deserialize_hybrid_wrap, parse_delegation, pin_fingerprint, sign_delegation, unwrap_dek_hybrid,
+    HybridEncSecretKey, SigningKey,
+};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::{AuthProofContext, WrapContext};
 use maxsecu_encoding::types::{Bytes32, Id, Text, Timestamp};
 use maxsecu_encoding::RECOVERY_ID;
+
+/// The offline-D5 delegation window: 90 days (spec §2/§7).
+const DELEGATION_WINDOW_SECS: u64 = 90 * 86_400;
 
 /// Where each artifact landed + the recovery enc pubkey that was pinned/registered.
 #[derive(Debug, Clone)]
@@ -41,6 +47,51 @@ pub struct SetupReport {
     pub pin_out: PathBuf,
     /// First registration key (plaintext) path (`--first-key-out`).
     pub first_key_out: PathBuf,
+    /// The offline-D5 ceremony report, if the ceremony ran (a delegation token was
+    /// supplied). `None` for a legacy/no-ceremony run.
+    pub ceremony: Option<CeremonyReport>,
+}
+
+/// Outcome of the offline-D5 ceremony (spec §§6,7): the admin-minted user-facing
+/// connection code plus where the D5 custody artifacts landed.
+#[derive(Debug, Clone)]
+pub struct CeremonyReport {
+    /// The user-facing connection code `addr:port#pin_fingerprint(server_cert,
+    /// d5_pub)` (the inversion — the admin PC mints it, spec §6).
+    pub connection_code: String,
+    /// The pinned D5 (directory) public key, written to `directory_pub.der`.
+    pub d5_pub: [u8; 32],
+    /// Where the sealed at-rest D5 landed (`d5_key.blob`).
+    pub d5_out: PathBuf,
+    /// Where the D5 recovery backup landed (`d5_recovery.blob`, same passphrase as
+    /// `recovery_key.blob`).
+    pub d5_recovery_out: PathBuf,
+    /// Where the local `directory_pub.der` pin landed.
+    pub dir_pub_out: PathBuf,
+    /// The delegation window end (unix seconds).
+    pub valid_until: u64,
+}
+
+/// Inputs to the offline-D5 ceremony (spec §7). Present in [`SetupOpts::ceremony`]
+/// only for a Prod install; when absent, [`run`] does the legacy recovery-only
+/// bootstrap unchanged.
+pub struct CeremonyOpts {
+    /// The one-time bootstrap delegation token (printed by `install-server.sh`;
+    /// `SETUP_DELEGATION_TOKEN`). Burned by a successful `POST /bootstrap/delegation`.
+    pub token: Zeroizing<String>,
+    /// The pinned server cert DER bytes — hashed into the connection code and the
+    /// TLS pin. (Same bytes the pinned [`Transport`] was built from.)
+    pub server_cert: Vec<u8>,
+    /// The `addr:port` the connection code advertises (what a user dials). Defaults
+    /// to the dial target but may differ (e.g. a public address vs a local map).
+    pub connect_addr: String,
+    /// Sealed at-rest D5 output (`d5_key.blob`). Create-new; never clobbered.
+    pub d5_out: PathBuf,
+    /// D5 recovery backup output (`d5_recovery.blob`), sealed under the SAME setup
+    /// passphrase as `recovery_key.blob`. Create-new.
+    pub d5_recovery_out: PathBuf,
+    /// Local `directory_pub.der` pin output (the client's pinned D5). Create-new.
+    pub dir_pub_out: PathBuf,
 }
 
 /// Inputs to [`run`]. Paths must NOT already exist (fail-closed: never clobber a
@@ -50,8 +101,13 @@ pub struct SetupOpts {
     pub out: PathBuf,
     pub pin_out: PathBuf,
     pub first_key_out: PathBuf,
-    /// Passphrase that seals the recovery `local_key_blob`. Zeroized on drop.
+    /// Passphrase that seals the recovery `local_key_blob` AND (when the ceremony
+    /// runs) the D5 seed blobs — the only passphrase available at ceremony time.
+    /// Zeroized on drop.
     pub passphrase: Zeroizing<String>,
+    /// The offline-D5 ceremony inputs (spec §7). `Some` for a Prod install (a
+    /// delegation token was supplied); `None` for the legacy recovery-only path.
+    pub ceremony: Option<CeremonyOpts>,
 }
 
 /// Everything that can stop the bootstrap. [`SetupError::AlreadyRegistered`] is the
@@ -62,6 +118,17 @@ pub enum SetupError {
     /// `POST /v1/recovery/register` returned 409: the server already has a recovery
     /// account. NOTHING is written; the caller exits non-zero.
     AlreadyRegistered,
+    /// `POST /v1/bootstrap/delegation` returned 409 (NotAwaiting): the server is
+    /// ALREADY delegated. NOTHING is written — we refuse to generate a fresh
+    /// (mismatched) D5 or print a wrong connection code. Mirrors the
+    /// [`AlreadyRegistered`](Self::AlreadyRegistered) "already done" exit-3 posture.
+    AlreadyDelegated,
+    /// `POST /v1/bootstrap/delegation` returned 403: the one-time token was wrong.
+    /// NOTHING is written; re-runnable with the correct token.
+    DelegationBadToken,
+    /// `POST /v1/bootstrap/delegation` returned 400: the server rejected the cert
+    /// (bad signature / window / op-key). NOTHING is written.
+    DelegationBadCert,
     /// A pre-flight guard failed (output path already exists, weak passphrase) —
     /// caught BEFORE any network or key generation.
     Precheck(String),
@@ -79,6 +146,18 @@ impl fmt::Display for SetupError {
             SetupError::AlreadyRegistered => write!(
                 f,
                 "the server already has a recovery account registered (409); nothing was written"
+            ),
+            SetupError::AlreadyDelegated => write!(
+                f,
+                "the server is already delegated (bootstrap 409 NotAwaiting); nothing was written"
+            ),
+            SetupError::DelegationBadToken => write!(
+                f,
+                "the one-time delegation token was rejected (403); nothing was written"
+            ),
+            SetupError::DelegationBadCert => write!(
+                f,
+                "the server rejected the delegation certificate (400); nothing was written"
             ),
             SetupError::Precheck(m) => write!(f, "pre-flight check failed: {m}"),
             SetupError::Network(m) => write!(f, "network error: {m}"),
@@ -122,9 +201,32 @@ pub async fn run(t: &Transport, opts: &SetupOpts) -> Result<SetupReport, SetupEr
     let sealed = seal_recovery_blob(opts.passphrase.as_str(), &recovery)?;
     let pin = canonical_pin(&enc_pub, mlkem_pub.as_ref().map(|m| &m[..]));
 
+    // (2b) Offline-D5 ceremony pre-compute (pure CPU): generate the D5 root, seal it
+    // at rest AND into the recovery backup (both under the setup passphrase — the
+    // only one available), and precompute the connection code. Nothing is uploaded
+    // or written yet; the sealed blobs are held until the post-commit write. `None`
+    // when no delegation token was supplied (legacy recovery-only path).
+    let d5 = match &opts.ceremony {
+        Some(c) => Some(precompute_d5(opts.passphrase.as_str(), c)?),
+        None => None,
+    };
+
     // (3) One pinned-TLS connection for the whole flow: the recovery challenge/verify
     // are channel-bound to THIS connection's RFC-5705 exporter, so they must share it.
     let (mut conn, exporter) = open(t).await?;
+
+    // (3b) CEREMONY (spec §7: BEFORE the recovery-account setup). Fetch the server's
+    // operational key, sign the 90-day delegation over it with D5, and upload it with
+    // the one-time token. A successful POST burns the token (the point of no return
+    // for the ceremony). 403/409/400 → a clear error with NOTHING written; in
+    // particular a 409 (already delegated) stops us cold rather than minting a wrong
+    // connection code for a mismatched, freshly-generated D5.
+    let mut ceremony_valid_until = 0u64;
+    if let Some(c) = &opts.ceremony {
+        let d5 = d5.as_ref().expect("ceremony ⇒ d5 precomputed");
+        ceremony_valid_until =
+            upload_delegation(&mut conn, &opts.host, &c.token, &d5.d5, &d5.d5_pub).await?;
+    }
 
     // (4) Register the recovery PUBLIC keys. 409 → already registered → write nothing.
     register(&mut conn, &opts.host, &recovery).await?;
@@ -137,12 +239,12 @@ pub async fn run(t: &Transport, opts: &SetupOpts) -> Result<SetupReport, SetupEr
     // enrolls with it first becomes admin via the server's atomic first-admin claim.
     let first_key = mint_first_key(&mut conn, &opts.host, &token).await?;
 
-    // (7) Write the three cold artifacts — only now that register + mint committed.
-    // register/mint are IRREVERSIBLE (a re-run 409s), so a write failure here would
-    // otherwise strand the irreplaceable recovery key + first key. On ANY write error,
-    // dump an emergency recovery block to stderr before returning the error.
-    if let Err(e) = write_all_artifacts(opts, &sealed, &pin, first_key.as_str()) {
-        emergency_dump(&sealed, first_key.as_str());
+    // (7) Write the cold artifacts — only now that the delegation + register + mint
+    // committed. These commits are IRREVERSIBLE (a re-run 409s), so a write failure
+    // here would otherwise strand irreplaceable material. On ANY write error, dump an
+    // emergency recovery block (incl. the sealed D5) to stderr before returning.
+    if let Err(e) = write_all_artifacts(opts, &sealed, &pin, first_key.as_str(), d5.as_ref()) {
+        emergency_dump(&sealed, first_key.as_str(), d5.as_ref());
         return Err(e);
     }
     // `sealed` (Zeroizing<Vec<u8>>) is dropped/zeroized here on the success path.
@@ -153,6 +255,12 @@ pub async fn run(t: &Transport, opts: &SetupOpts) -> Result<SetupReport, SetupEr
         out: opts.out.clone(),
         pin_out: opts.pin_out.clone(),
         first_key_out: opts.first_key_out.clone(),
+        ceremony: d5.map(|d| {
+            d.report(
+                opts.ceremony.as_ref().expect("d5 ⇒ ceremony opts"),
+                ceremony_valid_until,
+            )
+        }),
     })
 }
 
@@ -161,7 +269,13 @@ pub async fn run(t: &Transport, opts: &SetupOpts) -> Result<SetupReport, SetupEr
 fn preflight(opts: &SetupOpts) -> Result<(), SetupError> {
     password::check(opts.passphrase.as_str())
         .map_err(|_| SetupError::Precheck("recovery seal passphrase is too weak".into()))?;
-    for p in [&opts.out, &opts.pin_out, &opts.first_key_out] {
+    let mut paths: Vec<&Path> = vec![&opts.out, &opts.pin_out, &opts.first_key_out];
+    if let Some(c) = &opts.ceremony {
+        paths.push(&c.d5_out);
+        paths.push(&c.d5_recovery_out);
+        paths.push(&c.dir_pub_out);
+    }
+    for p in paths {
         if p.exists() {
             return Err(SetupError::Precheck(format!(
                 "output path already exists (refusing to overwrite): {}",
@@ -170,6 +284,117 @@ fn preflight(opts: &SetupOpts) -> Result<(), SetupError> {
         }
     }
     Ok(())
+}
+
+// ---- offline-D5 ceremony ----
+
+/// The pre-computed, held-in-memory ceremony state: the D5 signing key (to sign the
+/// delegation once we learn the op-key), its public half, the two sealed D5 blobs
+/// (at-rest + backup, both under the setup passphrase), and the connection code.
+struct PrecomputedD5 {
+    d5: SigningKey,
+    d5_pub: [u8; 32],
+    /// Sealed at-rest D5 seed (`d5_key.blob`).
+    sealed_at_rest: Zeroizing<Vec<u8>>,
+    /// Sealed D5 seed backup (`d5_recovery.blob`), SAME passphrase as recovery.
+    sealed_backup: Zeroizing<Vec<u8>>,
+    /// `addr:port#pin_fingerprint(server_cert, d5_pub)`.
+    connection_code: String,
+}
+
+impl PrecomputedD5 {
+    fn report(&self, c: &CeremonyOpts, valid_until: u64) -> CeremonyReport {
+        CeremonyReport {
+            connection_code: self.connection_code.clone(),
+            d5_pub: self.d5_pub,
+            d5_out: c.d5_out.clone(),
+            d5_recovery_out: c.d5_recovery_out.clone(),
+            dir_pub_out: c.dir_pub_out.clone(),
+            valid_until,
+        }
+    }
+}
+
+/// Pure-CPU ceremony pre-compute: generate D5, seal it at rest + as a backup (both
+/// under `passphrase`), and derive the connection code from the pinned cert + D5
+/// pub. No network, no disk. A seal failure surfaces here (nothing committed).
+fn precompute_d5(passphrase: &str, c: &CeremonyOpts) -> Result<PrecomputedD5, SetupError> {
+    let d5 = SigningKey::generate();
+    let d5_pub = d5.verifying_key().to_bytes();
+    let seed = Zeroizing::new(d5.to_seed());
+    let sealed_at_rest = seedblob::seal_seed(passphrase, &seed, ARGON2_DESKTOP_TARGET)
+        .map_err(|_| SetupError::Io("could not seal the D5 key".into()))?;
+    // Fresh salt/nonce per seal → the backup differs byte-wise from the at-rest blob
+    // but recovers the SAME seed under the same passphrase.
+    let sealed_backup = seedblob::seal_seed(passphrase, &seed, ARGON2_DESKTOP_TARGET)
+        .map_err(|_| SetupError::Io("could not seal the D5 backup".into()))?;
+    let connection_code = format!(
+        "{}#{}",
+        c.connect_addr,
+        pin_fingerprint(&c.server_cert, &d5_pub)
+    );
+    Ok(PrecomputedD5 {
+        d5,
+        d5_pub,
+        sealed_at_rest: Zeroizing::new(sealed_at_rest),
+        sealed_backup: Zeroizing::new(sealed_backup),
+        connection_code,
+    })
+}
+
+/// The ceremony network step (spec §7): GET the server's operational public key,
+/// sign a fresh 90-day delegation over it with D5, and POST it with the one-time
+/// token. Maps the server's status codes to the typed ceremony errors.
+async fn upload_delegation(
+    conn: &mut SendRequest<Full<Bytes>>,
+    host: &str,
+    token: &str,
+    d5: &SigningKey,
+    d5_pub: &[u8; 32],
+) -> Result<u64, SetupError> {
+    // (a) operational key.
+    let (st, res) = get(conn, host, "/v1/bootstrap/operational-key").await?;
+    if st != StatusCode::OK {
+        return Err(SetupError::Protocol(format!(
+            "GET operational-key: unexpected status {st} \
+             (is the server running the delegation model?)"
+        )));
+    }
+    let op_pub: [u8; 32] = res["operational_pub_b64"]
+        .as_str()
+        .and_then(|s| B64.decode(s).ok())
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| {
+            SetupError::Protocol("operational-key: missing/bad operational_pub_b64".into())
+        })?;
+
+    // (b) sign the delegation over the op-key for [now, now+90d] (unix SECONDS).
+    let now = now_secs();
+    let valid_until = now + DELEGATION_WINDOW_SECS;
+    let cert = sign_delegation(d5, &op_pub, now, valid_until);
+
+    // (c) upload with the one-time token (TOFU-pins our D5 server-side).
+    let (st, _res) = post(
+        conn,
+        host,
+        "/v1/bootstrap/delegation",
+        serde_json::json!({
+            "token": token,
+            "directory_pub_b64": B64.encode(d5_pub),
+            "delegation_cert_b64": B64.encode(&cert),
+        }),
+        None,
+    )
+    .await?;
+    match st {
+        StatusCode::CREATED => Ok(valid_until),
+        StatusCode::FORBIDDEN => Err(SetupError::DelegationBadToken),
+        StatusCode::CONFLICT => Err(SetupError::AlreadyDelegated),
+        StatusCode::BAD_REQUEST => Err(SetupError::DelegationBadCert),
+        other => Err(SetupError::Protocol(format!(
+            "bootstrap delegation: unexpected status {other}"
+        ))),
+    }
 }
 
 // ---- HTTP over the pinned Transport (mirror demo-seed) ----
@@ -208,6 +433,35 @@ async fn post(
     }
     let req = b
         .body(Full::new(Bytes::from(body.to_string())))
+        .map_err(|e| SetupError::Network(e.to_string()))?;
+    let resp = s
+        .send_request(req)
+        .await
+        .map_err(|e| SetupError::Network(e.to_string()))?;
+    let st = resp.status();
+    let by = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| SetupError::Network(e.to_string()))?
+        .to_bytes();
+    Ok((st, parse_json(&by)))
+}
+
+/// `GET uri` over the pinned connection, returning `(status, json)`.
+async fn get(
+    s: &mut SendRequest<Full<Bytes>>,
+    host: &str,
+    uri: &str,
+) -> Result<(StatusCode, serde_json::Value), SetupError> {
+    s.ready()
+        .await
+        .map_err(|e| SetupError::Network(e.to_string()))?;
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("host", host)
+        .body(Full::new(Bytes::new()))
         .map_err(|e| SetupError::Network(e.to_string()))?;
     let resp = s
         .send_request(req)
@@ -388,17 +642,26 @@ fn seal_recovery_blob(passphrase: &str, id: &Identity) -> Result<Zeroizing<Vec<u
     Ok(Zeroizing::new(blob))
 }
 
-/// Write the three cold artifacts create-new. Called ONLY after register + mint have
-/// committed. On the first failure, returns the error (the caller then emergency-dumps).
+/// Write the cold artifacts create-new. Called ONLY after the delegation + register
+/// + mint have committed. When the ceremony ran, ALSO writes the three D5 custody
+/// artifacts (sealed at-rest D5, sealed backup, and the local `directory_pub.der`
+/// pin). On the first failure, returns the error (the caller then emergency-dumps).
 fn write_all_artifacts(
     opts: &SetupOpts,
     sealed: &[u8],
     pin: &[u8],
     first_key: &str,
+    d5: Option<&PrecomputedD5>,
 ) -> Result<(), SetupError> {
     write_new(&opts.out, sealed)?;
     write_new(&opts.pin_out, pin)?;
     write_new(&opts.first_key_out, first_key.as_bytes())?;
+    if let (Some(c), Some(d5)) = (&opts.ceremony, d5) {
+        // The pin the client trusts is the raw 32-byte D5 public key.
+        write_new(&c.dir_pub_out, &d5.d5_pub)?;
+        write_new(&c.d5_out, &d5.sealed_at_rest)?;
+        write_new(&c.d5_recovery_out, &d5.sealed_backup)?;
+    }
     Ok(())
 }
 
@@ -407,7 +670,7 @@ fn write_all_artifacts(
 /// a bootstrap secret dumped only because register/mint already committed and a re-run
 /// 409s. NEVER prints the passphrase or any bare private key. The pin is omitted (it is
 /// recomputable from the sealed blob).
-fn emergency_dump(sealed: &[u8], first_key: &str) {
+fn emergency_dump(sealed: &[u8], first_key: &str, d5: Option<&PrecomputedD5>) {
     let bar = "!".repeat(72);
     eprintln!();
     eprintln!("{bar}");
@@ -415,8 +678,8 @@ fn emergency_dump(sealed: &[u8], first_key: &str) {
     eprintln!("{bar}");
     eprintln!();
     eprintln!("The recovery account is REGISTERED and the first registration key is MINTED,");
-    eprintln!("but one or more artifact files could NOT be written to disk. These two values");
-    eprintln!("are IRREPLACEABLE and re-running this tool will 409. SAVE THEM NOW, BY HAND.");
+    eprintln!("but one or more artifact files could NOT be written to disk. These values are");
+    eprintln!("IRREPLACEABLE and re-running this tool will 409. SAVE THEM NOW, BY HAND.");
     eprintln!();
     eprintln!("--- SEALED RECOVERY KEY BLOB (base64; passphrase-encrypted, == the --out file) ---");
     eprintln!("Recreate with e.g.:  echo '<line-below>' | base64 -d > recovery_key_blob");
@@ -425,7 +688,20 @@ fn emergency_dump(sealed: &[u8], first_key: &str) {
     eprintln!("--- FIRST REGISTRATION KEY (bootstrap secret; whoever enrolls FIRST is admin) ---");
     eprintln!("{first_key}");
     eprintln!();
-    eprintln!("(The recovery_pin.bin is NOT dumped — it is recomputable from the sealed blob.)");
+    if let Some(d5) = d5 {
+        // The delegation is already installed server-side; the D5 root is now the
+        // directory authority. It is sealed under the setup passphrase, so it is
+        // safe-ish to print — losing it means clients can never be re-pinned.
+        eprintln!("--- SEALED D5 ROOT (base64; passphrase-encrypted, == the d5_key.blob file) ---");
+        eprintln!("Recreate with e.g.:  echo '<line-below>' | base64 -d > d5_key.blob");
+        eprintln!("{}", B64.encode(&d5.sealed_at_rest));
+        eprintln!();
+        eprintln!("--- CONNECTION CODE (public; hand this to users) ---");
+        eprintln!("{}", d5.connection_code);
+        eprintln!();
+    }
+    eprintln!("(The recovery_pin.bin + directory_pub.der are NOT dumped — recomputable from the");
+    eprintln!(" sealed blobs above.)");
     eprintln!("{bar}");
     eprintln!();
 }
@@ -479,4 +755,238 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+/// Unix SECONDS (the delegation window's unit).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+// ---- D5 restore (spec §7) ----
+
+/// Inputs to [`restore`]: rebuild the D5 custody + connection code on a NEW admin
+/// PC from the recovery backup. No network; no delegation upload (the server keeps
+/// the delegation it already has — the SAME directory root, so no client re-pin).
+pub struct RestoreOpts {
+    /// The recovery passphrase (the same one that sealed `d5_recovery.blob`).
+    pub passphrase: Zeroizing<String>,
+    /// The `d5_recovery.blob` backup to restore from (input; must exist).
+    pub d5_recovery_in: PathBuf,
+    /// The pinned server cert DER bytes (for the connection code + TLS pin).
+    pub server_cert: Vec<u8>,
+    /// The `addr:port` the connection code advertises.
+    pub connect_addr: String,
+    /// Where to write the re-established at-rest seal (`d5_key.blob`). Create-new.
+    pub d5_out: PathBuf,
+    /// Where to write the local `directory_pub.der` pin. Create-new.
+    pub dir_pub_out: PathBuf,
+}
+
+/// What [`restore`] produced.
+#[derive(Debug, Clone)]
+pub struct RestoreReport {
+    pub connection_code: String,
+    pub d5_pub: [u8; 32],
+    pub d5_out: PathBuf,
+    pub dir_pub_out: PathBuf,
+}
+
+/// Restore the offline-D5 root from the recovery backup onto a new admin PC (spec
+/// §7). Unseal the backup → re-derive `d5_pub` → write `directory_pub.der` +
+/// re-seal the at-rest `d5_key.blob` → print the SAME connection code. Does NOT
+/// re-run the delegation upload: the server already holds a valid delegation for
+/// this exact D5, so nothing needs to change server-side and no client re-pins.
+pub fn restore(opts: &RestoreOpts) -> Result<RestoreReport, SetupError> {
+    // Never clobber existing outputs (same fail-closed posture as `preflight`).
+    password::check(opts.passphrase.as_str())
+        .map_err(|_| SetupError::Precheck("recovery passphrase is too weak".into()))?;
+    for p in [&opts.d5_out, &opts.dir_pub_out] {
+        if p.exists() {
+            return Err(SetupError::Precheck(format!(
+                "output path already exists (refusing to overwrite): {}",
+                p.display()
+            )));
+        }
+    }
+    let backup = std::fs::read(&opts.d5_recovery_in).map_err(|e| {
+        SetupError::Io(format!(
+            "read D5 backup {}: {e}",
+            opts.d5_recovery_in.display()
+        ))
+    })?;
+    let seed = seedblob::unseal_seed(opts.passphrase.as_str(), &backup).map_err(|e| {
+        SetupError::Precheck(format!(
+            "could not unseal the D5 backup (wrong passphrase or corrupt file): {e}"
+        ))
+    })?;
+    let d5 = SigningKey::from_seed(&seed);
+    let d5_pub = d5.verifying_key().to_bytes();
+
+    // Re-establish the at-rest seal (fresh salt/nonce), then write both create-new.
+    let sealed_at_rest =
+        seedblob::seal_seed(opts.passphrase.as_str(), &seed, ARGON2_DESKTOP_TARGET)
+            .map_err(|_| SetupError::Io("could not re-seal the D5 key".into()))?;
+    write_new(&opts.dir_pub_out, &d5_pub)?;
+    write_new(&opts.d5_out, &sealed_at_rest)?;
+
+    let connection_code = format!(
+        "{}#{}",
+        opts.connect_addr,
+        pin_fingerprint(&opts.server_cert, &d5_pub)
+    );
+    Ok(RestoreReport {
+        connection_code,
+        d5_pub,
+        d5_out: opts.d5_out.clone(),
+        dir_pub_out: opts.dir_pub_out.clone(),
+    })
+}
+
+// ---- offline-D5 delegation renewal (spec §7 "Manual fallback") ----
+
+/// Inputs to [`renew`] — the robust, unattended `renew-delegation` path. All via
+/// arg/env for the install scripts. Both the D5 root AND the recovery key are
+/// sealed under the SAME `passphrase` (the recovery passphrase): the D5 SIGNS the
+/// fresh delegation, and the recovery identity LOGS IN to obtain the admin session
+/// that `POST /v1/admin/delegation` requires (the recovery principal is a
+/// bindingless admin, spec §6).
+pub struct RenewOpts {
+    /// TLS SNI + HTTP `Host` header (mirrors [`SetupOpts::host`]).
+    pub host: String,
+    /// The recovery passphrase; unseals BOTH the D5 blob and the recovery key blob.
+    /// Zeroized on drop.
+    pub passphrase: Zeroizing<String>,
+    /// The sealed at-rest D5 root (`d5_key.blob`) to sign the renewal with.
+    pub d5_in: PathBuf,
+    /// The sealed recovery key blob (`recovery_key.blob`) used to mint the admin
+    /// session (recovery-login). Same passphrase as `d5_in`.
+    pub recovery_in: PathBuf,
+    /// Renew regardless of the 21-day threshold (`--force`).
+    pub force: bool,
+}
+
+/// What [`renew`] did: a no-op (already outside the renew threshold) or a fresh
+/// 90-day delegation installed. Either is a SUCCESS (exit 0); only faults error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewOutcome {
+    /// Not within the 21-day threshold and `--force` not set — nothing changed.
+    NotDue { valid_until: u64 },
+    /// A fresh 90-day delegation was signed and installed. Carries the new
+    /// `valid_until` (unix seconds).
+    Renewed { valid_until: u64 },
+}
+
+/// Renew the directory delegation against `t` (a pinned-TLS transport). Unseal D5 +
+/// recovery → recovery-login → read the current `valid_until` → apply the 21-day
+/// threshold ([`is_due`]) → if due, sign a fresh 90-day delegation for the server's
+/// current operational key and push it via the admin-gated `POST /v1/admin/delegation`.
+///
+/// Fail-closed and non-destructive: NOTHING on disk is touched. A failure exits
+/// non-zero but corrupts nothing (the existing server-side delegation stands). A
+/// not-due run is a clean no-op.
+pub async fn renew(t: &Transport, opts: &RenewOpts) -> Result<RenewOutcome, SetupError> {
+    use maxsecu_client_app::commands::renew::{is_due, sign_renewal};
+
+    // (1) Unseal the D5 root (signer) and the recovery identity (admin login). Both
+    //     under the recovery passphrase. A wrong passphrase / corrupt blob fails
+    //     closed here, before any network — nothing is written, ever.
+    let d5_blob = std::fs::read(&opts.d5_in)
+        .map_err(|e| SetupError::Io(format!("read D5 blob {}: {e}", opts.d5_in.display())))?;
+    let seed = seedblob::unseal_seed(opts.passphrase.as_str(), &d5_blob).map_err(|e| {
+        SetupError::Precheck(format!(
+            "could not unseal the D5 key (wrong passphrase or corrupt file): {e}"
+        ))
+    })?;
+    let d5 = SigningKey::from_seed(&seed);
+
+    let rec_blob = std::fs::read(&opts.recovery_in).map_err(|e| {
+        SetupError::Io(format!(
+            "read recovery key blob {}: {e}",
+            opts.recovery_in.display()
+        ))
+    })?;
+    let recovery = keyblob::unlock(opts.passphrase.as_str(), &rec_blob).map_err(|e| {
+        SetupError::Precheck(format!(
+            "could not unseal the recovery key (wrong passphrase or corrupt file): {e}"
+        ))
+    })?;
+
+    // (2) One pinned-TLS connection: recovery-login is channel-bound, so the admin
+    //     session and the renewal POST must share it.
+    let (mut conn, exporter) = open(t).await?;
+    let token = recovery_login(&mut conn, &opts.host, &recovery, &exporter).await?;
+
+    // (3) Read the current delegation to learn valid_until (404 ⇒ nothing to renew).
+    let (st, doc) = get(&mut conn, &opts.host, "/v1/bootstrap/delegation").await?;
+    match st {
+        StatusCode::OK => {}
+        StatusCode::NOT_FOUND => {
+            return Err(SetupError::Protocol(
+                "the server holds no delegation to renew (awaiting bootstrap or legacy)".into(),
+            ))
+        }
+        other => {
+            return Err(SetupError::Protocol(format!(
+                "GET delegation: unexpected status {other}"
+            )))
+        }
+    }
+    let cert = doc["delegation_cert_b64"]
+        .as_str()
+        .and_then(|s| B64.decode(s).ok())
+        .ok_or_else(|| SetupError::Protocol("delegation doc missing/bad delegation_cert_b64".into()))?;
+    let valid_until = parse_delegation(&cert)
+        .map_err(|_| SetupError::Protocol("server sent a malformed delegation cert".into()))?
+        .valid_until();
+
+    // (4) Threshold. Not due (and not forced) ⇒ a clean no-op, exit 0.
+    let now = now_secs();
+    if !is_due(valid_until, now, opts.force) {
+        return Ok(RenewOutcome::NotDue { valid_until });
+    }
+
+    // (5) The server's current operational key — the renewal MUST authorize it (the
+    //     server rejects a delegation for any other op-key: op-rotation is out of scope).
+    let (st, res) = get(&mut conn, &opts.host, "/v1/bootstrap/operational-key").await?;
+    if st != StatusCode::OK {
+        return Err(SetupError::Protocol(format!(
+            "GET operational-key: unexpected status {st}"
+        )));
+    }
+    let op_pub: [u8; 32] = res["operational_pub_b64"]
+        .as_str()
+        .and_then(|s| B64.decode(s).ok())
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| {
+            SetupError::Protocol("operational-key: missing/bad operational_pub_b64".into())
+        })?;
+
+    // (6) Sign a fresh 90-day delegation and push it admin-authenticated.
+    let (renewal, new_valid_until) = sign_renewal(&d5, &op_pub, now);
+    let (st, _res) = post(
+        &mut conn,
+        &opts.host,
+        "/v1/admin/delegation",
+        serde_json::json!({ "delegation_cert_b64": B64.encode(&renewal) }),
+        Some(token.as_str()),
+    )
+    .await?;
+    match st {
+        StatusCode::OK => Ok(RenewOutcome::Renewed {
+            valid_until: new_valid_until,
+        }),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(SetupError::Protocol(
+            "admin authorization rejected by the server (401/403)".into(),
+        )),
+        StatusCode::CONFLICT => Err(SetupError::Protocol(
+            "the server is not delegated — nothing to renew (409)".into(),
+        )),
+        StatusCode::BAD_REQUEST => Err(SetupError::DelegationBadCert),
+        other => Err(SetupError::Protocol(format!(
+            "admin delegation renewal: unexpected status {other}"
+        ))),
+    }
 }

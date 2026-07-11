@@ -73,12 +73,14 @@ fn build_blobs(cfg: &LauncherConfig, layout: &Layout) -> std::io::Result<Arc<dyn
 }
 
 /// What [`prepare`] produces: a bound listener + TLS config + the composed
-/// (monomorphized) router, plus the pinned DEV directory key.
+/// (monomorphized) router, plus the pinned directory key **if known at startup**.
+/// In the Prod delegation model `directory_pub` is `None` while awaiting the
+/// admin's delegation (the D5 root originates on the admin PC, spec §6).
 pub struct Prepared {
     pub listener: TcpListener,
     pub server_config: Arc<ServerConfig>,
     pub router: axum::Router,
-    pub directory_pub: [u8; 32],
+    pub directory_pub: Option<[u8; 32]>,
     pub local_addr: std::net::SocketAddr,
 }
 
@@ -87,23 +89,29 @@ pub struct Prepared {
 /// listener. Reusable by the smoke test. DEV profile only. There is NO bootstrap
 /// secret — enrollment is registration-key-only (the first registrant is admin).
 pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
-    // Dev artifacts are identical on BOTH profiles: the persistent profile is a
-    // SECURITY-DEGRADED *persistent-DEV* (Postgres persistence + dev cert/D5),
-    // NOT the production ceremony profile (which additionally requires an injected
-    // non-self-signed cert + an external WORM/audit sink + the offline ceremony
-    // key). Only the Store backend differs: MemoryStore vs PgStore.
+    // Profiles differ in BOTH the Store backend AND the directory-authority model:
+    //   * Dev  (MemoryStore): SECURITY-DEGRADED dev-D5 — the dev-D5 both signs
+    //     bindings AND is the pinned root; enrollment is always open (no ceremony).
+    //   * Prod (PgStore): the offline-D5 delegation model — a short-lived
+    //     operational key signs bindings, the admin-held D5 root delegates it, and
+    //     enrollment is CLOSED until a valid delegation is installed (spec §§5,6).
     let layout = Layout::ensure(&cfg.data_dir)?;
     pki::ensure_dev_cert(&layout, cfg.public_addr.as_deref())?;
-    let directory_pub = bootstrap::ensure_dev_d5(&layout)?;
-    // The server is the enrollment authority (§5, T4): it signs enrollment
-    // bindings with the DEV D5 key (the private half of `directory_pub`). The
-    // seed never leaves this process (DEV-only; production signs offline).
-    let dir_signer = Arc::new(maxsecu_crypto::SigningKey::from_seed(
-        &bootstrap::dev_d5_seed(&layout)?,
-    ));
+
+    // Per-profile directory-authority wiring (dir_signer + delegation ctx + the
+    // pinned D5 if known at startup). Dev self-generates the dev-D5; Prod never
+    // generates a D5 (the root is admin-supplied through the ceremony).
+    let wiring = match cfg.profile {
+        Profile::Dev => crate::delegation_setup::build_dev(&layout)?,
+        Profile::Prod => crate::delegation_setup::build_prod(&layout)?,
+    };
+    let directory_pub = wiring.directory_pub;
 
     let server_config = pki::load_server_config(&layout)?;
-    let auth_cfg = AuthConfig::default().with_directory_pub(directory_pub);
+    let mut auth_cfg = AuthConfig::default();
+    if let Some(dp) = directory_pub {
+        auth_cfg = auth_cfg.with_directory_pub(dp);
+    }
     let blobs = build_blobs(cfg, &layout)?;
 
     // Compose the router over the profile's Store. Each branch builds a distinct
@@ -113,7 +121,9 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
         Profile::Dev => {
             let state = AppState {
                 auth: Arc::new(
-                    AuthService::new(MemoryStore::new(), auth_cfg).with_dir_signer(dir_signer),
+                    AuthService::new(MemoryStore::new(), auth_cfg)
+                        .with_dir_signer(wiring.dir_signer.clone())
+                        .with_delegation(wiring.ctx.clone()),
                 ),
                 blobs,
                 audit: Arc::new(NullAuditSink),
@@ -134,7 +144,9 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
                 .map_err(|e| std::io::Error::other(format!("postgres connect: {e}")))?;
             let state = AppState {
                 auth: Arc::new(
-                    AuthService::new(PgStore::new(pool), auth_cfg).with_dir_signer(dir_signer),
+                    AuthService::new(PgStore::new(pool), auth_cfg)
+                        .with_dir_signer(wiring.dir_signer.clone())
+                        .with_delegation(wiring.ctx.clone()),
                 ),
                 blobs,
                 audit: Arc::new(NullAuditSink),
@@ -145,17 +157,19 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
         }
     };
 
-    // In-band pin bootstrap (design 2026-07-10 §2): export the two PUBLIC pins so
-    // the files exist here in `prepare`, read them back, and merge a router that
-    // serves those exact bytes over `GET /v1/bootstrap/pins`. `run::run` also
-    // exports the pins (idempotent copy) — doing it here too makes `prepare`
-    // self-contained for the smoke test and guarantees the served bytes are
-    // byte-identical to `client-pins/*.der`.
+    // In-band pin bootstrap (design 2026-07-10 §2): serve the PUBLIC pins over
+    // `GET /v1/bootstrap/pins`. The cert pin is always present; the directory pin is
+    // present once a directory_pub is known (Dev: always; Prod: only once
+    // delegated — empty while awaiting, since the D5 originates on the admin PC).
     let client_pins = cfg.data_dir.join("client-pins");
     pki::export_client_pin(&layout, &client_pins)?;
-    bootstrap::export_client_pin_d5(&layout, &client_pins)?;
     let cert_bytes = std::fs::read(client_pins.join("server_cert.der"))?;
-    let dir_bytes = std::fs::read(client_pins.join("directory_pub.der"))?;
+    let dir_bytes = if directory_pub.is_some() {
+        bootstrap::export_client_pin_d5(&layout, &client_pins)?;
+        std::fs::read(client_pins.join("directory_pub.der"))?
+    } else {
+        Vec::new() // awaiting delegation — no directory pin to serve yet
+    };
     let app_router = app_router.merge(crate::bootstrap_pins::router(cert_bytes, dir_bytes));
 
     let listener = TcpListener::bind((cfg.bind.as_str(), cfg.port)).await?;
@@ -175,34 +189,86 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
 pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
     let prepared = prepare(&cfg).await?;
     let layout = Layout::ensure(&cfg.data_dir)?;
-    // Export the client pins (cert + D5 pubkey) into a convenience dir the operator
-    // copies into the client's `config/` for the auto-connect scenario.
+    // Export the client cert pin into a convenience dir the operator copies into the
+    // client's `config/`. The D5 pin is exported per-profile below (Prod serves it
+    // only once delegated).
     let client_pins = cfg.data_dir.join("client-pins");
     pki::export_client_pin(&layout, &client_pins)?;
-    bootstrap::export_client_pin_d5(&layout, &client_pins)?;
-
-    // Connection code (design 2026-07-10 §3): the operator copies this by hand
-    // into `install-client`. The fingerprint commits to the exact pin bytes; the
-    // address half is untrusted transport info. Computed from the same
-    // `client-pins/*.der` the bootstrap endpoint serves, so they always agree.
     let cert_pin = std::fs::read(client_pins.join("server_cert.der"))?;
-    let dir_pin = std::fs::read(client_pins.join("directory_pub.der"))?;
-    let fp = maxsecu_crypto::pin_fingerprint(&cert_pin, &dir_pin);
     let code_addr = cfg.public_addr.as_deref().unwrap_or("127.0.0.1");
-    eprintln!("  connection code: {code_addr}:{}#{fp}", cfg.port);
 
-    let profile_label = match cfg.profile {
-        Profile::Dev => "DEV / ephemeral MemoryStore",
-        Profile::Prod => "persistent-DEV / Postgres (SECURITY-DEGRADED dev cert+D5)",
-    };
-    eprintln!(
-        "maxsecu-portable-server ({profile_label}) listening on https://{}",
-        prepared.local_addr
-    );
-    eprintln!(
-        "  client pins (copy into the client's config/): {}",
-        client_pins.display()
-    );
+    match cfg.profile {
+        Profile::Dev => {
+            // Dev banner is UNCHANGED (invariant 10): self-generated dev-D5, always
+            // open enrollment, no ceremony. Connection code = fp(cert, dev-D5 pub).
+            bootstrap::export_client_pin_d5(&layout, &client_pins)?;
+            let dir_pin = std::fs::read(client_pins.join("directory_pub.der"))?;
+            let fp = maxsecu_crypto::pin_fingerprint(&cert_pin, &dir_pin);
+            eprintln!("  connection code: {code_addr}:{}#{fp}", cfg.port);
+            eprintln!(
+                "maxsecu-portable-server (DEV / ephemeral MemoryStore) listening on https://{}",
+                prepared.local_addr
+            );
+            eprintln!(
+                "  client pins (copy into the client's config/): {}",
+                client_pins.display()
+            );
+            if let Some(dp) = prepared.directory_pub {
+                eprintln!(
+                    "  pinned D5 (DEV ONLY — replace with the offline ceremony key in production): {}",
+                    hex(&dp)
+                );
+            }
+        }
+        Profile::Prod => {
+            // Prod: offline-D5 delegation model. The `dev cert` label becomes
+            // `pinned self-signed cert`; the SECURITY-DEGRADED dev+D5 / DEV-ONLY
+            // lines are gone (invariant 9).
+            eprintln!(
+                "maxsecu-portable-server (Postgres / pinned self-signed cert) listening on https://{}",
+                prepared.local_addr
+            );
+            eprintln!(
+                "  client pins (copy into the client's config/): {}",
+                client_pins.display()
+            );
+            match prepared.directory_pub {
+                // Awaiting: the D5 root originates on the admin PC (spec §6), so we
+                // cannot compute the final connection code. Print the cert-only
+                // fingerprint (for the ceremony's TLS pinning) + the one-time token.
+                None => {
+                    let cert_fp = maxsecu_crypto::pin_fingerprint(&cert_pin, &[]);
+                    let token =
+                        std::fs::read_to_string(layout.bootstrap_token_path()).unwrap_or_default();
+                    eprintln!("  directory: AWAITING DELEGATION (enrollment closed)");
+                    eprintln!("  server address: {code_addr}:{}", cfg.port);
+                    eprintln!("  server-cert fingerprint: {cert_fp}");
+                    eprintln!("  one-time delegation token: {}", token.trim());
+                    eprintln!(
+                        "    run the ceremony from the admin PC (install-client / maxsecu-setup)"
+                    );
+                    eprintln!(
+                        "    with this address + fingerprint + token to install the delegation."
+                    );
+                }
+                // Delegated (loaded across a restart): print the full connection code
+                // and the current window's expiry.
+                Some(_dp) => {
+                    bootstrap::export_client_pin_d5(&layout, &client_pins)?;
+                    let dir_pin = std::fs::read(client_pins.join("directory_pub.der"))?;
+                    let fp = maxsecu_crypto::pin_fingerprint(&cert_pin, &dir_pin);
+                    let until = std::fs::read(layout.d5_delegation_path())
+                        .ok()
+                        .and_then(|b| maxsecu_crypto::parse_delegation(&b).ok())
+                        .map(|d| fmt_utc_date(d.valid_until()))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    eprintln!("  directory: delegated (valid until {until})");
+                    eprintln!("  connection code: {code_addr}:{}#{fp}", cfg.port);
+                }
+            }
+        }
+    }
+
     // Cold-tier offload mode — never prints the Dropbox token, only its root.
     let tier_label = match &cfg.cold_tier {
         ColdTierCfg::Off => "off (local only)".to_owned(),
@@ -221,10 +287,6 @@ pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
             "off"
         }
     );
-    eprintln!(
-        "  pinned D5 (DEV ONLY — replace with the offline ceremony key in production): {}",
-        hex(&prepared.directory_pub)
-    );
     // Enrollment model (T4/T14): NO bootstrap secret. Recovery registration is OPEN
     // on a fresh server and CLOSES (409) once used; enrollment is registration-key
     // only — the first account to enroll with a key becomes admin.
@@ -241,4 +303,23 @@ pub async fn run(cfg: LauncherConfig) -> std::io::Result<()> {
 /// Lowercase hex of a byte slice (for printing the pinned D5 key).
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Format a unix-seconds instant as a `YYYY-MM-DD UTC` calendar date for the
+/// human-facing banner (no external date crate). Uses Howard Hinnant's
+/// `civil_from_days` algorithm.
+fn fmt_utc_date(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64;
+    // Shift to a March-based year to make leap handling branch-free.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02} UTC")
 }

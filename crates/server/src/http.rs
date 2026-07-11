@@ -80,6 +80,16 @@ pub fn router<S: Store + 'static>(state: AppState<S>) -> Router {
     Router::new()
         .route("/v1/users", post(register::<S>))
         .route("/v1/registration-keys", post(mint_registration_key::<S>))
+        // Offline-D5 ceremony + delegation (spec §§5,6,8).
+        .route(
+            "/v1/bootstrap/operational-key",
+            get(bootstrap_operational_key::<S>),
+        )
+        .route(
+            "/v1/bootstrap/delegation",
+            get(get_delegation_doc::<S>).post(post_bootstrap_delegation::<S>),
+        )
+        .route("/v1/admin/delegation", post(post_admin_delegation::<S>))
         .route("/v1/recovery/register", post(recovery_register::<S>))
         .route("/v1/recovery/pubkey", get(recovery_pubkey::<S>))
         .route("/v1/recovery/challenge", post(recovery_challenge::<S>))
@@ -264,6 +274,13 @@ async fn register<S: Store>(
     let Some(signer) = st.auth.dir_signer() else {
         return StatusCode::FORBIDDEN.into_response(); // enrollment signing disabled
     };
+    // Offline-D5 gate (invariant 1): in the Prod delegation model, enrollment is
+    // CLOSED unless a currently-valid delegation is installed — re-checked here
+    // with the live clock so it auto-re-closes after `valid_until`. Dev / legacy
+    // paths are always open. `now_ms/1000` = unix seconds (delegation windows).
+    if !st.auth.enrollment_open(now_ms() / 1000) {
+        return StatusCode::FORBIDDEN.into_response(); // awaiting / expired delegation
+    }
 
     // (2) The server assigns the id, then signs BOTH role variants for it (pure).
     // The atomic `enroll` stores exactly the one that matches its first-admin
@@ -383,6 +400,140 @@ async fn mint_registration_key<S: Store + 'static>(
         )
             .into_response(),
         Err(e) => internal_error(e),
+    }
+}
+
+// ---- Offline-D5 delegation ceremony + renewal (spec §§5,6,8) ----
+
+#[derive(Serialize)]
+struct OperationalKeyRes {
+    /// STANDARD base64 of the server's 32-byte operational (binding-signing)
+    /// Ed25519 public key — the admin signs the delegation cert over this.
+    operational_pub_b64: String,
+}
+
+/// `GET /v1/bootstrap/operational-key` — return the server's operational public
+/// key so the admin PC can sign a delegation over it (spec §5). Works while
+/// awaiting. `404` when the delegation model is not active (legacy path).
+async fn bootstrap_operational_key<S: Store>(State(st): State<AppState<S>>) -> Response {
+    match st.auth.delegation() {
+        Some(ctx) => Json(OperationalKeyRes {
+            operational_pub_b64: b64encode(&ctx.operational_pub()),
+        })
+        .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct DelegationDocRes {
+    /// STANDARD base64 of the pinned D5 (directory) public key.
+    directory_pub_b64: String,
+    /// STANDARD base64 of the 113-byte delegation cert wire form.
+    delegation_cert_b64: String,
+}
+
+/// `GET /v1/bootstrap/delegation` — serve the currently-installed
+/// `{directory_pub, delegation_cert}` so a client can perform its verify-hop
+/// (spec §7). `404` while awaiting (no delegation yet).
+async fn get_delegation_doc<S: Store>(State(st): State<AppState<S>>) -> Response {
+    match st.auth.delegation().and_then(|c| c.current()) {
+        Some((dir, cert)) => Json(DelegationDocRes {
+            directory_pub_b64: b64encode(&dir),
+            delegation_cert_b64: b64encode(&cert),
+        })
+        .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct BootstrapDelegationReq {
+    /// The one-time bootstrap token (printed by `install-server.sh`).
+    token: String,
+    /// STANDARD base64 of the admin's 32-byte D5 public key (TOFU-pinned here).
+    directory_pub_b64: String,
+    /// STANDARD base64 of the 113-byte delegation cert the admin signed.
+    delegation_cert_b64: String,
+}
+
+#[derive(Serialize)]
+struct DelegationInstalledRes {
+    /// `"delegated"` (bootstrap) or `"renewed"` (admin renewal).
+    status: &'static str,
+    /// The delegation window's `valid_until` (unix seconds).
+    valid_until: u64,
+}
+
+/// `POST /v1/bootstrap/delegation` — one-time-token-gated ceremony install (spec
+/// §6). Verifies the cert against the POSTED D5 pub (TOFU), requires the extracted
+/// `operational_pub` to equal the server's own and a sane window, then pins the D5,
+/// installs the delegation, OPENS enrollment, and BURNS the token. Any verification
+/// failure leaves the server AWAITING. `201` on success; `403` bad token; `409`
+/// not awaiting (already delegated / burned); `400` malformed/invalid cert; `404`
+/// when the delegation model is not active.
+async fn post_bootstrap_delegation<S: Store>(
+    State(st): State<AppState<S>>,
+    Json(req): Json<BootstrapDelegationReq>,
+) -> Response {
+    let Some(ctx) = st.auth.delegation() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(dir_pub) = b64_fixed::<32>(&req.directory_pub_b64) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(cert) = B64.decode(&req.delegation_cert_b64) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match ctx.install_bootstrap(&req.token, dir_pub, &cert, now_ms() / 1000) {
+        crate::delegation::BootstrapResult::Ok { valid_until } => (
+            StatusCode::CREATED,
+            Json(DelegationInstalledRes {
+                status: "delegated",
+                valid_until,
+            }),
+        )
+            .into_response(),
+        crate::delegation::BootstrapResult::NotAwaiting => StatusCode::CONFLICT.into_response(),
+        crate::delegation::BootstrapResult::BadToken => StatusCode::FORBIDDEN.into_response(),
+        crate::delegation::BootstrapResult::BadCert => StatusCode::BAD_REQUEST.into_response(),
+        crate::delegation::BootstrapResult::Persist(e) => internal_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AdminDelegationReq {
+    /// STANDARD base64 of the 113-byte replacement delegation cert.
+    delegation_cert_b64: String,
+}
+
+/// `POST /v1/admin/delegation` — admin-authenticated renewal (spec §6). Verifies a
+/// fresh cert against the ALREADY-pinned D5, requires the extracted
+/// `operational_pub` to equal the current one (op-key rotation is out of scope),
+/// then replaces the stored delegation. Does NOT change the pinned D5. `200` on
+/// success; `409` while awaiting (nothing to renew); `400` invalid cert; `404`
+/// when the delegation model is not active. The `AdminSession` extractor supplies
+/// `401`/`403` for auth failures.
+async fn post_admin_delegation<S: Store + 'static>(
+    State(st): State<AppState<S>>,
+    _admin: AdminSession,
+    Json(req): Json<AdminDelegationReq>,
+) -> Response {
+    let Some(ctx) = st.auth.delegation() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(cert) = B64.decode(&req.delegation_cert_b64) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match ctx.install_renewal(&cert, now_ms() / 1000) {
+        crate::delegation::RenewResult::Ok { valid_until } => Json(DelegationInstalledRes {
+            status: "renewed",
+            valid_until,
+        })
+        .into_response(),
+        crate::delegation::RenewResult::NotDelegated => StatusCode::CONFLICT.into_response(),
+        crate::delegation::RenewResult::BadCert => StatusCode::BAD_REQUEST.into_response(),
+        crate::delegation::RenewResult::Persist(e) => internal_error(e),
     }
 }
 
@@ -1928,9 +2079,12 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AdminSession {
         if user_id == maxsecu_encoding::RECOVERY_ID.0 {
             return Ok(AdminSession { user_id, token });
         }
-        // Normal user admin path — unchanged.
-        let Some(dir_pub) = state.auth.directory_pub() else {
-            return Err(StatusCode::FORBIDDEN); // admin authz disabled (no pinned D5)
+        // Normal user admin path. Admin bindings are verified against the key that
+        // SIGNS enrollment bindings (invariant 2): in the Prod delegation model that
+        // is the operational key; in Dev/legacy it is the pinned `directory_pub`
+        // (byte-identical, since there the binding signer's pub IS `directory_pub`).
+        let Some(dir_pub) = state.auth.binding_verify_pub() else {
+            return Err(StatusCode::FORBIDDEN); // admin authz disabled (no binding key)
         };
         let stored = state
             .auth
@@ -3854,5 +4008,331 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ---- Offline-D5 delegation ceremony + renewal (spec §§5,6) ----
+
+    const DAY: u64 = 86_400;
+
+    fn now_secs() -> u64 {
+        now_ms() / 1000
+    }
+
+    /// A Prod-delegation app over a fresh store seeded with the admin registration
+    /// key `adminkey`. `dir_signer` = the operational key, so enrollment bindings
+    /// are signed by it and `AdminSession` verifies admin bindings against it
+    /// (invariant 2). The delegation `ctx` drives the enrollment gate (invariant 1).
+    fn prod_app(
+        ctx: Arc<crate::delegation::DelegationCtx>,
+        op: Arc<SigningKey>,
+        dir_pub: [u8; 32],
+    ) -> Router {
+        let store = MemoryStore::new();
+        store.add_reg_key(sha256(b"adminkey"));
+        let state = AppState {
+            auth: Arc::new(
+                AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                    .with_dir_signer(op)
+                    .with_delegation(ctx),
+            ),
+            blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
+            max_file_bytes: None,
+        };
+        router(state).layer(Extension(TlsExporter(EXPORTER)))
+    }
+
+    async fn register_admin(router: &Router) -> (SigningKey, StatusCode) {
+        let sk = SigningKey::generate();
+        let (st, _) = post_json(
+            router,
+            "/v1/users",
+            serde_json::json!({
+                "username": "admin",
+                "enc_pub_b64": b64encode(&[0xE1u8; 32]),
+                "sig_pub_b64": b64encode(&sk.verifying_key().to_bytes()),
+                "registration_key": "adminkey",
+            }),
+        )
+        .await;
+        (sk, st)
+    }
+
+    async fn login_token(router: &Router, username: &str, sk: &SigningKey) -> String {
+        let (_st, ch) = post_json(
+            router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": username }),
+        )
+        .await;
+        let nonce = b64_fixed::<32>(ch["nonce_b64"].as_str().unwrap()).unwrap();
+        let server_id = ch["server_id"].as_str().unwrap();
+        let ts = 1_719_500_000_000u64;
+        let proof = make_proof(sk, server_id, &EXPORTER, &nonce, ts);
+        let (_st, res) = post_json(
+            router,
+            "/v1/session/proof",
+            serde_json::json!({ "username": username, "timestamp": ts, "proof_b64": proof }),
+        )
+        .await;
+        res["session_token"].as_str().unwrap().to_owned()
+    }
+
+    async fn post_auth_empty(router: &Router, uri: &str, token: &str) -> StatusCode {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(AUTHORIZATION, format!("MaxSecu-Session {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn post_admin_delegation(
+        router: &Router,
+        token: Option<&str>,
+        cert: &[u8],
+    ) -> StatusCode {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/v1/admin/delegation")
+            .header("content-type", "application/json");
+        if let Some(t) = token {
+            b = b.header(AUTHORIZATION, format!("MaxSecu-Session {t}"));
+        }
+        let body = serde_json::json!({ "delegation_cert_b64": b64encode(cert) });
+        router
+            .clone()
+            .oneshot(b.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn post_bootstrap(
+        router: &Router,
+        token: &str,
+        dir_pub: &[u8; 32],
+        cert: &[u8],
+    ) -> (StatusCode, serde_json::Value) {
+        post_json(
+            router,
+            "/v1/bootstrap/delegation",
+            serde_json::json!({
+                "token": token,
+                "directory_pub_b64": b64encode(dir_pub),
+                "delegation_cert_b64": b64encode(cert),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn awaiting_prod_closes_enrollment_then_bootstrap_opens_and_admin_verifies() {
+        let d5 = SigningKey::from_seed(&[1u8; 32]);
+        let d5_pub = d5.verifying_key().to_bytes();
+        let op = Arc::new(SigningKey::from_seed(&[7u8; 32]));
+        let op_pub = op.verifying_key().to_bytes();
+        let ctx = Arc::new(crate::delegation::DelegationCtx::prod(
+            op_pub,
+            None,
+            Some(sha256(b"boot-token")),
+            Arc::new(crate::delegation::NullDelegationPersist),
+        ));
+        let router = prod_app(ctx, op.clone(), d5_pub);
+
+        // Awaiting ⇒ enrollment closed (invariant 1).
+        let (_sk, st) = register_admin(&router).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+
+        // GET operational-key works while awaiting (invariant 5) and returns our pub.
+        let (st, body) = get_json(&router, "/v1/bootstrap/operational-key").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            b64_fixed::<32>(body["operational_pub_b64"].as_str().unwrap()).unwrap(),
+            op_pub
+        );
+
+        // Valid bootstrap ⇒ 201, enrollment opens, token burned (invariant 6).
+        let now = now_secs();
+        let cert = maxsecu_crypto::sign_delegation(&d5, &op_pub, now - 3600, now + 80 * DAY);
+        let (st, body) = post_bootstrap(&router, "boot-token", &d5_pub, &cert).await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(body["status"], "delegated");
+        assert_eq!(body["valid_until"].as_u64().unwrap(), now + 80 * DAY);
+
+        // Enrollment now open: first registrant becomes admin.
+        let (sk, st) = register_admin(&router).await;
+        assert_eq!(st, StatusCode::CREATED);
+
+        // Login + an AdminSession-gated action succeeds — proves the server-signed
+        // binding verifies against the OPERATIONAL pub (invariant 2).
+        let token = login_token(&router, "admin", &sk).await;
+        assert_eq!(
+            post_auth_empty(&router, "/v1/registration-keys", &token).await,
+            StatusCode::CREATED
+        );
+
+        // Second bootstrap ⇒ 409 (token burned / already delegated).
+        let (st, _) = post_bootstrap(&router, "boot-token", &d5_pub, &cert).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn bad_bootstrap_is_rejected_and_stays_awaiting() {
+        let d5 = SigningKey::from_seed(&[1u8; 32]);
+        let d5_pub = d5.verifying_key().to_bytes();
+        let op = Arc::new(SigningKey::from_seed(&[7u8; 32]));
+        let op_pub = op.verifying_key().to_bytes();
+        let ctx = Arc::new(crate::delegation::DelegationCtx::prod(
+            op_pub,
+            None,
+            Some(sha256(b"tok")),
+            Arc::new(crate::delegation::NullDelegationPersist),
+        ));
+        let router = prod_app(ctx, op.clone(), d5_pub);
+        let now = now_secs();
+
+        // Wrong signer (op signs instead of d5) ⇒ 400.
+        let wrong = maxsecu_crypto::sign_delegation(&op, &op_pub, now - 60, now + DAY);
+        assert_eq!(
+            post_bootstrap(&router, "tok", &d5_pub, &wrong).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        // Bad token ⇒ 403.
+        let good = maxsecu_crypto::sign_delegation(&d5, &op_pub, now - 60, now + DAY);
+        assert_eq!(
+            post_bootstrap(&router, "WRONG", &d5_pub, &good).await.0,
+            StatusCode::FORBIDDEN
+        );
+        // Past (expired) window ⇒ 400 (delegation verify window failure).
+        let past = maxsecu_crypto::sign_delegation(&d5, &op_pub, now - 10 * DAY, now - DAY);
+        assert_eq!(
+            post_bootstrap(&router, "tok", &d5_pub, &past).await.0,
+            StatusCode::BAD_REQUEST
+        );
+
+        // Still awaiting: enrollment closed, delegation doc 404.
+        assert_eq!(register_admin(&router).await.1, StatusCode::FORBIDDEN);
+        assert_eq!(
+            get_json(&router, "/v1/bootstrap/delegation").await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        // A valid bootstrap then still works (the token was never burned).
+        assert_eq!(
+            post_bootstrap(&router, "tok", &d5_pub, &good).await.0,
+            StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_delegation_recloses_but_valid_one_stays_open() {
+        let d5 = SigningKey::from_seed(&[1u8; 32]);
+        let d5_pub = d5.verifying_key().to_bytes();
+        let op = Arc::new(SigningKey::from_seed(&[7u8; 32]));
+        let op_pub = op.verifying_key().to_bytes();
+        let now = now_secs();
+
+        // Pre-installed but EXPIRED delegation ⇒ enrollment closed (invariant 1).
+        let expired = maxsecu_crypto::sign_delegation(&d5, &op_pub, now - 100 * DAY, now - DAY);
+        let closed = prod_app(
+            Arc::new(crate::delegation::DelegationCtx::prod(
+                op_pub,
+                Some((d5_pub, expired)),
+                None,
+                Arc::new(crate::delegation::NullDelegationPersist),
+            )),
+            op.clone(),
+            d5_pub,
+        );
+        assert_eq!(register_admin(&closed).await.1, StatusCode::FORBIDDEN);
+
+        // A currently-valid delegation ⇒ enrollment open.
+        let valid = maxsecu_crypto::sign_delegation(&d5, &op_pub, now - DAY, now + 80 * DAY);
+        let open = prod_app(
+            Arc::new(crate::delegation::DelegationCtx::prod(
+                op_pub,
+                Some((d5_pub, valid)),
+                None,
+                Arc::new(crate::delegation::NullDelegationPersist),
+            )),
+            op,
+            d5_pub,
+        );
+        assert_eq!(register_admin(&open).await.1, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn admin_delegation_renewal_requires_admin_and_replaces_cert() {
+        let d5 = SigningKey::from_seed(&[1u8; 32]);
+        let d5_pub = d5.verifying_key().to_bytes();
+        let op = Arc::new(SigningKey::from_seed(&[7u8; 32]));
+        let op_pub = op.verifying_key().to_bytes();
+        let now = now_secs();
+        let initial = maxsecu_crypto::sign_delegation(&d5, &op_pub, now - DAY, now + DAY);
+        let ctx = Arc::new(crate::delegation::DelegationCtx::prod(
+            op_pub,
+            Some((d5_pub, initial)),
+            None,
+            Arc::new(crate::delegation::NullDelegationPersist),
+        ));
+        let router = prod_app(ctx, op.clone(), d5_pub);
+
+        // Without admin auth ⇒ 401 (AdminSession rejects before the body is read).
+        let renewal = maxsecu_crypto::sign_delegation(&d5, &op_pub, now - DAY, now + 80 * DAY);
+        assert_eq!(
+            post_admin_delegation(&router, None, &renewal).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Enroll + login an admin (enrollment is open — the delegation is valid).
+        let (sk, st) = register_admin(&router).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let token = login_token(&router, "admin", &sk).await;
+
+        // Valid renewal ⇒ 200; the served delegation doc updates, pinned D5 unchanged.
+        assert_eq!(
+            post_admin_delegation(&router, Some(&token), &renewal).await,
+            StatusCode::OK
+        );
+        let (st, body) = get_json(&router, "/v1/bootstrap/delegation").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            B64.decode(body["delegation_cert_b64"].as_str().unwrap())
+                .unwrap(),
+            renewal
+        );
+        assert_eq!(
+            b64_fixed::<32>(body["directory_pub_b64"].as_str().unwrap()).unwrap(),
+            d5_pub
+        );
+
+        // Op-key rotation (cert for a DIFFERENT op pub) ⇒ 400 (out of scope).
+        let other_op = SigningKey::from_seed(&[9u8; 32]).verifying_key().to_bytes();
+        let rotate = maxsecu_crypto::sign_delegation(&d5, &other_op, now - DAY, now + DAY);
+        assert_eq!(
+            post_admin_delegation(&router, Some(&token), &rotate).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_profile_enrollment_open_without_ceremony() {
+        // Dev: self-issued dev delegation (dev-D5 → dev-D5); operational == pinned;
+        // enrollment is open with NO ceremony (invariant 10).
+        let d5 = SigningKey::from_seed(&[1u8; 32]);
+        let d5_pub = d5.verifying_key().to_bytes();
+        let cert = maxsecu_crypto::sign_delegation(&d5, &d5_pub, 0, 4_102_444_800);
+        let ctx = Arc::new(crate::delegation::DelegationCtx::dev(d5_pub, cert));
+        let router = prod_app(ctx, Arc::new(d5), d5_pub);
+        assert_eq!(register_admin(&router).await.1, StatusCode::CREATED);
     }
 }

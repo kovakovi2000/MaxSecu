@@ -3,6 +3,7 @@
 //! supplies the live connection's TLS exporter; these methods are pure given
 //! `(store, now_ms, exporter)` and fully testable without TLS or a DB.
 
+use crate::delegation::DelegationCtx;
 use crate::error::{AuthError, ChallengeError, ProveError, StoreError};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::store::{SessionRecord, Store};
@@ -87,6 +88,14 @@ pub struct AuthService<S: Store> {
     /// (the value clients pin); the private seed lives ONLY here and is never put
     /// into any DTO, response, or log. `Arc` so cloning `AppState` is a bump.
     dir_signer: Option<Arc<SigningKey>>,
+    /// Offline-D5 delegation runtime state (spec §§3,5,6). `None` in the legacy
+    /// path (no ceremony): enrollment is gated only on `dir_signer` presence and
+    /// admin bindings verify against the pinned `directory_pub`. `Some` in the
+    /// delegation model (both `Profile`s of `portable-server`): enrollment is
+    /// gated on a currently-valid delegation, and admin bindings verify against the
+    /// operational key (the binding signer). See [`Self::binding_verify_pub`] and
+    /// [`Self::enrollment_open`].
+    delegation: Option<Arc<DelegationCtx>>,
 }
 
 impl<S: Store> AuthService<S> {
@@ -97,6 +106,7 @@ impl<S: Store> AuthService<S> {
             cfg,
             limiter,
             dir_signer: None,
+            delegation: None,
         }
     }
 
@@ -124,9 +134,48 @@ impl<S: Store> AuthService<S> {
         &self.cfg.server_id
     }
 
-    /// The pinned D5 directory-signing public key, if configured (§7.3).
+    /// The pinned D5 directory-signing public key, if configured (§7.3). This is
+    /// the value clients pin and the key delegation certs verify against — NOT the
+    /// key that signs enrollment bindings in the Prod delegation model (that is
+    /// [`Self::binding_verify_pub`]).
     pub fn directory_pub(&self) -> Option<[u8; 32]> {
         self.cfg.directory_pub
+    }
+
+    /// Install the offline-D5 delegation runtime state (builder form; legacy call
+    /// sites that never set it keep today's behavior). See the `delegation` field.
+    pub fn with_delegation(mut self, ctx: Arc<DelegationCtx>) -> Self {
+        self.delegation = Some(ctx);
+        self
+    }
+
+    /// The delegation runtime state, if the delegation model is active.
+    pub fn delegation(&self) -> Option<Arc<DelegationCtx>> {
+        self.delegation.clone()
+    }
+
+    /// The public key **enrollment bindings must verify against** (spec §6, invariant
+    /// 2). In the delegation model this is the operational key (the binding signer);
+    /// otherwise it falls back to the pinned `directory_pub` (legacy/Dev, where the
+    /// binding signer's public half *is* `directory_pub`, so the two coincide
+    /// byte-for-byte). Used by the `AdminSession` gate to verify admin bindings.
+    pub fn binding_verify_pub(&self) -> Option<[u8; 32]> {
+        match &self.delegation {
+            Some(ctx) => Some(ctx.operational_pub()),
+            None => self.cfg.directory_pub,
+        }
+    }
+
+    /// Is registration-key enrollment currently open (invariant 1)? With the
+    /// delegation model active, delegates to [`DelegationCtx::enrollment_open`]
+    /// (Prod: a currently-valid delegation must be installed; Dev: always). Legacy
+    /// path (no delegation ctx): always open — enrollment is then gated only on the
+    /// `dir_signer` being present, exactly as before. `now_secs` is unix SECONDS.
+    pub fn enrollment_open(&self, now_secs: u64) -> bool {
+        match &self.delegation {
+            Some(ctx) => ctx.enrollment_open(now_secs),
+            None => true,
+        }
     }
     /// The single-use challenge nonce TTL (ms). Exposed so the recovery login
     /// (`recovery.rs`) reuses the same expiry the normal login path applies.

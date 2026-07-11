@@ -67,6 +67,25 @@ impl Layout {
     pub fn d5_secret_path(&self) -> PathBuf {
         self.config_dir().join("d5_secret.bin")
     }
+
+    /// The server's operational (binding-signing) key seed — Prod delegation model
+    /// (`config/operational_secret.bin`). MAY live on the server (it is the
+    /// delegated key, not the offline D5 root).
+    pub fn operational_secret_path(&self) -> PathBuf {
+        self.config_dir().join("operational_secret.bin")
+    }
+
+    /// The installed delegation cert wire bytes — Prod (`config/d5_delegation.bin`).
+    pub fn d5_delegation_path(&self) -> PathBuf {
+        self.config_dir().join("d5_delegation.bin")
+    }
+
+    /// The one-time bootstrap delegation token (plaintext) the install script reads
+    /// while awaiting delegation (`config/bootstrap_delegation_token.txt`). Deleted
+    /// (burned) after a successful bootstrap.
+    pub fn bootstrap_token_path(&self) -> PathBuf {
+        self.config_dir().join("bootstrap_delegation_token.txt")
+    }
 }
 
 #[cfg(test)]

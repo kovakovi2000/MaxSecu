@@ -123,7 +123,7 @@ async fn fetch_pins_writes_exact_bytes_on_matching_fingerprint() {
     // Correct fingerprint over the served blobs.
     let fp = maxsecu_crypto::pin_fingerprint(&cert_blob(), &dir_blob());
 
-    maxsecu_setup::fetch::fetch_and_verify(&server, "localhost", &fp, &cert_out, &dir_out)
+    maxsecu_setup::fetch::fetch_and_verify(&server, "localhost", &fp, &cert_out, Some(&dir_out))
         .await
         .expect("fetch-pins succeeds on matching fingerprint");
 
@@ -158,10 +158,15 @@ async fn fetch_pins_writes_nothing_on_fingerprint_mismatch() {
         "mutated fingerprint must differ from the real one"
     );
 
-    let err =
-        maxsecu_setup::fetch::fetch_and_verify(&server, "localhost", &bad_fp, &cert_out, &dir_out)
-            .await
-            .expect_err("fetch-pins must fail on a mismatched fingerprint");
+    let err = maxsecu_setup::fetch::fetch_and_verify(
+        &server,
+        "localhost",
+        &bad_fp,
+        &cert_out,
+        Some(&dir_out),
+    )
+    .await
+    .expect_err("fetch-pins must fail on a mismatched fingerprint");
     assert!(
         err.to_lowercase().contains("mismatch"),
         "error should mention the fingerprint mismatch, got: {err}"
@@ -173,4 +178,52 @@ async fn fetch_pins_writes_nothing_on_fingerprint_mismatch() {
         !dir_out.exists(),
         "no directory_pub.der written on mismatch"
     );
+}
+
+#[tokio::test]
+async fn fetch_pins_cert_only_writes_only_the_cert() {
+    // Offline-D5 ceremony mode (`dir_out = None`): the fingerprint commits to the
+    // cert ALONE (`pin_fingerprint(cert, &[])`), any server-served dir is ignored,
+    // and only server_cert.der is written.
+    let addr = start_pins_server().await;
+    let server = addr.to_string();
+    let dir = tempdir();
+    let cert_out = dir.join("server_cert.der");
+    let dir_out = dir.join("directory_pub.der");
+
+    // The cert-ONLY fingerprint (empty dir), which is what
+    // `print-cert-fingerprint` produces while the server awaits delegation.
+    let fp = maxsecu_crypto::pin_fingerprint(&cert_blob(), &[]);
+
+    maxsecu_setup::fetch::fetch_and_verify(&server, "localhost", &fp, &cert_out, None)
+        .await
+        .expect("cert-only fetch-pins succeeds on the cert fingerprint");
+
+    assert_eq!(
+        std::fs::read(&cert_out).unwrap(),
+        cert_blob(),
+        "written server_cert.der must byte-match the served cert blob"
+    );
+    assert!(
+        !dir_out.exists(),
+        "cert-only mode must NOT write directory_pub.der (the ceremony writes it locally)"
+    );
+}
+
+#[tokio::test]
+async fn fetch_pins_cert_only_rejects_the_two_pin_fingerprint() {
+    // A caller who wrongly hands the 2-pin fingerprint to cert-only mode must be
+    // rejected (the hashes differ), and nothing is written.
+    let addr = start_pins_server().await;
+    let server = addr.to_string();
+    let dir = tempdir();
+    let cert_out = dir.join("server_cert.der");
+
+    let two_pin_fp = maxsecu_crypto::pin_fingerprint(&cert_blob(), &dir_blob());
+    let err =
+        maxsecu_setup::fetch::fetch_and_verify(&server, "localhost", &two_pin_fp, &cert_out, None)
+            .await
+            .expect_err("cert-only mode must reject the 2-pin fingerprint");
+    assert!(err.to_lowercase().contains("mismatch"), "got: {err}");
+    assert!(!cert_out.exists(), "nothing written on mismatch");
 }

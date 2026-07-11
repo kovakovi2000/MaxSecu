@@ -25,6 +25,7 @@ pub mod revocation;
 pub mod rotate;
 pub mod sandbox;
 pub mod sanitize;
+pub mod seedblob;
 pub mod sink;
 pub mod transparency;
 pub mod update;
@@ -55,6 +56,7 @@ pub use rotate::{
 };
 pub use sandbox::{decode_rgba_bounded, validate_decoded, DecodeError, DecodedImage, OutputReject};
 pub use sanitize::{safe_export_path, sanitize_filename, SanitizeError};
+pub use seedblob::{seal_seed, unseal_seed, SEEDBLOB_V1_LEN};
 #[cfg(feature = "net")]
 pub use sink::{confirm_anchored, HttpSinkClient};
 pub use sink::{verify_anchor_proof, AnchorProof, AnchoredHead, FakeSink, SinkClient, SinkError};

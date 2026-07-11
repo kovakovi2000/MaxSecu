@@ -20,7 +20,7 @@ use base64::Engine;
 use zeroize::Zeroize;
 
 use maxsecu_client_core::{
-    build_upload, resume_content_sealer, DirectoryVerifier, Identity, MemoryTrustStore,
+    build_upload, resume_content_sealer, Identity, MemoryTrustStore,
     SmallStreams, StreamingUploadBuilder, UploadParams,
 };
 use maxsecu_crypto::{EncPublicKey, WrappedDek};
@@ -240,13 +240,16 @@ async fn resolve_recipients(
     session: &Session,
 ) -> Result<(crate::directory::VerifiedAuthor, crate::directory::RecoveryRecipient, u64), UiError> {
     let pinned = load_directory_pub(app_dir)?;
-    let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
     let username = { session.0.lock().await.username.clone() }
         .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
     let server = server_of(app_dir)?;
     let (mut sender, host, _exporter) = open_conn(app_dir, &server).await?;
+    // Offline-D5 hop (spec §3/§7): resolve the effective directory verifier over the
+    // pinned connection; fail closed on a bad delegation before trusting my binding.
+    let verifier =
+        crate::directory::build_delegated_verifier(&mut sender, &host, pinned, now).await?;
     let me =
         resolve_my_binding(&mut sender, &host, &username, &verifier, &mut trust, now).await?;
     let recovery = resolve_recovery_pin(&mut sender, &host).await?;

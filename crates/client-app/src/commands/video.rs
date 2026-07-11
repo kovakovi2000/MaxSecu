@@ -40,7 +40,7 @@ use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use maxsecu_client_core::{
-    open_content_decryptor, verify_and_open_headers, ContentDecryptor, DirectoryVerifier, Identity,
+    open_content_decryptor, verify_and_open_headers, ContentDecryptor, Identity,
     MemoryTrustStore, StreamHeader,
 };
 use maxsecu_encoding::decode;
@@ -341,7 +341,6 @@ async fn open_video_inner(
     let route_mode = settings.connection.route_mode;
     let direct_http = crate::direct_link::shared_direct_http();
     let pinned = load_directory_pub(&dir.0)?;
-    let verifier = DirectoryVerifier::new(pinned);
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
 
@@ -353,6 +352,12 @@ async fn open_video_inner(
 
     let server = server_of(&dir.0)?;
     let (mut sender, host, token) = reauth(&dir.0, &server, session, connect_lock).await?;
+    // Offline-D5 hop (spec §3/§7): resolve the effective directory verifier over the
+    // pinned connection; fail closed on a bad delegation before any binding is trusted.
+    // A warm session delegation cache makes this a no-op (no extra round-trip) on the
+    // hot path shared by a bundle's videos.
+    let verifier =
+        crate::directory::build_delegated_verifier(&mut sender, &host, pinned, now).await?;
 
     let (status, view_json) = get_json(
         &mut sender,

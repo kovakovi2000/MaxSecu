@@ -1,6 +1,16 @@
-//! `fetch-pins` mode (spec §4): fetch the two public trust-anchor pins
-//! (`server_cert.der`, `directory_pub.der`) from the server over the network and
-//! trust them ONLY if they hash to the operator-supplied fingerprint code.
+//! `fetch-pins` mode (spec §4): fetch the public trust-anchor pin(s) from the
+//! server over the network and trust them ONLY if they hash to the
+//! operator-supplied fingerprint code. Two modes:
+//!
+//!   * **2-pin** (`dir_out = Some`): verify `pin_fingerprint(cert, dir)` and write
+//!     BOTH `server_cert.der` + `directory_pub.der` (the post-delegation / rebuild
+//!     path, where the server serves the real D5 directory pin).
+//!   * **cert-only** (`dir_out = None`, offline-D5 ceremony, spec §§6,7): the
+//!     server is still AWAITING delegation, so it has no directory pin yet — the D5
+//!     originates on the admin PC. Verify `pin_fingerprint(cert, &[])` against the
+//!     server's **cert fingerprint** (printed by `maxsecu-portable-server
+//!     print-cert-fingerprint`) and write ONLY `server_cert.der`. The ceremony then
+//!     writes `directory_pub.der` locally from the freshly-generated D5.
 //!
 //! Trust model: the pins are PUBLIC data; we need integrity, not secrecy. The
 //! transport here is deliberately UNauthenticated (accept-any-cert) — a MITM can
@@ -97,7 +107,13 @@ fn normalize_fp(s: &str) -> String {
 
 /// Fetch `/v1/bootstrap/pins` from `server` (dial target `ADDR:PORT`) over an
 /// UNpinned TLS connection using `host` as the SNI/Host header, verify the returned
-/// pins against `fingerprint`, and — ONLY on a match — write `cert_out` + `dir_out`.
+/// pin(s) against `fingerprint`, and — ONLY on a match — write the pin file(s).
+///
+/// `dir_out = Some(path)` selects **2-pin** mode: verify `pin_fingerprint(cert,
+/// dir)` and write both files. `dir_out = None` selects **cert-only** mode (the
+/// offline-D5 ceremony, server still awaiting): verify `pin_fingerprint(cert, &[])`
+/// against the server's cert fingerprint and write ONLY `cert_out` — the server's
+/// directory pin (if any) is ignored, because the D5 originates on the admin PC.
 ///
 /// On ANY failure (network / TLS / HTTP / JSON / base64 / fingerprint mismatch) this
 /// writes NOTHING and returns `Err`. No pin file is ever created before the
@@ -107,7 +123,7 @@ pub async fn fetch_and_verify(
     host: &str,
     fingerprint: &str,
     cert_out: &Path,
-    dir_out: &Path,
+    dir_out: Option<&Path>,
 ) -> Result<(), String> {
     // --- dial + unpinned TLS -------------------------------------------------
     let tcp = tokio::net::TcpStream::connect(server)
@@ -152,23 +168,33 @@ pub async fn fetch_and_verify(
         .map_err(|e| format!("reading response body: {e}"))?
         .to_bytes();
 
-    // --- parse JSON + base64-decode both pins -------------------------------
+    // --- parse JSON + base64-decode the cert (dir only in 2-pin mode) -------
     let json: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| format!("invalid JSON in bootstrap response: {e}"))?;
     let cert_b64 = json
         .get("server_cert_b64")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "bootstrap response missing string field `server_cert_b64`".to_owned())?;
-    let dir_b64 = json
-        .get("directory_pub_b64")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "bootstrap response missing string field `directory_pub_b64`".to_owned())?;
     let cert = base64::engine::general_purpose::STANDARD
         .decode(cert_b64)
         .map_err(|e| format!("server_cert_b64 is not valid base64: {e}"))?;
-    let dir = base64::engine::general_purpose::STANDARD
-        .decode(dir_b64)
-        .map_err(|e| format!("directory_pub_b64 is not valid base64: {e}"))?;
+
+    // In 2-pin mode the directory pin is required and hashed alongside the cert;
+    // in cert-only mode (ceremony, server awaiting) the fingerprint commits to the
+    // cert alone (`pin_fingerprint(cert, &[])`) and any server-served dir is ignored.
+    let dir: Vec<u8> = if dir_out.is_some() {
+        let dir_b64 = json
+            .get("directory_pub_b64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                "bootstrap response missing string field `directory_pub_b64`".to_owned()
+            })?;
+        base64::engine::general_purpose::STANDARD
+            .decode(dir_b64)
+            .map_err(|e| format!("directory_pub_b64 is not valid base64: {e}"))?
+    } else {
+        Vec::new()
+    };
 
     // --- fingerprint gate (authenticate the PAYLOAD) ------------------------
     let computed = maxsecu_crypto::pin_fingerprint(&cert, &dir);
@@ -183,8 +209,10 @@ pub async fn fetch_and_verify(
         ));
     }
 
-    // --- match: NOW (and only now) write the two pin files ------------------
+    // --- match: NOW (and only now) write the pin file(s) --------------------
     std::fs::write(cert_out, &cert).map_err(|e| format!("write {}: {e}", cert_out.display()))?;
-    std::fs::write(dir_out, &dir).map_err(|e| format!("write {}: {e}", dir_out.display()))?;
+    if let Some(dir_out) = dir_out {
+        std::fs::write(dir_out, &dir).map_err(|e| format!("write {}: {e}", dir_out.display()))?;
+    }
     Ok(())
 }

@@ -16,6 +16,7 @@ mod error;
 pub mod audit;
 pub mod auth;
 pub mod blob;
+pub mod delegation;
 pub mod detect;
 pub mod dropbox_tier;
 pub mod files;
@@ -39,6 +40,10 @@ pub use audit::{
 pub use auth::{AuthConfig, AuthService, Challenge, SessionToken};
 pub use blob::{
     BlobError, BlobStore, ChunkStatus, DirectLink, FetchSource, FsBlobStore, MemoryBlobStore,
+};
+pub use delegation::{
+    BootstrapResult, DelegationCtx, DelegationPersist, NullDelegationPersist, RenewResult,
+    DELEGATION_CLOCK_SKEW_SECS, MAX_DELEGATION_WINDOW_SECS,
 };
 pub use detect::{
     analyze, Alert, AlertSink, AuditEvent, MemoryAlertSink, NullAlertSink, Thresholds,
