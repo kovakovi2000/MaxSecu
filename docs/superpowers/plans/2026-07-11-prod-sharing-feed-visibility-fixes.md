@@ -53,11 +53,47 @@ pub struct ListFilter {
 }
 ```
 
-- [ ] **Step 2: Write the failing MemoryStore unit test**
+- [ ] **Step 2: Give the shared `v1_parsed` helper an owner self-wrap**
 
-In `crates/server/src/store.rs`, inside the existing `#[cfg(test)] mod tests` (near the `list_files` bundle test around line 1728), add. Use the existing test helpers in that module (`stage_and_finalize`-style helpers already present — mirror the existing `list_files` bundle test's setup for staging + finalizing a file with wraps). Add:
+The store.rs test helper `v1_parsed` (~line 1524) stages `wraps: vec![]`. After caller-scoping, a file with no wrap is invisible to everyone — which would break the existing `listing_excludes_bundle_members` test. Add an owner self-wrap. `WrapInput` is already imported at the top of store.rs (`use crate::files::{… WrapInput}`), in scope via the test module's `use super::*`. Replace the `wraps: vec![],` line inside `v1_parsed`:
 
 ```rust
+            streams: vec![],
+            // An owner self-wrap so the owner can SEE this file under the
+            // caller-scoped listing (mirrors the real self-wrap every upload posts).
+            wraps: vec![WrapInput {
+                recipient_id: owner,
+                recipient_type: 1,
+                wrapped_dek: vec![0xAA; 48],
+                wrap_alg: 1,
+                granted_by: owner,
+                grant_bytes: vec![],
+                grant_sig: [0u8; 64],
+            }],
+            recovery_present: true,
+```
+
+(Also apply the SAME `wraps` change to `v1_parsed_typed` (~line 1585) if it likewise stages `wraps: vec![]` and is used by any `list_files` test — check and match.)
+
+- [ ] **Step 3: Write the failing MemoryStore unit test + a recipient-wrap helper**
+
+In the store.rs test module (near `listing_excludes_bundle_members`, ~line 1720), add:
+
+```rust
+/// A user-type wrap for `recipient`, granted by `granter`. `granted_by` MUST be the
+/// granter: the coarse `add_wrap` gate rejects a wrap whose `granted_by != caller_id`.
+fn other_user_wrap(recipient: [u8; 16], granter: [u8; 16]) -> WrapInput {
+    WrapInput {
+        recipient_id: recipient,
+        recipient_type: 1,
+        wrapped_dek: vec![0xAA; 48],
+        wrap_alg: 1,
+        granted_by: granter,
+        grant_bytes: vec![],
+        grant_sig: [0u8; 64],
+    }
+}
+
 #[tokio::test]
 async fn list_files_returns_only_files_the_caller_holds_a_wrap_for() {
     let store = MemoryStore::new();
@@ -65,10 +101,10 @@ async fn list_files_returns_only_files_the_caller_holds_a_wrap_for() {
     let other = [0x22u8; 16];
     let file = [0xA1u8; 16];
 
-    // Stage + finalize one listed file owned by `owner`, wrapped to owner + recovery.
-    // (Reuse the same staging path the neighbouring `list_files` bundle test uses:
-    // stage genesis with wraps = [self_wrap(owner), recovery_wrap()], then finalize.)
-    stage_and_finalize_listed(&store, file, owner, /*listed=*/ true).await;
+    // Stage + finalize one listed file owned by `owner` (v1_parsed now includes an
+    // owner self-wrap). list_files only returns finalized files.
+    store.stage_version(v1_parsed(file, owner, true, None), 1_000).await.unwrap();
+    store.finalize_version(file, 1, owner, 1_000).await.unwrap();
 
     // The owner sees it (holds a self-wrap).
     let mine = store
@@ -85,8 +121,9 @@ async fn list_files_returns_only_files_the_caller_holds_a_wrap_for() {
         .unwrap();
     assert!(theirs.is_empty(), "a non-recipient's feed omits the post");
 
-    // After adding a wrap for `other` (granted by the owner), they now see it.
-    store.add_wrap(file, 1, other_user_wrap(other, owner), owner).await.unwrap();
+    // After adding a wrap for `other` (granted by owner), they now see it. NOTE the
+    // real add_wrap signature: (file_id, wrap, caller_id, now_ms) — NO explicit version.
+    store.add_wrap(file, other_user_wrap(other, owner), owner, 1_000).await.unwrap();
     let now_theirs = store
         .list_files(ListFilter { file_type: None, limit: 50, caller_id: other })
         .await
@@ -95,43 +132,25 @@ async fn list_files_returns_only_files_the_caller_holds_a_wrap_for() {
 }
 ```
 
-Add these two small helpers to the test module (below the test, or adapt the existing helpers — check the module's existing `self_wrap`/`recovery_wrap`/staging helpers first and REUSE them; only add what's missing):
-
-```rust
-/// A user-type wrap for `recipient`, granted by `granter` (mirrors the existing
-/// `self_wrap`, but for an arbitrary recipient). `granted_by` MUST be the granter:
-/// the coarse `add_wrap` gate rejects a wrap whose `granted_by != caller_id`.
-fn other_user_wrap(recipient: [u8; 16], granter: [u8; 16]) -> crate::files::WrapInput {
-    crate::files::WrapInput {
-        recipient_id: recipient,
-        recipient_type: 1,
-        wrapped_dek: vec![0xAA; 48],
-        wrap_alg: 1,
-        granted_by: granter,
-        grant_bytes: vec![],
-        grant_sig: [0u8; 64],
-    }
-}
-```
-
-> NOTE: Inspect the actual `WrapInput` fields in `crates/server/src/files.rs` (~line 32-49) and the existing `self_wrap()`/`recovery_wrap()`/staging helpers in the store.rs test module, and match them EXACTLY (field names, `granted_by`, `grant_bytes`, `grant_sig`). If a `stage_and_finalize_listed` helper does not already exist, factor one out of the neighbouring `list_files` bundle test's staging loop (it stages genesis with `[self_wrap(), recovery_wrap()]` then finalizes). Do NOT invent store methods — use the ones the neighbouring tests already call.
-
-- [ ] **Step 3: Run the test to verify it fails**
+- [ ] **Step 4: Run the test to verify it fails**
 
 Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p maxsecu-server --lib list_files_returns_only_files_the_caller_holds_a_wrap_for`
-Expected: FAIL to compile first (missing `caller_id` in other call sites) — fix call sites in Step 4 — then FAIL the assertion (stranger currently sees the post).
+Expected: FAIL to compile first (missing `caller_id` in other `ListFilter` sites — fix in Step 5), then FAIL the assertion (stranger currently sees the post).
 
-- [ ] **Step 4: Update all `ListFilter` construction sites to pass `caller_id`**
+- [ ] **Step 5: Update all other `ListFilter` construction sites to pass `caller_id`**
 
-- `crates/server/src/http.rs` ~1944: handled in Task 3 (pass `session.user_id`); for now, to keep the crate compiling, temporarily use `caller_id: _session_placeholder` — but do Task 3 in the same branch. Simplest: do Step 4's http.rs edit as part of Task 3. For THIS task, update only the non-handler call sites:
-- `crates/server/src/store.rs` test (~1743): add `caller_id: <the owner used in that test>` (that bundle test stages files owned by a known id — pass it; the bundle file is wrapped to its owner, so the owner sees it — keep the existing assertion intact).
-- `crates/server/tests/file_records.rs` (~283, 297): pass `caller_id: <owner id used in that test>` so its listing assertions still hold (the test stages files owned by one id; pass that id).
-- `crates/server/tests/pg_store.rs` (~1049, 1061, 1115, 1352): pass `caller_id: <the owner id in each test>`.
-- `crates/server/tests/sanitized_errors.rs`: its faulty-store `list_files` returns an error regardless; if it constructs a `ListFilter`, pass `caller_id: [0u8; 16]`.
+Every `ListFilter { … }` literal must now set `caller_id`. These tests stage files under a specific owner and assert the listing contains them; because `v1_parsed` now grants an owner self-wrap, passing that owner as `caller_id` keeps them green:
 
-> These tests stage files owned by a specific id and assert the listing contains them. Passing that same owner id as `caller_id` keeps them green (the owner holds a self-wrap). Where a test stages files under multiple owners and lists across all, pass the id that owns the files it asserts on, or extend the test to add cross-wraps — prefer the minimal change that preserves the test's intent.
+- `crates/server/src/http.rs` ~1944 (the handler): done in Task 3 — for THIS task, set `caller_id: session.user_id` there right away and drop the `_` (Task 3 only adds the e2e test). This keeps the crate compiling.
+- `crates/server/src/store.rs` `listing_excludes_bundle_members` (~1743): add `caller_id: owner` (the test's `owner` is `[7u8; 16]`; the bundle carries an owner self-wrap via `v1_parsed`, so it still lists).
+- `crates/server/src/http.rs` ~3548 (a delete test's listing check): pass `caller_id: <the owner used in that test>`.
+- `crates/server/tests/file_records.rs` (~283, 297): pass `caller_id: <owner id used in that test>`. If that test stages via a helper that omits wraps, ensure the staged files carry an owner self-wrap (mirror the `v1_parsed` change), else the owner-scoped listing returns empty.
+- `crates/server/tests/pg_store.rs` (~1049, 1061, 1115, 1352): pass `caller_id: <the owner id in each test>` (Postgres gate — Task 2 also touches this file; coordinate).
+- `crates/server/tests/sanitized_errors.rs`: if it constructs a `ListFilter`, pass `caller_id: [0u8; 16]` (the faulty store errors regardless).
 
-- [ ] **Step 5: Gate the MemoryStore listing by caller wrap**
+> For any test that stages files through a path OTHER than `v1_parsed` and then lists them, the staged file must carry a wrap for the `caller_id` you pass, or the assertion will see an empty list. Prefer the minimal change that preserves each test's intent (add an owner self-wrap to its staging, and pass that owner as `caller_id`).
+
+- [ ] **Step 6: Gate the MemoryStore listing by caller wrap**
 
 In `crates/server/src/store.rs`, `MemoryStore::list_files` (~1041), add one filter line after the `listed` filter:
 
@@ -153,17 +172,17 @@ In `crates/server/src/store.rs`, `MemoryStore::list_files` (~1041), add one filt
             .filter_map(|(id, f)| {
 ```
 
-- [ ] **Step 6: Run the test to verify it passes**
+- [ ] **Step 7: Run the test to verify it passes**
 
 Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p maxsecu-server --lib list_files`
 Expected: PASS (new test + existing `list_files` bundle test).
 
-- [ ] **Step 7: Run the full server lib test suite**
+- [ ] **Step 8: Run the full server lib test suite**
 
 Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p maxsecu-server --lib`
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add crates/server/src/files.rs crates/server/src/store.rs
