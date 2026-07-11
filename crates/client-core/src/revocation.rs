@@ -793,6 +793,29 @@ mod tests {
     }
 
     #[test]
+    fn unanchored_still_rejects_a_non_admin_issuer() {
+        // The safety claim for no-sink deployments rests on `authenticate_authority`
+        // still running on the unanchored path — prove it fails closed on a served
+        // record whose issuer holds no admin authority (mirrors
+        // `non_admin_issuer_is_rejected`, but via the unanchored constructor).
+        let mut chain = ControlChain::new();
+        let admin = SigningKey::generate();
+        let file = FileScope::Specific(Id([0x0A; 16]));
+        let r1 = chain.revoke(&admin, rp(file, U, None, 1), None).unwrap();
+        // The issuer's binding carries only the User ceiling — no admin authority.
+        let user_only = multi_issuer(vec![(
+            ADMIN_ID,
+            admin.verifying_key().to_bytes(),
+            vec![Role::User],
+        )]);
+        assert_eq!(
+            TombstoneSet::verify_authenticated_unanchored(&[rec_in(&r1)], &user_only)
+                .unwrap_err(),
+            TombstoneError::NotAdmin
+        );
+    }
+
+    #[test]
     fn empty_chain_matches_only_the_genesis_head() {
         let none: Vec<Vec<u8>> = Vec::new();
         assert!(TombstoneSet::verify(&none, GENESIS_HEAD.0).is_ok());
