@@ -6,9 +6,12 @@
 //! who could roll back, fork, or withhold a fresh tombstone. Two independent facts
 //! make the served set usable anyway, and only together:
 //!
-//! * the **anchored head** — fetched out of band from the pinned sink in Task 4
-//!   ([`crate::sink::fetch_anchored_head`]) and passed in here — pins the exact
-//!   chain tip the served records must reach (a short/withheld set is a `Gap`);
+//! * the **anchored head** — when a sink is pinned, it is fetched out of band from
+//!   that sink in Task 4 ([`crate::sink::fetch_anchored_head`]) and passed in here,
+//!   pinning the exact chain tip the served records must reach (a short/withheld set
+//!   is a `Gap`). The sink is now OPT-IN: `anchored_head` is `None` when no sink is
+//!   pinned, in which case the served set is verified UNANCHORED (issuer authority +
+//!   internal chain integrity only, with no external tip to catch a withheld tail);
 //! * **issuer authority** — every record's `issued_by` (and, for dual-controlled
 //!   records, its co-signer) is re-resolved to a D5-verified directory binding
 //!   under the pinned root, so the operator cannot forge admin authority.
@@ -43,21 +46,24 @@ use crate::error::UiError;
 use crate::http_client::get_json;
 
 /// Fetch `GET /v1/revocations`, authenticate every record's issuer authority under
-/// the pinned D5, and verify the served set is a contiguous chain reaching
-/// `anchored_head` (the head Task 4 attested out of band via the sink). Returns the
-/// authoritative [`TombstoneSet`] for §7.6 decisions, or a single sanitized
-/// fail-closed [`UiError`] on any transport/parse/chain/authority failure.
+/// the pinned D5, and verify the served set. When `anchored_head` is `Some`, the set
+/// must be a contiguous chain reaching that head (the head Task 4 attested out of
+/// band via the sink); when it is `None` (no sink pinned — the opt-in sink path) the
+/// set is verified UNANCHORED (issuer authority + internal chain integrity only).
+/// Returns the authoritative [`TombstoneSet`] for §7.6 decisions, or a single
+/// sanitized fail-closed [`UiError`] on any transport/parse/chain/authority failure.
 ///
 /// `anchored_head` is a PARAMETER (not fetched here): the caller/Task 8 obtains it
-/// from [`crate::sink::fetch_anchored_head`]. Decoupling the sink fetch from the
-/// record fetch keeps each independently testable — a test can anchor a head
-/// directly without standing up a sink — and lets Task 8 fetch the anchor once and
-/// reuse it. `verifier`/`trust` resolve each issuer binding under the pinned root;
-/// `now_ms` is the validity-window clock for those bindings.
+/// from [`crate::sink::fetch_anchored_head`] only when a sink is pinned, passing
+/// `None` otherwise. Decoupling the sink fetch from the record fetch keeps each
+/// independently testable — a test can anchor a head directly without standing up a
+/// sink — and lets Task 8 fetch the anchor once and reuse it. `verifier`/`trust`
+/// resolve each issuer binding under the pinned root; `now_ms` is the validity-window
+/// clock for those bindings.
 pub(crate) async fn build_tombstones(
     sender: &mut SendRequest<Full<Bytes>>,
     host: &str,
-    anchored_head: [u8; 32],
+    anchored_head: Option<[u8; 32]>,
     verifier: &DirectoryVerifier,
     // `+ Send`: the trust object is held across the `get_json` awaits, so the
     // returned future must be `Send` (mirrors `directory::resolve_and_verify_author`).
@@ -91,11 +97,17 @@ pub(crate) async fn build_tombstones(
         }
     }
 
-    // 4. Synchronous chain + authority verify against the sink-anchored head. The
-    //    closure only reads the pre-resolved map. Every failure is fail-closed.
-    TombstoneSet::verify_authenticated(&records, anchored_head, &|id: Id| {
-        resolved.get(&id.0).cloned()
-    })
+    // 4. Synchronous chain + authority verify. With a pinned sink, verify against
+    //    the anchored head; without one (opt-in sink), verify UNANCHORED. The closure
+    //    only reads the pre-resolved map. Every failure is fail-closed.
+    match anchored_head {
+        Some(head) => TombstoneSet::verify_authenticated(&records, head, &|id: Id| {
+            resolved.get(&id.0).cloned()
+        }),
+        None => TombstoneSet::verify_authenticated_unanchored(&records, &|id: Id| {
+            resolved.get(&id.0).cloned()
+        }),
+    }
     .map_err(map_tombstone_err)
 }
 
@@ -456,7 +468,7 @@ mod tests {
         let mut sender = connect(&addr).await;
         let mut trust = MemoryTrustStore::new();
 
-        let set = build_tombstones(&mut sender, "localhost", head, &verifier, &mut trust, NOW)
+        let set = build_tombstones(&mut sender, "localhost", Some(head), &verifier, &mut trust, NOW)
             .await
             .expect("authenticated chain verifies against the anchored head");
         assert!(
@@ -507,7 +519,7 @@ mod tests {
         let mut sender = connect(&addr).await;
         let mut trust = MemoryTrustStore::new();
 
-        let err = build_tombstones(&mut sender, "localhost", head2, &verifier, &mut trust, NOW)
+        let err = build_tombstones(&mut sender, "localhost", Some(head2), &verifier, &mut trust, NOW)
             .await
             .expect_err("a withheld tail must fail closed");
         assert_eq!(err.code, "revocation_unverified");
@@ -544,9 +556,36 @@ mod tests {
         let mut sender = connect(&addr).await;
         let mut trust = MemoryTrustStore::new();
 
-        let err = build_tombstones(&mut sender, "localhost", head, &verifier, &mut trust, NOW)
+        let err = build_tombstones(&mut sender, "localhost", Some(head), &verifier, &mut trust, NOW)
             .await
             .expect_err("a non-admin issuer must fail closed");
         assert_eq!(err.code, "revocation_unverified");
+    }
+
+    /// (d) The opt-in sink path: with `anchored_head == None` (no sink pinned), an
+    /// empty served set verifies UNANCHORED and yields a [`TombstoneSet`] that
+    /// revokes nobody — no external tip is required to accept an empty, well-formed
+    /// control log.
+    #[tokio::test]
+    async fn build_tombstones_unanchored_accepts_empty_served_set() {
+        let d5 = SigningKey::generate();
+        let verifier = DirectoryVerifier::new(d5.verifying_key().to_bytes());
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/v1/revocations".to_owned(),
+            (hyper::StatusCode::OK, revocations_body(&[])),
+        );
+        let addr = spawn_router(routes).await;
+        let mut sender = connect(&addr).await;
+        let mut trust = MemoryTrustStore::new();
+
+        let set = build_tombstones(&mut sender, "localhost", None, &verifier, &mut trust, NOW)
+            .await
+            .expect("an empty served set verifies unanchored");
+        assert!(
+            !set.is_account_revoked(&VICTIM),
+            "an empty unanchored set revokes nobody"
+        );
     }
 }

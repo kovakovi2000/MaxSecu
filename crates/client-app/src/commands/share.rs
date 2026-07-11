@@ -53,7 +53,7 @@ use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::bundle::open_bundle_members;
 use crate::commands::connection::{open_conn, reauth, server_of};
 use crate::commands::feed::{hex, hex16, now_ms};
-use crate::config::{load_directory_pub, load_sink_pins};
+use crate::config::{load_directory_pub, load_sink_pins_opt};
 use crate::directory::VerifiedAuthor;
 use crate::download::{parse_file_view, recover_own_dek};
 use crate::dto::{
@@ -115,12 +115,12 @@ async fn reshare_inner(
     // self-wrap to (content-substitution defense) — NOT the served manifest id.
     let file_id = hex16(&req.file_id)?;
 
-    // Pinned trust anchors: the D5 directory root and the out-of-band sink pins.
-    // Both are batch-wide prerequisites — a missing/malformed pin fails closed.
+    // Pinned trust anchors: the D5 directory root (a batch-wide prerequisite — a
+    // missing/malformed pin fails closed). The sink is OPT-IN and loaded lazily at
+    // step 4 (see `load_sink_pins_opt` below).
     let pinned = load_directory_pub(&dir.0)?;
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
-    let sink_pins = load_sink_pins(&dir.0)?;
 
     let username = { session.0.lock().await.username.clone() }
         .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
@@ -187,10 +187,15 @@ async fn reshare_inner(
         (dek, tofu, contacts)
     }; // guard drops here — identity no longer borrowed
 
-    // Step 4: fetch the sink-anchored head out of band, then build the authenticated
-    // TombstoneSet against it. Both fail CLOSED (a reshare cannot proceed on an
-    // unverified revocation state — `build_reshare` takes a mandatory TombstoneSet).
-    let anchored_head = fetch_anchored_head(&sink_pins)?;
+    // Step 4: build the authenticated TombstoneSet. The sink is OPT-IN: when one is
+    // pinned, fetch its anchored head out of band and verify the served set reaches
+    // it; when none is pinned, pass `None` so the set is verified UNANCHORED. Both
+    // fail CLOSED (a reshare cannot proceed on an unverified revocation state —
+    // `build_reshare` takes a mandatory TombstoneSet).
+    let anchored_head = match load_sink_pins_opt(&dir.0)? {
+        Some(pins) => Some(fetch_anchored_head(&pins)?),
+        None => None,
+    };
     let tombstones = build_tombstones(
         &mut sender,
         &host,
