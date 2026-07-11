@@ -262,8 +262,8 @@ mod tests {
     #[test]
     fn parse_rejects_wrong_lengths() {
         assert_eq!(parse(&[]), Err(CryptoError::BadLength));
-        assert_eq!(parse(&vec![0u8; 112]), Err(CryptoError::BadLength));
-        assert_eq!(parse(&vec![0u8; 114]), Err(CryptoError::BadLength));
+        assert_eq!(parse(&[0u8; 112]), Err(CryptoError::BadLength));
+        assert_eq!(parse(&[0u8; 114]), Err(CryptoError::BadLength));
     }
 
     #[test]
