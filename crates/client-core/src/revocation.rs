@@ -778,14 +778,13 @@ mod tests {
             (A2_ID, a2.verifying_key().to_bytes(), vec![Role::Admin]),
         ]);
         // Unanchored: no external head — derived from the record chain. Accepts it.
-        let set =
-            TombstoneSet::verify_authenticated_unanchored(&[rec.clone()], &res).unwrap();
+        let set = TombstoneSet::verify_authenticated_unanchored(std::slice::from_ref(&rec), &res)
+            .unwrap();
         assert!(set.is_account_revoked(&[U; 16]));
 
         // A record that does NOT chain from GENESIS still fails closed (BrokenChain),
         // proving the unanchored variant did not drop the contiguity check.
-        let (_h2, bad) =
-            signed_revocation(account_revoke(U, 1, [9u8; 32], None), &a1, Some(&a2));
+        let (_h2, bad) = signed_revocation(account_revoke(U, 1, [9u8; 32], None), &a1, Some(&a2));
         assert_eq!(
             TombstoneSet::verify_authenticated_unanchored(&[bad], &res).unwrap_err(),
             TombstoneError::BrokenChain
@@ -809,8 +808,7 @@ mod tests {
             vec![Role::User],
         )]);
         assert_eq!(
-            TombstoneSet::verify_authenticated_unanchored(&[rec_in(&r1)], &user_only)
-                .unwrap_err(),
+            TombstoneSet::verify_authenticated_unanchored(&[rec_in(&r1)], &user_only).unwrap_err(),
             TombstoneError::NotAdmin
         );
     }

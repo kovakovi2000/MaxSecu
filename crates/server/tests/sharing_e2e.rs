@@ -1296,10 +1296,7 @@ async fn feed_lists_a_post_only_after_it_is_shared() {
 
     // ---- (b) A's OWN feed DOES list it (A holds a self-wrap) ----
     let a_feed = list_file_ids(&mut c_a, &a_tok).await;
-    assert!(
-        a_feed.contains(&file_hex),
-        "the owner sees their own post"
-    );
+    assert!(a_feed.contains(&file_hex), "the owner sees their own post");
 
     // ---- A shares the post to B (POST a B-recipient wrap) ----
     let dek_commit = bundle.manifest.dek_commit.0;
@@ -1308,7 +1305,13 @@ async fn feed_lists_a_post_only_after_it_is_shared() {
         .iter()
         .find(|x| x.recipient_type == RecipientType::User)
         .unwrap();
-    let dek = unwrap_self(a.enc_secret(), &owner_wrap.wrapped_dek, file_id, 1, Id(a_id));
+    let dek = unwrap_self(
+        a.enc_secret(),
+        &owner_wrap.wrapped_dek,
+        file_id,
+        1,
+        Id(a_id),
+    );
     let to_b = build_reshare(
         &ReshareParams {
             granter: &a,
