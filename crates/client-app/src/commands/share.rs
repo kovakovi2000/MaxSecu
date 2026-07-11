@@ -1121,7 +1121,7 @@ mod tests {
     }
 
     /// Trust-alarm layer B (spec §0-B/§7): a username whose key was TOFU-pinned to a
-    /// DIFFERENT key now resolves to a changed key ⇒ fail-closed `server_untrusted`,
+    /// DIFFERENT key now resolves to a changed key ⇒ fail-closed `key_changed`,
     /// blocking the share for that recipient (no wrap POST), while an UNPINNED peer
     /// in the same batch is a normal first-sighting that still succeeds — the alarm
     /// is per-recipient and blocks a CHANGE only, never a first sighting.
@@ -1155,7 +1155,7 @@ mod tests {
             ),
         );
         // A 201 wraps route: if the alarm did NOT block, "alice" would succeed here —
-        // so a `server_untrusted` outcome proves the block happened BEFORE the POST.
+        // so a `key_changed` outcome proves the block happened BEFORE the POST.
         routes.insert(
             format!("/v1/files/{file_id_hex}/wraps"),
             (hyper::StatusCode::CREATED, "{}".to_owned()),
