@@ -211,6 +211,38 @@ impl TombstoneSet {
         Ok(TombstoneSet { records: decoded })
     }
 
+    /// Like [`TombstoneSet::verify_authenticated`], but with NO external anchor:
+    /// the target head is DERIVED from the served record chain itself. Chain
+    /// contiguity (`BrokenChain`), record well-formedness (`Malformed`), and full
+    /// D5 issuer-authority (`UnknownIssuer`/`BadAuthority`/`NotAdmin`/dual-control)
+    /// are still enforced — ONLY the out-of-band gap/withhold detection is skipped.
+    ///
+    /// Used when no revocation sink is pinned (opt-in, mirroring the opt-in KT /
+    /// sink-transparency gates): a single-server deployment can still enforce
+    /// D5-authenticated revocations without standing up a separate sink. The
+    /// tradeoff — trusting that the server is not withholding its own revocation
+    /// tail — is accepted by the caller (`client-app` reshare) only when no sink is
+    /// pinned; a pinned sink restores anchoring via `verify_authenticated`.
+    pub fn verify_authenticated_unanchored(
+        records: &[ControlRecordIn],
+        issuer: &dyn Fn(Id) -> Option<IssuerInfo>,
+    ) -> Result<TombstoneSet, TombstoneError> {
+        let mut head = GENESIS_HEAD.0;
+        let mut decoded: Vec<Decoded> = Vec::with_capacity(records.len());
+        for rec in records {
+            let d = Decoded::from_bytes(&rec.bytes)?;
+            if d.prev_head() != head {
+                return Err(TombstoneError::BrokenChain);
+            }
+            authenticate_authority(&d, rec, &decoded, issuer)?;
+            head = sha256(&rec.bytes);
+            decoded.push(d);
+        }
+        // No `head != anchored_head` gap check: the derived head IS the tip. Every
+        // other fail-closed check above still ran.
+        Ok(TombstoneSet { records: decoded })
+    }
+
     /// Is `user_id` under an active account-wide (`*`) access revocation — barred
     /// as a recipient everywhere (§7.2 step 5)?
     pub fn is_account_revoked(&self, user_id: &[u8; 16]) -> bool {
@@ -730,6 +762,33 @@ mod tests {
         assert_eq!(
             TombstoneSet::verify_authenticated(&[rec], sha256(&bytes), &res).unwrap_err(),
             TombstoneError::DualControlMissing
+        );
+    }
+
+    #[test]
+    fn unanchored_accepts_a_valid_served_chain_and_still_rejects_a_broken_link() {
+        let a1 = SigningKey::generate();
+        let a2 = SigningKey::generate();
+        // A single valid dual-controlled account-wide revocation chaining from
+        // GENESIS, issued by an admin (co-signed by a distinct admin).
+        let (_head, rec) =
+            signed_revocation(account_revoke(U, 1, GENESIS_HEAD.0, None), &a1, Some(&a2));
+        let res = multi_issuer(vec![
+            (ADMIN_ID, a1.verifying_key().to_bytes(), vec![Role::Admin]),
+            (A2_ID, a2.verifying_key().to_bytes(), vec![Role::Admin]),
+        ]);
+        // Unanchored: no external head — derived from the record chain. Accepts it.
+        let set =
+            TombstoneSet::verify_authenticated_unanchored(&[rec.clone()], &res).unwrap();
+        assert!(set.is_account_revoked(&[U; 16]));
+
+        // A record that does NOT chain from GENESIS still fails closed (BrokenChain),
+        // proving the unanchored variant did not drop the contiguity check.
+        let (_h2, bad) =
+            signed_revocation(account_revoke(U, 1, [9u8; 32], None), &a1, Some(&a2));
+        assert_eq!(
+            TombstoneSet::verify_authenticated_unanchored(&[bad], &res).unwrap_err(),
+            TombstoneError::BrokenChain
         );
     }
 
