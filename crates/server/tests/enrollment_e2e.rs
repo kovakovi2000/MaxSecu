@@ -34,7 +34,7 @@ use maxsecu_crypto::{sha256, SigningKey, VerifyingKey};
 use maxsecu_encoding::decode;
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::{AuthProofContext, DirBinding};
-use maxsecu_encoding::types::{Bytes32, Role, Text, Timestamp};
+use maxsecu_encoding::types::{Bytes32, MlKemPub, Role, Text, Timestamp};
 use maxsecu_server::{
     export_channel_binding, router, serve, AppState, AuthConfig, AuthService, MemoryBlobStore,
     MemoryStore, NullAuditSink, Store,
@@ -362,5 +362,88 @@ async fn enrollment_registration_key_only_over_real_tls() {
         st,
         StatusCode::FORBIDDEN,
         "a non-admin cannot mint registration keys"
+    );
+}
+
+/// PQ enrollment gate (P7.4 / `docs/runbooks/pq-reenrollment.md`): a registration
+/// that carries an ML-KEM-768 encapsulation key publishes a **hybrid** directory
+/// binding — the served binding's `mlkem_pub` is `Some` and byte-matches the
+/// enrolled key, and it still verifies under the directory pubkey (the D5
+/// signature covers the trailing field for free). A registration that omits the
+/// key stays classical (`None`). Without the PQ leg being published, every
+/// `Suite::V2` re-share to this recipient fails closed with `pq_key_missing`.
+#[tokio::test]
+async fn enrollment_publishes_mlkem_pub_for_a_hybrid_binding() {
+    let signer = Arc::new(SigningKey::generate());
+    let dir_pub = signer.verifying_key().to_bytes();
+
+    let store = MemoryStore::new();
+    store
+        .issue_registration_key(sha256(b"pq-key"), NEVER)
+        .await
+        .unwrap();
+    store
+        .issue_registration_key(sha256(b"classic-key"), NEVER)
+        .await
+        .unwrap();
+
+    let state = AppState {
+        auth: Arc::new(
+            AuthService::new(store, AuthConfig::default().with_directory_pub(dir_pub))
+                .with_dir_signer(signer.clone()),
+        ),
+        blobs: Arc::new(MemoryBlobStore::new()),
+        audit: Arc::new(NullAuditSink),
+        direct_links_enabled: false,
+        max_file_bytes: None,
+    };
+    let pki = test_pki();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve(listener, pki.server_config.clone(), router(state)));
+
+    let mut c = connect(addr, pki.client_config.clone()).await;
+
+    // A fresh identity is PQ-capable (Phase 7): it carries an ML-KEM-768 key.
+    let pq = Identity::generate();
+    let mlkem = pq.mlkem_pub_bytes().expect("fresh identity is PQ-capable");
+    let mut body = reg_body("pquser", "pq-key", &pq);
+    body["mlkem_pub_b64"] = serde_json::Value::String(B64.encode(mlkem));
+    let (st, _res) = post(&mut c, "/v1/users", None, body).await;
+    assert_eq!(st, StatusCode::CREATED, "a PQ enrollment succeeds");
+
+    let (st, dbody) = get(&mut c, "/v1/directory/pquser").await;
+    assert_eq!(st, StatusCode::OK);
+    let (binding, sig) = parse_binding(&dbody);
+    let vk = VerifyingKey::from_bytes(&dir_pub).unwrap();
+    assert!(
+        vk.verify_canonical(labels::DIRBINDING, &binding, &sig)
+            .is_ok(),
+        "the hybrid binding still verifies (the D5 signature covers mlkem_pub)"
+    );
+    assert_eq!(
+        binding.mlkem_pub,
+        Some(MlKemPub(mlkem)),
+        "the enrolled ML-KEM key is published in the directory binding — \
+         so a V2 re-share to this recipient no longer fails pq_key_missing"
+    );
+
+    // A registration that omits the ML-KEM key stays classical (regression lock
+    // on the optional semantics — never a placeholder key).
+    let classic = Identity::generate();
+    let (st, _) = post(
+        &mut c,
+        "/v1/users",
+        None,
+        reg_body("classicuser", "classic-key", &classic),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "a classical enrollment succeeds");
+    let (st, dbody) = get(&mut c, "/v1/directory/classicuser").await;
+    assert_eq!(st, StatusCode::OK);
+    let (cbind, _) = parse_binding(&dbody);
+    assert_eq!(
+        cbind.mlkem_pub, None,
+        "omitting the ML-KEM key yields a classical binding"
     );
 }

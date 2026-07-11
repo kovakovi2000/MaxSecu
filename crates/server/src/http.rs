@@ -28,7 +28,7 @@ use base64::Engine;
 use maxsecu_crypto::{random_array, VerifyingKey};
 use maxsecu_encoding::labels::DIRBINDING;
 use maxsecu_encoding::structs::{DirBinding, Manifest};
-use maxsecu_encoding::types::{Bytes32, Id, Role, RoleSet, Text, Timestamp};
+use maxsecu_encoding::types::{Bytes32, Id, MlKemPub, Role, RoleSet, Text, Timestamp};
 use maxsecu_encoding::{decode, encode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -224,6 +224,11 @@ struct RegisterReq {
     username: String,
     enc_pub_b64: String,
     sig_pub_b64: String,
+    /// Optional PQ-hybrid ML-KEM-768 encapsulation pubkey (exactly 1184 bytes
+    /// when present), published in the signed directory binding so a `Suite::V2`
+    /// re-share/rotation can target this user (P7.4, `pq-reenrollment.md`).
+    /// Absent ⇒ a classical (V1) binding. Mirrors [`RecoveryRegisterReq`].
+    mlkem_pub_b64: Option<String>,
     /// The single-use registration key (plaintext); the server persists only its
     /// `sha256` and consumes it atomically. Operator- or admin-minted.
     registration_key: String,
@@ -281,6 +286,17 @@ async fn register<S: Store>(
     if !st.auth.enrollment_open(now_ms() / 1000) {
         return StatusCode::FORBIDDEN.into_response(); // awaiting / expired delegation
     }
+    // A present ML-KEM key MUST be exactly 1184 bytes; a wrong length is a 400 —
+    // we never sign a binding carrying a truncated/oversized key. Absent ⇒ a
+    // classical (V1) binding (mirrors `recovery_register`). Validated BEFORE any
+    // store I/O so a malformed request never burns a registration key.
+    let mlkem_pub = match req.mlkem_pub_b64.as_deref() {
+        None => None,
+        Some(s) => match b64_fixed::<{ maxsecu_encoding::structs::MLKEM768_PUB_LEN }>(s) {
+            Some(m) => Some(MlKemPub(m)),
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+    };
 
     // (2) The server assigns the id, then signs BOTH role variants for it (pure).
     // The atomic `enroll` stores exactly the one that matches its first-admin
@@ -297,7 +313,7 @@ async fn register<S: Store>(
             roles,
             not_before: Timestamp(BINDING_NOT_BEFORE_MS),
             not_after: Timestamp(BINDING_NOT_AFTER_MS),
-            mlkem_pub: None,
+            mlkem_pub,
         };
         let signature = signer.sign_canonical(DIRBINDING, &binding);
         crate::store::StoredBinding {

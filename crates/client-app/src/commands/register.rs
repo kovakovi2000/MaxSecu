@@ -83,12 +83,20 @@ pub async fn enroll_exchange(
     id: &Identity,
     registration_key: &str,
 ) -> Result<String, UiError> {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "username": username,
         "enc_pub_b64": b64(id.enc_pub_bytes()),
         "sig_pub_b64": b64(id.sig_pub_bytes()),
         "registration_key": registration_key,
     });
+    // Publish the ML-KEM-768 key so the server signs a PQ-hybrid directory
+    // binding — otherwise every `Suite::V2` re-share (or rotation) to this user
+    // fails closed with `pq_key_missing` (P7.4, `docs/runbooks/pq-reenrollment.md`).
+    // A fresh identity is always PQ-capable; a legacy v1-blob identity carries no
+    // ML-KEM key and enrols classical (the `None` arm is a forward-compat guard).
+    if let Some(mlkem) = id.mlkem_pub_bytes() {
+        body["mlkem_pub_b64"] = serde_json::Value::String(b64(mlkem));
+    }
     let (status, json) = post_json(sender, "/v1/users", &body, None, host).await?;
     match status {
         StatusCode::CREATED => json["user_id"]
