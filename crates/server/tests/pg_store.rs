@@ -1049,6 +1049,7 @@ async fn listing_filters_by_type_in_postgres() {
         .list_files(ListFilter {
             file_type: None,
             limit: 10,
+            caller_id: owner,
         })
         .await
         .unwrap();
@@ -1061,6 +1062,7 @@ async fn listing_filters_by_type_in_postgres() {
         .list_files(ListFilter {
             file_type: Some(FileType::Blog as u8 as i16),
             limit: 10,
+            caller_id: owner,
         })
         .await
         .unwrap();
@@ -1115,6 +1117,7 @@ async fn listing_excludes_bundle_members_in_postgres() {
         .list_files(ListFilter {
             file_type: None,
             limit: 50,
+            caller_id: owner,
         })
         .await
         .unwrap();
@@ -1352,6 +1355,7 @@ async fn delete_finalized_file_cascades_in_postgres() {
         .list_files(ListFilter {
             file_type: None,
             limit: 50,
+            caller_id: owner,
         })
         .await
         .unwrap();

@@ -1920,7 +1920,7 @@ struct ListRes {
 /// small-stream structure/sizes only; never values.
 async fn list_files<S: Store + 'static>(
     State(st): State<AppState<S>>,
-    _session: AuthedSession,
+    session: AuthedSession,
     Query(q): Query<ListQuery>,
 ) -> Response {
     // An unknown type filter matches nothing rather than erroring the browse.
@@ -1941,7 +1941,11 @@ async fn list_files<S: Store + 'static>(
     match st
         .auth
         .store()
-        .list_files(ListFilter { file_type, limit })
+        .list_files(ListFilter {
+            file_type,
+            limit,
+            caller_id: session.user_id,
+        })
         .await
     {
         Ok(entries) => {
@@ -3548,6 +3552,7 @@ mod tests {
             .list_files(ListFilter {
                 file_type: None,
                 limit: 50,
+                caller_id: owner,
             })
             .await
             .unwrap();

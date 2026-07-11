@@ -286,6 +286,10 @@ pub struct ListFilter {
     pub file_type: Option<i16>,
     /// Max entries to return.
     pub limit: usize,
+    /// The authenticated session principal. The listing returns ONLY files this
+    /// caller holds a wrap for (their own posts + anything shared to them) — a file
+    /// with no wrap for the caller is omitted (no oracle; matches the open path).
+    pub caller_id: [u8; 16],
 }
 
 /// Decode and coarse-validate a staging request (api.md §8.1/§8.2). Pure: no DB,

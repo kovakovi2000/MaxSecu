@@ -283,6 +283,7 @@ async fn listing_filters_by_type_newest_first() {
         .list_files(ListFilter {
             file_type: None,
             limit: 10,
+            caller_id: OWNER,
         })
         .await
         .unwrap();
@@ -297,6 +298,7 @@ async fn listing_filters_by_type_newest_first() {
         .list_files(ListFilter {
             file_type: Some(FileType::Blog as u8 as i16),
             limit: 10,
+            caller_id: OWNER,
         })
         .await
         .unwrap();

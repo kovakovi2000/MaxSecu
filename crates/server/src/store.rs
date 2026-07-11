@@ -1045,6 +1045,14 @@ impl Store for MemoryStore {
             .iter()
             .filter(|(_, f)| f.current_version >= 1) // finalized only
             .filter(|(_, f)| f.listed) // hide bundle members (Task 1.4)
+            // Caller-visibility gate: only files the caller holds a wrap for in the
+            // current version (their own self-wrap or a share) — omit everything else
+            // (no oracle; matches the open path's wrap check).
+            .filter(|(_, f)| {
+                f.versions
+                    .get(&f.current_version)
+                    .is_some_and(|v| v.wraps.iter().any(|w| w.recipient_id == filter.caller_id))
+            })
             .filter(|(_, f)| filter.file_type.is_none_or(|t| t == f.file_type))
             .filter_map(|(id, f)| {
                 let ver = f.versions.get(&f.current_version)?;
@@ -1542,7 +1550,17 @@ mod memory_store_tests {
                 genesis_sig: [0u8; 64],
             }),
             streams: vec![],
-            wraps: vec![],
+            // An owner self-wrap so the owner can SEE this file under the
+            // caller-scoped listing (mirrors the real self-wrap every upload posts).
+            wraps: vec![WrapInput {
+                recipient_id: owner,
+                recipient_type: 1,
+                wrapped_dek: vec![0xAA; 48],
+                wrap_alg: 1,
+                granted_by: owner,
+                grant_bytes: vec![],
+                grant_sig: [0u8; 64],
+            }],
             recovery_present: true,
             listed,
             bundle_id,
@@ -1743,10 +1761,84 @@ mod memory_store_tests {
             .list_files(ListFilter {
                 file_type: None,
                 limit: 50,
+                caller_id: owner,
             })
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].file_id, bundle_id);
+    }
+
+    /// A user-type wrap for `recipient`, granted by `granter`. `granted_by` MUST be the
+    /// granter: the coarse `add_wrap` gate rejects a wrap whose `granted_by != caller_id`.
+    fn other_user_wrap(recipient: [u8; 16], granter: [u8; 16]) -> WrapInput {
+        WrapInput {
+            recipient_id: recipient,
+            recipient_type: 1,
+            wrapped_dek: vec![0xAA; 48],
+            wrap_alg: 1,
+            granted_by: granter,
+            grant_bytes: vec![],
+            grant_sig: [0u8; 64],
+        }
+    }
+
+    #[tokio::test]
+    async fn list_files_returns_only_files_the_caller_holds_a_wrap_for() {
+        let store = MemoryStore::new();
+        let owner = [0x11u8; 16];
+        let other = [0x22u8; 16];
+        let file = [0xA1u8; 16];
+
+        // Stage + finalize one listed file owned by `owner` (v1_parsed now includes an
+        // owner self-wrap). list_files only returns finalized files.
+        store
+            .stage_version(v1_parsed(file, owner, true, None), 1_000)
+            .await
+            .unwrap();
+        store.finalize_version(file, 1, owner, 1_000).await.unwrap();
+
+        // The owner sees it (holds a self-wrap).
+        let mine = store
+            .list_files(ListFilter {
+                file_type: None,
+                limit: 50,
+                caller_id: owner,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mine.len(), 1, "owner sees their own post");
+        assert_eq!(mine[0].file_id, file);
+
+        // A stranger with no wrap does NOT see it.
+        let theirs = store
+            .list_files(ListFilter {
+                file_type: None,
+                limit: 50,
+                caller_id: other,
+            })
+            .await
+            .unwrap();
+        assert!(theirs.is_empty(), "a non-recipient's feed omits the post");
+
+        // After adding a wrap for `other` (granted by owner), they now see it. NOTE the
+        // real add_wrap signature: (file_id, wrap, caller_id, now_ms) — NO explicit version.
+        store
+            .add_wrap(file, other_user_wrap(other, owner), owner, 1_000)
+            .await
+            .unwrap();
+        let now_theirs = store
+            .list_files(ListFilter {
+                file_type: None,
+                limit: 50,
+                caller_id: other,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            now_theirs.len(),
+            1,
+            "a recipient sees a post once shared to them"
+        );
     }
 }
