@@ -240,6 +240,10 @@ mod tests {
 
     #[cfg(feature = "unpinned-dev")]
     #[test]
+    // Intentionally asserts on a compile-time const: it verifies the value build.rs
+    // GENERATED (that the embedded pin under unpinned-dev really is the test pin), so
+    // the const-ness is the point, not a mistake clippy should flag.
+    #[allow(clippy::assertions_on_constants)]
     fn embedded_pin_is_test_pin_flag_true_under_unpinned_dev() {
         assert!(
             EMBEDDED_PIN_IS_TEST_PIN,
@@ -275,7 +279,8 @@ mod tests {
         let h1 = hex(&d1);
         assert_eq!(h1.len(), 64, "sha256 hex is 64 chars");
         assert!(
-            h1.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            h1.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
             "hex is lowercase, digits+a-f only"
         );
         // Re-hash the same embedded bytes → identical digest (ties the subcommand
