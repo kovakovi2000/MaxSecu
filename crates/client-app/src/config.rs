@@ -162,6 +162,19 @@ pub fn load_sink_pins(dir: &Path) -> Result<SinkPins, UiError> {
     })
 }
 
+/// Load [`SinkPins`] if a sink is CONFIGURED, else `Ok(None)` (opt-in). Absence is
+/// detected by a missing `sink.json` (the endpoint file): a deployment that never
+/// pinned a sink runs the unanchored revocation path (mirrors `load_kt_log_pubs`'
+/// opt-in shape). A PRESENT `sink.json` with any missing/malformed sibling pin is a
+/// half-configured sink — that FAILS CLOSED via [`load_sink_pins`], never silently
+/// treated as opt-out.
+pub fn load_sink_pins_opt(dir: &Path) -> Result<Option<SinkPins>, UiError> {
+    if !dir.join("config").join("sink.json").exists() {
+        return Ok(None); // no sink pinned → opt-in (unanchored reshare)
+    }
+    load_sink_pins(dir).map(Some)
+}
+
 /// Load the offline-pinned **directory key-transparency (KT) log** public keys
 /// from `<dir>/config/kt_log.der` (a raw concatenation of 32-byte Ed25519 keys) —
 /// held to the SAME build-/deploy-time pinned trust model as the D5 directory pin
@@ -692,6 +705,33 @@ mod tests {
         // A malformed custodian allowlist (not a multiple of 32) fails closed.
         std::fs::write(cfg.join("sink_custodians.der"), [0u8; 31]).unwrap();
         assert_eq!(load_sink_pins(&dir).unwrap_err().code, "sink_unpinned");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_sink_pins_opt_absent_is_none_present_is_some_malformed_is_err() {
+        let dir = std::env::temp_dir().join(format!("mxsinkopt-{}", n()));
+        let cfg = dir.join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        // Absent sink.json → Ok(None) (opt-in; caller runs the unanchored path).
+        assert!(load_sink_pins_opt(&dir).unwrap().is_none());
+
+        // Fully pinned → Ok(Some).
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        std::fs::write(cfg.join("sink_root.der"), cert.cert.der()).unwrap();
+        std::fs::write(
+            cfg.join("sink.json"),
+            br#"{"addr":"127.0.0.1:9443","server_name":"localhost"}"#,
+        )
+        .unwrap();
+        std::fs::write(cfg.join("sink_custodians.der"), [0x11u8; 32]).unwrap();
+        assert!(load_sink_pins_opt(&dir).unwrap().is_some());
+
+        // Present sink.json but a malformed sibling pin → Err (fail closed, NOT opt-out).
+        std::fs::write(cfg.join("sink_custodians.der"), [0u8; 31]).unwrap();
+        assert_eq!(load_sink_pins_opt(&dir).unwrap_err().code, "sink_unpinned");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
