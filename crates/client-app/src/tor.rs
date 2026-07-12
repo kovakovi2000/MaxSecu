@@ -80,9 +80,16 @@ impl TorState {
                     .map_err(|_| {
                         UiError::new("tor_unavailable", "Tor configuration is invalid.")
                     })?;
-                TorClient::create_bootstrapped(cfg).await.map_err(|_| {
-                    UiError::new("tor_unavailable", "Could not connect to the Tor network.")
-                })
+                crate::timeout::with_deadline(
+                    crate::timeout::TOR_BOOTSTRAP_TIMEOUT,
+                    async {
+                        TorClient::create_bootstrapped(cfg).await.map_err(|_| {
+                            UiError::new("tor_unavailable", "Could not connect to the Tor network.")
+                        })
+                    },
+                    UiError::new("tor_timeout", "Connecting to the Tor network timed out."),
+                )
+                .await
             })
             .await?;
         Ok(client.clone())
@@ -98,10 +105,17 @@ impl TorState {
         on_bootstrap: impl FnOnce() + Send,
     ) -> Result<BoxedStream, UiError> {
         let client = self.client(on_bootstrap).await?;
-        let stream = client
-            .connect((host, port))
-            .await
-            .map_err(|_| UiError::new("offline", "Could not reach the server over Tor."))?;
+        let stream = crate::timeout::with_deadline(
+            crate::timeout::TOR_DIAL_TIMEOUT,
+            async {
+                client
+                    .connect((host, port))
+                    .await
+                    .map_err(|_| UiError::new("offline", "Could not reach the server over Tor."))
+            },
+            UiError::new("tor_timeout", "Reaching the server over Tor timed out."),
+        )
+        .await?;
         Ok(Box::new(stream) as BoxedStream)
     }
 }

@@ -3,6 +3,7 @@
 //! the RFC 5705 exporter and feeds it to the login proof (api.md §1.5/§2).
 
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -35,11 +36,42 @@ pub async fn tls_over(
     ),
     UiError,
 > {
+    tls_over_within(
+        crate::timeout::TLS_HANDSHAKE_TIMEOUT,
+        tls,
+        server_name,
+        stream,
+    )
+    .await
+}
+
+/// Same as [`tls_over`], with the handshake deadline injected so tests can assert
+/// the timeout without a real 15s wait. The pinned TLS 1.3 handshake is bounded by
+/// `dur`; on expiry we return the sanitized `tls` timeout error.
+async fn tls_over_within(
+    dur: Duration,
+    tls: Arc<ClientConfig>,
+    server_name: ServerName<'static>,
+    stream: BoxedStream,
+) -> Result<
+    (
+        tokio_rustls::client::TlsStream<BoxedStream>,
+        [u8; EXPORTER_LEN],
+    ),
+    UiError,
+> {
     let connector = TlsConnector::from(tls);
-    let tls = connector
-        .connect(server_name, stream)
-        .await
-        .map_err(|_| UiError::new("tls", "Secure connection failed."))?;
+    let tls = crate::timeout::with_deadline(
+        dur,
+        async {
+            connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|_| UiError::new("tls", "Secure connection failed."))
+        },
+        UiError::new("tls", "Secure connection timed out."),
+    )
+    .await?;
     let mut exporter = [0u8; EXPORTER_LEN];
     tls.get_ref()
         .1
@@ -123,5 +155,26 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
         assert!(pinned_client_config(cert_der).is_ok());
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_times_out_on_a_silent_peer() {
+        // A duplex whose far end never responds: rustls waits for the ServerHello
+        // forever. `_server_end` is kept alive (no EOF) so the ONLY way the future
+        // completes is the deadline — proving the handshake is bounded.
+        let (client_end, _server_end) = tokio::io::duplex(1024);
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let cfg = pinned_client_config(cert_der).unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        // NB: the Ok type contains `TlsStream<BoxedStream>` which is not `Debug`,
+        // so `.expect_err()` won't compile — match to extract the error instead.
+        let err = match tls_over_within(Duration::from_millis(80), cfg, name, Box::new(client_end))
+            .await
+        {
+            Ok(_) => panic!("silent peer must time out"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "tls");
     }
 }

@@ -26,6 +26,7 @@ pub mod revocations;
 pub mod session;
 pub mod session_seal;
 pub mod thumb_cache;
+mod timeout;
 pub mod sink;
 pub mod state;
 pub mod tofu;
