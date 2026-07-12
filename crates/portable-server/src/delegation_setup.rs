@@ -31,10 +31,10 @@ struct FileDelegationPersist {
 
 impl DelegationPersist for FileDelegationPersist {
     fn persist_directory_pub(&self, dir_pub: &[u8; 32]) -> std::io::Result<()> {
-        std::fs::write(self.layout.d5_pub_path(), dir_pub)
+        write_atomic(&self.layout.d5_pub_path(), dir_pub)
     }
     fn persist_delegation(&self, bytes: &[u8]) -> std::io::Result<()> {
-        std::fs::write(self.layout.d5_delegation_path(), bytes)
+        write_atomic(&self.layout.d5_delegation_path(), bytes)
     }
     fn burn_token(&self) -> std::io::Result<()> {
         match std::fs::remove_file(self.layout.bootstrap_token_path()) {
@@ -66,12 +66,34 @@ fn ensure_operational_key(layout: &Layout) -> std::io::Result<SigningKey> {
         Ok(_) => return Err(std::io::Error::other("operational seed malformed")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let s: [u8; 32] = maxsecu_crypto::random_array();
-            std::fs::write(layout.operational_secret_path(), s)?;
+            // Atomic write: a kill/power-loss mid-write can never leave a TRUNCATED
+            // seed (which is a hard error) that would brick the server into a systemd
+            // crash loop — the file is always either absent or the full 32 bytes.
+            write_atomic(&layout.operational_secret_path(), &s)?;
             s
         }
         Err(e) => return Err(e),
     };
     Ok(SigningKey::from_seed(&seed))
+}
+
+/// Write `bytes` to `path` atomically: write a sibling temp file, fsync its data, then
+/// rename it over the target. Because the target is only ever swapped by an atomic
+/// rename (never written in place), a process kill / systemd restart mid-write can
+/// never leave the target truncated — every reader sees either the old bytes or the
+/// complete new bytes. The `sync_all` flushes the temp's data before the rename commits
+/// so the swap does not expose a zero-length file. (We do not fsync the directory, so a
+/// hard power-loss on a filesystem that reorders the rename ahead of the data could in
+/// principle lose the *rename*, reverting to the old bytes — but never a truncated
+/// target.) Used for the operational seed (a truncated seed is fatal by design) and the
+/// persisted delegation/pin (a truncated one would silently revert to awaiting).
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Load a persisted `(directory_pub, delegation_bytes)` if BOTH files are present
@@ -235,6 +257,59 @@ mod tests {
         let w3 = build_prod(&layout).unwrap();
         assert_eq!(w3.directory_pub, Some(d5_pub));
         assert!(w3.ctx.enrollment_open(now));
+        // REGRESSION (part 4): a restart must NOT rotate the operational key out from
+        // under the installed delegation — the loaded op-key still equals the one the
+        // persisted delegation authorizes, so the delegation stays valid across restarts.
+        assert_eq!(
+            w3.ctx.operational_pub(),
+            op_pub,
+            "restart kept the op-key that the installed delegation authorizes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_round_trips_and_leaves_no_temp_file() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("operational_secret.bin");
+        write_atomic(&path, &[9u8; 32]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![9u8; 32]);
+        // Overwrite in place still works and never leaves the sibling temp behind.
+        write_atomic(&path, &[7u8; 32]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 32]);
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "the temp file must be renamed away, never left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_operational_seed_is_fatal_and_never_silently_regenerated() {
+        // A wrong-length (truncated) operational seed MUST be a hard error — never
+        // regenerated. Regenerating would silently rotate the op-key and invalidate an
+        // already-installed delegation (the delegation would authorize the OLD key),
+        // locking out every client. The atomic write exists to prevent such truncation;
+        // this locks in the fail-closed behaviour it protects.
+        let dir = tmp();
+        let layout = Layout::ensure(&dir).unwrap();
+        std::fs::write(layout.operational_secret_path(), [1u8; 5]).unwrap();
+        // `DelegationWiring` isn't `Debug`, so match rather than `expect_err`.
+        let err = match build_prod(&layout) {
+            Err(e) => e,
+            Ok(_) => panic!("a malformed seed must be fatal"),
+        };
+        assert!(
+            err.to_string().contains("malformed"),
+            "expected a 'malformed' error, got: {err}"
+        );
+        // The bad file is left UNTOUCHED — not silently rotated to a fresh 32-byte key.
+        assert_eq!(
+            std::fs::read(layout.operational_secret_path()).unwrap(),
+            vec![1u8; 5],
+            "a malformed seed must not be overwritten/regenerated"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

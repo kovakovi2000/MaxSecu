@@ -34,6 +34,25 @@ pub const DELEGATION_WIRE_LEN: usize = DELEGATION_BODY_LEN + 64;
 /// The only supported delegation-cert version.
 pub const DELEGATION_VERSION: u8 = 1;
 
+/// Tolerated clock skew (seconds) between the admin PC that *signs* a delegation
+/// and the internet-facing server that *verifies* it. The single source of truth
+/// for the offline-D5 ceremony's skew handling:
+///
+/// * the client SIGNERS (ceremony + renewal) back-date `valid_from` by this amount
+///   (`valid_from = now - DELEGATION_CLOCK_SKEW_SECS`) so a delegation still passes
+///   the server's strict `now >= valid_from` check when the server clock trails the
+///   client clock by up to this much;
+/// * the server's `sane_window` tolerates a `valid_from` up to this far in the
+///   *future* (the mirror direction).
+///
+/// `verify()` itself stays STRICT (no tolerance): the skew handling lives entirely
+/// on the signing side, so the relaxed lower bound is baked into the signed bytes
+/// and every verifier applies it uniformly. Back-dating has zero security cost —
+/// `valid_until` (expiry) is unchanged, so the delegation is not extended, only its
+/// start moves earlier; the resulting window (typ. 90d + this) stays far under any
+/// sane-window cap.
+pub const DELEGATION_CLOCK_SKEW_SECS: u64 = 24 * 3_600;
+
 /// A parsed directory-delegation certificate (spec §4). The **issuer is
 /// implicit** — the signature verifies against the pinned `directory_pub` (D5),
 /// so no issuer field is stored.

@@ -426,6 +426,11 @@ struct OperationalKeyRes {
     /// STANDARD base64 of the server's 32-byte operational (binding-signing)
     /// Ed25519 public key — the admin signs the delegation cert over this.
     operational_pub_b64: String,
+    /// The server's current unix time (seconds), from the SAME clock the delegation
+    /// window is verified against. Lets the ceremony/renewal preflight detect clock
+    /// skew BEFORE signing. Non-secret (also inferable from the HTTP `Date` header);
+    /// older clients simply ignore the extra field.
+    server_unix_secs: u64,
 }
 
 /// `GET /v1/bootstrap/operational-key` — return the server's operational public
@@ -435,6 +440,7 @@ async fn bootstrap_operational_key<S: Store>(State(st): State<AppState<S>>) -> R
     match st.auth.delegation() {
         Some(ctx) => Json(OperationalKeyRes {
             operational_pub_b64: b64encode(&ctx.operational_pub()),
+            server_unix_secs: now_ms() / 1000,
         })
         .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -481,6 +487,41 @@ struct DelegationInstalledRes {
     valid_until: u64,
 }
 
+#[derive(Serialize)]
+struct DelegationErrorRes {
+    /// Machine-readable reason slug: `bad_signature` | `op_key_mismatch` | `bad_window`.
+    error: &'static str,
+    /// Human-readable, sanitized detail (safe to show the admin; contains no secrets).
+    detail: &'static str,
+}
+
+/// A `400` carrying a machine-readable `{error, detail}` reason for a rejected
+/// delegation (bootstrap or renewal), so `maxsecu-setup` can tell the operator CLOCK
+/// SKEW (`bad_window`) apart from a reinstalled server (`op_key_mismatch`) or a wrong
+/// build (`bad_signature`). Both endpoints gate on the one-time token / `AdminSession`
+/// BEFORE any cert-specific reason is computed, so this is not an unauthenticated
+/// oracle; everything it reveals (op-key, window) is already public via the
+/// unauthenticated GET operational-key / GET delegation endpoints.
+fn delegation_reason_400(error: &'static str, detail: &'static str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(DelegationErrorRes { error, detail }),
+    )
+        .into_response()
+}
+
+/// The sanitized `detail` string for each delegation-rejection slug (shared by the
+/// bootstrap and renewal handlers).
+const BAD_SIGNATURE_DETAIL: &str =
+    "the delegation signature or certificate format did not verify against the \
+     posted directory (D5) key";
+const OP_KEY_MISMATCH_DETAIL: &str =
+    "the delegation authorizes a different operational key than this server holds \
+     (the server may have been reinstalled or reset since the token was issued)";
+const BAD_WINDOW_DETAIL: &str =
+    "the delegation window is not valid for the server's current clock (almost always \
+     clock skew — sync NTP on both machines, then re-run)";
+
 /// `POST /v1/bootstrap/delegation` — one-time-token-gated ceremony install (spec
 /// §6). Verifies the cert against the POSTED D5 pub (TOFU), requires the extracted
 /// `operational_pub` to equal the server's own and a sane window, then pins the D5,
@@ -512,7 +553,15 @@ async fn post_bootstrap_delegation<S: Store>(
             .into_response(),
         crate::delegation::BootstrapResult::NotAwaiting => StatusCode::CONFLICT.into_response(),
         crate::delegation::BootstrapResult::BadToken => StatusCode::FORBIDDEN.into_response(),
-        crate::delegation::BootstrapResult::BadCert => StatusCode::BAD_REQUEST.into_response(),
+        crate::delegation::BootstrapResult::BadSignature => {
+            delegation_reason_400("bad_signature", BAD_SIGNATURE_DETAIL)
+        }
+        crate::delegation::BootstrapResult::OpKeyMismatch => {
+            delegation_reason_400("op_key_mismatch", OP_KEY_MISMATCH_DETAIL)
+        }
+        crate::delegation::BootstrapResult::BadWindow => {
+            delegation_reason_400("bad_window", BAD_WINDOW_DETAIL)
+        }
         crate::delegation::BootstrapResult::Persist(e) => internal_error(e),
     }
 }
@@ -548,7 +597,15 @@ async fn post_admin_delegation<S: Store + 'static>(
         })
         .into_response(),
         crate::delegation::RenewResult::NotDelegated => StatusCode::CONFLICT.into_response(),
-        crate::delegation::RenewResult::BadCert => StatusCode::BAD_REQUEST.into_response(),
+        crate::delegation::RenewResult::BadSignature => {
+            delegation_reason_400("bad_signature", BAD_SIGNATURE_DETAIL)
+        }
+        crate::delegation::RenewResult::OpKeyMismatch => {
+            delegation_reason_400("op_key_mismatch", OP_KEY_MISMATCH_DETAIL)
+        }
+        crate::delegation::RenewResult::BadWindow => {
+            delegation_reason_400("bad_window", BAD_WINDOW_DETAIL)
+        }
         crate::delegation::RenewResult::Persist(e) => internal_error(e),
     }
 }
@@ -4180,6 +4237,11 @@ mod tests {
             b64_fixed::<32>(body["operational_pub_b64"].as_str().unwrap()).unwrap(),
             op_pub
         );
+        // …and carries the server clock so the ceremony can preflight for skew.
+        assert!(
+            body["server_unix_secs"].as_u64().unwrap() >= now_secs() - 5,
+            "operational-key response must carry a fresh server_unix_secs"
+        );
 
         // Valid bootstrap ⇒ 201, enrollment opens, token burned (invariant 6).
         let now = now_secs();
@@ -4251,6 +4313,59 @@ mod tests {
         assert_eq!(
             post_bootstrap(&router, "tok", &d5_pub, &good).await.0,
             StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_400_reasons_are_specific_and_gated_behind_the_token() {
+        let d5 = SigningKey::from_seed(&[1u8; 32]);
+        let d5_pub = d5.verifying_key().to_bytes();
+        let op = Arc::new(SigningKey::from_seed(&[7u8; 32]));
+        let op_pub = op.verifying_key().to_bytes();
+        let mk = || {
+            Arc::new(crate::delegation::DelegationCtx::prod(
+                op_pub,
+                None,
+                Some(sha256(b"tok")),
+                Arc::new(crate::delegation::NullDelegationPersist),
+            ))
+        };
+        let now = now_secs();
+
+        // (a) valid signature + valid op-key, but the window has not opened at the
+        //     server clock (valid_from in the future) — exactly what a server clock
+        //     BEHIND the signer sees ⇒ 400 bad_window with the clock-skew hint.
+        let router = prod_app(mk(), op.clone(), d5_pub);
+        let not_yet = maxsecu_crypto::sign_delegation(&d5, &op_pub, now + 3600, now + 80 * DAY);
+        let (st, body) = post_bootstrap(&router, "tok", &d5_pub, &not_yet).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "bad_window");
+        assert!(body["detail"].as_str().unwrap().contains("clock skew"));
+
+        // (b) valid D5 signature but a DIFFERENT op-key ⇒ 400 op_key_mismatch.
+        let router = prod_app(mk(), op.clone(), d5_pub);
+        let other = SigningKey::from_seed(&[9u8; 32]).verifying_key().to_bytes();
+        let wrong_op = maxsecu_crypto::sign_delegation(&d5, &other, now - 60, now + 80 * DAY);
+        let (st, body) = post_bootstrap(&router, "tok", &d5_pub, &wrong_op).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "op_key_mismatch");
+
+        // (c) wrong signer ⇒ 400 bad_signature.
+        let router = prod_app(mk(), op.clone(), d5_pub);
+        let bad_sig = maxsecu_crypto::sign_delegation(&op, &op_pub, now - 60, now + 80 * DAY);
+        let (st, body) = post_bootstrap(&router, "tok", &d5_pub, &bad_sig).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "bad_signature");
+
+        // (d) SECURITY (token-first invariant): a WRONG token ⇒ 403 with NO
+        //     cert-diagnostic body. The specific reasons must never leak to a caller
+        //     who does not hold the one-time token, or they become an oracle.
+        let router = prod_app(mk(), op.clone(), d5_pub);
+        let (st, body) = post_bootstrap(&router, "WRONG-TOKEN", &d5_pub, &not_yet).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert!(
+            body.get("error").is_none(),
+            "no cert reason may leak before the token check: {body}"
         );
     }
 

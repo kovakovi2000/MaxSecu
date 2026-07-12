@@ -30,7 +30,8 @@ pub use aead::{
 pub use dek::{fingerprint, Dek};
 pub use delegation::{
     parse as parse_delegation, sign as sign_delegation, verify as verify_delegation,
-    DirectoryDelegation, DELEGATION_BODY_LEN, DELEGATION_VERSION, DELEGATION_WIRE_LEN,
+    DirectoryDelegation, DELEGATION_BODY_LEN, DELEGATION_CLOCK_SKEW_SECS, DELEGATION_VERSION,
+    DELEGATION_WIRE_LEN,
 };
 pub use hash::sha256;
 pub use hybrid::{

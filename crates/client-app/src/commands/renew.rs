@@ -28,7 +28,7 @@ use base64::Engine;
 use zeroize::Zeroizing;
 
 use maxsecu_client_core::unseal_seed;
-use maxsecu_crypto::{parse_delegation, sign_delegation, SigningKey};
+use maxsecu_crypto::{parse_delegation, sign_delegation, SigningKey, DELEGATION_CLOCK_SKEW_SECS};
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
@@ -78,13 +78,17 @@ pub fn is_due(current_valid_until: u64, now_secs: u64, force: bool) -> bool {
     force || current_valid_until <= now_secs.saturating_add(RENEW_THRESHOLD_SECS)
 }
 
-/// Sign a fresh 90-day delegation with the D5 root over `op_pub`, starting `now_secs`.
+/// Sign a fresh 90-day delegation with the D5 root over `op_pub`. `valid_from` is
+/// back-dated by [`DELEGATION_CLOCK_SKEW_SECS`] so the cert still passes the server's
+/// strict `now >= valid_from` check when the server clock trails this (client) clock
+/// by up to that margin; `valid_until = now + 90d` is UNCHANGED (expiry not extended).
 /// Returns `(cert_wire_bytes, valid_until)`. Pure; the single home for the renewal
 /// window + signing shared by every renew path.
 pub fn sign_renewal(d5: &SigningKey, op_pub: &[u8; 32], now_secs: u64) -> (Vec<u8>, u64) {
+    let valid_from = now_secs.saturating_sub(DELEGATION_CLOCK_SKEW_SECS);
     let valid_until = now_secs.saturating_add(RENEW_WINDOW_SECS);
     (
-        sign_delegation(d5, op_pub, now_secs, valid_until),
+        sign_delegation(d5, op_pub, valid_from, valid_until),
         valid_until,
     )
 }
@@ -336,7 +340,7 @@ pub async fn renew_delegation(
 mod tests {
     use super::*;
     use maxsecu_client_core::seal_seed;
-    use maxsecu_crypto::{verify_delegation, ARGON2_FLOOR};
+    use maxsecu_crypto::{verify_delegation, ARGON2_FLOOR, DELEGATION_CLOCK_SKEW_SECS};
 
     const DAY: u64 = 86_400;
     const NOW: u64 = 1_700_000_000;
@@ -385,13 +389,41 @@ mod tests {
         let parsed = parse_delegation(&cert).expect("renewal parses");
         // Same operational_pub (the server requires this).
         assert_eq!(parsed.operational_pub(), op);
-        assert_eq!(parsed.valid_from(), NOW);
+        // valid_from is BACK-DATED by the clock-skew margin so the cert still passes
+        // the server's strict `now >= valid_from` check when the server clock trails
+        // this (client) clock. valid_until is UNCHANGED (expiry not extended).
+        assert_eq!(parsed.valid_from(), NOW - DELEGATION_CLOCK_SKEW_SECS);
         assert_eq!(parsed.valid_until(), NOW + 90 * DAY);
 
         // Within the server's "sane window" (spec §6): non-empty, ends in future,
-        // ≤ 366 days, and valid_from within the 24h forward-skew.
+        // ≤ 366 days (90d + the 24h back-date = 91d), and valid_from not in the
+        // future (it is back-dated, so trivially ≤ now + the forward-skew).
         let (vf, vu) = (parsed.valid_from(), parsed.valid_until());
-        assert!(vu > NOW && vu >= vf && vu - vf <= 366 * DAY && vf <= NOW + 24 * 3_600);
+        assert!(
+            vu > NOW && vu >= vf && vu - vf <= 366 * DAY && vf <= NOW + DELEGATION_CLOCK_SKEW_SECS
+        );
+        assert_eq!(vu - vf, 90 * DAY + DELEGATION_CLOCK_SKEW_SECS);
+    }
+
+    // The whole point of the back-date: a renewal signed against THIS (client) clock
+    // must still verify on a server whose clock TRAILS ours by up to the skew margin.
+    #[test]
+    fn signed_renewal_verifies_on_a_server_clock_behind_by_up_to_the_skew_margin() {
+        let d5 = d5();
+        let op = op_pub();
+        let (cert, _) = sign_renewal(&d5, &op, NOW);
+        let d5_pub = d5.verifying_key().to_bytes();
+
+        // Server exactly the skew margin behind ⇒ now == valid_from ⇒ passes (inclusive).
+        assert!(
+            verify_delegation(&d5_pub, &cert, NOW - DELEGATION_CLOCK_SKEW_SECS).is_ok(),
+            "server behind by exactly the margin must still verify"
+        );
+        // One second past the margin ⇒ before valid_from ⇒ fails closed.
+        assert!(
+            verify_delegation(&d5_pub, &cert, NOW - DELEGATION_CLOCK_SKEW_SECS - 1).is_err(),
+            "server behind by MORE than the margin must fail closed"
+        );
     }
 
     #[test]

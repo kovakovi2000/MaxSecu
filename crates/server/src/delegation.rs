@@ -25,7 +25,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use maxsecu_crypto::{parse_delegation, sha256, verify_delegation};
+use maxsecu_crypto::{parse_delegation, sha256, verify_delegation, CryptoError};
 
 /// The longest delegation window the server will accept (spec §6 "sane window").
 /// A cert whose `valid_until - valid_from` exceeds this is rejected — the whole
@@ -33,8 +33,10 @@ use maxsecu_crypto::{parse_delegation, sha256, verify_delegation};
 pub const MAX_DELEGATION_WINDOW_SECS: u64 = 366 * 86_400;
 
 /// Tolerated forward clock skew for a delegation's `valid_from` (spec §6). A
-/// `valid_from` more than this far in the future is rejected.
-pub const DELEGATION_CLOCK_SKEW_SECS: u64 = 24 * 3_600;
+/// `valid_from` more than this far in the future is rejected. Single source of truth
+/// lives in `maxsecu_crypto` — the client signers back-date `valid_from` by the same
+/// amount so a server clock behind the signer still accepts the cert.
+pub const DELEGATION_CLOCK_SKEW_SECS: u64 = maxsecu_crypto::DELEGATION_CLOCK_SKEW_SECS;
 
 /// The durable side of the delegation state. `portable-server` implements this
 /// over files under `<data_dir>/config/`; tests use [`NullDelegationPersist`].
@@ -88,9 +90,17 @@ pub enum BootstrapResult {
     NotAwaiting,
     /// The one-time token was missing or did not match.
     BadToken,
-    /// The cert failed verification: bad signature, out of window, wrong
-    /// `operational_pub`, or an insane window.
-    BadCert,
+    /// The delegation's Ed25519 signature (or certificate format) did not verify
+    /// against the posted D5 key. Surfaced to the operator as `bad_signature`.
+    BadSignature,
+    /// The delegation authorizes a different `operational_pub` than this server holds
+    /// (e.g. the server was reinstalled/reset since the token was issued). Surfaced
+    /// as `op_key_mismatch`.
+    OpKeyMismatch,
+    /// The delegation's validity window is not acceptable for the server's current
+    /// clock (out of window — almost always CLOCK SKEW) or violates the sane-window
+    /// bounds. Surfaced as `bad_window`.
+    BadWindow,
     /// Persisting the new state to disk failed.
     Persist(std::io::Error),
 }
@@ -102,9 +112,14 @@ pub enum RenewResult {
     Ok { valid_until: u64 },
     /// No delegation is installed yet — renewal requires an existing pinned D5.
     NotDelegated,
-    /// The cert failed verification against the pinned D5 / wrong `operational_pub`
-    /// / insane window.
-    BadCert,
+    /// The replacement's signature/format did not verify against the pinned D5.
+    /// Surfaced as `bad_signature`.
+    BadSignature,
+    /// The replacement authorizes a different `operational_pub` than the current one
+    /// (op-key rotation is out of scope). Surfaced as `op_key_mismatch`.
+    OpKeyMismatch,
+    /// The replacement's window is out of range / insane. Surfaced as `bad_window`.
+    BadWindow,
     /// Persisting the replacement failed.
     Persist(std::io::Error),
 }
@@ -119,7 +134,9 @@ impl PartialEq for BootstrapResult {
             (Ok { valid_until: a }, Ok { valid_until: b }) => a == b,
             (NotAwaiting, NotAwaiting) => true,
             (BadToken, BadToken) => true,
-            (BadCert, BadCert) => true,
+            (BadSignature, BadSignature) => true,
+            (OpKeyMismatch, OpKeyMismatch) => true,
+            (BadWindow, BadWindow) => true,
             (Persist(_), Persist(_)) => true,
             _ => false,
         }
@@ -132,7 +149,9 @@ impl PartialEq for RenewResult {
         match (self, other) {
             (Ok { valid_until: a }, Ok { valid_until: b }) => a == b,
             (NotDelegated, NotDelegated) => true,
-            (BadCert, BadCert) => true,
+            (BadSignature, BadSignature) => true,
+            (OpKeyMismatch, OpKeyMismatch) => true,
+            (BadWindow, BadWindow) => true,
             (Persist(_), Persist(_)) => true,
             _ => false,
         }
@@ -251,16 +270,34 @@ impl DelegationCtx {
         if sha256(token.as_bytes()) != expected {
             return BootstrapResult::BadToken;
         }
-        // Verify the cert against the POSTED directory pub (TOFU) and the window.
+        // Verify the cert against the POSTED directory pub (TOFU) and the window. A
+        // signature/format failure, an op-key mismatch, and an out-of-window cert map
+        // to DISTINCT outcomes (and journalctl lines) so the operator can tell CLOCK
+        // SKEW apart from a wrong build or a reinstalled server. These lines are only
+        // reachable AFTER the one-time token check above, so they are not an oracle.
         let op_pub = match verify_delegation(&directory_pub, cert, now_secs) {
             Ok(p) => p,
-            Err(_) => return BootstrapResult::BadCert,
+            Err(CryptoError::DelegationExpired) => {
+                log_delegation_reject("bootstrap", "bad_window", cert, now_secs);
+                return BootstrapResult::BadWindow;
+            }
+            Err(e) => {
+                log_delegation_reject(
+                    "bootstrap",
+                    &format!("bad_signature ({e:?})"),
+                    cert,
+                    now_secs,
+                );
+                return BootstrapResult::BadSignature;
+            }
         };
         if op_pub != self.operational_pub {
-            return BootstrapResult::BadCert;
+            log_delegation_reject("bootstrap", "op_key_mismatch", cert, now_secs);
+            return BootstrapResult::OpKeyMismatch;
         }
         if !sane_window(cert, now_secs) {
-            return BootstrapResult::BadCert;
+            log_delegation_reject("bootstrap", "bad_window (insane window)", cert, now_secs);
+            return BootstrapResult::BadWindow;
         }
         // Persist BEFORE flipping in-RAM state so a disk fault fails closed.
         if let Err(e) = self.persist.persist_directory_pub(&directory_pub) {
@@ -294,15 +331,24 @@ impl DelegationCtx {
         };
         let op_pub = match verify_delegation(&cur.directory_pub, cert, now_secs) {
             Ok(p) => p,
-            Err(_) => return RenewResult::BadCert,
+            Err(CryptoError::DelegationExpired) => {
+                log_delegation_reject("renewal", "bad_window", cert, now_secs);
+                return RenewResult::BadWindow;
+            }
+            Err(e) => {
+                log_delegation_reject("renewal", &format!("bad_signature ({e:?})"), cert, now_secs);
+                return RenewResult::BadSignature;
+            }
         };
         // Op-key rotation to a NEW operational_pub is out of scope (deferred,
         // design §12) — a delegation for a different op-key is rejected.
         if op_pub != self.operational_pub {
-            return RenewResult::BadCert;
+            log_delegation_reject("renewal", "op_key_mismatch", cert, now_secs);
+            return RenewResult::OpKeyMismatch;
         }
         if !sane_window(cert, now_secs) {
-            return RenewResult::BadCert;
+            log_delegation_reject("renewal", "bad_window (insane window)", cert, now_secs);
+            return RenewResult::BadWindow;
         }
         if let Err(e) = self.persist.persist_delegation(cert) {
             return RenewResult::Persist(e);
@@ -316,6 +362,34 @@ impl DelegationCtx {
             delegation_bytes: cert.to_vec(),
         });
         RenewResult::Ok { valid_until }
+    }
+}
+
+/// Emit a non-secret diagnostic line to stderr (→ journalctl under systemd) naming
+/// WHICH delegation check failed, so an operator can tell CLOCK SKEW (`bad_window`)
+/// apart from a reinstalled server (`op_key_mismatch`) or a wrong build
+/// (`bad_signature`). Deliberately logs ONLY non-secret values — the reason, the
+/// server clock, and the cert's public window + operational-key prefix. It NEVER
+/// receives or logs the one-time bootstrap token or any seed material.
+fn log_delegation_reject(phase: &str, reason: &str, cert: &[u8], now_secs: u64) {
+    match parse_delegation(cert) {
+        Ok(d) => {
+            let op = d.operational_pub();
+            eprintln!(
+                "maxsecu: {phase} delegation rejected [{reason}]: server_now={now_secs} \
+                 cert_window=[{},{}] cert_op_pub={:02x}{:02x}{:02x}{:02x}",
+                d.valid_from(),
+                d.valid_until(),
+                op[0],
+                op[1],
+                op[2],
+                op[3]
+            );
+        }
+        Err(e) => eprintln!(
+            "maxsecu: {phase} delegation rejected [{reason}]: server_now={now_secs} \
+             unparseable_cert={e:?}"
+        ),
     }
 }
 
@@ -402,10 +476,10 @@ mod tests {
         );
         assert!(!ctx.enrollment_open(now), "awaiting ⇒ closed");
 
-        // Wrong signer (op signed instead of d5) ⇒ BadCert, still awaiting.
+        // Wrong signer (op signed instead of d5) ⇒ BadSignature, still awaiting.
         assert_eq!(
             ctx.install_bootstrap("tok-123", d5_pub, &cert, now),
-            BootstrapResult::BadCert
+            BootstrapResult::BadSignature
         );
         assert!(!ctx.enrollment_open(now));
 
@@ -448,12 +522,12 @@ mod tests {
             BootstrapResult::BadToken
         );
         assert!(!ctx.enrollment_open(now));
-        // Right token, but cert authorizes a DIFFERENT op-key ⇒ BadCert.
+        // Right token, but cert authorizes a DIFFERENT op-key ⇒ OpKeyMismatch.
         let other_op = SigningKey::from_seed(&[9u8; 32]).verifying_key().to_bytes();
         let wrong = sign_delegation(&d5, &other_op, now, now + DAY);
         assert_eq!(
             ctx.install_bootstrap("secret", d5_pub, &wrong, now),
-            BootstrapResult::BadCert
+            BootstrapResult::OpKeyMismatch
         );
         assert!(!ctx.enrollment_open(now));
         // Token still usable afterwards (not burned by a failed attempt).
@@ -475,11 +549,48 @@ mod tests {
             Some(sha256(b"t")),
             Arc::new(NullDelegationPersist),
         );
-        // Window longer than the cap (2 years) ⇒ BadCert even though it verifies.
+        // Window longer than the cap (2 years) ⇒ BadWindow even though it verifies.
         let toolong = sign_delegation(&d5, &op_pub, now, now + 2 * 366 * DAY);
         assert_eq!(
             ctx.install_bootstrap("t", d5_pub, &toolong, now),
-            BootstrapResult::BadCert
+            BootstrapResult::BadWindow
+        );
+    }
+
+    #[test]
+    fn bootstrap_distinguishes_out_of_window_from_signature_and_op_key() {
+        let d5 = d5();
+        let d5_pub = d5.verifying_key().to_bytes();
+        let op_pub = op().verifying_key().to_bytes();
+        let now = 1_700_000_000u64;
+        let fresh_ctx = || {
+            DelegationCtx::prod(
+                op_pub,
+                None,
+                Some(sha256(b"tk")),
+                Arc::new(NullDelegationPersist),
+            )
+        };
+
+        // The ACTUAL field bug: a validly-D5-signed cert whose window has not opened
+        // yet at the server clock (valid_from in the server's future — exactly what a
+        // server clock BEHIND the signer sees) ⇒ BadWindow, NOT BadSignature.
+        let not_yet = sign_delegation(&d5, &op_pub, now + 100, now + 90 * DAY);
+        assert_eq!(
+            fresh_ctx().install_bootstrap("tk", d5_pub, &not_yet, now),
+            BootstrapResult::BadWindow,
+            "valid signature + future valid_from must be BadWindow (the clock-skew case)"
+        );
+
+        // A BACK-DATED cert (valid_from before the server clock, as the fixed client
+        // now signs) with the right op-key and a sane window ⇒ Ok.
+        let back_dated = sign_delegation(&d5, &op_pub, now - 50, now + 90 * DAY);
+        assert_eq!(
+            fresh_ctx().install_bootstrap("tk", d5_pub, &back_dated, now),
+            BootstrapResult::Ok {
+                valid_until: now + 90 * DAY
+            },
+            "a back-dated, correctly-signed cert installs"
         );
     }
 
@@ -529,14 +640,24 @@ mod tests {
         let other_op = SigningKey::from_seed(&[3u8; 32]).verifying_key().to_bytes();
         assert_eq!(
             ctx.install_renewal(&sign_delegation(&d5, &other_op, now, vu2), now),
-            RenewResult::BadCert
+            RenewResult::OpKeyMismatch
         );
 
         // A renewal signed by a NON-pinned key is rejected (must chain to pinned D5).
         let evil = SigningKey::from_seed(&[42u8; 32]);
         assert_eq!(
             ctx.install_renewal(&sign_delegation(&evil, &op_pub, now, vu2), now),
-            RenewResult::BadCert
+            RenewResult::BadSignature
+        );
+
+        // A renewal with an over-cap (insane) window ⇒ BadWindow (exercises the
+        // renewal side of the split, mirroring the bootstrap path).
+        assert_eq!(
+            ctx.install_renewal(
+                &sign_delegation(&d5, &op_pub, now, now + 2 * 366 * DAY),
+                now
+            ),
+            RenewResult::BadWindow
         );
     }
 

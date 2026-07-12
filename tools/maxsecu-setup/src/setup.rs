@@ -24,7 +24,7 @@ use maxsecu_client_app::transport::Transport;
 use maxsecu_client_core::{keyblob, password, seedblob, Identity, ARGON2_DESKTOP_TARGET};
 use maxsecu_crypto::{
     deserialize_hybrid_wrap, parse_delegation, pin_fingerprint, sign_delegation, unwrap_dek_hybrid,
-    HybridEncSecretKey, SigningKey,
+    HybridEncSecretKey, SigningKey, DELEGATION_CLOCK_SKEW_SECS,
 };
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::{AuthProofContext, WrapContext};
@@ -126,9 +126,22 @@ pub enum SetupError {
     /// `POST /v1/bootstrap/delegation` returned 403: the one-time token was wrong.
     /// NOTHING is written; re-runnable with the correct token.
     DelegationBadToken,
-    /// `POST /v1/bootstrap/delegation` returned 400: the server rejected the cert
-    /// (bad signature / window / op-key). NOTHING is written.
+    /// `POST /v1/bootstrap/delegation` returned 400 with no machine-readable reason
+    /// (an older server, or an opaque body). NOTHING is written.
     DelegationBadCert,
+    /// `POST /v1/bootstrap/delegation` (or the renewal) returned 400 with a specific
+    /// `{error, detail}` reason (`bad_window` / `op_key_mismatch` / `bad_signature`).
+    /// NOTHING is written.
+    DelegationRejected { reason: String, detail: String },
+    /// The pre-sign clock-skew preflight found this machine too far AHEAD of the
+    /// server (server clock trailing by more than the tolerated margin): the
+    /// delegation would be rejected as "not yet valid". NOTHING is written — sync NTP
+    /// on both machines and re-run.
+    ClockSkew {
+        local: u64,
+        server: u64,
+        magnitude: u64,
+    },
     /// A pre-flight guard failed (output path already exists, weak passphrase) —
     /// caught BEFORE any network or key generation.
     Precheck(String),
@@ -158,6 +171,41 @@ impl fmt::Display for SetupError {
             SetupError::DelegationBadCert => write!(
                 f,
                 "the server rejected the delegation certificate (400); nothing was written"
+            ),
+            SetupError::DelegationRejected { reason, detail } => {
+                let hint = match reason.as_str() {
+                    "bad_window" => {
+                        " — this is almost always CLOCK SKEW between the two machines: \
+                         sync NTP on BOTH the server and this PC, then re-run"
+                    }
+                    "op_key_mismatch" => {
+                        " — the server's operational key does not match the delegation: \
+                         the server may have been reinstalled or its data reset since the \
+                         token was issued (re-run install-server.sh to mint a fresh token)"
+                    }
+                    "bad_signature" => {
+                        " — the delegation signature or certificate format did not verify \
+                         (check both machines are on the same build)"
+                    }
+                    _ => "",
+                };
+                write!(
+                    f,
+                    "the server rejected the delegation certificate (400: {reason}){hint}. \
+                     Server detail: {detail}. Nothing was written."
+                )
+            }
+            SetupError::ClockSkew {
+                local,
+                server,
+                magnitude,
+            } => write!(
+                f,
+                "clock skew too large: this machine is ~{magnitude}s AHEAD of the server \
+                 (local={local}, server={server}), so the delegation would be rejected as \
+                 'not yet valid'. Sync NTP on BOTH machines (e.g. `timedatectl set-ntp true` \
+                 on the server, and Windows Internet Time on this PC), then re-run. \
+                 Nothing was written."
             ),
             SetupError::Precheck(m) => write!(f, "pre-flight check failed: {m}"),
             SetupError::Network(m) => write!(f, "network error: {m}"),
@@ -368,13 +416,43 @@ async fn upload_delegation(
             SetupError::Protocol("operational-key: missing/bad operational_pub_b64".into())
         })?;
 
-    // (b) sign the delegation over the op-key for [now, now+90d] (unix SECONDS).
+    // (a2) Preflight clock-skew check (spec §7 hardening). The server reports its unix
+    // clock; if this machine is too far AHEAD of it (server clock trailing) the
+    // back-date cannot rescue the delegation, so abort BEFORE signing with an NTP hint.
+    // A server that omits the field (older build) simply skips the check.
     let now = now_secs();
-    let valid_until = now + DELEGATION_WINDOW_SECS;
-    let cert = sign_delegation(d5, &op_pub, now, valid_until);
+    if let Some(server_now) = res["server_unix_secs"].as_u64() {
+        match assess_skew(now, server_now) {
+            SkewVerdict::Abort { magnitude } => {
+                return Err(SetupError::ClockSkew {
+                    local: now,
+                    server: server_now,
+                    magnitude,
+                })
+            }
+            SkewVerdict::Warn {
+                magnitude,
+                client_ahead,
+            } => eprintln!(
+                "[setup] warning: clock skew ~{magnitude}s ({}); consider syncing NTP on both machines",
+                if client_ahead {
+                    "this PC is ahead of the server"
+                } else {
+                    "the server is ahead of this PC"
+                }
+            ),
+            SkewVerdict::Ok => {}
+        }
+    }
+
+    // (b) sign the delegation over the op-key. `ceremony_window` back-dates valid_from
+    // by the skew margin so a server clock behind ours still accepts it; valid_until =
+    // now + 90d is unchanged.
+    let (valid_from, valid_until) = ceremony_window(now);
+    let cert = sign_delegation(d5, &op_pub, valid_from, valid_until);
 
     // (c) upload with the one-time token (TOFU-pins our D5 server-side).
-    let (st, _res) = post(
+    let (st, res) = post(
         conn,
         host,
         "/v1/bootstrap/delegation",
@@ -390,7 +468,7 @@ async fn upload_delegation(
         StatusCode::CREATED => Ok(valid_until),
         StatusCode::FORBIDDEN => Err(SetupError::DelegationBadToken),
         StatusCode::CONFLICT => Err(SetupError::AlreadyDelegated),
-        StatusCode::BAD_REQUEST => Err(SetupError::DelegationBadCert),
+        StatusCode::BAD_REQUEST => Err(delegation_rejected(&res)),
         other => Err(SetupError::Protocol(format!(
             "bootstrap delegation: unexpected status {other}"
         ))),
@@ -765,6 +843,82 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// The delegation window the ceremony signs, given the signer's current clock
+/// `now`. `valid_from` is back-dated by [`DELEGATION_CLOCK_SKEW_SECS`] so the cert
+/// still passes the server's strict `now >= valid_from` check when the server clock
+/// trails this (client) clock by up to that margin; `valid_until = now + 90d` is
+/// UNCHANGED (expiry not extended). Pure; the single, testable home for the ceremony
+/// window (mirrors `client-app` `sign_renewal`). It depends ONLY on the client clock
+/// — never on any server-reported time — so a lying server can never shift the window.
+fn ceremony_window(now: u64) -> (u64, u64) {
+    (
+        now.saturating_sub(DELEGATION_CLOCK_SKEW_SECS),
+        now.saturating_add(DELEGATION_WINDOW_SECS),
+    )
+}
+
+/// How far apart the local and server clocks may drift before the preflight WARNS
+/// (still proceeds) — 5 minutes.
+const SKEW_WARN_SECS: u64 = 5 * 60;
+
+/// Verdict of the pre-sign clock-skew preflight (spec §7 hardening). Advisory only —
+/// it NEVER influences the signed window (see [`ceremony_window`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkewVerdict {
+    /// Clocks agree within [`SKEW_WARN_SECS`] — proceed silently.
+    Ok,
+    /// Clocks disagree by `magnitude` seconds but the ceremony can still succeed
+    /// (the back-date covers a server that is behind us; a server ahead of us is
+    /// accepted by its wide `valid_until`). Warn, then proceed.
+    Warn { magnitude: u64, client_ahead: bool },
+    /// This machine is AHEAD of the server by more than [`DELEGATION_CLOCK_SKEW_SECS`]:
+    /// the back-date cannot cover it, so the server WILL reject the delegation as
+    /// "not yet valid". Abort BEFORE signing with an NTP hint.
+    Abort { magnitude: u64 },
+}
+
+/// Assess clock skew between the local (signing) clock and the server-reported clock.
+/// Pure; the single home for the preflight rule. The abort is DIRECTIONAL to match the
+/// server's asymmetric tolerance: only a client that is too far AHEAD (server too far
+/// behind) is unrecoverable; a client behind the server still installs, so it only
+/// warns.
+fn assess_skew(local: u64, server: u64) -> SkewVerdict {
+    // Direction + magnitude computed on RAW u64 (no i64 cast) so an out-of-range
+    // server-reported clock can never panic or wrap. `client_ahead` ⇒ this machine is
+    // ahead of the server (the server clock trails ours).
+    let (client_ahead, magnitude) = if local >= server {
+        (true, local - server)
+    } else {
+        (false, server - local)
+    };
+    // Only the client-ahead-beyond-the-margin case is unrecoverable: the back-date
+    // makes valid_from = local - margin, and the server (trailing by > margin) still
+    // sees now < valid_from ⇒ "not yet valid". Abort before signing.
+    if client_ahead && magnitude > DELEGATION_CLOCK_SKEW_SECS {
+        return SkewVerdict::Abort { magnitude };
+    }
+    if magnitude > SKEW_WARN_SECS {
+        return SkewVerdict::Warn {
+            magnitude,
+            client_ahead,
+        };
+    }
+    SkewVerdict::Ok
+}
+
+/// Build the typed error for a `400` from the delegation endpoints: prefer the
+/// server's machine-readable `{error, detail}` reason; fall back to the generic
+/// bad-cert error when the body is absent/opaque (e.g. an older server).
+fn delegation_rejected(body: &serde_json::Value) -> SetupError {
+    match body["error"].as_str() {
+        Some(reason) => SetupError::DelegationRejected {
+            reason: reason.to_string(),
+            detail: body["detail"].as_str().unwrap_or_default().to_string(),
+        },
+        None => SetupError::DelegationBadCert,
+    }
+}
+
 // ---- D5 restore (spec §7) ----
 
 /// Inputs to [`restore`]: rebuild the D5 custody + connection code on a NEW admin
@@ -937,7 +1091,9 @@ pub async fn renew(t: &Transport, opts: &RenewOpts) -> Result<RenewOutcome, Setu
     let cert = doc["delegation_cert_b64"]
         .as_str()
         .and_then(|s| B64.decode(s).ok())
-        .ok_or_else(|| SetupError::Protocol("delegation doc missing/bad delegation_cert_b64".into()))?;
+        .ok_or_else(|| {
+            SetupError::Protocol("delegation doc missing/bad delegation_cert_b64".into())
+        })?;
     let valid_until = parse_delegation(&cert)
         .map_err(|_| SetupError::Protocol("server sent a malformed delegation cert".into()))?
         .valid_until();
@@ -964,9 +1120,35 @@ pub async fn renew(t: &Transport, opts: &RenewOpts) -> Result<RenewOutcome, Setu
             SetupError::Protocol("operational-key: missing/bad operational_pub_b64".into())
         })?;
 
+    // (5b) Preflight clock-skew check (same as the ceremony): abort BEFORE signing if
+    // this machine is too far ahead of the server (the back-date can't rescue it).
+    if let Some(server_now) = res["server_unix_secs"].as_u64() {
+        match assess_skew(now, server_now) {
+            SkewVerdict::Abort { magnitude } => {
+                return Err(SetupError::ClockSkew {
+                    local: now,
+                    server: server_now,
+                    magnitude,
+                })
+            }
+            SkewVerdict::Warn {
+                magnitude,
+                client_ahead,
+            } => eprintln!(
+                "[setup] warning: clock skew ~{magnitude}s ({}); consider syncing NTP on both machines",
+                if client_ahead {
+                    "this PC is ahead of the server"
+                } else {
+                    "the server is ahead of this PC"
+                }
+            ),
+            SkewVerdict::Ok => {}
+        }
+    }
+
     // (6) Sign a fresh 90-day delegation and push it admin-authenticated.
     let (renewal, new_valid_until) = sign_renewal(&d5, &op_pub, now);
-    let (st, _res) = post(
+    let (st, res) = post(
         &mut conn,
         &opts.host,
         "/v1/admin/delegation",
@@ -984,9 +1166,203 @@ pub async fn renew(t: &Transport, opts: &RenewOpts) -> Result<RenewOutcome, Setu
         StatusCode::CONFLICT => Err(SetupError::Protocol(
             "the server is not delegated — nothing to renew (409)".into(),
         )),
-        StatusCode::BAD_REQUEST => Err(SetupError::DelegationBadCert),
+        StatusCode::BAD_REQUEST => Err(delegation_rejected(&res)),
         other => Err(SetupError::Protocol(format!(
             "admin delegation renewal: unexpected status {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAY: u64 = 86_400;
+    const NOW: u64 = 1_700_000_000;
+
+    // ---- ceremony_window: back-date valid_from, keep valid_until ----
+
+    #[test]
+    fn ceremony_window_back_dates_start_and_keeps_expiry() {
+        let (vf, vu) = ceremony_window(NOW);
+        assert_eq!(
+            vf,
+            NOW - DELEGATION_CLOCK_SKEW_SECS,
+            "valid_from is back-dated"
+        );
+        assert_eq!(
+            vu,
+            NOW + DELEGATION_WINDOW_SECS,
+            "valid_until unchanged (expiry not extended)"
+        );
+        assert_eq!(DELEGATION_WINDOW_SECS, 90 * DAY);
+        // 91d window: non-empty, ends in the future, within any 366d sane cap.
+        assert_eq!(vu - vf, 90 * DAY + DELEGATION_CLOCK_SKEW_SECS);
+        assert!(vu - vf <= 366 * DAY);
+        assert!(
+            vf < NOW,
+            "start is in the past relative to signing now (direction)"
+        );
+    }
+
+    #[test]
+    fn ceremony_window_saturates_at_the_epoch() {
+        // No underflow when now < the skew margin.
+        assert_eq!(ceremony_window(0), (0, DELEGATION_WINDOW_SECS));
+        assert_eq!(ceremony_window(10), (0, 10 + DELEGATION_WINDOW_SECS));
+    }
+
+    // The originally-failing path: a CEREMONY cert (signed with ceremony_window at THIS
+    // clock) must verify on a server whose clock trails ours by up to the skew margin.
+    #[test]
+    fn ceremony_window_cert_verifies_on_a_server_behind_by_up_to_the_margin() {
+        use maxsecu_crypto::verify_delegation;
+        let d5 = SigningKey::from_seed(&[1u8; 32]);
+        let d5_pub = d5.verifying_key().to_bytes();
+        let op = SigningKey::from_seed(&[7u8; 32]).verifying_key().to_bytes();
+        let (vf, vu) = ceremony_window(NOW);
+        let cert = sign_delegation(&d5, &op, vf, vu);
+
+        // Server exactly the margin behind ⇒ now == valid_from ⇒ passes (inclusive).
+        assert!(
+            verify_delegation(&d5_pub, &cert, NOW - DELEGATION_CLOCK_SKEW_SECS).is_ok(),
+            "server behind by exactly the margin must still verify"
+        );
+        // One second past the margin ⇒ before valid_from ⇒ fails closed.
+        assert!(
+            verify_delegation(&d5_pub, &cert, NOW - DELEGATION_CLOCK_SKEW_SECS - 1).is_err(),
+            "server behind by MORE than the margin must fail closed"
+        );
+    }
+
+    // ---- assess_skew: directional preflight ----
+
+    #[test]
+    fn assess_skew_ok_when_clocks_agree_within_warn() {
+        assert_eq!(assess_skew(NOW, NOW), SkewVerdict::Ok);
+        // Exactly the warn threshold is NOT past it (inclusive Ok).
+        assert_eq!(assess_skew(NOW + SKEW_WARN_SECS, NOW), SkewVerdict::Ok);
+        assert_eq!(assess_skew(NOW - SKEW_WARN_SECS, NOW), SkewVerdict::Ok);
+    }
+
+    #[test]
+    fn assess_skew_warns_past_the_warn_threshold_either_direction() {
+        assert_eq!(
+            assess_skew(NOW + SKEW_WARN_SECS + 1, NOW),
+            SkewVerdict::Warn {
+                magnitude: SKEW_WARN_SECS + 1,
+                client_ahead: true
+            }
+        );
+        assert_eq!(
+            assess_skew(NOW - SKEW_WARN_SECS - 1, NOW),
+            SkewVerdict::Warn {
+                magnitude: SKEW_WARN_SECS + 1,
+                client_ahead: false
+            }
+        );
+    }
+
+    #[test]
+    fn assess_skew_aborts_only_when_client_ahead_beyond_the_backdate_margin() {
+        // Exactly the margin ahead ⇒ recoverable (back-date makes vf == server_now) ⇒ Warn.
+        assert_eq!(
+            assess_skew(NOW + DELEGATION_CLOCK_SKEW_SECS, NOW),
+            SkewVerdict::Warn {
+                magnitude: DELEGATION_CLOCK_SKEW_SECS,
+                client_ahead: true
+            }
+        );
+        // One second past the margin ahead ⇒ unrecoverable ⇒ Abort.
+        assert_eq!(
+            assess_skew(NOW + DELEGATION_CLOCK_SKEW_SECS + 1, NOW),
+            SkewVerdict::Abort {
+                magnitude: DELEGATION_CLOCK_SKEW_SECS + 1
+            }
+        );
+    }
+
+    #[test]
+    fn assess_skew_is_total_and_never_panics_on_an_out_of_range_server_time() {
+        // A server reporting an absurd clock (≥ 2^63) must not panic or wrap the skew
+        // magnitude — the tool talks only to a TLS-pinned server, but the preflight
+        // must be TOTAL regardless. (The old `local as i64 - server as i64` overflowed.)
+        let huge = 1u64 << 63;
+        assert_eq!(
+            assess_skew(NOW, huge),
+            SkewVerdict::Warn {
+                magnitude: huge - NOW,
+                client_ahead: false
+            }
+        );
+        assert_eq!(
+            assess_skew(huge, NOW),
+            SkewVerdict::Abort {
+                magnitude: huge - NOW
+            }
+        );
+    }
+
+    #[test]
+    fn assess_skew_never_aborts_when_client_is_behind_even_grossly() {
+        // A client BEHIND the server (server ahead) still installs — the wide
+        // valid_until covers it — so a symmetric abort would wrongly block a working
+        // setup. It must WARN, never Abort.
+        assert_eq!(
+            assess_skew(NOW - (DELEGATION_CLOCK_SKEW_SECS + 1), NOW),
+            SkewVerdict::Warn {
+                magnitude: DELEGATION_CLOCK_SKEW_SECS + 1,
+                client_ahead: false
+            }
+        );
+        assert!(matches!(
+            assess_skew(NOW - 30 * DAY, NOW),
+            SkewVerdict::Warn {
+                client_ahead: false,
+                ..
+            }
+        ));
+    }
+
+    // ---- 400 body → typed error, and the operator-facing messages ----
+
+    #[test]
+    fn delegation_rejected_prefers_the_server_reason_then_falls_back() {
+        let body = serde_json::json!({ "error": "bad_window", "detail": "server_now=5 vf=9" });
+        match delegation_rejected(&body) {
+            SetupError::DelegationRejected { reason, detail } => {
+                assert_eq!(reason, "bad_window");
+                assert_eq!(detail, "server_now=5 vf=9");
+            }
+            other => panic!("expected DelegationRejected, got {other:?}"),
+        }
+        // No machine-readable body (older server / opaque) ⇒ the generic bad-cert error.
+        assert!(matches!(
+            delegation_rejected(&serde_json::Value::Null),
+            SetupError::DelegationBadCert
+        ));
+    }
+
+    #[test]
+    fn clock_skew_and_bad_window_messages_point_at_ntp() {
+        let skew = SetupError::ClockSkew {
+            local: 100,
+            server: 10,
+            magnitude: 90,
+        }
+        .to_string();
+        assert!(
+            skew.contains("NTP"),
+            "skew message must mention NTP: {skew}"
+        );
+        let bw = SetupError::DelegationRejected {
+            reason: "bad_window".into(),
+            detail: "x".into(),
+        }
+        .to_string();
+        assert!(
+            bw.to_uppercase().contains("CLOCK SKEW") && bw.contains("NTP"),
+            "bad_window message must point at clock skew + NTP: {bw}"
+        );
     }
 }
