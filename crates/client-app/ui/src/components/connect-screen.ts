@@ -1,8 +1,15 @@
-import { call } from "../core/rpc.ts";
+import { call, on } from "../core/rpc.ts";
 import { setUsername } from "../core/session.ts";
-import type { Settings } from "../core/types.ts";
+import { connectionStatusText } from "../core/connection-status.ts";
+import type { ConnState, Settings } from "../core/types.ts";
 
 export class ConnectScreen extends HTMLElement {
+  private unlistenConn?: () => void;
+
+  disconnectedCallback() {
+    this.unlistenConn?.();
+  }
+
   connectedCallback() {
     this.innerHTML = `
       <main id="main" class="connect-main" tabindex="-1" aria-labelledby="cn-h" data-deco-slot="login">
@@ -68,14 +75,26 @@ export class ConnectScreen extends HTMLElement {
     const submitLabel = this.querySelector(".submit-label") as HTMLElement;
     const controls = Array.from(f.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button"));
 
-    const setBusy = (busy: boolean, msg: string) => {
-      f.toggleAttribute("aria-busy", busy);
-      stage.classList.toggle("is-loading", busy);
-      f.classList.toggle("is-loading", busy);
+    let busy = false;
+    const setBusy = (b: boolean, msg: string) => {
+      busy = b;
+      f.toggleAttribute("aria-busy", b);
+      stage.classList.toggle("is-loading", b);
+      f.classList.toggle("is-loading", b);
       status.textContent = msg;
-      submitLabel.textContent = busy ? "Handshake running" : "Connect securely";
-      controls.forEach((el) => { el.disabled = busy; });
+      submitLabel.textContent = b ? "Handshake running" : "Connect securely";
+      controls.forEach((el) => { el.disabled = b; });
     };
+
+    // Live transport progress: the `connect` backend emits ConnectionState over
+    // EVT_CONNECTION (notably the slow first Tor bootstrap). We only override the
+    // status line WHILE the form is busy, so idle/disconnected transitions don't
+    // stomp the resting message. Without this a Tor stall read as a dead spinner.
+    on<ConnState>("maxsecu://connection-state", (s) => {
+      if (busy) status.textContent = connectionStatusText(s.state);
+    })
+      .then((cl) => { this.unlistenConn = cl; })
+      .catch(() => { /* progress is best-effort; login still works without it */ });
 
     f.addEventListener("submit", async (e) => {
       e.preventDefault();
