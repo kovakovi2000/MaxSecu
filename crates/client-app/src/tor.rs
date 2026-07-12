@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use arti_client::config::TorClientConfigBuilder;
-use arti_client::TorClient;
-use tokio::sync::OnceCell;
+use arti_client::{DormantMode, TorClient};
+use tokio::sync::{Mutex, OnceCell};
 use tor_rtcompat::PreferredRuntime;
 
 use crate::error::UiError;
@@ -42,11 +42,18 @@ pub fn global() -> Option<&'static TorState> {
     GLOBAL.get()
 }
 
-/// A lazily-bootstrapped, shared Tor client. The `OnceCell` guarantees the slow
-/// first bootstrap runs at most once; a failed bootstrap is NOT cached, so the
-/// next `TorOnly` connect retries cleanly.
+/// A lazily-bootstrapped, shared Tor client. The arti client is CREATED at most
+/// once (cached in `cell`) and REUSED across every connect attempt, so a failed
+/// bootstrap never spawns a *second* client whose background tasks would spin the
+/// CPU. `bootstrapped` serializes bootstrap attempts and records success; on a
+/// bootstrap timeout the shared client is put dormant so its background dir/channel
+/// tasks stop churning (arti abandoning the bootstrap future does not stop them —
+/// arti has no hard shutdown, see its TODO #1932).
 pub struct TorState {
+    /// The arti client, created UNBOOTSTRAPPED at most once, then reused.
     cell: OnceCell<Arc<TorClient<PreferredRuntime>>>,
+    /// `false` until a bootstrap has succeeded; the mutex also serializes attempts.
+    bootstrapped: Mutex<bool>,
     /// `<config-dir>/tor` — arti's persistent state dir (cache is a subdir).
     state_dir: PathBuf,
 }
@@ -57,6 +64,7 @@ impl TorState {
     pub fn new(config_dir: PathBuf) -> Self {
         Self {
             cell: OnceCell::new(),
+            bootstrapped: Mutex::new(false),
             state_dir: config_dir.join("tor"),
         }
     }
@@ -70,29 +78,65 @@ impl TorState {
         &self,
         on_bootstrap: impl FnOnce() + Send,
     ) -> Result<Arc<TorClient<PreferredRuntime>>, UiError> {
+        // 1) Create the shared arti client (UNBOOTSTRAPPED) exactly once. Creation is
+        //    cheap and does NOT start fetching the consensus; we drive and bound the
+        //    bootstrap ourselves below. Reusing one client means a stalled bootstrap
+        //    never leaves a *second* client's background tasks spinning the CPU.
         let client = self
             .cell
             .get_or_try_init(|| async {
-                on_bootstrap();
                 let cache_dir = self.state_dir.join("cache");
                 let cfg = TorClientConfigBuilder::from_directories(&self.state_dir, &cache_dir)
                     .build()
                     .map_err(|_| {
                         UiError::new("tor_unavailable", "Tor configuration is invalid.")
                     })?;
-                crate::timeout::with_deadline(
-                    crate::timeout::TOR_BOOTSTRAP_TIMEOUT,
-                    async {
-                        TorClient::create_bootstrapped(cfg).await.map_err(|_| {
-                            UiError::new("tor_unavailable", "Could not connect to the Tor network.")
-                        })
-                    },
-                    UiError::new("tor_timeout", "Connecting to the Tor network timed out."),
-                )
-                .await
+                TorClient::builder()
+                    .config(cfg)
+                    .create_unbootstrapped_async()
+                    .await
+                    .map_err(|_| {
+                        UiError::new("tor_unavailable", "Could not initialize the Tor client.")
+                    })
             })
-            .await?;
-        Ok(client.clone())
+            .await?
+            .clone();
+
+        // 2) Bootstrap once, serialized. If a previous connect already bootstrapped
+        //    the shared client, reuse it immediately.
+        let mut done = self.bootstrapped.lock().await;
+        if *done {
+            return Ok(client);
+        }
+        on_bootstrap();
+        // Wake the client in case a prior failed attempt left it dormant (below).
+        client.set_dormant(DormantMode::Normal);
+        match crate::timeout::with_deadline(
+            crate::timeout::TOR_BOOTSTRAP_TIMEOUT,
+            async {
+                client.bootstrap().await.map_err(|_| {
+                    UiError::new("tor_unavailable", "Could not connect to the Tor network.")
+                })
+            },
+            UiError::new("tor_timeout", "Connecting to the Tor network timed out."),
+        )
+        .await
+        {
+            Ok(()) => {
+                *done = true;
+                Ok(client)
+            }
+            Err(e) => {
+                // Bootstrap stalled — e.g. the network blocks/DPI-filters Tor, so the
+                // consensus never downloads. Abandoning the bootstrap future does NOT
+                // stop arti's background dir/channel tasks (no hard shutdown — arti's
+                // TODO #1932); left running they peg the CPU retrying forever. Put the
+                // shared client dormant to pause them until the next connect attempt
+                // wakes it (DormantMode::Normal above).
+                client.set_dormant(DormantMode::Soft);
+                Err(e)
+            }
+        }
     }
 
     /// Dial `host:port` over Tor and return the circuit stream boxed for

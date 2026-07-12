@@ -50,6 +50,9 @@ maxsecu-sink-server = { path = "../sink-server" }
 maxsecu-admin-core = { path = "../admin-core" }
 base64 = "0.22"
 serde_json = "1"
+# Diagnostic-only: lets tor_diag.rs surface arti's bootstrap tracing logs (already
+# in this workspace's lockfile transitively via arti-client).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 hyper = { version = "1", features = ["client", "http1", "server"] }
