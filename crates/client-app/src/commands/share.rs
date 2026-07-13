@@ -90,15 +90,10 @@ pub async fn reshare_file(
     let emit = |p: SharePhase| {
         let _ = app.emit(EVT_RESHARE, p);
     };
-    let outcomes = reshare_inner(&req, &dir, &session, &connect_lock, &emit).await?;
-    let shared = outcomes.iter().filter(|o| o.ok).count() as u32;
-    let failed = outcomes.len() as u32 - shared;
-    emit(SharePhase::Done {
-        file_id: req.file_id.clone(),
-        shared,
-        failed,
-    });
-    Ok(outcomes)
+    // `reshare_inner` emits the terminal `Done` for `req.file_id` itself (right
+    // where the batch that produced this file's tray progress finished), so the
+    // row always finalizes. Nothing more to emit here.
+    reshare_inner(&req, &dir, &session, &connect_lock, &emit).await
 }
 
 /// The batch-wide prerequisites (spec §4 steps 1–4). A failure of ANY of these is
@@ -232,6 +227,15 @@ async fn reshare_inner(
     )
     .await;
 
+    // Terminal `Done` for THIS file's tray row (spec §6/§11), emitted per file,
+    // right where the batch that produced its progress finished. Because a
+    // `Resolving` (which opens the row) is only ever emitted from inside the batch
+    // above, every file that has a row reaches this point and finalizes it. A
+    // bundle reshare relies on exactly this: it fans out over the bundle file AND
+    // every member, calling `reshare_inner` per target, so each member emits its
+    // OWN `Done` and no member row is left stuck on "Wrapping…". (A single
+    // bundle-level `Done` used to finalize only the bundle row.)
+    emit(done_phase(&req.file_id, &outcomes));
     Ok(outcomes)
 }
 
@@ -299,8 +303,9 @@ fn aggregate_bundle_outcomes(
 /// machinery as [`reshare_file`] (`reshare_inner`), then the per-target results
 /// are aggregated to ONE outcome per recipient: a recipient's share succeeds only
 /// if the bundle file and EVERY member shared to them. Per-recipient
-/// fail-isolated; emits [`SharePhase`] over [`EVT_RESHARE`] (per-target progress
-/// plus a bundle-scoped `Done`).
+/// fail-isolated; emits [`SharePhase`] over [`EVT_RESHARE`] — per-target progress
+/// AND a per-target `Done` (one for the bundle file and one per member, so every
+/// tray row finalizes), never a single bundle-scoped `Done`.
 #[tauri::command]
 pub async fn reshare_bundle(
     req: ReshareRequest,
@@ -350,14 +355,14 @@ pub async fn reshare_bundle(
         per_target.push(outcomes);
     }
 
+    // Each target's `reshare_inner` (in the loop above) already emitted its OWN
+    // terminal `Done`, so every tray row — the bundle file AND each member —
+    // finalizes individually. We deliberately do NOT emit a second bundle-level
+    // `Done` here: it only ever carried `req.file_id`, so it finalized the bundle
+    // row while leaving every member row stuck. The aggregate below is purely the
+    // command's RETURN value for the dialog (a recipient succeeds only if EVERY
+    // target shared to them) — it never crosses the event channel.
     let aggregate = aggregate_bundle_outcomes(&per_target, &req.recipient_usernames);
-    let shared = aggregate.iter().filter(|o| o.ok).count() as u32;
-    let failed = aggregate.len() as u32 - shared;
-    emit(SharePhase::Done {
-        file_id: req.file_id.clone(),
-        shared,
-        failed,
-    });
     Ok(aggregate)
 }
 
@@ -617,6 +622,22 @@ fn push_outcome(
         old_fingerprint,
         new_fingerprint,
     });
+}
+
+/// The terminal [`SharePhase::Done`] for ONE file's reshare batch: an
+/// AUTHORITATIVE tally (`shared` = the `ok` rows, `failed` = the remainder) over
+/// that file's own outcomes. Pure + testable. Every file that opened a
+/// `<share-tray>` row (i.e. emitted a `Resolving`) MUST receive exactly one of
+/// these so the row finalizes — a bundle reshare fans out over many `file_id`s,
+/// so this is emitted PER FILE (see [`reshare_inner`]), never once per batch.
+fn done_phase(file_id_hex: &str, outcomes: &[ReshareOutcomeDto]) -> SharePhase {
+    let shared = outcomes.iter().filter(|o| o.ok).count() as u32;
+    let failed = outcomes.len() as u32 - shared;
+    SharePhase::Done {
+        file_id: file_id_hex.to_owned(),
+        shared,
+        failed,
+    }
 }
 
 /// Map a [`ReshareError`] to a stable, sanitized per-recipient code (no oracle,
@@ -1343,6 +1364,68 @@ mod tests {
             "recovery_recipient"
         );
         assert_eq!(reshare_error_code(&ReshareError::WrapFailed), "wrap_failed");
+    }
+
+    fn outcome(username: &str, ok: bool) -> ReshareOutcomeDto {
+        ReshareOutcomeDto {
+            username: username.to_owned(),
+            ok,
+            code: if ok {
+                None
+            } else {
+                Some("share_failed".to_owned())
+            },
+            old_fingerprint: None,
+            new_fingerprint: None,
+        }
+    }
+
+    /// The terminal `Done` a file emits carries an authoritative `shared`/`failed`
+    /// tally over THAT file's own outcomes — and, crucially, is scoped to the
+    /// file_id passed in. Because `reshare_inner` calls this per file, a bundle
+    /// reshare emits one `Done` per target (bundle + each member), so every tray
+    /// row finalizes instead of members hanging on "Wrapping…".
+    #[test]
+    fn done_phase_tallies_per_file_and_keeps_the_file_id() {
+        // Mixed batch → shared counts the ok rows; failed is the remainder.
+        let mixed = done_phase(
+            "ab".repeat(16).as_str(),
+            &[outcome("a", true), outcome("b", false), outcome("c", true)],
+        );
+        assert_eq!(
+            mixed,
+            SharePhase::Done {
+                file_id: "ab".repeat(16),
+                shared: 2,
+                failed: 1,
+            }
+        );
+
+        // All-ok, single-failed, and empty edges — always for the given file_id.
+        assert_eq!(
+            done_phase("f1", &[outcome("a", true), outcome("b", true)]),
+            SharePhase::Done {
+                file_id: "f1".to_owned(),
+                shared: 2,
+                failed: 0,
+            }
+        );
+        assert_eq!(
+            done_phase("f2", &[outcome("a", false)]),
+            SharePhase::Done {
+                file_id: "f2".to_owned(),
+                shared: 0,
+                failed: 1,
+            }
+        );
+        assert_eq!(
+            done_phase("f3", &[]),
+            SharePhase::Done {
+                file_id: "f3".to_owned(),
+                shared: 0,
+                failed: 0,
+            }
+        );
     }
 
     /// A successful share RECORDS the recipient as a contact; an unresolvable /
