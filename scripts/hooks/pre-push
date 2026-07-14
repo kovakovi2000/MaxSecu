@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+#
+# pre-push — the MaxSecu BACKWARD-COMPATIBILITY GATE.
+#
+#   Every upgrade must keep existing users' access intact — account/login, keys,
+#   and already-uploaded data. No change may force a re-enroll, re-key,
+#   re-upload, re-share, or reset.
+#
+# MaxSecu ships to non-technical users on a real VPS with real data and there is
+# no admin escape hatch by design: if an upgrade makes a user's keyblob, DEK wrap
+# or directory binding unreadable, that user's data is gone permanently. This hook
+# is the last thing that stands between such a change and `origin`.
+#
+# What it does, in order:
+#   1. Runs the compat gate in BOTH cargo workspaces (root + the CI-excluded
+#      client workspace). A failure BLOCKS the push.
+#   2. Diffs the pushed range against the FROZEN PATHS. If one is touched it
+#      prints the review checklist and requires an entry in docs/compat/LEDGER.md
+#      (warning only — the tests are the hard gate).
+#   3. Refuses a push that EDITS or DELETES a frozen corpus fixture. The corpus is
+#      add-only: fixtures may be added, never edited, never deleted.
+#
+# Installed by `scripts/install-hooks.ps1` (git config core.hooksPath scripts/hooks).
+# Git for Windows runs hooks in Git Bash, so this is bash, not PowerShell.
+#
+# Escape hatch (loud, and it does NOT get you past CI):
+#   SKIP_COMPAT_GATE=1 git push
+#
+# Keep the command list below in sync with scripts/compat-gate.ps1 and the
+# `compat` job in .github/workflows/ci.yml — those three run the SAME gate.
+
+set -u
+# NOGLOB, and it is load-bearing: the frozen-path patterns below are iterated with
+# an unquoted `for g in $FROZEN_GLOBS`, which without this would PATHNAME-EXPAND
+# them against the working tree (`crates/crypto/*` -> `crates/crypto/src`) and the
+# frozen-surface check would silently match nothing. `case` pattern matching is
+# unaffected by -f, so the globs still work as patterns.
+set -f
+
+RULE="Every upgrade must keep existing users' access intact — account/login, keys, and already-uploaded data. No change may force a re-enroll, re-key, re-upload, re-share, or reset."
+
+# The hook's environment is not a login shell: cargo is not on PATH.
+export PATH="$HOME/.cargo/bin:$PATH"
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT" || exit 1
+
+# ---------------------------------------------------------------------------
+# The frozen surfaces. Touching one of these can strand an existing user.
+# (docs/superpowers/specs/2026-07-14-backward-compat-gate-design.md §3)
+# ---------------------------------------------------------------------------
+FROZEN_GLOBS='
+crates/encoding/*
+crates/crypto/*
+crates/client-core/src/keyblob.rs
+crates/client-core/src/seedblob.rs
+crates/server/src/http.rs
+crates/server/src/blob.rs
+docs/schema.sql
+migrations/*
+compat/*
+crates/client-app/src/config.rs
+crates/client-app/src/tofu.rs
+crates/client-app/src/contacts.rs
+crates/client-app/src/index.rs
+crates/client-app/src/recovery_pin.rs
+crates/client-app/src/upload_staging.rs
+crates/client-app/src/layout.rs
+crates/client-app/src/keystore.rs
+'
+
+# The compat test targets the gate requires. A MISSING target is a FAILURE: a
+# gate that silently passes because its tests vanished is worse than no gate.
+ROOT_TARGETS='
+crates/compat/tests/value_locks.rs
+crates/compat/tests/golden_open.rs
+crates/compat/tests/interop_matrix.rs
+crates/compat/tests/http_wire.rs
+crates/compat/tests/schema_equivalence.rs
+'
+CLIENT_TARGET='crates/client-app/tests/compat.rs'
+
+say()  { printf '%s\n' "$*"; }
+rule() { printf '%s\n' '---------------------------------------------------------------------------'; }
+
+if [ "${SKIP_COMPAT_GATE:-0}" = "1" ]; then
+    rule
+    say "!!  COMPAT GATE SKIPPED (SKIP_COMPAT_GATE=1)"
+    rule
+    say "You are pushing WITHOUT proving that yesterday's bytes still open today."
+    say "The risk you are accepting: an existing user may be unable to log in, may"
+    say "lose access to their keys, or may find already-uploaded data permanently"
+    say "undecryptable. There is no admin recovery path for that."
+    say ""
+    say "CI CANNOT BE BYPASSED — the \`compat\` job will run this same gate on the"
+    say "pushed commits and fail if you broke a frozen surface."
+    say ""
+    say "Rule: $RULE"
+    rule
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Which commits are being pushed?  git feeds us, on stdin:
+#       <local ref> <local sha> <remote ref> <remote sha>
+#    remote sha = all-zeros  -> the branch is NEW on the remote (nothing to diff
+#    against), so we diff against the merge-base with origin/main instead.
+#    local sha  = all-zeros  -> a branch DELETE; nothing to check.
+# ---------------------------------------------------------------------------
+ZERO_RE='^0*$'
+CHANGED=""
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -n "${local_sha:-}" ] || continue
+    if printf '%s' "$local_sha" | grep -Eq "$ZERO_RE"; then
+        continue # branch deletion
+    fi
+
+    base=""
+    if [ -n "${remote_sha:-}" ] && ! printf '%s' "$remote_sha" | grep -Eq "$ZERO_RE"; then
+        if git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+            base="$remote_sha"
+        fi
+    fi
+    if [ -z "$base" ]; then
+        # New branch on the remote: compare against where we forked from main.
+        base="$(git merge-base "$local_sha" origin/main 2>/dev/null || true)"
+    fi
+    if [ -z "$base" ]; then
+        # No usable base (e.g. no origin/main yet): review the whole commit.
+        base="${local_sha}^"
+        git cat-file -e "${base}^{commit}" 2>/dev/null || base=""
+    fi
+
+    if [ -n "$base" ]; then
+        files="$(git diff --name-only "$base" "$local_sha" 2>/dev/null || true)"
+    else
+        files="$(git show --pretty=format: --name-only "$local_sha" 2>/dev/null || true)"
+    fi
+    CHANGED="$CHANGED
+$files"
+done
+
+CHANGED="$(printf '%s\n' "$CHANGED" | sed '/^[[:space:]]*$/d' | sort -u)"
+
+touched_frozen=""
+for f in $CHANGED; do
+    for g in $FROZEN_GLOBS; do
+        # shellcheck disable=SC2254  # $g is a glob on purpose
+        case "$f" in
+            $g) touched_frozen="$touched_frozen $f" ;;
+        esac
+    done
+done
+touched_frozen="$(printf '%s' "$touched_frozen" | tr ' ' '\n' | sed '/^$/d' | sort -u)"
+
+# ---------------------------------------------------------------------------
+# 2. The corpus is ADD-ONLY. An edited or deleted fixture is a rewritten past.
+# ---------------------------------------------------------------------------
+tampered=""
+if [ -n "$CHANGED" ]; then
+    for f in $CHANGED; do
+        case "$f" in
+            compat/fixtures/*)
+                case "$f" in
+                    *corpus.lock) continue ;; # the lock GROWS when a fixture is added
+                esac
+                # Present in the working tree AND present at origin/main => it existed
+                # before and was changed (or it was deleted outright).
+                if git cat-file -e "origin/main:$f" 2>/dev/null; then
+                    tampered="$tampered $f"
+                fi
+                ;;
+        esac
+    done
+fi
+
+if [ -n "$tampered" ]; then
+    rule
+    say "PUSH BLOCKED — a FROZEN CORPUS FIXTURE was edited or deleted."
+    rule
+    for f in $tampered; do say "    $f"; done
+    say ""
+    say "The corpus is ADD-ONLY: fixtures may be ADDED, never edited, never deleted."
+    say "A fixture is a recording of bytes a real user's client already wrote. Editing"
+    say "it to match new code does not make the new code compatible — it just deletes"
+    say "the evidence that it isn't. Editing the fixture is NEVER the fix."
+    say ""
+    say "To land an intentional format change:"
+    say "  1. Keep the old fixture AND a read path that still opens it."
+    say "  2. ADD a new fixture for the new format."
+    say "  3. Append an entry to docs/compat/LEDGER.md."
+    say ""
+    say "See docs/compat/CHECKLIST.md."
+    rule
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Run the gate. Both workspaces. This is the hard gate.
+# ---------------------------------------------------------------------------
+if ! command -v cargo >/dev/null 2>&1; then
+    rule
+    say "PUSH BLOCKED — cargo not found (looked in \$HOME/.cargo/bin and \$PATH)."
+    say "The compat gate cannot run, so it cannot pass. Install/point at the pinned"
+    say "toolchain and push again."
+    rule
+    exit 1
+fi
+
+missing=""
+for t in $ROOT_TARGETS $CLIENT_TARGET; do
+    [ -f "$t" ] || missing="$missing $t"
+done
+if [ -n "$missing" ]; then
+    rule
+    say "PUSH BLOCKED — compat gate INCOMPLETE: expected test target(s) missing."
+    rule
+    for t in $missing; do say "    $t"; done
+    say ""
+    say "These targets ARE the gate. If they are gone, the gate proves nothing and a"
+    say "green run means nothing. Restore them (or, if a target was deliberately"
+    say "renamed, update scripts/compat-gate.ps1, scripts/hooks/pre-push and the"
+    say "\`compat\` job in .github/workflows/ci.yml together)."
+    rule
+    exit 1
+fi
+
+say ""
+say "compat gate: running the backward-compatibility tests (both workspaces)..."
+say ""
+
+failed=0
+
+say "==> [1/2] root workspace: cargo test -p maxsecu-compat --locked"
+if ! cargo test -p maxsecu-compat --locked; then
+    failed=1
+fi
+
+say ""
+say "==> [2/2] client workspace: cargo test --manifest-path crates/client-app/Cargo.toml --test compat"
+if ! cargo test --manifest-path crates/client-app/Cargo.toml --locked \
+        --no-default-features --features unpinned-dev --test compat; then
+    failed=1
+fi
+
+if [ "$failed" -ne 0 ]; then
+    rule
+    say "PUSH BLOCKED — the backward-compatibility gate FAILED."
+    rule
+    say "$RULE"
+    say ""
+    say "A failing compat test does not mean a test is stale. It means that bytes an"
+    say "EXISTING USER'S CLIENT ALREADY WROTE — their keyblob, their DEK wraps, their"
+    say "uploaded chunks, their pins — can no longer be opened by this code. On a real"
+    say "deployment that is a permanent, unrecoverable loss of access. There is no"
+    say "admin override."
+    say ""
+    say "Do NOT 'fix' this by editing the fixture or relaxing the assertion."
+    say "Read:   docs/compat/CHECKLIST.md   (how to evolve a format safely)"
+    say "Re-run: powershell -File scripts/compat-gate.ps1"
+    say ""
+    say "If you are certain this is intentional and backward compatible, the change"
+    say "must keep a read path for the OLD bytes, ADD a fixture for the new ones, and"
+    say "be recorded in docs/compat/LEDGER.md."
+    rule
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Frozen surface touched? Walk the author through the checklist.
+# ---------------------------------------------------------------------------
+if [ -n "$touched_frozen" ]; then
+    rule
+    say "FROZEN SURFACE TOUCHED — the compat gate passed, but read this."
+    rule
+    say "$RULE"
+    say ""
+    say "This push changes files that define formats existing users' data is already"
+    say "written in:"
+    for f in $touched_frozen; do say "    $f"; done
+    say ""
+    say "Before you push, answer these (docs/compat/CHECKLIST.md):"
+    say "  * Can a user who enrolled on the PREVIOUS version still log in?"
+    say "  * Can this code still OPEN a file uploaded by the previous version?"
+    say "  * Did you ADD a field/behaviour, or CHANGE/REQUIRE one? Old data will not"
+    say "    have the new one. Additive is safe; required is a break."
+    say "  * Did you TIGHTEN a check? A stricter rule that rejects data the previous"
+    say "    version WROTE is a break — even when it is more secure."
+    say "  * Does an existing deployment get there AUTOMATICALLY on upgrade, with no"
+    say "    re-enroll, re-key, re-upload, re-share or reset?"
+    say ""
+    say "Precedent, not theory: commit 2a626d6 published ML-KEM keys into the directory"
+    say "binding but did not republish EXISTING bindings — every already-enrolled"
+    say "recipient had to re-enroll. That is exactly the class of break this gate exists"
+    say "to stop."
+    say ""
+
+    if printf '%s\n' "$CHANGED" | grep -qx 'docs/compat/LEDGER.md'; then
+        say "LEDGER: docs/compat/LEDGER.md is updated in this range. Good."
+    else
+        say "!!  LEDGER NOT UPDATED  !!"
+        say "    docs/compat/LEDGER.md is NOT modified in this push."
+        say "    If this change alters a format (rather than only its internals), append"
+        say "    an entry: date, commit, surface, what changed, why it is backward"
+        say "    compatible, how OLD data is still read, which fixture proves it."
+        say "    (Warning only — the tests are the hard gate. Do not ignore it twice.)"
+    fi
+    rule
+fi
+
+say ""
+say "compat gate: PASS — yesterday's bytes still open today. Pushing."
+exit 0

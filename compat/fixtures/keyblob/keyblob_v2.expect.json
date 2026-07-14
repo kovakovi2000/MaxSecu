@@ -1,0 +1,8 @@
+{
+  "blob_len": 221,
+  "enc_pub": "aebabe85a513fc2dd7af2a7485c6cd10f6b2f4dcc197489d577277d28fc9df34",
+  "fingerprint": "cdfdeb59b1f07b502f8c37adc2079c4bf8bdd37101361dc55c464bbe11f67561",
+  "mlkem_pub_sha256": "c5e0afa62723e18a7148bee460ecc417ba8f135cd5e307e857404589ed2876a4",
+  "sig_pub": "d3f26ffc648f9a2639eb599fabc1c656ff48f955b14a900aa53a4012dfbeb2c9",
+  "version": 2
+}

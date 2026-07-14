@@ -88,7 +88,10 @@ pub fn verify_corpus_lock(area_name: &str) {
     let dir = area(area_name);
     let lock_path = dir.join("corpus.lock");
     let lock = std::fs::read_to_string(&lock_path).unwrap_or_else(|e| {
-        panic!("missing corpus lock {}: {e}. {CHECKLIST}", lock_path.display())
+        panic!(
+            "missing corpus lock {}: {e}. {CHECKLIST}",
+            lock_path.display()
+        )
     });
 
     let mut locked: Vec<(String, String)> = Vec::new();
@@ -130,7 +133,12 @@ pub fn verify_corpus_lock(area_name: &str) {
     // Every file present must be locked (catches an un-recorded addition).
     let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
-        .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .filter(|n| n != "corpus.lock")
         .collect();
     on_disk.sort();

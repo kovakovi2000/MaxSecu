@@ -1,0 +1,14 @@
+{
+  "dek": "c02f3a2de030e4c61ac83de7420a60a6e342aafcdab28e10e825845e0dc33d0b",
+  "dek_commit": "8a18ea4d62856fac382307015717d676ee332dcbeedae4ad60b0a2f8140cefed",
+  "recipient_mlkem_pub_sha256": "c5e0afa62723e18a7148bee460ecc417ba8f135cd5e307e857404589ed2876a4",
+  "recipient_x25519_pub": "aebabe85a513fc2dd7af2a7485c6cd10f6b2f4dcc197489d577277d28fc9df34",
+  "secret_key_file": "wrap_v2.testkey (x25519_secret[32] ‖ mlkem_seed[64])",
+  "suite": 2,
+  "wire_len": 1168,
+  "wrap_context": {
+    "file_id": "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2",
+    "recipient_id": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "version": 1
+  }
+}

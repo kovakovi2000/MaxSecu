@@ -96,6 +96,12 @@ arti-client = { version = "0.44", default-features = false, features = ["tokio",
 tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"] }
 
 [dev-dependencies]
+# The backward-compatibility gate's shared helpers (`tests/compat.rs`): the frozen
+# corpus root + `corpus.lock` verification, shared with the root workspace's
+# `crates/compat`. Its LIBRARY has no `maxsecu-server`/`sqlx` dependency (those are
+# dev-deps of that crate, and dev-deps do not propagate), so this does NOT drag
+# sqlx into this arti-bearing workspace — the whole reason for the workspace split.
+maxsecu-compat = { path = "../compat" }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 # Pure-Rust png/jpeg for a client-app unit test that synthesizes a source image
 # (src/upload.rs). Kept here for the lib's own tests; the e2e crate depends on it

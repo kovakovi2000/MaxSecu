@@ -1,0 +1,8 @@
+{
+  "bundle_view": "stacked",
+  "cache_location": "Disk",
+  "frontend": "pizza",
+  "route_mode": "prefer-dropbox",
+  "text_size": "large",
+  "theme": "light"
+}

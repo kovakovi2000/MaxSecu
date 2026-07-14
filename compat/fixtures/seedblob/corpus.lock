@@ -1,0 +1,6 @@
+# MaxSecu backward-compatibility gate — frozen corpus lock.
+# Fixtures may be ADDED. Never edited. Never deleted.
+# <filename>  <sha256-hex>, sorted.  see docs/compat/CHECKLIST.md
+seedblob_v1.bin  b73c3432bf2674a951023e980d7056a6847e3e1b2834241473987633c69ea047
+seedblob_v1.expect.json  4926714235b5605f2d2bbfaf0deda8fe162569560971c6ac6741f3a373fb9a1b
+seedblob_v1.passphrase.txt  069e978b52c1dc078ed1890dc61d82c633322c6f297f512c3dafe371d54ed827

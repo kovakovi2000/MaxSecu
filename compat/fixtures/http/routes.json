@@ -1,0 +1,137 @@
+{
+  "_comment": "The (method, path) surface a SHIPPED client depends on. Routes may be added; an existing one may never be removed or moved. Dispatched with no session token — a 401 still proves the route exists; a 404/405 does not.",
+  "routes": [
+    {
+      "method": "POST",
+      "path": "/v1/users"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/registration-keys"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/bootstrap/operational-key"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/bootstrap/delegation"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/bootstrap/delegation"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/admin/delegation"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/recovery/register"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/recovery/pubkey"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/recovery/challenge"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/recovery/verify"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/session/challenge"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/session/proof"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/session/logout"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/directory"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/directory/alice"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/directory/by-id/11111111111111111111111111111111"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/revocations"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/revocations"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/reinstatements"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/key-compromise"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/files?limit=50"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/files"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/files/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1?version=latest"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/files/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/files/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1/recipients"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/files/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1/wraps"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/files/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1/wraps/22222222222222222222222222222222"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/files/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1/versions"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/files/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1/versions/1/finalize"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/files/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1/versions/1/streams/content/chunks/0"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/files/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1/versions/1/streams/content/chunks/0"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/files/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1/versions/1/streams/content/chunks/0/status"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/files/f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1/versions/1/streams/content/chunks/0/direct-link"
+    }
+  ]
+}

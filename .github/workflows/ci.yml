@@ -65,6 +65,55 @@ jobs:
         run: rustup show
       - name: Postgres integration gate
         run: cargo test -p maxsecu-server --test pg_store --locked
+      # The other half of the compat gate: a FRESH install (docs/schema.sql) and an
+      # UPGRADED install (migrations/0001_baseline.sql + every migration) must be the
+      # same product. Without this, editing schema.sql silently strands every already
+      # deployed server. It lives here because it is the only compat test that needs a
+      # real Postgres; it SKIPS itself when DATABASE_URL is unset (the same pattern as
+      # pg_store), so the offline `compat` job stays offline.
+      - name: Compat gate - schema equivalence (fresh install == baseline + migrations)
+        env:
+          DATABASE_URL: postgres://maxsecu:maxsecu@localhost:5432/maxsecu
+        run: cargo test -p maxsecu-compat --test schema_equivalence --locked
+
+  compat:
+    # THE BACKWARD-COMPATIBILITY GATE.
+    #
+    #   Every upgrade must keep existing users' access intact - account/login, keys,
+    #   and already-uploaded data. No change may force a re-enroll, re-key,
+    #   re-upload, re-share, or reset.
+    #
+    # Opens a frozen corpus of yesterday's bytes (keyblobs, DEK wraps, chunk
+    # framing, delegation certs, pins, client on-disk state) with today's code. A
+    # failure here means an existing user would lose access - permanently, with no
+    # admin recovery path.
+    #
+    # Runs in BOTH cargo workspaces. The second one is the point: `crates/client-app`
+    # is a separate workspace that the `test` job above does not build, so the
+    # keyblob consumer, recovery_pin.bin, settings.json and the TOFU pin store have
+    # had ZERO CI coverage until now. This job closes that hole.
+    #
+    # Same gate as scripts/hooks/pre-push and scripts/compat-gate.ps1 - keep the
+    # three in sync. Offline and deterministic: no Postgres, no network (the
+    # schema-equivalence half runs in `pg-gate` above, which has the PG service).
+    #
+    # Windows, matching the `test` job: the client is a Windows product and its
+    # on-disk formats are what this job is here to protect.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain (installs the pinned channel)
+        run: rustup show
+      - name: Compat gate - root workspace (encoding, crypto, keyblob, seedblob, HTTP wire)
+        run: cargo test -p maxsecu-compat --locked
+      # The client workspace is heavy (it links arti), so build ONLY the compat test
+      # target. `--no-default-features` drops `embed-ffmpeg`: vendor/ffmpeg/ffmpeg.exe
+      # is gitignored and absent on the runner, and the gate must not depend on it.
+      # `--features unpinned-dev` is required because build.rs fails CLOSED with no
+      # real recovery_pin.bin - this is the documented test-only pin path, and the
+      # build-time guard still refuses to ship a test pin in a release build.
+      - name: Compat gate - client workspace (keyblob, recovery pin, settings, TOFU)
+        run: cargo test --manifest-path crates/client-app/Cargo.toml --locked --no-default-features --features unpinned-dev --test compat
 
   supply-chain:
     runs-on: ubuntu-latest

@@ -1,0 +1,5 @@
+{
+  "appearance": { "theme": "light", "frontend": "default", "accent_color": "#ff00aa" },
+  "connection": { "route_mode": "tor-only", "use_tor": true },
+  "quantum_teleport": { "enabled": true }
+}

@@ -1,0 +1,42 @@
+{
+  "file_id": "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2",
+  "file_type": "blog",
+  "genesis_b64": "AAXy8vLy8vLy8vLy8vLy8vLyEREREREREREREREREREREQAAAAAAAAABAAABkFovywA=",
+  "genesis_sig_b64": "hJeBvwBtrnNorsG2ynjD+6kLGcJwclSkNfo5o41dY5XKoKO2IwOCu8at67eyWerZ4UJ+RjjWar5dnXs31ChoDA==",
+  "manifest_b64": "AALy8vLy8vLy8vLy8vLy8vLyAAAAAAAAAAEDAAEAABAA9z5dYmG+GIE/AI/zRt33AbQQEfXa9dwTBGgnNIjBltECAA0BAAAAAAAAAAACwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMAADQIAAAAAAAAAAAEuLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLgERERERERERERERERERERERAAABkFovywE=",
+  "manifest_sig_b64": "ZBpAO0q1hkegVQRNPzRVOt0z2rIQs982KZG0H6JBoYzAIyGnIJ7w9T+jvm6NwQgumXCxe8BPXtYJwtmmsF/pBQ==",
+  "streams": [
+    {
+      "chunk_count": 2,
+      "chunk_size": 4096,
+      "stream_type": "content",
+      "total_bytes": 4640
+    },
+    {
+      "chunk_count": 1,
+      "chunk_size": 4096,
+      "stream_type": "metadata",
+      "total_bytes": 272
+    }
+  ],
+  "wraps": [
+    {
+      "grant_b64": "AAPy8vLy8vLy8vLy8vLy8vLyAAAAAAAAAAERERERERERERERERERERERAfc+XWJhvhiBPwCP80bd9wG0EBH12vXcEwRoJzSIwZbREREREREREREREREREREREQAAAZBaL8sA",
+      "grant_sig_b64": "qqjmyDy9rN99prcbVf1Dh3D8EzmCNZbwZrj9svEUzCS4eVJ/v6YiOMNlIx25R6ir39IjG6v8BVyqmWDP2ZfEBA==",
+      "granted_by": "11111111111111111111111111111111",
+      "recipient_id": "11111111111111111111111111111111",
+      "recipient_type": "user",
+      "wrap_alg": 1,
+      "wrapped_dek_b64": "tUOksoUTHWCi2mdGV3Drphe3jzPakew/eFf7XUFyz2YNLQ+S4fGM27F1n4q8HY7/ZnVdkVoou8vMv5GsBl6jx7itREu3fqeLgg+VJfunPu4="
+    },
+    {
+      "grant_b64": "AAPy8vLy8vLy8vLy8vLy8vLyAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAvc+XWJhvhiBPwCP80bd9wG0EBH12vXcEwRoJzSIwZbREREREREREREREREREREREQAAAZBaL8sA",
+      "grant_sig_b64": "1u97ukcDm/4iHqjJjz0Mk9eLLyTMOFq70kdpnjC9qo7RcWzucyqXtN+TLHxLBipsmznx1JYWD1CtRo2UvFnVAQ==",
+      "granted_by": "11111111111111111111111111111111",
+      "recipient_id": "recovery",
+      "recipient_type": "recovery",
+      "wrap_alg": 1,
+      "wrapped_dek_b64": "FnXGY0N7CBmGqUlEsB7n61XHcbblFHFH3ZGWcFgfVEC2PxIBziKjRrpgodVEm4A9T2vVjxQ/xDKs7CJw5LnPpavkfd3jNHA/ltcLIoW44bw="
+    }
+  ]
+}

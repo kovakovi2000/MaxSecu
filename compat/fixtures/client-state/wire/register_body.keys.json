@@ -1,0 +1,7 @@
+[
+  "enc_pub_b64",
+  "mlkem_pub_b64",
+  "registration_key",
+  "sig_pub_b64",
+  "username"
+]

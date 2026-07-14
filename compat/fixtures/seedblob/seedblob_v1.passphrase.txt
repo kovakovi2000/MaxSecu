@@ -1,0 +1,1 @@
+compat-fixture-d5-seedblob-passphrase

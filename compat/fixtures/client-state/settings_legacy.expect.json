@@ -1,0 +1,5 @@
+{
+  "media_cache_cap_mb": 512,
+  "route_mode": "tor-only",
+  "thumb_cache_cap_mb": 256
+}

@@ -111,7 +111,11 @@ fn stream_type_from_u8(v: u8) -> Option<maxsecu_encoding::types::StreamType> {
 /// directly (no re-encoding). `total_bytes` for the content stream is the exact
 /// ciphertext byte count from pass 1 (advisory: server uses it for listing/quota,
 /// not enforcement).
-fn stage_body_from_record(rec: &StagingRecord, flags: StageFlags) -> serde_json::Value {
+///
+/// PURE + `pub` so the RESUME wire shape is testable without a network
+/// (`tests/compat.rs`): an in-flight upload staged by yesterday's client must
+/// still finalize against today's server, so this body's key set is frozen.
+pub fn stage_body_from_record(rec: &StagingRecord, flags: StageFlags) -> serde_json::Value {
     let file_id_hex: String = rec.file_id.iter().map(|b| format!("{b:02x}")).collect();
 
     // Content stream first (ascending stream_type order)

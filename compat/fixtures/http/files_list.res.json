@@ -1,0 +1,16 @@
+{
+  "files": [
+    {
+      "file_id": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+      "file_type": "blog",
+      "streams": {
+        "metadata": {
+          "size": 272
+        }
+      },
+      "updated_at": 1784057916649,
+      "version": 1
+    }
+  ],
+  "next_cursor": null
+}

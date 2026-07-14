@@ -1,0 +1,18 @@
+{
+  "recipients": [
+    {
+      "ancestor_grants": [],
+      "grant_b64": "AAPx8fHx8fHx8fHx8fHx8fHxAAAAAAAAAAERERERERERERERERERERERAWlfNyTK4O2Y+DtpM8DkdQaN9frXvK9kicRA0pz15OOIEREREREREREREREREREREQAAAZBaL8sA",
+      "grant_sig_b64": "ZkUGf7v+MQucrx9GVzXKCpDMvHvKgPvGIdvP6OX9bMVluL/F/oXH6VZVMcLLjXQKQfVYtD3d8r7SmNLinsyzBw==",
+      "granted_by": "11111111111111111111111111111111",
+      "recipient_id": "11111111111111111111111111111111"
+    },
+    {
+      "ancestor_grants": [],
+      "grant_b64": "AAPx8fHx8fHx8fHx8fHx8fHxAAAAAAAAAAEiIiIiIiIiIiIiIiIiIiIiAWlfNyTK4O2Y+DtpM8DkdQaN9frXvK9kicRA0pz15OOIEREREREREREREREREREREQAAAZBaL8sA",
+      "grant_sig_b64": "m78hZ+NNZoOspX4sK0zFRmS0z2IHNL0UoIv1Zzk7iyp/27sjtci1e7w6r2Zr7HJNAj9uYADWna9a4do5/lPHBA==",
+      "granted_by": "11111111111111111111111111111111",
+      "recipient_id": "22222222222222222222222222222222"
+    }
+  ]
+}

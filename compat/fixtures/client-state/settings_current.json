@@ -1,0 +1,16 @@
+{
+  "a11y": { "reduced_motion": true, "high_contrast": false, "text_size": "large" },
+  "behavior": { "confirm_destructive": true },
+  "performance": {
+    "media_cache_cap_mb": 2048,
+    "thumb_cache_cap_mb": 512,
+    "feed_concurrency": 6,
+    "transcode_threads": 4,
+    "decode_threads": 4,
+    "cache_location": "Disk"
+  },
+  "connection": { "route_mode": "prefer-dropbox", "use_tor": false },
+  "appearance": { "theme": "light", "frontend": "pizza" },
+  "ui": { "bundle_view": "stacked" },
+  "playback": { "volume": 0.5, "muted": true }
+}

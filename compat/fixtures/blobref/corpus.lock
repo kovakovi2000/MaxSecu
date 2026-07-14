@@ -1,0 +1,5 @@
+# MaxSecu backward-compatibility gate — frozen corpus lock.
+# Fixtures may be ADDED. Never edited. Never deleted.
+# <filename>  <sha256-hex>, sorted.  see docs/compat/CHECKLIST.md
+blobref_manifest.bin  444527d131ff56896a03c3b42b9d5f56cdfe00778bebc7ba53a5ae493dc4d5c4
+blobref_manifest.expect.json  0e4f9b1c1d517aaeb8404077ccc54a1844aaa3b4bb2dc8eb2ba56a3e47957735

@@ -1,0 +1,13 @@
+{
+  "alg": 1,
+  "author_id": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "chunk_size": 1048576,
+  "created_at": 1700000000000,
+  "dek_commit": "e082460b2a671430493e2b8d6d0f8e6f46f2c8b26fc9f60cbbc2b2f301de9869",
+  "file_id": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+  "file_type": 1,
+  "label": "MaxSecu-manifest-v1",
+  "recovery_present": true,
+  "signer_pub": "fc5450d7c4f3d56035f2122cfce08b2982aa2f2f0065a5ed164eee595ed9b849",
+  "version": 1
+}

@@ -1,0 +1,7 @@
+{
+  "a11y": { "reduced_motion": false, "high_contrast": false, "text_size": "normal" },
+  "behavior": { "confirm_destructive": false },
+  "performance": { "ram_cache_cap_mb": 512 },
+  "connection": { "use_tor": true },
+  "appearance": { "theme": "dark" }
+}

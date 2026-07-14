@@ -1,0 +1,12 @@
+{
+  "blob_refs": {
+    "1": "b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9/3/1",
+    "2": "b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9/3/2",
+    "3": "b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9/3/3",
+    "4": "b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9/3/4"
+  },
+  "caller_id": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "file_id": "b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9",
+  "scheme": "hex(file_id)/version/stream_type",
+  "version": 3
+}

@@ -943,7 +943,6 @@ mod tests {
     use maxsecu_client_core::{
         build_upload, PlaintextStreams, StreamChunks, UploadBundle, UploadParams,
     };
-    use maxsecu_client_core::{VerifyContext, NO_ADMINS, NO_GRANTERS};
     use maxsecu_crypto::generate_enc_keypair;
     use maxsecu_encoding::encode;
     use maxsecu_encoding::types::{FileType, Id, RecipientType, Timestamp};

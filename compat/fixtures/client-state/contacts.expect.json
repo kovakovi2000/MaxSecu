@@ -1,0 +1,12 @@
+[
+  {
+    "fingerprint_hex": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+    "user_id_hex": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "username": "alice"
+  },
+  {
+    "fingerprint_hex": "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2",
+    "user_id_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+    "username": "bob"
+  }
+]

@@ -1,0 +1,10 @@
+[
+  "file_id",
+  "file_type",
+  "genesis_b64",
+  "genesis_sig_b64",
+  "manifest_b64",
+  "manifest_sig_b64",
+  "streams",
+  "wraps"
+]

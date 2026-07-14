@@ -136,6 +136,31 @@ impl RecoveryChallenge {
     }
 }
 
+/// Build the `POST /v1/recovery/challenge` body — PURE, so the wire shape is
+/// testable without a network (`tests/compat.rs`). Deliberately EMPTY: the
+/// recovery account is the singleton the server already knows, so the challenge
+/// carries no identifier (the server wraps the nonce to the pinned recovery key).
+/// Adding a REQUIRED key here would break every shipped client.
+pub fn build_recovery_challenge_body() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+/// Build the `POST /v1/recovery/verify` body — PURE (see above). All three keys
+/// are read by the server's `recovery_verify` handler; dropping any of them makes
+/// the channel-bound recovery proof unverifiable and destroys the ONLY
+/// account-recovery path (there is no admin escape hatch).
+pub fn build_recovery_verify_body(
+    challenge_id: &str,
+    proof_b64: &str,
+    timestamp_ms: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "challenge_id": challenge_id,
+        "proof_b64": proof_b64,
+        "timestamp": timestamp_ms,
+    })
+}
+
 /// `POST /v1/recovery/challenge` over an already-connected, channel-bound sender,
 /// then UNWRAP the returned blob to the nonce with `recovery`. Mirrors the first
 /// half of a normal `login_exchange`; all failures collapse to [`recovery_failed`].
@@ -147,7 +172,7 @@ pub async fn request_challenge_exchange(
     let (status, ch) = post_json(
         sender,
         "/v1/recovery/challenge",
-        &serde_json::json!({}),
+        &build_recovery_challenge_body(),
         None,
         host,
     )
@@ -200,11 +225,7 @@ pub async fn verify_exchange(
     let (status, res) = post_json(
         sender,
         "/v1/recovery/verify",
-        &serde_json::json!({
-            "challenge_id": challenge.challenge_id,
-            "proof_b64": B64.encode(proof),
-            "timestamp": now_ms,
-        }),
+        &build_recovery_verify_body(&challenge.challenge_id, &B64.encode(proof), now_ms),
         None,
         host,
     )

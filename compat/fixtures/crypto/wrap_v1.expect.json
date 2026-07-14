@@ -1,0 +1,12 @@
+{
+  "dek": "c91fcee329bbbdc2fa00d17c9d1b21592c5b541e9a56ac64051eb20f57da7082",
+  "dek_commit": "e082460b2a671430493e2b8d6d0f8e6f46f2c8b26fc9f60cbbc2b2f301de9869",
+  "recipient_x25519_pub": "40125242e21563e5a928e70765105d036d05f1c1fceacfc5d24fc0f6bbd69c00",
+  "secret_key_file": "wrap_v1.testkey",
+  "suite": 1,
+  "wrap_context": {
+    "file_id": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+    "recipient_id": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "version": 1
+  }
+}

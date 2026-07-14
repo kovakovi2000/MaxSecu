@@ -1,0 +1,12 @@
+{
+  "next_cursor": null,
+  "records": [
+    {
+      "chain_head_b64": "wx2zTw5JO72mvvwmeDOzC9sVb6gx2ITFxR7bDjWMmfw=",
+      "co_sig_b64": "Jb0iW2j5JaZSSdNeGezx5VQMo9PYBjM2Q0QG7J2w9qVRb0qEYaNwljlC1TLzTNwGCszdV0oV4UieSS1aLDMRDg==",
+      "kind": "revocation",
+      "record_b64": "AAYCMzMzMzMzMzMzMzMzMzMzMwAAAAAAAAAAAQAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARERERERERERERERERERERASIiIiIiIiIiIiIiIiIiIiIAAAGQWi/LAA==",
+      "sig_b64": "uI0w/pt9avrwUlrEZg2nDJTh5r3yuuvEK1Swy2Ma0XsjmtI7G2e3B/KHgXJPxKffpa/a9xDSYKNNCJt1g/7oCg=="
+    }
+  ]
+}

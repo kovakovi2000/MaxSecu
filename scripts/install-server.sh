@@ -376,11 +376,48 @@ have_users="$(
 	PGPASSWORD="$DB_PASS" psql -h localhost -U maxsecu -d maxsecu -tAc \
 		"SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='users' LIMIT 1" || true
 )"
+FRESH_SCHEMA=0
 if [ -n "$have_users" ]; then
 	echo "    schema already applied (table 'users' present) — skipping"
 else
 	echo "    loading $ROOT/docs/schema.sql"
 	PGPASSWORD="$DB_PASS" psql -v ON_ERROR_STOP=1 -h localhost -U maxsecu -d maxsecu -f "$ROOT/docs/schema.sql" >/dev/null
+	FRESH_SCHEMA=1
+fi
+
+# --------------------------------------------------------------------------- #
+# 8b. Migration bookkeeping (migrations/apply.sh). A fresh install gets its whole
+#     schema from docs/schema.sql above, which — proven by the compat gate's
+#     schema-equivalence test — is exactly `0001_baseline.sql` + every later
+#     migration. So we RECORD every migration as already-applied rather than
+#     re-running it. That is what makes a fresh box and an upgraded box the same
+#     product.
+#
+#     This script is also re-runnable on an EXISTING install (it is documented as
+#     idempotent). In that case the database may be older than this checkout, so
+#     we must NOT blanket-mark migrations as applied — that would silently strand
+#     it. Instead we run the very same pending-migration path upgrade-server.sh
+#     uses. Migrations run as the `maxsecu` app role (not the postgres
+#     superuser), so every object they create is owned by the role the server
+#     connects as.
+# --------------------------------------------------------------------------- #
+echo "==> Recording database migrations"
+MIGRATIONS_DIR="$ROOT/migrations"
+db_psql() {
+	PGPASSWORD="$DB_PASS" psql -v ON_ERROR_STOP=1 -h localhost -U maxsecu -d maxsecu "$@"
+}
+# shellcheck source=../migrations/apply.sh
+. "$MIGRATIONS_DIR/apply.sh"
+
+migrations_ensure_table
+if [ "$FRESH_SCHEMA" -eq 1 ]; then
+	migrations_mark_all_applied
+else
+	# Pre-existing database: it may predate migrations entirely (empty
+	# schema_migrations → 0001_baseline is "pending", and it is idempotent, so
+	# applying it to the already-present schema is a no-op).
+	migrations_verify_history
+	migrations_apply_pending
 fi
 
 # --------------------------------------------------------------------------- #

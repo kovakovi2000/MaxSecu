@@ -1,0 +1,43 @@
+{
+  "file_id": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+  "file_type": "blog",
+  "genesis_b64": "AAXx8fHx8fHx8fHx8fHx8fHxEREREREREREREREREREREQAAAAAAAAABAAABkFovywA=",
+  "genesis_sig_b64": "xvby+fliWreXoO3AlOCorZBje5hBfxb2cFfnOJi4Hqh/OJfE2Z9/GNxAo3umt2eOOYiaB/yppPRS5tusaqKuAA==",
+  "listed": true,
+  "manifest_b64": "AALx8fHx8fHx8fHx8fHx8fHxAAAAAAAAAAEDAAEAABAAaV83JMrg7Zj4O2kzwOR1Bo31+te8r2SJxEDSnPXk44gCAA0BAAAAAAAAAAACwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMAADQIAAAAAAAAAAAEuLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLgERERERERERERERERERERERAAABkFovywE=",
+  "manifest_sig_b64": "6GhmcQEnppESDfDi5mWAuYOjt1QLKiX5V9L+8Owt6eMMxlMLzLUFvf2zCS3K6JfBdon24rJjGYzJ5G+j2QBLDA==",
+  "streams": [
+    {
+      "chunk_count": 2,
+      "chunk_size": 4096,
+      "stream_type": "content",
+      "total_bytes": 4640
+    },
+    {
+      "chunk_count": 1,
+      "chunk_size": 4096,
+      "stream_type": "metadata",
+      "total_bytes": 272
+    }
+  ],
+  "wraps": [
+    {
+      "grant_b64": "AAPx8fHx8fHx8fHx8fHx8fHxAAAAAAAAAAERERERERERERERERERERERAWlfNyTK4O2Y+DtpM8DkdQaN9frXvK9kicRA0pz15OOIEREREREREREREREREREREQAAAZBaL8sA",
+      "grant_sig_b64": "ZkUGf7v+MQucrx9GVzXKCpDMvHvKgPvGIdvP6OX9bMVluL/F/oXH6VZVMcLLjXQKQfVYtD3d8r7SmNLinsyzBw==",
+      "granted_by": "11111111111111111111111111111111",
+      "recipient_id": "11111111111111111111111111111111",
+      "recipient_type": "user",
+      "wrap_alg": 1,
+      "wrapped_dek_b64": "/OxnvQEi0GPQmmUy9+hcyXcoys4cuSlzlwYB9sCz/xizBNTjJGVtb+mmvD/4uczdqeY/DVZqdDd3EFwSEnCJmCWJu0cMihwamyoB93VgwgQ="
+    },
+    {
+      "grant_b64": "AAPx8fHx8fHx8fHx8fHx8fHxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAmlfNyTK4O2Y+DtpM8DkdQaN9frXvK9kicRA0pz15OOIEREREREREREREREREREREQAAAZBaL8sA",
+      "grant_sig_b64": "nbpjsWj5t6QMFG754QRnvYtsnu4V3fh8uvHjGeA2TTwkSXHR96aVpxKLk/Nshtn1c6HNFK+PjFxBpA81JjfhAg==",
+      "granted_by": "11111111111111111111111111111111",
+      "recipient_id": "recovery",
+      "recipient_type": "recovery",
+      "wrap_alg": 1,
+      "wrapped_dek_b64": "3nV+0WYr20tvUGnTC8tW4ozQJsL5MnH9AXp+Bn1ScyzgwK9n2ksAuyHKPGFgcJekzuBWxAFhl8MVlYWHTLn08me1bCqfGwTckmDDu4j5+Z8="
+    }
+  ]
+}

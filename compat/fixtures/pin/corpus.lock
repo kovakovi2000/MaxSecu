@@ -1,0 +1,10 @@
+# corpus.lock — ADD-ONLY. Fixtures may be added; never edited, never deleted.
+# Format: <filename>  <sha256-hex>, sorted by filename, LF endings.
+# See docs/compat/CHECKLIST.md.
+bootstrap_directory_pub.der  73a210154ad7a0d313d6de7fd795ad29e65d8e71fc23a91d2d80abc03f8147a9
+bootstrap_pins.expect.json  0798840c4c64e60759313a358c119c8cc2a67eb06115bf0c1f5ec549d43992dc
+bootstrap_server_cert.der  750e89eefdc9093c2d7c3a1747843504b3b11fc9e1a6e2eae19c2412b53c2ff7
+canonical_pin_v1_classical.bin  695ce7b12b589be7d2fe616d29f59bd9176a97d5025a33e3d88ac89fb62a0b01
+canonical_pin_v1_classical.expect.json  17197e2364cfebd75d464180abb9f37d7c02a3e368fdf39a85c17db0e3f5122b
+canonical_pin_v1_hybrid.bin  c5cd28a9b940ff082c3b74bd86dbd61aa7ad8c1dc554f3c21cfc7f6405e1ccf2
+canonical_pin_v1_hybrid.expect.json  d8e947dcde9d6e1309a5883bee088d4e1aca2eaa26e64b9fa0c9d0921772b6cb

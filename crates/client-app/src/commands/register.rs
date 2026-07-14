@@ -70,6 +70,35 @@ fn b64(bytes: impl AsRef<[u8]>) -> String {
     B64.encode(bytes.as_ref())
 }
 
+/// Build the `POST /v1/users` enrollment body — a PURE function so the wire shape
+/// is testable without a network (see `tests/compat.rs`; this is the exact seam
+/// where `mlkem_pub_b64` once went missing and forced every recipient to
+/// re-enroll).
+///
+/// Every emitted key is read by the server's `RegisterReq`; DROPPING one is a
+/// backward-compatibility break, not a refactor. `mlkem_pub_b64` in particular is
+/// what makes the server publish a PQ-hybrid directory binding — without it every
+/// `Suite::V2` re-share (or rotation) to this user fails closed with
+/// `pq_key_missing` (P7.4, `docs/runbooks/pq-reenrollment.md`). A fresh identity is
+/// always PQ-capable; a legacy v1-blob identity carries no ML-KEM key and enrols
+/// classical (the `None` arm is a forward-compat guard).
+pub fn build_register_body(
+    username: &str,
+    id: &Identity,
+    registration_key: &str,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "username": username,
+        "enc_pub_b64": b64(id.enc_pub_bytes()),
+        "sig_pub_b64": b64(id.sig_pub_bytes()),
+        "registration_key": registration_key,
+    });
+    if let Some(mlkem) = id.mlkem_pub_bytes() {
+        body["mlkem_pub_b64"] = serde_json::Value::String(b64(mlkem));
+    }
+    body
+}
+
 /// `POST /v1/users` with the registration key + the new identity's PUBLIC keys +
 /// `username`, over an already-connected, pinned-TLS sender. Returns the server-
 /// assigned `user_id` (hex16) on 201. A consumed/invalid key (403) → the single
@@ -83,20 +112,7 @@ pub async fn enroll_exchange(
     id: &Identity,
     registration_key: &str,
 ) -> Result<String, UiError> {
-    let mut body = serde_json::json!({
-        "username": username,
-        "enc_pub_b64": b64(id.enc_pub_bytes()),
-        "sig_pub_b64": b64(id.sig_pub_bytes()),
-        "registration_key": registration_key,
-    });
-    // Publish the ML-KEM-768 key so the server signs a PQ-hybrid directory
-    // binding — otherwise every `Suite::V2` re-share (or rotation) to this user
-    // fails closed with `pq_key_missing` (P7.4, `docs/runbooks/pq-reenrollment.md`).
-    // A fresh identity is always PQ-capable; a legacy v1-blob identity carries no
-    // ML-KEM key and enrols classical (the `None` arm is a forward-compat guard).
-    if let Some(mlkem) = id.mlkem_pub_bytes() {
-        body["mlkem_pub_b64"] = serde_json::Value::String(b64(mlkem));
-    }
+    let body = build_register_body(username, id, registration_key);
     let (status, json) = post_json(sender, "/v1/users", &body, None, host).await?;
     match status {
         StatusCode::CREATED => json["user_id"]

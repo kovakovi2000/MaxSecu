@@ -1,0 +1,48 @@
+{
+  "file_type": "blog",
+  "manifest_b64": "AALx8fHx8fHx8fHx8fHx8fHxAAAAAAAAAAIDAAEAABAA4anO3PQnS245QqDueRm8u+Qrt1cEVJWHQFSskEjVWg0CAA0BAAAAAAAAAAACwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMAADQIAAAAAAAAAAAEuLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLgERERERERERERERERERERERAAABkFovywI=",
+  "manifest_sig_b64": "Hb3pTIL8tl28j+KgAJ2myS0wIgrZkuaPLujr0unkYeS5s1+qv85CUQYLg+XtjHqi5UnwA/nXPibKMEICyF0+CQ==",
+  "streams": [
+    {
+      "chunk_count": 2,
+      "chunk_size": 4096,
+      "stream_type": "content",
+      "total_bytes": 4640
+    },
+    {
+      "chunk_count": 1,
+      "chunk_size": 4096,
+      "stream_type": "metadata",
+      "total_bytes": 272
+    }
+  ],
+  "wraps": [
+    {
+      "grant_b64": "AAPx8fHx8fHx8fHx8fHx8fHxAAAAAAAAAAIRERERERERERERERERERERAeGpztz0J0tuOUKg7nkZvLvkK7dXBFSVh0BUrJBI1VoNEREREREREREREREREREREQAAAZBaL8sA",
+      "grant_sig_b64": "HiSoxUYTH5UWLSkjaPp8zWuwKxL1SKF8rQ/UFh48s1T2+f7yaZQDJbqEiIjVL2m++/1Ib5XjVBLDB0It1nvtBw==",
+      "granted_by": "11111111111111111111111111111111",
+      "recipient_id": "11111111111111111111111111111111",
+      "recipient_type": "user",
+      "wrap_alg": 1,
+      "wrapped_dek_b64": "U+3CNPiHKBx9dis3LpmLSKbrWGF3q1p9DQjIalNqJhWovgfDWuyac8lGuo7nDVfbCDfPvniEaEuva6IXuXEwU0vY9Bo/P0cyj8K931RAQSY="
+    },
+    {
+      "grant_b64": "AAPx8fHx8fHx8fHx8fHx8fHxAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAuGpztz0J0tuOUKg7nkZvLvkK7dXBFSVh0BUrJBI1VoNEREREREREREREREREREREQAAAZBaL8sA",
+      "grant_sig_b64": "X/jEeEFoJtEP9CcMJupNc1VEO2O9G1BUH7tqna0lVkzClNt6hQOYxeNO2GRs4Gxl2MnzlRiVmM9w5kD3oGQ3CA==",
+      "granted_by": "11111111111111111111111111111111",
+      "recipient_id": "recovery",
+      "recipient_type": "recovery",
+      "wrap_alg": 1,
+      "wrapped_dek_b64": "2a8dA7g3sYSXZSKWk+gHmcNkPza1k6uDW94Y/8If7j3ckWhmknHm7ynO1WSeWP7tc9VpDqlGrQwiQ6n1sjweBNcdn9hUxt7AEylQw+oRjX8="
+    },
+    {
+      "grant_b64": "AAPx8fHx8fHx8fHx8fHx8fHxAAAAAAAAAAIiIiIiIiIiIiIiIiIiIiIiAeGpztz0J0tuOUKg7nkZvLvkK7dXBFSVh0BUrJBI1VoNEREREREREREREREREREREQAAAZBaL8sA",
+      "grant_sig_b64": "ku6sFKObcVrLwbLf9FxVTvzTSPYBIH6jKW4Ky/2xGrRCsFrMBQrEcwKT1swbGjNOqBp49MXJBep4+dmvRQHYAQ==",
+      "granted_by": "11111111111111111111111111111111",
+      "recipient_id": "22222222222222222222222222222222",
+      "recipient_type": "user",
+      "wrap_alg": 1,
+      "wrapped_dek_b64": "armg/1kQohU1DmpuzgYL2/jGqYRvuwipTFGBDkD7JxkgJNtARvsZ6jW/7fbvytTVvKO33bruYS8nzBUAIcsenjYy4ZzSHTpEF3mej26D+98="
+    }
+  ]
+}

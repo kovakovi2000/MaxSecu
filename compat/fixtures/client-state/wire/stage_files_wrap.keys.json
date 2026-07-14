@@ -1,0 +1,9 @@
+[
+  "grant_b64",
+  "grant_sig_b64",
+  "granted_by",
+  "recipient_id",
+  "recipient_type",
+  "wrap_alg",
+  "wrapped_dek_b64"
+]

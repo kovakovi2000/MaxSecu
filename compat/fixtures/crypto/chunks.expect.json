@@ -1,0 +1,56 @@
+{
+  "chunks": [
+    {
+      "chunk_index": 0,
+      "file": "chunk_content_0.bin",
+      "file_id": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+      "is_last": false,
+      "plaintext": "666972737420636f6e74656e74206672616d65202d206e6f7420746865206c617374206f6e65",
+      "stream_subkey": "a6384c304708fbc8420d17be0470723e71522905838ea6a2c0547ee6f2785bbc",
+      "stream_type": 1,
+      "version": 1
+    },
+    {
+      "chunk_index": 1,
+      "file": "chunk_content_1.bin",
+      "file_id": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+      "is_last": true,
+      "plaintext": "7365636f6e6420616e642046494e414c20636f6e74656e74206672616d65",
+      "stream_subkey": "a6384c304708fbc8420d17be0470723e71522905838ea6a2c0547ee6f2785bbc",
+      "stream_type": 1,
+      "version": 1
+    },
+    {
+      "chunk_index": 0,
+      "file": "chunk_metadata.bin",
+      "file_id": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+      "is_last": true,
+      "plaintext": "7b227469746c65223a22612066726f7a656e20706f7374227d",
+      "stream_subkey": "75070937a89c0441123681e7b4f9f746f88a8dc6f705c2e48d881e80e479b19b",
+      "stream_type": 2,
+      "version": 1
+    },
+    {
+      "chunk_index": 0,
+      "file": "chunk_thumbnail.bin",
+      "file_id": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+      "is_last": true,
+      "plaintext": "7468756d626e61696c206279746573",
+      "stream_subkey": "c272a6f393d52b291e296c7477afef03dc490d5d898592c5c63c353be7d5094a",
+      "stream_type": 3,
+      "version": 1
+    },
+    {
+      "chunk_index": 0,
+      "file": "chunk_preview.bin",
+      "file_id": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+      "is_last": true,
+      "plaintext": "70726576696577206279746573",
+      "stream_subkey": "672c52c7255f95574d3a6b5522fe88706ae7cec31ea7daf2903853ec8031658c",
+      "stream_type": 4,
+      "version": 1
+    }
+  ],
+  "dek_commit": "1d100e49d7ad29921d1c48eba0bdf49d70e898147705c48da42bff8fcb4c70a1",
+  "dek_key_file": "chunk_dek.testkey"
+}

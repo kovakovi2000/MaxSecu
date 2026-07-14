@@ -3182,6 +3182,7 @@ dependencies = [
  "hyper-util",
  "image",
  "maxsecu-client-core",
+ "maxsecu-compat",
  "maxsecu-crypto",
  "maxsecu-encoding",
  "maxsecu-media-launcher",
@@ -3239,6 +3240,17 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "maxsecu-compat"
+version = "0.0.0"
+dependencies = [
+ "hex",
+ "maxsecu-client-core",
+ "maxsecu-crypto",
+ "maxsecu-encoding",
+ "sha2",
 ]
 
 [[package]]

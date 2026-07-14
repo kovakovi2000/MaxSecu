@@ -552,7 +552,7 @@ async fn run_reshare_batch(
 
         // (async) POST the wrap. A non-201 or transport error is a per-recipient
         // failure, not a batch abort (idempotent server-side → safe to retry).
-        let body = wrap_req_body(&wrap);
+        let body = build_add_wrap_body(&wrap);
         let uri = format!("/v1/files/{file_id_hex}/wraps");
         match post_json(sender, &uri, &body, Some(token), host).await {
             Ok((st, _)) if st == hyper::StatusCode::CREATED => {
@@ -655,7 +655,12 @@ fn reshare_error_code(e: &ReshareError) -> &'static str {
 /// Shape one `WrapOut` into the `POST /v1/files/{id}/wraps` body (a single
 /// `WrapReq`, api.md §10.1) — the same field shape `upload::stage_body` uses for a
 /// `wraps[]` entry. A reshare always targets a USER (never recovery).
-fn wrap_req_body(w: &WrapOut) -> serde_json::Value {
+///
+/// PURE + `pub` so the wire shape is testable without a network
+/// (`tests/compat.rs`). Every key here is read by the server's `add_wrap`
+/// handler: dropping one silently breaks sharing for every existing user (a
+/// recipient with no `wrapped_dek_b64`/`grant_b64` can never open the file).
+pub fn build_add_wrap_body(w: &WrapOut) -> serde_json::Value {
     serde_json::json!({
         "recipient_id": hex(&w.recipient_id.0),
         "recipient_type": "user",

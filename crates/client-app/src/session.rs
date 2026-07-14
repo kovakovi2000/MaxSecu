@@ -25,6 +25,25 @@ pub fn make_proof(
         .map_err(|_| UiError::new("unauthorized", "Sign-in failed."))
 }
 
+/// Build the `POST /v1/session/challenge` body — PURE, so the wire shape is
+/// testable without a network (`tests/compat.rs`). `username` is the ONLY key the
+/// server's challenge handler reads; dropping/renaming it locks every existing
+/// user out of login.
+pub fn build_session_challenge_body(username: &str) -> serde_json::Value {
+    serde_json::json!({ "username": username })
+}
+
+/// Build the `POST /v1/session/proof` body — PURE (see above). All three keys are
+/// read by the server's `prove` handler: dropping any of them makes the
+/// channel-bound proof unverifiable and locks every existing user out of login.
+pub fn build_session_prove_body(
+    username: &str,
+    timestamp_ms: u64,
+    proof_b64: &str,
+) -> serde_json::Value {
+    serde_json::json!({ "username": username, "timestamp": timestamp_ms, "proof_b64": proof_b64 })
+}
+
 /// The successful outcome of [`login_exchange`]: the server's self-asserted id
 /// (public; safe to return to the UI), the opaque session token (kept in
 /// managed state, NEVER returned to the UI), and the token lifetime.
@@ -97,7 +116,7 @@ pub async fn login_exchange(
         sender,
         host,
         "/v1/session/challenge",
-        serde_json::json!({ "username": username }),
+        build_session_challenge_body(username),
     )
     .await?;
     if !status.is_success() {
@@ -122,7 +141,7 @@ pub async fn login_exchange(
         sender,
         host,
         "/v1/session/proof",
-        serde_json::json!({ "username": username, "timestamp": now_ms, "proof_b64": proof_b64 }),
+        build_session_prove_body(username, now_ms, &proof_b64),
     )
     .await?;
     if !status.is_success() {

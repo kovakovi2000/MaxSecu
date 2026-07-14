@@ -1,0 +1,12 @@
+{
+  "enc_pub": "40125242e21563e5a928e70765105d036d05f1c1fceacfc5d24fc0f6bbd69c00",
+  "key_version": 1,
+  "label": "MaxSecu-dirbinding-v1",
+  "mlkem_pub_sha256": null,
+  "not_after": 2015360000000,
+  "not_before": 1700000000000,
+  "sig_pub": "fc5450d7c4f3d56035f2122cfce08b2982aa2f2f0065a5ed164eee595ed9b849",
+  "signer_pub": "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618",
+  "user_id": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "username": "alice"
+}

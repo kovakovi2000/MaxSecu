@@ -1,0 +1,37 @@
+# compat/schema.lock — the DB half of the backward-compatibility gate.
+#
+# HARD RULE (docs/compat/CHECKLIST.md): every upgrade must keep existing users'
+# access intact. For the database that means: *a fresh install and an upgraded
+# install must be the same product.*
+#
+# `docs/schema.sql` is loaded only on a FRESH install. Existing servers only ever
+# see `migrations/NNNN_*.sql` (scripts/upgrade-server.sh). So a bare edit to
+# schema.sql, with no matching migration, gives new installs a column that every
+# already-deployed server will never have — and the new server code, which is the
+# same binary everywhere, then breaks on the old databases.
+#
+# This file pins both sides so that cannot happen silently:
+#
+#   schema      <sha256 of docs/schema.sql>        — changing it fails the gate
+#   0001        <sha256 of migrations/0001_baseline.sql>
+#   NNNN        <sha256 of migrations/NNNN_<slug>.sql>
+#   schema_head <id>   the migration that brings a database up to the pinned
+#                      docs/schema.sql — i.e. the highest migration id
+#
+# TO CHANGE THE SCHEMA:
+#   1. Add `migrations/NNNN_<slug>.sql` (never edit an applied one — upgrade-server.sh
+#      records each migration's sha256 in `schema_migrations` and REFUSES to run
+#      when a recorded digest no longer matches disk).
+#   2. Mirror exactly the same change into `docs/schema.sql`.
+#   3. Re-pin this file: new `schema` digest, the new `NNNN` line, bump `schema_head`.
+#   4. `crates/compat/tests/schema_equivalence.rs` (CI `pg-gate`) then PROVES,
+#      against a live Postgres, that schema.sql and baseline+migrations produce
+#      the identical catalog — columns, constraints, indexes, triggers, functions.
+#
+# Digests are SHA-256 over the file's bytes with CRLF normalized to LF, so the
+# lock is identical on a Windows checkout and on Linux CI. (.gitattributes
+# already forces LF, so in practice this is the plain file digest.)
+
+schema       f666b01ede1e3a4fe4dca08ae29f098ce5704cbac1a35dd27af604500817946c
+0001         828d88127d86c96863e0462c513b358f0c3f586289c174e46582f652550f263f
+schema_head  1

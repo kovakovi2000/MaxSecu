@@ -15,8 +15,13 @@
 #      isn't (you copied the files in by hand), that step is skipped.
 #   3. Rebuild the release server binary WHILE the old one keeps serving, so a
 #      build failure leaves the running server completely untouched.
-#   4. (optional) set the local cache capacity via a systemd drop-in.
-#   5. Restart the service (a ~1s blip) and health-check it.
+#   4. Apply any pending database migrations (migrations/NNNN_*.sql), each in one
+#      transaction, BEFORE the new binary starts — so the new code never meets an
+#      old schema. Migrations only ADD to the schema; your rows are never
+#      rewritten or dropped, and step 1 took a dump first anyway. Nothing at all
+#      happens here when the schema is already up to date (the common case).
+#   5. (optional) set the local cache capacity via a systemd drop-in.
+#   6. Restart the service (a ~1s blip) and health-check it.
 #
 # Usage:
 #   ./scripts/upgrade-server.sh                    # pull + backup + rebuild + restart
@@ -45,10 +50,15 @@ usage() {
 Usage: upgrade-server.sh [--no-pull] [--no-backup] [--capacity-gb N]
 
 Rebuild + restart an already-installed MaxSecu server IN PLACE, with no data
-loss and no client re-pin. Your database, blobs, TLS cert, client pins, and
-Dropbox login are all left untouched (only `install-server.sh --reset` deletes
-those). The build runs while the old server keeps serving, so a build failure
-leaves production running the old binary.
+loss and no client re-pin. Your rows, blobs, TLS cert, client pins, and Dropbox
+login are all left untouched (only `install-server.sh --reset` deletes those).
+The build runs while the old server keeps serving, so a build failure leaves
+production running the old binary.
+
+Pending database migrations (migrations/NNNN_*.sql) are applied before the
+restart, each in a single transaction, so the new code never starts against an
+old schema. Migrations only ADD to the schema — no account, key, or uploaded
+file is ever touched — and a pg_dump is taken first unless you pass --no-backup.
 
   --no-pull        Do NOT `git pull`; rebuild whatever is checked out now.
   --no-backup      Do NOT pg_dump the database first.
@@ -247,6 +257,83 @@ fi
 echo "    build OK"
 
 # --------------------------------------------------------------------------- #
+# 6b. Apply pending database migrations — BEFORE the restart, so the new binary
+#     never starts against an old schema.
+#
+#     This is the hole this step closes: docs/schema.sql used to be applied ONLY
+#     by install-server.sh on a FRESH install, and this script applied no schema
+#     change at all. Any edit to the schema therefore stranded every existing
+#     deployment — new code expecting a column the running database did not have.
+#
+#     migrations/apply.sh applies each pending migrations/NNNN_*.sql in ONE
+#     transaction together with its schema_migrations row (all-or-nothing), in
+#     numeric order, and REFUSES to run if an already-applied migration's
+#     recorded sha256 no longer matches the file on disk (rewritten history would
+#     make this server and a fresh install permanently different products).
+#
+#     Migrations must run as the `maxsecu` APP role, not the postgres superuser —
+#     otherwise new objects would be owned by `postgres` and the server could not
+#     use them. The role's password lives in the root-owned 0600 systemd unit, so
+#     we read it from there and pass it via PGPASSWORD (never on argv, where `ps`
+#     would show it).
+# --------------------------------------------------------------------------- #
+echo "==> Applying database migrations"
+
+# Take the LAST Environment=DATABASE_URL= across the unit and any drop-in, which
+# is what systemd itself would use. The optional surrounding quotes systemd
+# permits are stripped.
+DATABASE_URL="$(
+	run_root "cat '$UNIT_PATH' '$DROPIN_DIR'/*.conf 2>/dev/null |
+		sed -n 's/^Environment=\"\\?DATABASE_URL=//p' |
+		sed 's/\"\$//' |
+		tail -n1"
+)"
+DATABASE_URL="$(printf '%s' "$DATABASE_URL" | tr -d '\r')"
+if [ -z "$DATABASE_URL" ]; then
+	echo "error: no DATABASE_URL in $UNIT_PATH — cannot reach the database to check" >&2
+	echo "       for pending schema migrations. Refusing to restart into a possibly" >&2
+	echo "       mismatched schema. Re-run scripts/install-server.sh to repair the unit." >&2
+	exit 1
+fi
+
+# postgres://USER:PASS@HOST[:PORT]/DB[?params]  (install-server.sh writes exactly
+# this shape; the password is `openssl rand -hex 24`, so it is never URL-encoded).
+DB_REST="${DATABASE_URL#*://}"
+DB_CREDS="${DB_REST%%@*}"
+DB_HOSTPATH="${DB_REST#*@}"
+DB_USER="${DB_CREDS%%:*}"
+DB_PASS=""
+if [ "$DB_CREDS" != "$DB_USER" ]; then
+	DB_PASS="${DB_CREDS#*:}"
+fi
+DB_HOSTPORT="${DB_HOSTPATH%%/*}"
+DB_NAME="${DB_HOSTPATH#*/}"
+DB_NAME="${DB_NAME%%\?*}"
+DB_HOST="${DB_HOSTPORT%%:*}"
+DB_PORT="${DB_HOSTPORT#*:}"
+if [ "$DB_PORT" = "$DB_HOSTPORT" ]; then
+	DB_PORT=5432
+fi
+if [ -z "$DB_USER" ] || [ -z "$DB_HOST" ] || [ -z "$DB_NAME" ]; then
+	echo "error: could not parse the DATABASE_URL from $UNIT_PATH." >&2
+	echo "       Expected postgres://USER:PASS@HOST/DB. Refusing to continue." >&2
+	exit 1
+fi
+
+MIGRATIONS_DIR="$ROOT/migrations"
+db_psql() {
+	PGPASSWORD="$DB_PASS" psql -v ON_ERROR_STOP=1 \
+		-h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" "$@"
+}
+# shellcheck source=../migrations/apply.sh
+. "$MIGRATIONS_DIR/apply.sh"
+
+migrations_ensure_table
+# Refuse BEFORE applying anything: a rewritten history must never be half-run.
+migrations_verify_history
+migrations_apply_pending
+
+# --------------------------------------------------------------------------- #
 # 7. Optional: set the cache capacity via a systemd drop-in (clean + reversible;
 #    does not edit the main unit). Only written when --capacity-gb was given.
 # --------------------------------------------------------------------------- #
@@ -282,7 +369,8 @@ run_as_user "MAXSECU_DATA_DIR='$DATA_DIR' '$SERVER_BIN' print-fingerprint" || tr
 
 echo ""
 echo "================ UPGRADE COMPLETE ================"
-echo "The new server binary is live. Data, database, TLS cert and client pins"
-echo "were all left in place. Watch it handle real traffic with:"
+echo "The new server binary is live, on an up-to-date schema. Accounts, keys,"
+echo "uploads, TLS cert and client pins were all left in place. Watch it handle"
+echo "real traffic with:"
 echo "    journalctl -u maxsecu-server -f"
 echo "================================================="
