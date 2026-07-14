@@ -727,6 +727,31 @@ struct RecoveryVerifyRes {
     expires_in_s: u64,
 }
 
+/// The configured session TTL (ms) as the whole seconds every session-minting
+/// response advertises. **One** conversion, shared by the login (`§2.2`) and
+/// recovery (`§4.3`) paths — they used to disagree, and the login path reported a
+/// constant `3600` that silently lied whenever an operator retuned the TTL.
+///
+/// Truncating (`/ 1000`), matching the sibling nonce-TTL conversion in
+/// `auth.rs`. Rounding DOWN is the safe direction: it can only under-state the
+/// lifetime, so a client re-authenticates fractionally early (harmless) instead
+/// of trusting a token the server has already expired (the surprise-logout bug
+/// this fixes). Rounding up would re-introduce exactly that lie.
+///
+/// The single clamp is at the bottom: a sub-second TTL floors to `0`, which a
+/// client reads as "already expired" and which can drive a re-auth hot-loop in
+/// any client that schedules its refresh off this value — so a non-zero TTL
+/// always reports at least `1`. The over-statement that clamp introduces is
+/// bounded by <1 s on a configuration that is already degenerate (the session
+/// dies within one round-trip regardless), so it cannot cause the multi-minute
+/// surprise logout that motivated the fix. A genuinely zero TTL reports `0`.
+fn session_expires_in_s(ttl_ms: u64) -> u64 {
+    match ttl_ms {
+        0 => 0,
+        ms => (ms / 1000).max(1),
+    }
+}
+
 /// `POST /v1/recovery/verify` — verify the channel-bound proof for `challenge_id`
 /// and, on success, mint an admin session (principal = `RECOVERY_ID`). The proof
 /// is bound to THIS connection's TLS exporter (relay-hardened) and the nonce is
@@ -749,9 +774,9 @@ async fn recovery_verify<S: Store + 'static>(
     {
         Ok(token) => Json(RecoveryVerifyRes {
             session_token: token.to_hex(),
-            // Report the actual configured TTL (mirror the login path) so the
+            // Report the actual configured TTL (shared with the login path) so the
             // client's expiry can't be a lie if the TTL is reconfigured.
-            expires_in_s: st.auth.session_ttl_ms() / 1000,
+            expires_in_s: session_expires_in_s(st.auth.session_ttl_ms()),
         })
         .into_response(),
         // Single 401 shape for every auth-failure cause — no oracle.
@@ -826,7 +851,11 @@ async fn prove<S: Store>(
     {
         Ok(token) => Json(ProveRes {
             session_token: token.to_hex(),
-            expires_in_s: 3600,
+            // The REAL configured TTL, not a constant: the session the server
+            // just minted expires at `now + session_ttl_ms` (auth.rs), so a
+            // hardcoded 3600 lied to every client whenever an operator retuned
+            // the TTL. Same conversion the recovery path uses.
+            expires_in_s: session_expires_in_s(st.auth.session_ttl_ms()),
         })
         .into_response(),
         // Single 401 shape for every auth-failure cause — no oracle (§3) …
@@ -2225,6 +2254,13 @@ mod tests {
     }
 
     fn app(exporter: [u8; 32]) -> (Router, SigningKey) {
+        app_with_auth_cfg(exporter, AuthConfig::default())
+    }
+
+    /// [`app`] over a caller-chosen [`AuthConfig`], so a test can pin a session
+    /// TTL other than the 60-minute default and assert the login response
+    /// reports *that* TTL rather than a constant.
+    fn app_with_auth_cfg(exporter: [u8; 32], cfg: AuthConfig) -> (Router, SigningKey) {
         let store = MemoryStore::new();
         let sk = SigningKey::generate();
         store.add_user(
@@ -2236,7 +2272,7 @@ mod tests {
             },
         );
         let state = AppState {
-            auth: Arc::new(AuthService::new(store, AuthConfig::default())),
+            auth: Arc::new(AuthService::new(store, cfg)),
             blobs: Arc::new(MemoryBlobStore::new()),
             audit: Arc::new(crate::audit::NullAuditSink),
             direct_links_enabled: false,
@@ -2244,6 +2280,67 @@ mod tests {
         };
         let router = router(state).layer(Extension(TlsExporter(exporter)));
         (router, sk)
+    }
+
+    /// Regression: `POST /v1/session/proof` must advertise the CONFIGURED session
+    /// TTL, not a hardcoded `3600`.
+    ///
+    /// The response used to return `expires_in_s: 3600` unconditionally. An
+    /// operator who shortens `session_ttl_ms` got a response that LIED: the
+    /// client believed it had an hour while the server expired the token sooner
+    /// (surprise logouts mid-session). The recovery path already reported the
+    /// real value; login now shares the same conversion.
+    #[tokio::test]
+    async fn prove_reports_the_configured_session_ttl() {
+        // A 15-minute TTL: a plausible operator hardening, and deliberately NOT
+        // the 60-minute default — so a hardcoded 3600 cannot pass by accident.
+        let cfg = AuthConfig {
+            session_ttl_ms: 900_000,
+            ..AuthConfig::default()
+        };
+        let (router, sk) = app_with_auth_cfg(EXPORTER, cfg);
+
+        let (_st, ch) = post_json(
+            &router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": "alice" }),
+        )
+        .await;
+        let nonce = b64_fixed::<32>(ch["nonce_b64"].as_str().unwrap()).unwrap();
+        let server_id = ch["server_id"].as_str().unwrap();
+        let ts = 1_719_500_000_000u64;
+        let proof_b64 = make_proof(&sk, server_id, &EXPORTER, &nonce, ts);
+
+        let (st, res) = post_json(
+            &router,
+            "/v1/session/proof",
+            serde_json::json!({"username":"alice","timestamp":ts,"proof_b64":proof_b64}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        // The wire shape is unchanged — the key is still there, still a number …
+        assert!(res["session_token"].as_str().is_some());
+        // … only the VALUE stops being a lie.
+        assert_eq!(
+            res["expires_in_s"].as_u64().unwrap(),
+            900,
+            "login must report the configured 900 s TTL, not a hardcoded 3600"
+        );
+    }
+
+    /// The ms→s conversion both session-minting paths share (see
+    /// [`session_expires_in_s`]): floor, so the reported lifetime can only ever
+    /// be an under-statement — never the over-statement that logs a user out by
+    /// surprise — with a single clamp keeping a sub-second TTL off a useless `0`.
+    #[test]
+    fn session_expires_in_s_rounds_down_but_never_to_zero() {
+        assert_eq!(session_expires_in_s(3_600_000), 3600); // the default, unchanged
+        assert_eq!(session_expires_in_s(900_000), 900); // exact multiple
+        assert_eq!(session_expires_in_s(1_500), 1); // non-multiple ⇒ floor, never up
+        assert_eq!(session_expires_in_s(1_999), 1); // …still floor
+        assert_eq!(session_expires_in_s(500), 1); // sub-second ⇒ clamped off 0
+        assert_eq!(session_expires_in_s(1), 1); // …ditto
+        assert_eq!(session_expires_in_s(0), 0); // a zero TTL is honestly zero
     }
 
     fn make_proof(

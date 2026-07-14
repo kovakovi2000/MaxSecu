@@ -61,6 +61,51 @@ pub struct LauncherConfig {
     pub direct_links_enabled: bool,
 }
 
+/// **Every environment variable the server reads** — the single source of truth
+/// for the server's *env surface*, listed in the order [`LauncherConfig::from_parts`]
+/// reads them.
+///
+/// This list exists because of a hole with the same shape as the DB-schema one:
+///
+/// > `scripts/install-server.sh` writes the systemd unit — including its
+/// > `Environment=` lines — and `scripts/upgrade-server.sh` **never rewrites that
+/// > unit**. So a new variable added here would reach **FRESH INSTALLS ONLY**;
+/// > every already-deployed server would keep, forever, the unit it was installed
+/// > with, and would silently run without the new variable.
+///
+/// That is latent today only because every variable below happens to have a safe
+/// default. The day one lands without a safe default — or the *meaning* of a
+/// default changes — every upgraded server silently becomes a different product
+/// from every fresh one.
+///
+/// So a variable is only real once **both** deployment paths know it:
+///
+/// * `scripts/install-server.sh` — its `SERVER_ENV_SURFACE` table (fresh installs), and
+/// * `scripts/upgrade-server.sh` — its `SERVER_ENV_RECONCILE` table, which adds
+///   any missing variable to an already-deployed unit via a drop-in, without ever
+///   overriding a value the operator set.
+///
+/// `crates/compat/tests/env_surface.rs` fails the build if this list, the reads in
+/// `from_parts`, and the two scripts' tables ever disagree. See
+/// `docs/compat/CHECKLIST.md`.
+pub const MAXSECU_ENV_VARS: &[&str] = &[
+    "MAXSECU_DATA_DIR",
+    "MAXSECU_PORT",
+    "MAXSECU_BIND",
+    "MAXSECU_PUBLIC_ADDR",
+    "DATABASE_URL",
+    "MAXSECU_COLD_TIER",
+    "MAXSECU_COLD_FS_DIR",
+    "MAXSECU_DROPBOX_APP_KEY",
+    "MAXSECU_DROPBOX_APP_SECRET",
+    "MAXSECU_DROPBOX_REFRESH_TOKEN",
+    "MAXSECU_DROPBOX_ACCESS_TOKEN",
+    "MAXSECU_DROPBOX_ROOT",
+    "MAXSECU_CACHE_CAPACITY_BYTES",
+    "MAXSECU_OFFLOAD_IDLE_DAYS",
+    "MAXSECU_DIRECT_LINKS",
+];
+
 /// Default port for the portable server.
 const DEFAULT_PORT: u16 = 8443;
 /// Default data directory (relative to the launcher's working dir).
@@ -179,8 +224,23 @@ impl LauncherConfig {
 
     /// Thin wrapper over [`from_parts`](Self::from_parts) reading the real process
     /// environment. Wired into the launcher in Task 5.
+    ///
+    /// The `debug_assert!` is a tripwire, not a behaviour change: in release it
+    /// compiles away entirely, and in a debug build it fires the moment
+    /// `from_parts` reaches for a variable that is not in [`MAXSECU_ENV_VARS`] —
+    /// i.e. a variable that the deployment scripts therefore cannot know about,
+    /// and that would consequently reach fresh installs only.
     pub fn from_env() -> LauncherConfig {
-        Self::from_parts(|k| std::env::var(k).ok())
+        Self::from_parts(|k| {
+            debug_assert!(
+                MAXSECU_ENV_VARS.contains(&k),
+                "the server read an undeclared environment variable `{k}`. Add it to \
+                 MAXSECU_ENV_VARS and wire BOTH scripts/install-server.sh (fresh installs) \
+                 and scripts/upgrade-server.sh (already-deployed servers) — otherwise it \
+                 reaches fresh installs only. See crates/compat/tests/env_surface.rs."
+            );
+            std::env::var(k).ok()
+        })
     }
 }
 

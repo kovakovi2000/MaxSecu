@@ -163,6 +163,73 @@ fi
 CARGO_ENV="$RUN_HOME/.cargo/env"
 DATA_DIR="${MAXSECU_DATA_DIR:-$RUN_HOME/maxsecu-server-data}"
 UNIT_PATH="/etc/systemd/system/maxsecu-server.service"
+DROPIN_DIR="/etc/systemd/system/maxsecu-server.service.d"
+# The drop-in scripts/upgrade-server.sh generates to reconcile an already-deployed
+# unit's environment with the surface the build expects. This script writes a unit
+# that carries the WHOLE surface explicitly, so that drop-in is redundant the
+# moment we (re-)write the unit — and it must be REMOVED, not left behind: a
+# drop-in is applied AFTER the base unit, so a stale one would override the
+# freshly-chosen --port / --bind / --capacity-gb values.
+ENV_DROPIN="$DROPIN_DIR/10-maxsecu-env.conf"
+
+# --------------------------------------------------------------------------- #
+# 2a. THE SERVER ENV SURFACE — the fresh-install half of the single source of
+#     truth for every environment variable the server reads
+#     (`MAXSECU_ENV_VARS` in crates/portable-server/src/config.rs).
+#
+#     Why this table exists: THIS script writes the systemd unit, including its
+#     `Environment=` lines. scripts/upgrade-server.sh never rewrites that unit —
+#     so a variable wired only here would reach FRESH INSTALLS ONLY, and every
+#     already-deployed server would silently run without it, forever. The two
+#     scripts must therefore always agree on the surface; upgrade-server.sh
+#     carries the matching SERVER_ENV_RECONCILE table, and
+#     crates/compat/tests/env_surface.rs FAILS THE BUILD if the code and the two
+#     tables ever drift apart.
+#
+#     `<NAME>|<how it reaches the server>`:
+#       unit      an `Environment=` line in the unit written in step 10 below.
+#       unit-opt  an `Environment=` line written only when it applies (--public).
+#       envfile   supplied by `EnvironmentFile=-/etc/maxsecu/dropbox.env`, the
+#                 root-only 0600 creds file written in step 9b. NEVER an
+#                 `Environment=` line: the unit is readable by anyone who can read
+#                 /etc/systemd/system, and these are secrets.
+#       default   deliberately NOT written; the compiled-in default is correct and
+#                 self-consistent. Each one carries its reason below.
+#
+#     The `unit` / `unit-opt` rows are ENFORCED against the generated unit in step
+#     10 (`assert_env_surface_written`), so this table cannot rot into a comment.
+# --------------------------------------------------------------------------- #
+SERVER_ENV_SURFACE='
+DATABASE_URL|unit
+MAXSECU_DATA_DIR|unit
+MAXSECU_BIND|unit
+MAXSECU_PORT|unit
+MAXSECU_CACHE_CAPACITY_BYTES|unit
+MAXSECU_OFFLOAD_IDLE_DAYS|unit
+MAXSECU_DIRECT_LINKS|unit
+MAXSECU_PUBLIC_ADDR|unit-opt
+MAXSECU_COLD_TIER|envfile
+MAXSECU_DROPBOX_APP_KEY|envfile
+MAXSECU_DROPBOX_APP_SECRET|envfile
+MAXSECU_DROPBOX_REFRESH_TOKEN|envfile
+MAXSECU_DROPBOX_ACCESS_TOKEN|envfile
+MAXSECU_DROPBOX_ROOT|envfile
+MAXSECU_COLD_FS_DIR|default
+'
+# MAXSECU_COLD_FS_DIR|default — read ONLY when MAXSECU_COLD_TIER=fs (the local,
+# no-credential model of the cold tier). Neither script ever configures `fs`: a
+# real deployment is either `off` or `dropbox`. Its default derives from
+# MAXSECU_DATA_DIR (`<data_dir>/cold`), which IS in the unit, so writing it would
+# add nothing and would falsely imply the fs tier is in play.
+
+# The compiled-in defaults for the two knobs with no install flag. Written
+# EXPLICITLY into the unit (rather than left to the binary) so that the unit is a
+# complete, auditable statement of how this server is configured — and so that
+# upgrade-server.sh has something to compare an existing unit against. Both values
+# must stay IDENTICAL to crates/portable-server/src/config.rs, or a fresh install
+# and an upgraded one stop being the same product.
+OFFLOAD_IDLE_DAYS=30 # DEFAULT_OFFLOAD_IDLE_DAYS
+DIRECT_LINKS=0       # direct_links_enabled: only "1"/"true" enable it — fail-closed
 
 # Run a command string as root (directly if already root, else via sudo).
 run_root() {
@@ -216,9 +283,14 @@ if [ "$RESET" -eq 1 ]; then
 	echo ""
 
 	# 1. Stop + disable + remove the systemd service so nothing restarts mid-wipe.
+	#    The DROP-IN DIRECTORY goes too. A drop-in is applied AFTER the base unit,
+	#    so anything left behind here (the capacity drop-in, the env-reconcile
+	#    drop-in) would silently override the next install's freshly-chosen values —
+	#    a "reset" that quietly kept the old configuration is not a reset.
 	echo "==> Stopping and removing the systemd service"
 	run_root "systemctl disable --now maxsecu-server 2>/dev/null || true"
 	run_root "rm -f '$UNIT_PATH'"
+	run_root "rm -rf '$DROPIN_DIR'"
 	run_root "systemctl daemon-reload 2>/dev/null || true"
 
 	# 2. Drop the database (all accounts incl. the singleton recovery account) and
@@ -654,6 +726,14 @@ trap 'rm -f "$UNIT_TMP"' EXIT
 	echo "Environment=MAXSECU_PORT=$PORT"
 	echo "Environment=MAXSECU_DATA_DIR=$DATA_DIR"
 	echo "Environment=MAXSECU_CACHE_CAPACITY_BYTES=$CAP_BYTES"
+	# The two knobs with no install flag, written explicitly at their compiled-in
+	# defaults (see SERVER_ENV_SURFACE in step 2a). Both are exactly what the binary
+	# would have used had they been absent, so this changes nothing about how the
+	# server behaves — it makes the unit a COMPLETE statement of its configuration,
+	# which is what lets upgrade-server.sh tell "missing" apart from "set to the
+	# default on purpose" on an already-deployed box.
+	echo "Environment=MAXSECU_OFFLOAD_IDLE_DAYS=$OFFLOAD_IDLE_DAYS"
+	echo "Environment=MAXSECU_DIRECT_LINKS=$DIRECT_LINKS"
 	# Optional Dropbox cold-tier creds. Leading '-' => an absent file is ignored,
 	# so no-Dropbox installs and re-runs are unaffected and never clobbered.
 	echo "EnvironmentFile=-$DROPBOX_ENV_PATH"
@@ -662,9 +742,57 @@ trap 'rm -f "$UNIT_TMP"' EXIT
 	echo "WantedBy=multi-user.target"
 } >"$UNIT_TMP"
 
+# --------------------------------------------------------------------------- #
+# 10b. Enforce SERVER_ENV_SURFACE against the unit we just generated, BEFORE it is
+#      installed. Without this the table in step 2a is a comment that can silently
+#      rot; with it, a variable declared `unit` but never emitted aborts the
+#      install rather than shipping a server missing part of its configuration.
+#      (`envfile` rows are covered by the EnvironmentFile line; `default` rows are
+#      deliberately absent.)
+# --------------------------------------------------------------------------- #
+surface_missing=""
+while IFS='|' read -r sname skind; do
+	[ -n "$sname" ] || continue
+	case "$skind" in
+	unit) ;;
+	unit-opt)
+		# Only required on the deployment shape it applies to.
+		[ "$PUBLIC" -eq 1 ] || continue
+		;;
+	*) continue ;;
+	esac
+	if ! grep -q "^Environment=${sname}=" "$UNIT_TMP"; then
+		surface_missing="$surface_missing $sname"
+	fi
+done <<EOF
+$SERVER_ENV_SURFACE
+EOF
+
+if ! grep -q "^EnvironmentFile=-\{0,1\}${DROPBOX_ENV_PATH}\$" "$UNIT_TMP"; then
+	surface_missing="$surface_missing EnvironmentFile=$DROPBOX_ENV_PATH"
+fi
+
+if [ -n "$surface_missing" ]; then
+	echo "error: the generated unit is missing part of the declared server env surface:" >&2
+	echo "        $surface_missing" >&2
+	echo "       SERVER_ENV_SURFACE (step 2a) and the unit writer (step 10) have drifted." >&2
+	echo "       Refusing to install a server whose configuration is incomplete." >&2
+	rm -f "$UNIT_TMP"
+	exit 1
+fi
+
 run_root "install -o root -g root -m 0600 '$UNIT_TMP' '$UNIT_PATH'"
 rm -f "$UNIT_TMP"
 trap - EXIT
+
+# The unit we just wrote carries the WHOLE env surface explicitly, so
+# upgrade-server.sh's env-reconcile drop-in is redundant by construction. Drop it:
+# a drop-in is applied AFTER the base unit, so a stale one from an earlier upgrade
+# would OVERRIDE the values just chosen here (a re-run with a new --port would
+# silently keep the old one). upgrade-server.sh regenerates it on the next upgrade
+# if it is ever needed again. Any OTHER drop-in (an operator's own, the capacity
+# drop-in) is left strictly alone — those are deliberate overrides, not ours.
+run_root "rm -f '$ENV_DROPIN'"
 
 # --------------------------------------------------------------------------- #
 # 11. Enable + (re)start the service.

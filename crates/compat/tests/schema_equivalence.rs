@@ -638,9 +638,52 @@ async fn compat_fresh_install_equals_upgraded_install() {
         ),
     ];
 
+    // Gate-integrity defects, kept apart from schema divergences: these say the
+    // COMPARISON ITSELF is broken, not that the two schemas differ.
+    let mut sanity = String::new();
+
     for (aspect, sql, blast) in aspects {
         let a = probe(&admin, sql, &fresh_schema).await;
         let b = probe(&admin, sql, &upgraded_schema).await;
+
+        // ANTI-VACUITY. `fresh == upgraded` is trivially true when BOTH are empty,
+        // so an introspection query that silently matches nothing (a typo'd schema
+        // predicate, a `search_path` regression that lands the DDL somewhere else,
+        // a catalog change in a future Postgres) would turn this gate green while
+        // comparing nothing at all. Every aspect here is non-empty in the real
+        // schema — 14 tables, 6 triggers, 5 trigger functions, 2 column comments —
+        // so zero rows means the probe is broken, not that the schema is bare.
+        if a.is_empty() || b.is_empty() {
+            sanity.push_str(&format!(
+                "\n--- {aspect} probe returned NOTHING (fresh={}, upgraded={}) ---\n\
+                 This aspect is non-empty in the real schema, so the query matched no rows \
+                 and the {aspect} comparison was VACUOUS — it would pass no matter how far \
+                 the two install paths had drifted. Fix the introspection query.\n",
+                a.len(),
+                b.len()
+            ));
+        }
+
+        // The append-only enforcement must actually EXIST, not merely be equal on
+        // both paths. `fresh == upgraded` is also satisfied when BOTH have lost it,
+        // and this file's whole reason for comparing triggers is that append-only
+        // must survive every upgrade. Assert the guards are really in the database.
+        if aspect == "TRIGGER FUNCTIONS" {
+            for guard in ["maxsecu_forbid_update_delete", "maxsecu_forbid_delete"] {
+                let present = |rows: &[String]| rows.iter().any(|r| r.starts_with(guard));
+                if !present(&a) || !present(&b) {
+                    sanity.push_str(&format!(
+                        "\n--- APPEND-ONLY GUARD {guard}() IS MISSING (fresh={}, upgraded={}) ---\n\
+                         directory_bindings / control_log / file_genesis immutability is \
+                         enforced by this plpgsql function. Both install paths agreeing that \
+                         it is gone is not compatibility — it is a SECURITY regression.\n",
+                        present(&a),
+                        present(&b)
+                    ));
+                }
+            }
+        }
+
         compare(aspect, blast, &a, &b, &mut report);
     }
 
@@ -653,6 +696,19 @@ async fn compat_fresh_install_equals_upgraded_install() {
             .execute(&admin)
             .await;
     }
+
+    // Gate integrity first: if the comparison itself was vacuous, a green "no
+    // divergence" below would mean nothing, so say THAT rather than let it pass.
+    assert!(
+        sanity.is_empty(),
+        "\n\nTHE SCHEMA-EQUIVALENCE GATE IS NOT ACTUALLY COMPARING ANYTHING.\n\
+         \n\
+         This test passes when the fresh and upgraded catalogs are equal — which is also\n\
+         true when both are EMPTY. The checks below exist so that a broken probe fails loudly\n\
+         instead of reporting a green gate that proves nothing:\n\
+         {sanity}\n\
+         {CHECKLIST}\n"
+    );
 
     assert!(
         report.is_empty(),

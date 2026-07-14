@@ -21,7 +21,15 @@
 #      rewritten or dropped, and step 1 took a dump first anyway. Nothing at all
 #      happens here when the schema is already up to date (the common case).
 #   5. (optional) set the local cache capacity via a systemd drop-in.
-#   6. Restart the service (a ~1s blip) and health-check it.
+#   6. RECONCILE the service's environment with what this build expects. The unit
+#      was written once, by install-server.sh, and is never rewritten here — so a
+#      new MAXSECU_* variable would otherwise reach FRESH INSTALLS ONLY and every
+#      already-deployed server would silently run without it, forever. This step
+#      adds any MISSING variable via a drop-in, at exactly the value the binary
+#      already defaults to. It NEVER touches a variable you have set: your port,
+#      your DATABASE_URL, your cache capacity and your Dropbox login are read, not
+#      written. Running it twice changes nothing.
+#   7. Restart the service (a ~1s blip) and health-check it.
 #
 # Usage:
 #   ./scripts/upgrade-server.sh                    # pull + backup + rebuild + restart
@@ -59,6 +67,12 @@ Pending database migrations (migrations/NNNN_*.sql) are applied before the
 restart, each in a single transaction, so the new code never starts against an
 old schema. Migrations only ADD to the schema — no account, key, or uploaded
 file is ever touched — and a pg_dump is taken first unless you pass --no-backup.
+
+The service's ENVIRONMENT is reconciled the same way: any variable this build
+expects that your unit does not define anywhere is added via a systemd drop-in,
+at exactly the value the server already defaults to. A variable you HAVE set —
+your port, your DATABASE_URL, your cache capacity, your Dropbox login — is read
+and left alone, never overwritten. Running the upgrade twice changes nothing.
 
   --no-pull        Do NOT `git pull`; rebuild whatever is checked out now.
   --no-backup      Do NOT pg_dump the database first.
@@ -142,6 +156,111 @@ DATA_DIR="${MAXSECU_DATA_DIR:-$RUN_HOME/maxsecu-server-data}"
 UNIT_PATH="/etc/systemd/system/maxsecu-server.service"
 DROPIN_DIR="/etc/systemd/system/maxsecu-server.service.d"
 SERVER_BIN="$ROOT/target/release/maxsecu-portable-server"
+# The drop-in this script generates to reconcile the unit's environment (step 7b).
+# `10-` sorts before an operator's own drop-in and before `capacity.conf`, and
+# drop-ins are applied in lexicographic order with the LAST assignment winning —
+# so anything an operator writes still beats what we generate here.
+ENV_DROPIN="$DROPIN_DIR/10-maxsecu-env.conf"
+# Root-only 0600 creds file the unit loads via `EnvironmentFile=-`. Secrets live
+# here and NEVER in an `Environment=` line.
+DROPBOX_ENV_PATH="/etc/maxsecu/dropbox.env"
+
+# --------------------------------------------------------------------------- #
+# 2a. THE SERVER ENV RECONCILE TABLE — the upgrade half of the single source of
+#     truth for every environment variable the server reads (`MAXSECU_ENV_VARS` in
+#     crates/portable-server/src/config.rs).
+#
+#     THE HOLE THIS CLOSES. scripts/install-server.sh writes the systemd unit,
+#     including its `Environment=` lines. This script has never rewritten that
+#     unit — it only ever appended a capacity drop-in. So a new MAXSECU_* variable
+#     added to the installer reached FRESH INSTALLS ONLY: every already-deployed
+#     server kept the unit it was installed with, forever, and silently ran
+#     without the variable. Exactly the shape of the schema hole (docs/schema.sql
+#     applied on fresh install only) that migrations/ now closes.
+#
+#     THE CONSTRAINT. An upgrade that resets an operator's MAXSECU_PORT or their
+#     DATABASE_URL is itself a break. So step 7b writes a drop-in containing ONLY
+#     the variables that are MISSING EVERYWHERE — never one that is already set in
+#     the unit, in another drop-in, or in an EnvironmentFile. A drop-in is applied
+#     AFTER the base unit, so re-emitting a variable that is already set would
+#     OVERRIDE the operator, which is the exact opposite of the goal.
+#
+#     `<NAME>|<default>`, where `-` means NEVER SYNTHESIZE: absence is either
+#     meaningful or unrecoverable, and each such row carries its reason below.
+#
+#     Every non-`-` default is EXACTLY the value the binary already uses when the
+#     variable is absent (crates/portable-server/src/config.rs). That is what makes
+#     writing it provably behaviour-preserving on a live server: we only ever
+#     materialise the value the server is *already running with*, so a reconcile
+#     can never change how an existing deployment behaves. It only makes the unit
+#     an explicit, complete statement of that configuration — which is what gives a
+#     FUTURE variable (one whose default is not safe, or whose default changes) a
+#     place to land on servers that already exist.
+#
+#     NEVER PUT A SECRET IN THIS TABLE: the generated drop-in is 0644. Secrets go
+#     in the root-only 0600 EnvironmentFile (see MAXSECU_DROPBOX_* below).
+#
+#     scripts/install-server.sh carries the matching SERVER_ENV_SURFACE table, and
+#     crates/compat/tests/env_surface.rs FAILS THE BUILD if the code and the two
+#     tables ever drift apart.
+# --------------------------------------------------------------------------- #
+SERVER_ENV_RECONCILE='
+DATABASE_URL|-
+MAXSECU_DATA_DIR|-
+MAXSECU_PUBLIC_ADDR|-
+MAXSECU_BIND|127.0.0.1
+MAXSECU_PORT|8443
+MAXSECU_CACHE_CAPACITY_BYTES|200000000000
+MAXSECU_OFFLOAD_IDLE_DAYS|30
+MAXSECU_DIRECT_LINKS|0
+MAXSECU_COLD_TIER|-
+MAXSECU_COLD_FS_DIR|-
+MAXSECU_DROPBOX_APP_KEY|-
+MAXSECU_DROPBOX_APP_SECRET|-
+MAXSECU_DROPBOX_REFRESH_TOKEN|-
+MAXSECU_DROPBOX_ACCESS_TOKEN|-
+MAXSECU_DROPBOX_ROOT|-
+'
+# Why each `-` (never synthesize):
+#
+#   DATABASE_URL          The most load-bearing variable of all, and the ONE we
+#                         could never invent: it carries a per-install random
+#                         password that exists nowhere but this unit. Guessing it
+#                         would point the server at a database that does not exist
+#                         — every account, key and upload gone from the users'
+#                         point of view. Its absence is therefore a HARD ERROR, not
+#                         something to paper over: step 6b already aborts the
+#                         upgrade (before touching anything) when it is missing,
+#                         and tells you to re-run install-server.sh to repair the
+#                         unit. There is no default and there must never be one.
+#
+#   MAXSECU_DATA_DIR      Absence means the server is using `./maxsecu-server-data`
+#                         RELATIVE to WorkingDirectory. That directory holds the TLS
+#                         cert, the client pins, the recovery state and every blob.
+#                         Writing an absolute path here would MOVE the data dir out
+#                         from under a running deployment: the server would come
+#                         back with a brand-new cert (every pinned client locked
+#                         out) and an empty blob store. Never.
+#
+#   MAXSECU_PUBLIC_ADDR   Absence is MEANINGFUL: this server was installed
+#                         local-only, and its TLS cert has no public-IP SAN. There
+#                         is nothing to default it to — we cannot invent the
+#                         operator's IP — and setting one would not regenerate the
+#                         cert anyway. `install-server.sh --public` is how a server
+#                         becomes public; it rewrites the unit AND drops the stale
+#                         cert.
+#
+#   MAXSECU_COLD_TIER     Absence == the compiled-in `Off` == no cold tier, which is
+#   MAXSECU_COLD_FS_DIR   precisely what a server without a Dropbox creds file is
+#   MAXSECU_DROPBOX_*     doing today. The cold-tier family is supplied as a group
+#                         by the root-only 0600 EnvironmentFile (they are SECRETS —
+#                         they must never appear in a 0644 drop-in), and the tier
+#                         fails closed unless the whole credential set is present.
+#                         Materialising `MAXSECU_COLD_TIER=off` here would add
+#                         nothing and would put a second, contradictory assignment
+#                         in play against that file. What this script MUST ensure is
+#                         that the unit actually LOADS the file — step 7b adds the
+#                         `EnvironmentFile=` line if an old unit predates it.
 
 # Run a command string as root (directly if already root, else via sudo).
 run_root() {
@@ -344,6 +463,234 @@ if [ -n "$CAPACITY_GB" ]; then
 	run_root "printf '[Service]\nEnvironment=MAXSECU_CACHE_CAPACITY_BYTES=%s\n' '$CAP_BYTES' > '$DROPIN_DIR/capacity.conf'"
 	run_root "chmod 0644 '$DROPIN_DIR/capacity.conf'"
 	run_root "systemctl daemon-reload"
+fi
+
+# --------------------------------------------------------------------------- #
+# 7b. RECONCILE THE UNIT'S ENVIRONMENT with the surface this build expects.
+#     (Runs AFTER step 7 on purpose, so a --capacity-gb given on THIS run counts
+#     as "already set" and is never second-guessed below.)
+#
+#     Algorithm — deliberately conservative, because getting this wrong resets a
+#     live server's configuration:
+#
+#       ALREADY = every variable NAME defined by
+#                   the base unit
+#                 ∪ every drop-in EXCEPT the one we generate
+#                 ∪ every EnvironmentFile the unit loads
+#                 ∪ (systemd's own merged view MINUS the names in our drop-in)
+#       WRITE   = { (name, default) ∈ SERVER_ENV_RECONCILE
+#                 : default ≠ '-'  ∧  name ∉ ALREADY }
+#
+#     SYSTEMD PRECEDENCE, and why the shape above is the safe one:
+#
+#       * Drop-ins are applied AFTER the base unit (and among themselves in
+#         lexicographic filename order), and for a variable set twice the LAST
+#         assignment wins. So writing a variable into a drop-in OVERRIDES the base
+#         unit. That is why we must never emit a name that is already set anywhere:
+#         it would silently replace the operator's value with our default. "Only
+#         what is missing everywhere" is the entire safety property.
+#       * `EnvironmentFile=` is read at exec time and its settings OVERRIDE
+#         `Environment=` (systemd.exec(5)). We still treat a name defined in one as
+#         ALREADY-set and decline to emit it — relying on that precedence rule to
+#         save us would be relying on the subtlest line in the manual.
+#
+#     We parse the FILES rather than trusting `systemctl show` alone, because the
+#     merged view cannot tell our own drop-in apart from the operator's — and on
+#     the second run ours is loaded, so "already set" computed from the merged view
+#     would make us rewrite our own drop-in EMPTY (a flip-flop, not a no-op). We
+#     still UNION IN `systemctl show` (minus the names in our own drop-in) as a
+#     safety net for anything the file parser could miss (line continuations,
+#     exotic quoting). Every discrepancy therefore lands on the safe side: an extra
+#     name in ALREADY means we decline to write — never that we overwrite.
+#
+#     IDEMPOTENT: the drop-in's content is a pure function of the table and of
+#     ALREADY, and it is rewritten only when it actually differs — so a second run
+#     changes nothing and does not even daemon-reload.
+# --------------------------------------------------------------------------- #
+echo "==> Reconciling the service environment with this build"
+
+# Extract variable NAMES from `Environment=` directives. Several assignments may
+# share one line, and systemd permits surrounding quotes.
+env_names_from_unit_text() {
+	sed -n 's/^[[:space:]]*Environment=//p' |
+		tr ' \t' '\n\n' |
+		sed -n 's/^["'\'']\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)=.*$/\1/p'
+}
+
+# Extract variable NAMES from an EnvironmentFile's `KEY=value` lines (`#` comments
+# and blanks simply do not match).
+env_names_from_env_file() {
+	sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)=.*$/\1/p'
+}
+
+# Extract the PATHS an `EnvironmentFile=` directive names, dropping the optional
+# leading `-` (= "ignore if absent") and any surrounding quotes.
+env_file_paths() {
+	sed -n 's/^[[:space:]]*EnvironmentFile=//p' |
+		sed -e 's/^-//' -e 's/^["'\'']//' -e 's/["'\'']$//' |
+		sed '/^$/d'
+}
+
+# The unit is root:root 0600, and so are the creds files — read them as root.
+# `</dev/null` on every run_root inside a read loop: `sudo bash -c` would otherwise
+# inherit the loop's stdin and could swallow the lines still to be read.
+UNIT_TEXT="$(run_root "cat '$UNIT_PATH'" </dev/null)"
+DROPIN_LIST="$(run_root "ls -1 '$DROPIN_DIR'/*.conf 2>/dev/null || true" </dev/null | tr -d '\r')"
+
+# Split every config file into OTHER (the base unit + every drop-in that is NOT
+# ours — i.e. everything an operator or install-server.sh owns) and OURS (the
+# drop-in this script generates). The split is the whole trick: OURS is ours to
+# rewrite, so it must never count as "somebody already set this" — otherwise the
+# second run would see its own output, conclude nothing is missing, and rewrite the
+# drop-in EMPTY. That is a flip-flop, not an idempotent no-op.
+OTHER_TEXT="$UNIT_TEXT"
+OURS_TEXT=""
+while IFS= read -r dconf; do
+	[ -n "$dconf" ] || continue
+	dtext="$(run_root "cat '$dconf'" </dev/null)"
+	if [ "$dconf" = "$ENV_DROPIN" ]; then
+		OURS_TEXT="$OURS_TEXT
+$dtext"
+	else
+		OTHER_TEXT="$OTHER_TEXT
+$dtext"
+	fi
+done <<EOF
+$DROPIN_LIST
+EOF
+
+# (1) Names set by the base unit + every drop-in that is not ours.
+ALREADY="$(printf '%s\n' "$OTHER_TEXT" | env_names_from_unit_text)"
+OURS="$(printf '%s\n' "$OURS_TEXT" | env_names_from_unit_text)"
+
+# (2) Names set by every EnvironmentFile the unit loads. The Dropbox creds arrive
+#     this way; they are SECRETS and must never be re-emitted into a 0644 drop-in.
+#     Names are harvested from every declared file (ours included — the file's
+#     contents are the same whoever declared it), but whether the unit ALREADY
+#     DECLARES the Dropbox file is judged from OTHER only, for the same reason as
+#     above: if we added that declaration on a previous run we must add it again,
+#     or it would vanish on this one.
+ENV_FILE_LIST_OTHER="$(printf '%s\n' "$OTHER_TEXT" | env_file_paths)"
+ENV_FILE_LIST_ALL="$(printf '%s\n%s\n' "$OTHER_TEXT" "$OURS_TEXT" | env_file_paths | sort -u)"
+
+UNIT_LOADS_DROPBOX_ENV=0
+if printf '%s\n' "$ENV_FILE_LIST_OTHER" | grep -qxF -- "$DROPBOX_ENV_PATH"; then
+	UNIT_LOADS_DROPBOX_ENV=1
+fi
+
+while IFS= read -r efile; do
+	[ -n "$efile" ] || continue
+	if run_root "test -f '$efile'" </dev/null; then
+		ALREADY="$ALREADY
+$(run_root "cat '$efile'" </dev/null | env_names_from_env_file)"
+	fi
+done <<EOF
+$ENV_FILE_LIST_ALL
+EOF
+
+# (3) Safety net: systemd's own merged view of `Environment=` — it, not us, is the
+#     authority on drop-in ordering, quoting and line continuations — minus the
+#     names in OUR drop-in (same reason as above). A name this adds can only make
+#     us decline to write; it can never make us overwrite. Every discrepancy
+#     between the two parsers therefore lands on the safe side.
+SYSTEMD_ENV_NAMES="$(
+	run_root "systemctl show maxsecu-server -p Environment --value 2>/dev/null || true" </dev/null |
+		tr -d '\r' | tr ' \t' '\n\n' |
+		sed -n 's/^["'\'']\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)=.*$/\1/p'
+)"
+while IFS= read -r sname; do
+	[ -n "$sname" ] || continue
+	if printf '%s\n' "$OURS" | grep -qxF -- "$sname"; then
+		continue
+	fi
+	ALREADY="$ALREADY
+$sname"
+done <<EOF
+$SYSTEMD_ENV_NAMES
+EOF
+
+ALREADY="$(printf '%s\n' "$ALREADY" | sed '/^$/d' | sort -u)"
+
+# Build the drop-in body: the table's entries that have a default AND are missing
+# everywhere. A default is never a secret and never contains whitespace (guarded),
+# so no quoting is required.
+DROPIN_BODY=""
+ADDED=""
+while IFS='|' read -r rname rdefault; do
+	[ -n "$rname" ] || continue
+	[ "$rdefault" != "-" ] || continue # never synthesize (see the table's notes)
+	case "$rdefault" in
+	*[[:space:]\"\']*)
+		echo "error: SERVER_ENV_RECONCILE default for $rname contains whitespace or a quote." >&2
+		echo "       The generated drop-in writes bare Environment=NAME=VALUE lines." >&2
+		exit 1
+		;;
+	esac
+	if printf '%s\n' "$ALREADY" | grep -qxF -- "$rname"; then
+		continue # already set — the operator's / the unit's value stands untouched
+	fi
+	DROPIN_BODY="$DROPIN_BODY
+Environment=$rname=$rdefault"
+	ADDED="$ADDED $rname"
+done <<EOF
+$SERVER_ENV_RECONCILE
+EOF
+
+# An old unit may predate the `EnvironmentFile=` line entirely — in which case the
+# operator could drop a perfectly good /etc/maxsecu/dropbox.env in place and the
+# server would never load it. `EnvironmentFile=` entries APPEND across drop-ins,
+# and the leading `-` makes an absent file a no-op, so adding it is safe either way.
+if [ "$UNIT_LOADS_DROPBOX_ENV" -ne 1 ]; then
+	DROPIN_BODY="$DROPIN_BODY
+EnvironmentFile=-$DROPBOX_ENV_PATH"
+	ADDED="$ADDED EnvironmentFile=$DROPBOX_ENV_PATH"
+fi
+
+if [ -z "$DROPIN_BODY" ]; then
+	# Nothing is missing anywhere else — so our drop-in has nothing left to supply.
+	# It must be REMOVED, not merely left alone: a drop-in is applied AFTER the base
+	# unit, so a stale one full of our defaults would OVERRIDE the values the unit
+	# now carries (this is exactly what happens after `install-server.sh` re-writes
+	# the unit with the full surface). Every OTHER drop-in — the capacity one, an
+	# operator's own — is left strictly alone.
+	if run_root "test -f '$ENV_DROPIN'"; then
+		echo "    the unit now defines every variable itself — removing the stale $ENV_DROPIN"
+		run_root "rm -f '$ENV_DROPIN'"
+		run_root "systemctl daemon-reload"
+	else
+		echo "    the unit already defines every variable this build expects — nothing to do"
+	fi
+else
+	ENV_TMP="$(mktemp)"
+	trap 'rm -f "$ENV_TMP"' EXIT
+	{
+		echo "# GENERATED by scripts/upgrade-server.sh — DO NOT EDIT."
+		echo "#"
+		echo "# Variables this build expects that the unit did not define anywhere. Each"
+		echo "# value is exactly the server's compiled-in default, i.e. what this server was"
+		echo "# ALREADY running with when the variable was absent — so this file changes no"
+		echo "# behaviour; it makes the configuration explicit. A variable already set in the"
+		echo "# unit, in another drop-in, or in an EnvironmentFile is NEVER written here."
+		echo "#"
+		echo "# To override any of these, set them in the unit or in a drop-in whose filename"
+		echo "# sorts AFTER this one — later assignments win. Edits to THIS file are"
+		echo "# regenerated away on the next upgrade."
+		echo "[Service]"
+		printf '%s\n' "$DROPIN_BODY" | sed '/^$/d'
+	} >"$ENV_TMP"
+
+	if run_root "test -f '$ENV_DROPIN'" && run_root "cmp -s '$ENV_TMP' '$ENV_DROPIN'"; then
+		echo "    already reconciled — no change"
+		rm -f "$ENV_TMP"
+		trap - EXIT
+	else
+		echo "    adding to $ENV_DROPIN:$ADDED"
+		run_root "mkdir -p '$DROPIN_DIR'"
+		run_root "install -o root -g root -m 0644 '$ENV_TMP' '$ENV_DROPIN'"
+		rm -f "$ENV_TMP"
+		trap - EXIT
+		run_root "systemctl daemon-reload"
+	fi
 fi
 
 # --------------------------------------------------------------------------- #

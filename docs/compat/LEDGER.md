@@ -58,3 +58,59 @@ Copy this block, fill it in, append it to the bottom.
 | **Why nothing caught it** | Every test round-tripped: it sealed and opened with the same code, so both sides drifted together and the suite stayed green. There was no test that took an OLD binding and asked whether TODAY's code could still reshare to it. |
 | **What now catches it** | The interop matrix (`crates/compat/tests/interop_matrix.rs`): every frozen `Suite` (V1 classical, V2 hybrid) × every frozen keyblob version (v1 classical, v2 PQ) must still unwrap, verify and **reshare**. It reproduces the break as its real symptom — *an old classical binding can no longer participate in a reshare* — not as a missing JSON field. |
 | **Status** | Not retro-fixed; the affected recipients have already re-enrolled. Out of scope by decision (design spec §8). Recorded permanently. |
+
+---
+
+## 2026-07-14 — deployment env (systemd unit) — the SECOND fresh-install-only hole, closed
+
+| | |
+|---|---|
+| **Commit** | `feat/compat-gate` |
+| **Surface** | Deployment environment — `scripts/install-server.sh`, `scripts/upgrade-server.sh`, `crates/portable-server/src/config.rs` |
+| **The hole** | `install-server.sh` writes the unit's `Environment=` lines; `upgrade-server.sh` never rewrote that unit (it only appended a `capacity.conf` drop-in). So **a new `MAXSECU_*` var reached fresh installs only — every already-deployed server kept its original unit forever.** Identical shape to the `docs/schema.sql`-on-fresh-install-only hole. Latent, not yet a live break: every var happened to have a safe default in `LauncherConfig::from_env`. |
+| **What changed** | `MAXSECU_ENV_VARS` in `config.rs` is now the single source of truth (15 vars incl. `DATABASE_URL`). Both scripts carry matching tables (`SERVER_ENV_SURFACE` / `SERVER_ENV_RECONCILE`). `upgrade-server.sh` reconciles an existing unit with a `10-maxsecu-env.conf` drop-in containing **only vars missing everywhere**. |
+| **Why it is backward compatible** | **Nothing an operator set is ever overwritten.** Drop-ins are applied *after* the base unit, so re-emitting an already-set name would override the operator — the opposite of the goal. We therefore write only names absent from the base unit, every other drop-in, and every `EnvironmentFile`. Every value written equals the compiled-in default, i.e. exactly what that server was already running with. `DATABASE_URL` (per-install random password), `MAXSECU_DATA_DIR` (synthesizing a path would MOVE the data dir → new cert, every pinned client locked out, empty blob store), `MAXSECU_PUBLIC_ADDR` (absence is meaningful) and the Dropbox secrets are **never synthesized** — each `-` in the table carries a written reason. |
+| **Automatic on upgrade?** | Yes — step 7b of `upgrade-server.sh`. Idempotent (a second run is byte-identical, "already reconciled — no change"). |
+| **Proven by** | `crates/compat/tests/env_surface.rs` (7 `compat_*` tests): a var the server reads that is not declared, or is declared but wired into only one of the two deployment paths, fails the gate. Plus a harness that runs the reconcile block **verbatim** from the shipped script against mock units: operator values survive untouched, a second run is a no-op, secrets never leave the 0600 `EnvironmentFile`. |
+| **Also fixed** | `--reset` never removed the drop-in dir (a stale `capacity.conf` survived a "back to zero" reset and silently overrode the reinstall); a re-run of `install-server.sh` now clears the reconcile drop-in (else it would silently override a new `--port`). |
+
+---
+
+## 2026-07-14 — server `file_versions.alg` — records the manifest's real suite (was hardcoded `1`)
+
+| | |
+|---|---|
+| **Commit** | `feat/compat-gate` |
+| **Surface** | Server DB row (not a signed format) — `crates/server/src/files.rs` `parse_stage` |
+| **What changed** | `alg: 1` was written unconditionally, so every `Suite::V2` (PQ-hybrid) file was recorded in the server's row as V1/classical — a lie in the database. Now it records the decoded manifest's actual suite, via an exhaustive match (a future `Suite::V3` fails to compile here rather than silently mis-recording). |
+| **Why it is backward compatible** | **The column has no authoritative reader.** Traced end to end: it is never `SELECT`ed (every `FROM file_versions` reads `finalized` / `manifest_bytes` / `manifest_sig` / `owner_id`), `MemoryStore` does not even store it, `FileView`/`FileRes` have no `alg` field, no HTTP response body carries it, and the client takes the suite from the **signed manifest** it re-decodes. Old rows stay wrong and new rows are right, but both are inert — so fixing the writer creates no old/new divergence. **Had a reader existed, fixing the writer alone would have created a NEW divergence, and that would have been worse than the bug.** |
+| **How OLD data is still read** | Unchanged: `client-core/download.rs:309`, `reshare.rs:139` read `manifest.alg` from the signed bytes. |
+| **Not retro-fixed** | Existing rows keep `alg = 1`. Safe per the above; no re-upload, no re-key, no re-share. |
+| **Next one of these** | `pg.rs:902` and `pg.rs:1258` hardcode `wrap_alg: 1` on the **read** side — the mirror-image bug. Harmless today for the same reason. Not fixed. |
+
+---
+
+## 2026-07-14 — `POST /v1/session/proof` — reports the configured session TTL (was hardcoded `3600`)
+
+| | |
+|---|---|
+| **Commit** | `feat/compat-gate` |
+| **Surface** | #10, `/v1` HTTP JSON — `crates/server/src/http.rs` |
+| **What changed** | Login returned a hardcoded `expires_in_s: 3600` while the recovery path reported the real `session_ttl_ms / 1000`. The two disagreed. Both now share one `session_expires_in_s(ttl_ms)`, so they cannot drift apart again. |
+| **Why it is backward compatible** | **Value-only change; the wire shape is identical** — `expires_in_s` is still present and still a JSON number, so every frozen HTTP golden still passes (they pin the key and type). At the default TTL the value is still literally `3600`. The client parses it as `u64` and hard-fails login if it is missing or non-numeric; both still hold. |
+| **Rounding** | Floor, clamped to ≥1s for a non-zero TTL. Rounding *up* would re-introduce the very lie being fixed (a client trusting a token the server already killed); a sub-second TTL flooring to `0` reads as "already expired" and could drive a re-auth hot loop. |
+
+---
+
+## 2026-07-14 — GATE HARDENING — the schema-equivalence test could pass VACUOUSLY
+
+**This entry records a bug found *in the gate itself*, on its first run against a live Postgres.**
+
+| | |
+|---|---|
+| **Commit** | `feat/compat-gate` |
+| **Surface** | The gate — `crates/compat/tests/schema_equivalence.rs` |
+| **The bug** | Nothing asserted the introspection queries returned any rows. `fresh == upgraded` is **trivially true when both are empty**, so a probe that silently matched nothing — a typo'd predicate, a `search_path` regression, a future PG catalog change — would have produced a green gate that compared *nothing at all*. Worse: `A == B` is also satisfied when **both** paths have LOST the append-only triggers, so equality alone never proved append-only still exists. |
+| **Fix** | A per-aspect non-empty guard, plus an explicit presence check for `maxsecu_forbid_update_delete` / `maxsecu_forbid_delete`. Proven by sabotaging a query to match zero rows: it now fails loudly, and **without the guard that sabotage passed silently.** |
+| **Why this matters beyond the DB** | It is the same failure the whole gate exists to prevent — a test that is green because it is not looking. Any future compat probe must assert it found something. |
+| **Also proven on live PG** | Gutting a trigger's plpgsql body (`RAISE EXCEPTION` → `RETURN NEW`) leaves `pg_get_triggerdef` **byte-identical** — the `TRIGGERS` comparison does not diverge, and only the trigger-function-body comparison catches it. Without that aspect, append-only would silently disappear from upgraded servers while the gate stayed green. |

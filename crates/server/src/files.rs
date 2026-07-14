@@ -14,6 +14,7 @@
 //! exact canonical bytes are stored verbatim — the server never re-encodes.
 
 use maxsecu_encoding::structs::{Genesis, Manifest};
+use maxsecu_encoding::types::Suite;
 use maxsecu_encoding::{decode, RECOVERY_ID};
 
 use crate::error::StoreError;
@@ -386,7 +387,16 @@ pub fn parse_stage(input: StageInput) -> Result<ParsedStage, StageError> {
         file_type: manifest.file_type as u8 as i16,
         version: manifest.version,
         author_id: manifest.author_id.0,
-        alg: 1, // Suite::V1 (encoding-spec §3)
+        // The manifest's ACTUAL suite codepoint (encoding-spec §3), not a
+        // constant: a Suite::V2 (PQ-hybrid) file recorded as V1 is a lie in
+        // `file_versions.alg`. Advisory either way — the signed manifest the
+        // client re-decodes stays authoritative for the wrap layout (§8.5) — but
+        // the column must not contradict it. Exhaustive on purpose: a new Suite
+        // fails to compile here rather than silently mis-recording.
+        alg: match manifest.alg {
+            Suite::V1 => 1,
+            Suite::V2 => 2,
+        },
         manifest_bytes: input.manifest_bytes,
         manifest_sig: input.manifest_sig,
         genesis,
@@ -431,11 +441,21 @@ mod tests {
     }
 
     fn manifest_bytes(file: [u8; 16], version: u64, author: [u8; 16], chunk_size: u32) -> Vec<u8> {
+        manifest_bytes_with_suite(file, version, author, chunk_size, Suite::V1)
+    }
+
+    fn manifest_bytes_with_suite(
+        file: [u8; 16],
+        version: u64,
+        author: [u8; 16],
+        chunk_size: u32,
+        alg: Suite,
+    ) -> Vec<u8> {
         let m = Manifest {
             file_id: Id(file),
             version,
             file_type: FileType::Blog,
-            alg: Suite::V1,
+            alg,
             chunk_size,
             dek_commit: Bytes32([0xDC; 32]),
             streams: vec![
@@ -522,6 +542,30 @@ mod tests {
         // blob_ref is deterministic and distinguishes (file, version, stream).
         assert!(content.blob_ref.contains(&format!("{}", 1)));
         assert_ne!(content.blob_ref, parsed.streams[1].blob_ref);
+    }
+
+    /// Regression: the persisted `alg` must be the manifest's ACTUAL suite.
+    ///
+    /// `parse_stage` used to hardcode `alg: 1`, so a `Suite::V2` (PQ-hybrid)
+    /// upload was recorded in `file_versions.alg` as V1/classical — a lie in the
+    /// database. Nothing reads that column today (the client trusts the *signed*
+    /// manifest), so it is not an access break; but any future reader would pick
+    /// the classical wrap layout for a hybrid DEK and fail to unwrap it.
+    #[test]
+    fn parsed_alg_records_the_manifests_actual_suite() {
+        // A classical manifest still records the V1 codepoint …
+        let v1 = parse_stage(v1_input(1 << 20)).expect("valid v1 parses");
+        assert_eq!(v1.alg, 1, "a Suite::V1 manifest must record alg = 1");
+
+        // … and a PQ-hybrid one must record V2, not a hardcoded V1.
+        let mut input = v1_input(1 << 20);
+        input.manifest_bytes = manifest_bytes_with_suite(FILE, 1, OWNER, 1 << 20, Suite::V2);
+        let v2 = parse_stage(input).expect("valid v2 parses");
+        assert_eq!(
+            v2.alg, 2,
+            "a Suite::V2 (PQ-hybrid) manifest must record alg = 2 — hardcoding V1 \
+             stores the wrong suite for every hybrid file ever uploaded"
+        );
     }
 
     #[test]
