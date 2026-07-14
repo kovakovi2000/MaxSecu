@@ -11,6 +11,7 @@ members = [
     "crates/crypto",
     "crates/client-core",
     "crates/admin-core",
+    "crates/compat",
     "crates/server",
     "crates/media-launcher",
     "crates/sink-server",

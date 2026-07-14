@@ -1,0 +1,39 @@
+[package]
+name = "maxsecu-compat"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The backward-compatibility gate: yesterday's bytes must still open today (docs/superpowers/specs/2026-07-14-backward-compat-gate-design.md)."
+
+# IMPORTANT: the LIBRARY half of this crate must stay dependency-light and MUST
+# NOT depend on `maxsecu-server` (which pulls `sqlx`). `crates/client-app` — a
+# SEPARATE cargo workspace whose `arti-client` brings a `libsqlite3-sys` that
+# collides with sqlx's under Cargo's `links` rule — dev-depends on this lib to
+# run the client half of the gate. Dev-dependencies do not propagate to
+# dependents, so everything heavy (server, sqlx, axum) lives in [dev-dependencies]
+# and is used only by this crate's own tests.
+[dependencies]
+maxsecu-encoding = { path = "../encoding" }
+maxsecu-crypto = { path = "../crypto" }
+maxsecu-client-core = { path = "../client-core" }
+sha2 = "0.10"  # corpus-lock digests (already in both workspace lockfiles)
+hex = "0.4"    # corpus-lock digests (already in both workspace lockfiles)
+
+[dev-dependencies]
+# The HTTP-wire half of the gate drives the REAL `router()` in-process over
+# `MemoryStore` (no network, no PG).
+maxsecu-server = { path = "../server" }
+maxsecu-admin-core = { path = "../admin-core" }
+tower = { version = "0.5", features = ["util"] } # oneshot
+axum = "0.8"
+http-body-util = "0.1"
+serde_json = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Schema-equivalence test (fresh install == baseline + migrations). Skips when
+# DATABASE_URL is unset; runs for real in the CI `pg-gate` job.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+
+[lints.rust]
+unsafe_code = "forbid"

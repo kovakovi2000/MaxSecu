@@ -1279,6 +1279,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxsecu-compat"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "base64",
+ "hex",
+ "http-body-util",
+ "maxsecu-admin-core",
+ "maxsecu-client-core",
+ "maxsecu-crypto",
+ "maxsecu-encoding",
+ "maxsecu-server",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "maxsecu-crypto"
 version = "0.0.0"
 dependencies = [
