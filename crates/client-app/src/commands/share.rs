@@ -375,8 +375,13 @@ pub async fn reshare_bundle(
 /// non-`Clone` identity can be RE-borrowed for each synchronous `build_reshare`
 /// and released BEFORE the async POST — the loop is (async resolve) → (sync borrow:
 /// build) → (async POST), so the borrow never spans an await.
+///
+/// `pub` (Tauri-free) so `crates/client-e2e/reshare_e2e.rs` drives the ACTUAL
+/// orchestration — the real per-recipient resolve→TOFU→wrap→POST loop and per-file
+/// outcome tally that ships, with `build_add_wrap_body` shaping the wire — over a
+/// live server, instead of a hand-copied reconstruction that is green by design.
 #[allow(clippy::too_many_arguments)]
-async fn run_reshare_batch(
+pub async fn run_reshare_batch(
     sender: &mut SendRequest<Full<Bytes>>,
     host: &str,
     token: &str,

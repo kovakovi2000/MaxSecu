@@ -909,17 +909,43 @@ fn compat_wire_register_body_still_publishes_mlkem_pub() {
 
 #[test]
 fn compat_wire_session_bodies_still_carry_every_key() {
+    let challenge = build_session_challenge_body("alice");
     assert_superset(
         "POST /v1/session/challenge",
         "no user can log in",
         &frozen_keys("wire/session_challenge_body.keys.json"),
-        &keys_of(&build_session_challenge_body("alice")),
+        &keys_of(&challenge),
     );
+    // VALUE LOCK: the key set alone cannot catch a builder that keeps `username` but
+    // emits the WRONG value — the server looks the account up by this exact string.
+    assert_eq!(
+        challenge["username"], "alice",
+        "\n\n`session/challenge` must send the username VERBATIM under `username`; a \
+         transformed value means the server never finds the account and login fails.\n{CHECKLIST}\n"
+    );
+
+    let prove = build_session_prove_body("alice", 1_719_500_000_000, "cHJvb2Y=");
     assert_superset(
         "POST /v1/session/proof",
         "the channel-bound login proof is unverifiable — no user can log in",
         &frozen_keys("wire/session_prove_body.keys.json"),
-        &keys_of(&build_session_prove_body("alice", 1_719_500_000_000, "cHJvb2Y=")),
+        &keys_of(&prove),
+    );
+    // VALUE LOCK: username / timestamp / proof are ALL re-hashed by the server to
+    // verify the channel-bound proof; a wrong value under any correct key = no login.
+    assert_eq!(
+        prove["username"], "alice",
+        "session/proof must forward the username verbatim under `username`.\n{CHECKLIST}"
+    );
+    assert_eq!(
+        prove["timestamp"], 1_719_500_000_000u64,
+        "\n\nsession/proof `timestamp` must be the raw u64 milliseconds the client signed \
+         over — a stringified, truncated, or rescaled value fails the server's freshness + \
+         signature check and locks every existing user out of login.\n{CHECKLIST}\n"
+    );
+    assert_eq!(
+        prove["proof_b64"], "cHJvb2Y=",
+        "session/proof must forward the base64 proof under `proof_b64` unchanged.\n{CHECKLIST}"
     );
 }
 
@@ -934,12 +960,30 @@ fn compat_wire_recovery_bodies_still_carry_every_key() {
          BLAST RADIUS: if the server ever REQUIRES it, every shipped client's recovery login \
          breaks — and recovery is the ONLY way back in (there is no admin escape hatch).\n{CHECKLIST}\n"
     );
+    let cid = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+    let verify = build_recovery_verify_body(cid, "cHJvb2Y=", 1_719_500_000_000);
     assert_superset(
         "POST /v1/recovery/verify",
         "recovery login breaks — and recovery is the last resort when a user loses their \
          password; there is no admin escape hatch",
         &frozen_keys("wire/recovery_verify_body.keys.json"),
-        &keys_of(&build_recovery_verify_body("0f1e2d3c4b5a69788796a5b4c3d2e1f0", "cHJvb2Y=", 1_719_500_000_000)),
+        &keys_of(&verify),
+    );
+    // VALUE LOCK: recovery_verify re-checks each field, and recovery is the ONLY way
+    // back in — a wrong value under a correct key is silently unrecoverable.
+    assert_eq!(
+        verify["challenge_id"], cid,
+        "recovery/verify must echo the exact `challenge_id` the server issued.\n{CHECKLIST}"
+    );
+    assert_eq!(
+        verify["proof_b64"], "cHJvb2Y=",
+        "recovery/verify must forward the base64 proof under `proof_b64` unchanged.\n{CHECKLIST}"
+    );
+    assert_eq!(
+        verify["timestamp"], 1_719_500_000_000u64,
+        "\n\nrecovery/verify `timestamp` must be the raw u64 ms the recovery proof was signed \
+         over — a rescaled/stringified value fails the freshness + signature check and the \
+         user can never recover.\n{CHECKLIST}\n"
     );
 }
 
@@ -974,12 +1018,48 @@ fn compat_wire_upload_and_share_bodies_still_carry_every_key() {
         &frozen_keys("wire/stage_files_body.keys.json"),
         &keys_of(&body),
     );
+    // VALUE LOCK: `file_id`/`file_type` are the keys the whole record is stored under —
+    // a wrong value here mis-identifies or mis-buckets the file with every key present.
+    assert_eq!(
+        body["file_id"], hex(&[0xF1u8; 16]),
+        "\n\n`POST /v1/files` must send `file_id` as the lowercase-hex client id — the server \
+         keys the whole record (streams, wraps, chunks) on it.\n{CHECKLIST}\n"
+    );
+    assert_eq!(
+        body["file_type"], "blog",
+        "\n\n`file_type` is the AUTHENTICATED listing key; a wrong value mis-buckets the file \
+         in every feed and browse view.\n{CHECKLIST}\n"
+    );
+    // The signed manifest/genesis must reach the server as their EXACT canonical bytes
+    // (base64) — a re-encode or field swap makes `manifest_sig`/`genesis_sig` unverifiable.
+    assert_eq!(
+        base64_decode(body["manifest_b64"].as_str().unwrap()),
+        maxsecu_encoding::encode(&bundle.manifest),
+        "\n\n`manifest_b64` must be the canonical-encoded signed manifest — any other bytes \
+         fail the recipient's `manifest_sig` verify and the file cannot be opened.\n{CHECKLIST}\n"
+    );
+    assert_eq!(
+        base64_decode(body["genesis_b64"].as_str().unwrap()),
+        maxsecu_encoding::encode(&bundle.genesis),
+        "`genesis_b64` must be the canonical-encoded signed genesis record.\n{CHECKLIST}"
+    );
     let stream0 = &body["streams"].as_array().unwrap()[0];
     assert_superset(
         "POST /v1/files → streams[]",
         "the server cannot size/verify a stream, so finalize fails and the upload is lost",
         &frozen_keys("wire/stage_files_stream.keys.json"),
         &keys_of(stream0),
+    );
+    // VALUE LOCK: stream 0 is CONTENT at the frozen chunk size — a wrong stream_type or
+    // chunk_size mis-frames every content chunk and the server rejects finalize.
+    assert_eq!(
+        stream0["stream_type"], "content",
+        "\n\nthe first `streams[]` entry must be `content` — the download re-assembles content \
+         by that name; a wrong tag orphans the ciphertext.\n{CHECKLIST}\n"
+    );
+    assert_eq!(
+        stream0["chunk_size"], 4096,
+        "the content stream must report the exact `chunk_size` it was sealed at.\n{CHECKLIST}"
     );
     let wrap0 = &body["wraps"].as_array().unwrap()[0];
     assert_superset(
@@ -1004,7 +1084,8 @@ fn compat_wire_upload_and_share_bodies_still_carry_every_key() {
     );
 
     // POST /v1/files/{id}/wraps — the reshare body.
-    let wrap_body = build_add_wrap_body(&bundle.wraps[0]);
+    let w0 = &bundle.wraps[0];
+    let wrap_body = build_add_wrap_body(w0);
     assert_superset(
         "POST /v1/files/{id}/wraps (reshare)",
         "sharing is dead: the recipient's wrapped DEK or its signed grant never reaches the \
@@ -1017,6 +1098,37 @@ fn compat_wire_upload_and_share_bodies_still_carry_every_key() {
         "a reshare always targets a USER (never the recovery sentinel)"
     );
     assert_eq!(wrap_body["wrap_alg"], 1, "`wrap_alg` is the frozen wrap-algorithm id");
+    // VALUE LOCK: every value the server's `add_wrap` handler reads must be the exact
+    // bytes of the wrap it is derived from — a wrong value under a correct key silently
+    // ships a wrap the recipient (or the grant chain) cannot open. Computed from the
+    // real builder INPUT (`bundle.wraps[0]`), so a field swap or re-encode is caught.
+    assert_eq!(
+        wrap_body["recipient_id"], hex(&w0.recipient_id.0),
+        "\n\n`recipient_id` must be the lowercase-hex id the wrap was built FOR — a wrong id \
+         binds the grant to the wrong account.\n{CHECKLIST}\n"
+    );
+    assert_eq!(
+        wrap_body["granted_by"], hex(&w0.granted_by.0),
+        "`granted_by` must be the resharer's id — the recipient's grant-chain verify pins it.\n{CHECKLIST}"
+    );
+    let mut wire = w0.wrapped_dek.enc.to_vec();
+    wire.extend_from_slice(&w0.wrapped_dek.ct);
+    assert_eq!(
+        base64_decode(wrap_body["wrapped_dek_b64"].as_str().unwrap()),
+        wire,
+        "\n\n`wrapped_dek_b64` must be the wrapped DEK as `enc ‖ ct` (base64) — any other bytes \
+         and the recipient cannot unwrap the DEK, so the file is unopenable for them.\n{CHECKLIST}\n"
+    );
+    assert_eq!(
+        base64_decode(wrap_body["grant_b64"].as_str().unwrap()),
+        maxsecu_encoding::encode(&w0.grant),
+        "`grant_b64` must be the canonical-encoded signed grant.\n{CHECKLIST}"
+    );
+    assert_eq!(
+        base64_decode(wrap_body["grant_sig_b64"].as_str().unwrap()),
+        w0.grant_sig.to_vec(),
+        "`grant_sig_b64` must be the 64-byte grant signature (base64).\n{CHECKLIST}"
+    );
 }
 
 fn base64_decode(s: &str) -> Vec<u8> {

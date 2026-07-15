@@ -18,18 +18,19 @@
 //!   * the wrap is POSTed to `/v1/files/{id}/wraps` and the recipient downloads +
 //!     runs the full `verify_and_open` ladder to prove the DEK genuinely opens.
 //!
-//! ## Why the flow is reconstructed rather than calling `reshare_file`
+//! ## The flow drives the REAL product orchestration
 //! `reshare_file` is a `#[tauri::command]` that takes `tauri::AppHandle` (bound to
-//! the concrete `Wry` runtime — not constructible headless) and its orchestration
-//! (`reshare_inner` / `run_reshare_batch`) plus the glue helpers `recover_own_dek`
-//! / `build_tombstones` / `wrap_wire` are private / `pub(crate)`, so an external
-//! test crate cannot reach them. Exactly as `upload_e2e.rs` reconstructs the
-//! upload pipeline from public primitives, this suite reconstructs the per-batch
-//! loop from the SAME public product code (`build_reshare`, `fetch_anchored_head`,
-//! `resolve_recipient`, `TombstoneSet`, `load_sink_pins`) over real transport and
-//! real crypto — only the trivial POST-body shaping mirrors `share.rs::wrap_req_body`
-//! byte-for-byte. The private orchestration's per-recipient isolation is unit-tested
-//! in `commands/share.rs`.
+//! the concrete `Wry` runtime — not constructible headless). Its Tauri-free core,
+//! `share::run_reshare_batch`, already takes plain arguments (a `SendRequest`, a
+//! `Session`, a `TofuStore`, a `DirectoryVerifier`, an `emit` closure — no
+//! `AppHandle`); it is now `pub`, so this suite calls THAT actual function. Every
+//! scenario therefore exercises the shipping per-recipient resolve→TOFU→wrap→POST
+//! loop and per-file outcome tally, with the wire body coming from the real
+//! `share::build_add_wrap_body` — not a hand-copied reconstruction that would be
+//! green by construction. The per-recipient isolation is ADDITIONALLY unit-tested
+//! against an in-process stub in `commands/share.rs`; here it runs end-to-end over
+//! the same real transport + real crypto (`build_reshare`, `fetch_anchored_head`,
+//! `resolve_recipient`, `TombstoneSet`, `load_sink_pins`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,26 +49,32 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
 use maxsecu_admin_core::{CoSign, ControlChain, DirectorySigner, RevokeParams};
+use maxsecu_client_app::commands::auth::{Session, SessionInner};
+use maxsecu_client_app::commands::share::{build_add_wrap_body, run_reshare_batch};
 use maxsecu_client_app::config::{client_config_for_pinned_root, load_sink_pins};
 use maxsecu_client_app::directory::resolve_recipient;
 use maxsecu_client_app::download::parse_file_view;
+use maxsecu_client_app::dto::ReshareOutcomeDto;
 use maxsecu_client_app::sink::fetch_anchored_head;
+use maxsecu_client_app::state::SharePhase;
+use maxsecu_client_app::tofu::TofuStore;
 use maxsecu_client_app::upload::{prepare_image_streams, run_pipeline};
 use maxsecu_client_core::{
     build_reshare, build_upload, verify_and_open, ControlRecordIn, DirectoryVerifier,
-    DownloadBundle, Identity, IssuerInfo, MemoryTrustStore, ReshareError, ReshareParams,
-    StreamChunks, TombstoneSet, UploadParams, VerifyContext, WrapOut, NO_ADMINS, NO_GRANTERS,
+    DownloadBundle, Identity, IssuerInfo, MemoryTrustStore, ReshareParams, StreamChunks,
+    TombstoneSet, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
 use maxsecu_crypto::{
     deserialize_hybrid_wrap, sha256, unwrap_dek, unwrap_dek_hybrid, Dek, EncPublicKey,
     HybridEncSecretKey, SigningKey, WrappedDek,
 };
-use maxsecu_encoding::structs::{DirBinding, Grant, Manifest, WrapContext};
+use maxsecu_encoding::structs::{DirBinding, Manifest, WrapContext};
 use maxsecu_encoding::types::{
     Bytes32, FileScope, FileType, Id, MlKemPub, RecipientType, Role, RoleSet, StreamType, Suite,
     Text, Timestamp,
 };
 use maxsecu_sink_server::{router as sink_router, serve as sink_serve, Anchorer, SinkState};
+use tokio::sync::Mutex;
 
 use maxsecu_server::{
     export_channel_binding, serve, AppState, AuthConfig, AuthService, FsBlobStore, GrantAction,
@@ -432,131 +439,76 @@ fn gen_png() -> Vec<u8> {
 }
 
 // ============================================================================
-// Reshare reconstruction over public product code (see module doc)
+// Reshare driver — calls the REAL product orchestration (see module doc)
 // ============================================================================
 
-#[derive(Debug, Clone)]
-struct Outcome {
-    username: String,
-    ok: bool,
-    code: Option<String>,
+/// A fresh, empty TOFU pin store in a unique temp dir, sealed to a throwaway
+/// identity (its own sealing key is unrelated to the granter — the batch only
+/// records recipient pins). Every drive starts with no pins, so a recipient is a
+/// first-sighting that pins WITHOUT blocking (mirrors `share.rs`'s `empty_tofu`).
+fn fresh_tofu() -> TofuStore {
+    let dir = std::env::temp_dir().join(format!(
+        "mxreshare_tofu_{}",
+        hex(&maxsecu_crypto::random_array::<8>())
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    TofuStore::open(&dir, &Identity::generate()).unwrap()
 }
 
-/// Sanitized per-recipient failure code — mirrors `share.rs::reshare_error_code`.
-fn reshare_error_code(e: &ReshareError) -> &'static str {
-    match e {
-        ReshareError::RecipientRevoked => "revoked",
-        ReshareError::ResharePqKeyMissing => "pq_key_missing",
-        ReshareError::DekCommitMismatch => "verify_failed",
-        ReshareError::RecipientIsRecovery => "recovery_recipient",
-        ReshareError::WrapFailed => "wrap_failed",
-    }
-}
-
-/// The `POST /v1/files/{id}/wraps` body — byte-identical to `share.rs::wrap_req_body`.
-fn wrap_body(w: &WrapOut) -> serde_json::Value {
-    let mut wire = w.wrapped_dek.enc.to_vec();
-    wire.extend_from_slice(&w.wrapped_dek.ct);
-    serde_json::json!({
-        "recipient_id": hex(&w.recipient_id.0),
-        "recipient_type": "user",
-        "wrapped_dek_b64": B64.encode(&wire),
-        "wrap_alg": 1,
-        "granted_by": hex(&w.granted_by.0),
-        "grant_b64": B64.encode(maxsecu_encoding::encode::<Grant>(&w.grant)),
-        "grant_sig_b64": B64.encode(w.grant_sig),
-    })
-}
-
-/// The per-recipient reshare loop, reconstructed from public product code exactly
-/// as `run_reshare_batch` does: (async resolve+verify under the pinned D5) →
-/// (sync `build_reshare`, fail-closed on tombstone / PQ-missing / commitment) →
-/// (async POST). One [`Outcome`] per entered username, in order; a per-recipient
-/// failure never aborts the batch. `post_token` lets a scenario inject a transient
-/// POST-auth failure (a real non-201) without touching the crypto.
+/// Drive the SHIPPING per-recipient reshare orchestration
+/// (`share::run_reshare_batch`) over the live TLS connection: the exact
+/// resolve→TOFU→wrap→POST loop `reshare_file` runs, with the wire body coming from
+/// the real `share::build_add_wrap_body` — NO Tauri `AppHandle`. The granter
+/// identity is borrowed from `session`; `post_token` is the bearer the wrap POST
+/// carries (a scenario can inject a bad one for a real non-201). Returns the
+/// per-recipient [`ReshareOutcomeDto`]s AND every emitted [`SharePhase`], so a
+/// scenario can assert on both the return value and the progress channel.
 #[allow(clippy::too_many_arguments)]
-async fn reshare_batch(
+async fn reshare(
     conn: &mut Conn,
+    session: &Session,
+    granter_id: [u8; 16],
+    pinned: [u8; 32],
     post_token: &str,
-    file_id_hex: &str,
     file_id: [u8; 16],
     version: u64,
     dek_commit: [u8; 32],
     suite: Suite,
-    granter: &Identity,
-    granter_id: [u8; 16],
     dek: &Dek,
     tombstones: &TombstoneSet,
-    pinned: [u8; 32],
     recipients: &[&str],
-) -> Vec<Outcome> {
+) -> (Vec<ReshareOutcomeDto>, Vec<SharePhase>) {
     let verifier = DirectoryVerifier::new(pinned);
-    let mut outcomes = Vec::with_capacity(recipients.len());
-    for uname in recipients {
-        let mut trust = MemoryTrustStore::new();
-        let author = match resolve_recipient(
-            &mut conn.sender,
-            "localhost",
-            uname,
-            &verifier,
-            &mut trust,
-            TS,
-        )
-        .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                outcomes.push(Outcome {
-                    username: (*uname).to_owned(),
-                    ok: false,
-                    code: Some(e.code),
-                });
-                continue;
-            }
-        };
-        let params = ReshareParams {
-            granter,
-            granter_id: Id(granter_id),
-            file_id: Id(file_id),
-            version,
-            dek_commit,
-            recipient_id: Id(author.user_id),
-            recipient_enc_pub: EncPublicKey::from_bytes(author.enc_pub),
-            suite,
-            recipient_mlkem_pub: author.mlkem_pub,
-            created_at: Timestamp(TS),
-        };
-        match build_reshare(&params, dek, tombstones) {
-            Ok(w) => {
-                let (st, _) = post(
-                    conn,
-                    &format!("/v1/files/{file_id_hex}/wraps"),
-                    Some(post_token),
-                    wrap_body(&w),
-                )
-                .await;
-                if st == StatusCode::CREATED {
-                    outcomes.push(Outcome {
-                        username: (*uname).to_owned(),
-                        ok: true,
-                        code: None,
-                    });
-                } else {
-                    outcomes.push(Outcome {
-                        username: (*uname).to_owned(),
-                        ok: false,
-                        code: Some("share_failed".to_owned()),
-                    });
-                }
-            }
-            Err(e) => outcomes.push(Outcome {
-                username: (*uname).to_owned(),
-                ok: false,
-                code: Some(reshare_error_code(&e).to_owned()),
-            }),
-        }
-    }
-    outcomes
+    let mut trust = MemoryTrustStore::new();
+    let mut tofu = fresh_tofu();
+    let recips: Vec<String> = recipients.iter().map(|s| (*s).to_owned()).collect();
+    let file_id_hex = hex(&file_id);
+    let phases = std::sync::Mutex::new(Vec::<SharePhase>::new());
+    let emit = |p: SharePhase| phases.lock().unwrap().push(p);
+    let outcomes = run_reshare_batch(
+        &mut conn.sender,
+        "localhost",
+        post_token,
+        &file_id_hex,
+        file_id,
+        version,
+        dek_commit,
+        suite,
+        granter_id,
+        dek,
+        tombstones,
+        session,
+        &mut tofu,
+        None,
+        &recips,
+        &[],
+        &verifier,
+        &mut trust,
+        TS,
+        &emit,
+    )
+    .await;
+    (outcomes, phases.into_inner().unwrap())
 }
 
 // ============================================================================
@@ -569,7 +521,13 @@ struct Fixture {
     blob_dir: PathBuf,
     dir_signer: DirectorySigner,
     pinned: [u8; 32],
-    owner: Identity,
+    /// The owner's unlocked identity, held EXACTLY as the running app holds it — in
+    /// a `Session` — so `run_reshare_batch` borrows the real granter identity under
+    /// the session lock (the product's borrow discipline), not a bespoke `&Identity`.
+    session: Session,
+    /// The owner's Ed25519 verifying key, captured before the identity moved into
+    /// `session`, for the download-side `VerifyContext` (author/owner sig pub).
+    owner_sig_pub: [u8; 32],
     owner_id: [u8; 16],
     owner_token: String,
     ctr: usize,
@@ -662,13 +620,23 @@ impl Fixture {
         )
         .await;
 
+        // Hold the owner identity the way the app does — inside a `Session` — so the
+        // reshare drives the real granter-borrow path. Capture the sig pub first.
+        let owner_sig_pub = owner.sig_pub_bytes();
+        let session = Session(Mutex::new(SessionInner {
+            identity: Some(owner),
+            username: Some("owner".to_owned()),
+            ..Default::default()
+        }));
+
         Fixture {
             conn,
             app_dir,
             blob_dir,
             dir_signer,
             pinned,
-            owner,
+            session,
+            owner_sig_pub,
             owner_id,
             owner_token,
             ctr,
@@ -697,7 +665,11 @@ impl Fixture {
         )
         .await;
         let recovery_enc = recovery_id.enc_pub_bytes();
-        let recovery_mlkem = if pq { recovery_id.mlkem_pub_bytes() } else { None };
+        let recovery_mlkem = if pq {
+            recovery_id.mlkem_pub_bytes()
+        } else {
+            None
+        };
 
         let src_png = gen_png();
         let (file_type, streams) =
@@ -705,21 +677,27 @@ impl Fixture {
         assert_eq!(file_type, FileType::Image);
         let canonical = streams.content.clone();
         let file_id = Id(maxsecu_crypto::random_array::<16>());
-        let bundle = build_upload(
-            &UploadParams {
-                owner: &self.owner,
-                owner_id: Id(self.owner_id),
-                owner_key_version: 1,
-                file_id,
-                file_type,
-                chunk_size: 4096,
-                recovery_pub: EncPublicKey::from_bytes(recovery_enc),
-                recovery_mlkem_pub: recovery_mlkem,
-                created_at: Timestamp(TS),
-            },
-            &streams,
-        )
-        .unwrap();
+        // Borrow the owner identity from the session for the SYNCHRONOUS build_upload
+        // (guard released before any await — same discipline as the product).
+        let bundle = {
+            let guard = self.session.0.lock().await;
+            let owner = guard.identity.as_ref().expect("owner identity in session");
+            build_upload(
+                &UploadParams {
+                    owner,
+                    owner_id: Id(self.owner_id),
+                    owner_key_version: 1,
+                    file_id,
+                    file_type,
+                    chunk_size: 4096,
+                    recovery_pub: EncPublicKey::from_bytes(recovery_enc),
+                    recovery_mlkem_pub: recovery_mlkem,
+                    created_at: Timestamp(TS),
+                },
+                &streams,
+            )
+            .unwrap()
+        };
         run_pipeline(
             &mut self.conn.sender,
             "localhost",
@@ -752,21 +730,24 @@ impl Fixture {
             version: manifest.version,
             recipient_id: Id(self.owner_id),
         };
+        // Borrow the owner identity from the session (where the app holds it), the
+        // same guard the reshare uses for `build_reshare`.
+        let guard = self.session.0.lock().await;
+        let owner = guard.identity.as_ref().expect("owner identity in session");
         let dek = match manifest.alg {
-            Suite::V1 => unwrap_dek(self.owner.enc_secret(), &view.wrapped_dek, &ctx).unwrap(),
+            Suite::V1 => unwrap_dek(owner.enc_secret(), &view.wrapped_dek, &ctx).unwrap(),
             Suite::V2 => {
-                let seed = self.owner.mlkem_seed().unwrap();
+                let seed = owner.mlkem_seed().unwrap();
                 let mut wire = Vec::with_capacity(32 + view.wrapped_dek.ct.len());
                 wire.extend_from_slice(&view.wrapped_dek.enc);
                 wire.extend_from_slice(&view.wrapped_dek.ct);
                 let hybrid = deserialize_hybrid_wrap(&wire).unwrap();
-                let hsk = HybridEncSecretKey::from_components(
-                    self.owner.enc_secret().expose_bytes(),
-                    seed,
-                );
+                let hsk =
+                    HybridEncSecretKey::from_components(owner.enc_secret().expose_bytes(), seed);
                 unwrap_dek_hybrid(&hsk, &hybrid, &ctx).unwrap()
             }
         };
+        drop(guard);
         assert_eq!(
             dek.commit(),
             manifest.dek_commit.0,
@@ -820,7 +801,7 @@ impl Fixture {
     ) {
         let fid_hex = hex(&file_id);
         let bundle = download_bundle(&mut self.conn, token, &fid_hex).await;
-        let owner_sig_pub = self.owner.sig_pub_bytes();
+        let owner_sig_pub = self.owner_sig_pub;
         let ctx = VerifyContext {
             file_id: Id(file_id),
             author_sig_pub: owner_sig_pub,
@@ -937,19 +918,18 @@ async fn scenario1_share_to_fresh_recipient_downloads_and_verifies() {
     )
     .await;
 
-    let out = reshare_batch(
+    let (out, phases) = reshare(
         &mut fx.conn,
+        &fx.session,
+        fx.owner_id,
+        fx.pinned,
         &fx.owner_token,
-        &hex(&file_id),
         file_id,
         1,
         dek.commit(),
         Suite::V1,
-        &fx.owner,
-        fx.owner_id,
         &dek,
         &tombstones,
-        fx.pinned,
         &["carol"],
     )
     .await;
@@ -957,6 +937,22 @@ async fn scenario1_share_to_fresh_recipient_downloads_and_verifies() {
     assert!(
         out[0].ok && out[0].code.is_none(),
         "fresh recipient shares OK: {out:?}"
+    );
+    // The SHIPPING progress channel fired for carol: a `Resolving` opened her tray
+    // row and a terminal `Recipient{ok:true}` closed it (both emitted from inside
+    // `run_reshare_batch`). Asserting them proves the real `emit` path is wired.
+    assert!(
+        phases
+            .iter()
+            .any(|p| matches!(p, SharePhase::Resolving { username, .. } if username == "carol")),
+        "a Resolving phase opened carol's row: {phases:?}"
+    );
+    assert!(
+        phases.iter().any(|p| matches!(
+            p,
+            SharePhase::Recipient { username, ok: true, code: None, .. } if username == "carol"
+        )),
+        "a Recipient{{ok:true}} phase closed carol's row: {phases:?}"
     );
 
     // GATE: carol is now a recipient and her download opens the exact plaintext.
@@ -987,19 +983,18 @@ async fn scenario2_idempotent_reshare_keeps_one_recipient_row() {
 
     // Share to carol TWICE.
     for _ in 0..2 {
-        let out = reshare_batch(
+        let (out, _phases) = reshare(
             &mut fx.conn,
+            &fx.session,
+            fx.owner_id,
+            fx.pinned,
             &fx.owner_token,
-            &hex(&file_id),
             file_id,
             1,
             dek.commit(),
             Suite::V1,
-            &fx.owner,
-            fx.owner_id,
             &dek,
             &tombstones,
-            fx.pinned,
             &["carol"],
         )
         .await;
@@ -1027,19 +1022,18 @@ async fn scenario3_unpublished_recipient_untrusted_no_post() {
     let tombstones = TombstoneSet::verify(&[], fx.anchored_head().await).unwrap();
 
     // "ghost" is never registered/published → the D5 resolve fails closed.
-    let out = reshare_batch(
+    let (out, _phases) = reshare(
         &mut fx.conn,
+        &fx.session,
+        fx.owner_id,
+        fx.pinned,
         &fx.owner_token,
-        &hex(&file_id),
         file_id,
         1,
         dek.commit(),
         Suite::V1,
-        &fx.owner,
-        fx.owner_id,
         &dek,
         &tombstones,
-        fx.pinned,
         &["ghost"],
     )
     .await;
@@ -1156,19 +1150,18 @@ async fn scenario4_tombstoned_recipient_rejected_cobatch_valid_succeeds() {
     assert!(tombstones.is_account_revoked(&victim_id));
 
     // Same batch: `victim` is refused (revoked), `keep` still succeeds.
-    let out = reshare_batch(
+    let (out, phases) = reshare(
         &mut fx.conn,
+        &fx.session,
+        fx.owner_id,
+        fx.pinned,
         &fx.owner_token,
-        &hex(&file_id),
         file_id,
         1,
         dek.commit(),
         Suite::V1,
-        &fx.owner,
-        fx.owner_id,
         &dek,
         &tombstones,
-        fx.pinned,
         &["victim", "keep"],
     )
     .await;
@@ -1180,6 +1173,23 @@ async fn scenario4_tombstoned_recipient_rejected_cobatch_valid_succeeds() {
     assert!(
         out[1].ok,
         "the non-revoked co-batch recipient still succeeds: {out:?}"
+    );
+    // The mixed batch's per-recipient outcomes were also emitted on the progress
+    // channel — a failing `revoked` for victim, a succeeding row for keep.
+    assert!(
+        phases.iter().any(|p| matches!(
+            p,
+            SharePhase::Recipient { username, ok: false, code: Some(c), .. }
+                if username == "victim" && c == "revoked"
+        )),
+        "a Recipient{{revoked}} phase fired for victim: {phases:?}"
+    );
+    assert!(
+        phases.iter().any(|p| matches!(
+            p,
+            SharePhase::Recipient { username, ok: true, .. } if username == "keep"
+        )),
+        "a Recipient{{ok:true}} phase fired for keep: {phases:?}"
     );
 
     // GATE: only `keep` gained access; `victim` never did.
@@ -1226,19 +1236,18 @@ async fn scenario5_batch_partial_failure_then_targeted_retry() {
     // Batch [carol, dave] where dave's POST hits a REAL transient auth failure
     // (a bogus session token → 401 non-201 → "share_failed"), isolated from
     // carol's success. carol POSTs with the valid owner token; dave with a bad one.
-    let out_carol = reshare_batch(
+    let (out_carol, _p1) = reshare(
         &mut fx.conn,
+        &fx.session,
+        fx.owner_id,
+        fx.pinned,
         &fx.owner_token,
-        &hex(&file_id),
         file_id,
         1,
         dek.commit(),
         Suite::V1,
-        &fx.owner,
-        fx.owner_id,
         &dek,
         &tombstones,
-        fx.pinned,
         &["carol"],
     )
     .await;
@@ -1247,19 +1256,18 @@ async fn scenario5_batch_partial_failure_then_targeted_retry() {
         "carol succeeds in the batch: {out_carol:?}"
     );
 
-    let out_dave_fail = reshare_batch(
+    let (out_dave_fail, _p2) = reshare(
         &mut fx.conn,
+        &fx.session,
+        fx.owner_id,
+        fx.pinned,
         "not-a-valid-session-token",
-        &hex(&file_id),
         file_id,
         1,
         dek.commit(),
         Suite::V1,
-        &fx.owner,
-        fx.owner_id,
         &dek,
         &tombstones,
-        fx.pinned,
         &["dave"],
     )
     .await;
@@ -1273,19 +1281,18 @@ async fn scenario5_batch_partial_failure_then_targeted_retry() {
     assert!(!fx.recipients_of(file_id).await.contains(&dave_id));
 
     // Targeted retry of ONLY dave with the valid token → success (idempotent-safe).
-    let out_dave_retry = reshare_batch(
+    let (out_dave_retry, _p3) = reshare(
         &mut fx.conn,
+        &fx.session,
+        fx.owner_id,
+        fx.pinned,
         &fx.owner_token,
-        &hex(&file_id),
         file_id,
         1,
         dek.commit(),
         Suite::V1,
-        &fx.owner,
-        fx.owner_id,
         &dek,
         &tombstones,
-        fx.pinned,
         &["dave"],
     )
     .await;
@@ -1341,19 +1348,18 @@ async fn scenario6_v2_hybrid_roundtrip_and_pq_key_missing() {
     )
     .await;
 
-    let out = reshare_batch(
+    let (out, _phases) = reshare(
         &mut fx.conn,
+        &fx.session,
+        fx.owner_id,
+        fx.pinned,
         &fx.owner_token,
-        &hex(&file_id),
         file_id,
         1,
         dek.commit(),
         Suite::V2,
-        &fx.owner,
-        fx.owner_id,
         &dek,
         &tombstones,
-        fx.pinned,
         &["pqr", "classic"],
     )
     .await;
@@ -1455,7 +1461,7 @@ async fn scenario7_non_holder_cannot_reshare_before_any_post() {
         &mut fx.conn,
         &format!("/v1/files/{fid_hex}/wraps"),
         Some(&mallory_token),
-        wrap_body(&w),
+        build_add_wrap_body(&w),
     )
     .await;
     assert_eq!(
@@ -1493,19 +1499,18 @@ async fn scenario8_reshare_audit_edge_recorded() {
     )
     .await;
 
-    let out = reshare_batch(
+    let (out, _phases) = reshare(
         &mut fx.conn,
+        &fx.session,
+        fx.owner_id,
+        fx.pinned,
         &fx.owner_token,
-        &hex(&file_id),
         file_id,
         1,
         dek.commit(),
         Suite::V1,
-        &fx.owner,
-        fx.owner_id,
         &dek,
         &tombstones,
-        fx.pinned,
         &["carol"],
     )
     .await;
