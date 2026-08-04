@@ -57,6 +57,19 @@ struct Account {
 /// is shared across request tasks behind the `AuthService`.
 pub struct RateLimiter {
     cfg: RateLimitConfig,
+    /// Keyed on the claimed username, and **never evicted**: an entry created by
+    /// one unauthenticated `POST /v1/session/challenge` or `/v1/session/proof`
+    /// lives until the process restarts. Two consequences, and only the first is
+    /// currently closed:
+    ///
+    /// * **Key SIZE is bounded** by `http::MAX_SESSION_USERNAME_BYTES`, applied
+    ///   on both routes before either one reaches this map. Before that bound,
+    ///   one request could pin the whole 8 MiB body limit here, permanently.
+    /// * **Key COUNT is not bounded.** Cycling distinct claimed names still
+    ///   grows this map, at ≤ 4 KiB + `Account` per distinct name. Bounding it
+    ///   means an eviction policy (or an LRU/TTL map) plus a decision about what
+    ///   forgetting an account's backoff means for anti-automation — a separate
+    ///   change, deliberately not folded in here.
     accounts: Mutex<HashMap<String, Account>>,
 }
 

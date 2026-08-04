@@ -31,13 +31,13 @@ use time::OffsetDateTime;
 use crate::control::{decode_control, role_text};
 use crate::error::{ControlAppendError, StoreError};
 use crate::files::{
-    AddWrapError, DeleteError, DeleteWrapError, DiscardError, FinalizeError, ListFilter,
+    AddWrapError, DeleteError, DeleteWrapError, DiscardError, FinalizeError, ListFilter, ListSort,
     ParsedStage, StageError, VersionSelector, WrapInput,
 };
 use crate::store::{
-    ancestor_chain, ChunkSlot, EnrollOutcome, FileListEntry, FileMeta, FileView, RecipientView,
-    RecoveryAccount, SessionRecord, Store, StoredBinding, StoredControlRecord, StreamView,
-    UserRecord, VersionMeta, WrapView, BUNDLE_FILE_TYPE,
+    ancestor_chain, ChunkSlot, EnrollOutcome, FileListEntry, FileListPage, FileMeta, FileView,
+    PruneCounts, RecipientView, RecoveryAccount, SessionRecord, Store, StoredBinding,
+    StoredControlRecord, StreamView, UserRecord, VersionMeta, WrapView, BUNDLE_FILE_TYPE,
 };
 
 /// Postgres [`Store`]. Cheap to clone (the pool is an `Arc` internally).
@@ -252,6 +252,55 @@ impl Store for PgStore {
         .await
         .map_err(store_err("revoke_session"))?;
         Ok(())
+    }
+
+    /// Bounded, expiry-only housekeeping delete (see the [`Store`] trait docs for
+    /// why the predicate may name *only* `expires_at`).
+    ///
+    /// The cutoff is derived from the **app** clock and bound as a parameter, not
+    /// written as `now() - interval '7 days'`: this adapter's contract is that
+    /// freshness is decided by the app-provided `now_ms`, never the DB clock, so
+    /// the DELETE removes exactly the rows the MemoryStore would.
+    ///
+    /// Each table is one statement in its own implicit transaction, and the
+    /// `ctid IN (SELECT ... LIMIT $2)` form caps the rows it touches. That bound
+    /// is the point: an unbounded `DELETE FROM sessions WHERE expires_at < $1` on
+    /// a table that has never been pruned would open one long transaction holding
+    /// row locks and bloating WAL while logins wait. Bounded, it is a short,
+    /// interruptible pass that simply resumes on the next tick.
+    async fn prune_expired_auth_rows(
+        &self,
+        now_ms: u64,
+        grace_ms: u64,
+        batch_limit: u32,
+    ) -> Result<PruneCounts, StoreError> {
+        const OP: &str = "prune_expired_auth_rows";
+        let cutoff = try_ms_to_ts(now_ms.saturating_sub(grace_ms), OP)?;
+        let limit = i64::from(batch_limit);
+
+        let sessions = sqlx::query(
+            "DELETE FROM sessions WHERE ctid IN \
+             (SELECT ctid FROM sessions WHERE expires_at < $1 LIMIT $2)",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err(OP))?
+        .rows_affected();
+
+        let nonces = sqlx::query(
+            "DELETE FROM auth_nonces WHERE ctid IN \
+             (SELECT ctid FROM auth_nonces WHERE expires_at < $1 LIMIT $2)",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err(OP))?
+        .rows_affected();
+
+        Ok(PruneCounts { sessions, nonces })
     }
 
     async fn put_binding(
@@ -967,28 +1016,67 @@ impl Store for PgStore {
         }))
     }
 
-    async fn list_files(&self, filter: ListFilter) -> Result<Vec<FileListEntry>, StoreError> {
+    async fn list_files(&self, filter: ListFilter) -> Result<FileListPage, StoreError> {
         let op = "list_files";
-        let rows = sqlx::query(
-            "SELECT file_id, file_type, current_version, updated_at FROM files \
-             WHERE current_version >= 1 AND listed = true \
+        // The one predicate shared by the COUNT and the page, so `total` can never
+        // describe a different set than `entries`. `$4` is the `owner=me` switch:
+        // a plain boolean parameter rather than string interpolation, so the SQL
+        // text is constant and nothing from the request reaches the parser.
+        const WHERE: &str = "WHERE current_version >= 1 AND listed = true \
              AND ($1::smallint IS NULL OR file_type = $1) \
+             AND (NOT $4::boolean OR owner_id = $3) \
              AND EXISTS ( \
                  SELECT 1 FROM file_key_wraps w \
                  WHERE w.file_id = files.file_id \
                    AND w.file_version = files.current_version \
                    AND w.recipient_id = $3 \
-             ) \
-             ORDER BY updated_at DESC, file_id LIMIT $2",
-        )
-        .bind(filter.file_type)
-        .bind(filter.limit as i64)
-        .bind(&filter.caller_id[..])
-        .fetch_all(&self.pool)
-        .await
-        .map_err(store_err(op))?;
+             )";
+        // Only the ORDER BY direction varies, and it is chosen from a closed enum
+        // — never from request text. `file_id` is the ASC tiebreak either way, so
+        // the order is total (no page can repeat or drop a row at equal
+        // `updated_at`).
+        let page_sql = format!(
+            "SELECT file_id, file_type, current_version, updated_at FROM files {WHERE} \
+             ORDER BY updated_at {}, file_id LIMIT $2 OFFSET $5",
+            match filter.sort {
+                ListSort::Newest => "DESC",
+                ListSort::Oldest => "ASC",
+            }
+        );
+        let count_sql = format!("SELECT count(*) FROM files {WHERE}");
 
-        let mut out = Vec::with_capacity(rows.len());
+        // ONE snapshot for the count, the page and every per-row stream lookup.
+        // READ COMMITTED gives each STATEMENT its own snapshot, so without this a
+        // concurrent finalize/re-share could make `total` and the page disagree —
+        // and a numbered pager built on a `total` that never matched the pages is
+        // a page that renders "1 2 3" over two pages of data. REPEATABLE READ is
+        // free for a read-only transaction (no serialization failures).
+        let mut tx = self.pool.begin().await.map_err(store_err(op))?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err(op))?;
+
+        let total: i64 = sqlx::query_scalar(&count_sql)
+            .bind(filter.file_type)
+            .bind(filter.limit as i64) // $2 unused by the COUNT; bound for arity
+            .bind(&filter.caller_id[..])
+            .bind(filter.owner_only)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(store_err(op))?;
+
+        let rows = sqlx::query(&page_sql)
+            .bind(filter.file_type)
+            .bind(filter.limit as i64)
+            .bind(&filter.caller_id[..])
+            .bind(filter.owner_only)
+            .bind(filter.offset as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(store_err(op))?;
+
+        let mut entries = Vec::with_capacity(rows.len());
         for r in &rows {
             let file_id: [u8; 16] = col_fixed(r, op, "file_id")?;
             let version: i64 = r.get("current_version");
@@ -999,7 +1087,7 @@ impl Store for PgStore {
             )
             .bind(&file_id[..])
             .bind(version)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await
             .map_err(store_err(op))?;
             let small_streams = srows
@@ -1011,7 +1099,7 @@ impl Store for PgStore {
                     )
                 })
                 .collect();
-            out.push(FileListEntry {
+            entries.push(FileListEntry {
                 file_id,
                 file_type: r.get("file_type"),
                 version: version as u64,
@@ -1019,7 +1107,13 @@ impl Store for PgStore {
                 small_streams,
             });
         }
-        Ok(out)
+        // Read-only: commit and rollback are equivalent, but commit releases the
+        // snapshot explicitly rather than leaning on `Drop`.
+        tx.commit().await.map_err(store_err(op))?;
+        Ok(FileListPage {
+            entries,
+            total: total.max(0) as u64,
+        })
     }
 
     async fn version_meta(
@@ -1174,11 +1268,41 @@ impl Store for PgStore {
         caller_id: [u8; 16],
     ) -> Result<(), DeleteWrapError> {
         let op = "delete_wrap";
-        let frow = sqlx::query("SELECT owner_id, current_version FROM files WHERE file_id = $1")
-            .bind(&file_id[..])
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(store_err(op))?;
+        let serr = |e: sqlx::Error| DeleteWrapError::Store(store_err(op)(e));
+
+        // The escrow wrap is not the owner's to remove — see
+        // `DeleteWrapError::RecoveryProtected`. This MUST run BEFORE `begin()`:
+        // the transaction below writes an `INSERT INTO wrap_revocations`, and that
+        // table is append-only (the `maxsecu_forbid_update_delete` trigger,
+        // migrations/0002_delete_tombstones.sql:82-84), so a guard placed after it
+        // would leave a permanent, unremovable tombstone for a request the server
+        // nominally refused — and a later restore-merge reads that tombstone as
+        // "the recovery wrap was revoked on purpose" and drops it for good.
+        if recipient_id == maxsecu_encoding::RECOVERY_ID.0 {
+            return Err(DeleteWrapError::RecoveryProtected);
+        }
+
+        // One transaction over the gate, the DELETE and the revocation record.
+        // These used to be bare autocommits on the pool — fine while the removal
+        // was the whole story, but the wrap's ABSENCE is the revocation, so a
+        // crash between the DELETE and the record would leave the wrap gone with
+        // nothing saying it was taken away on purpose. A later restore would then
+        // merge the wrap straight back and hand a de-authorized recipient their
+        // wrapped DEK. The two writes must not be separable.
+        let mut tx = self.pool.begin().await.map_err(serr)?;
+
+        // FOR UPDATE: `version` chooses both the wrap that is deleted and the row
+        // that records it, so a finalize_version landing between this read and the
+        // DELETE would revoke against a superseded version — an owner-requested
+        // revoke that silently does nothing. finalize_version locks the same
+        // `files` row, so the two serialize instead.
+        let frow = sqlx::query(
+            "SELECT owner_id, current_version FROM files WHERE file_id = $1 FOR UPDATE",
+        )
+        .bind(&file_id[..])
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(serr)?;
         let Some(frow) = frow else {
             return Err(DeleteWrapError::NotFound);
         };
@@ -1188,20 +1312,30 @@ impl Store for PgStore {
             return Err(DeleteWrapError::NotFound);
         }
         let wrow = sqlx::query(
-            "SELECT granted_by FROM file_key_wraps \
+            "SELECT granted_by, recipient_type FROM file_key_wraps \
              WHERE file_id = $1 AND file_version = $2 AND recipient_id = $3",
         )
         .bind(&file_id[..])
         .bind(version)
         .bind(&recipient_id[..])
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(store_err(op))?;
+        .map_err(serr)?;
         let Some(wrow) = wrow else {
             return Err(DeleteWrapError::NotFound);
         };
         let granted_by: [u8; 16] = col_fixed(&wrow, op, "granted_by")?;
-        // Coarse owner-or-granter gate (§14.5).
+        // Second half of the escrow guard, on the STORED row's type. Still ahead
+        // of every write in this transaction, so the early return drops `tx` →
+        // ROLLBACK and no `wrap_revocations` row is left behind. (The baseline
+        // CHECK makes `recipient_type = 2` imply `recipient_id = RECOVERY_ID`, so
+        // on a healthy DB the pre-`begin()` guard has already fired — this is the
+        // belt to its braces.)
+        if wrow.get::<i16, _>("recipient_type") == 2 {
+            return Err(DeleteWrapError::RecoveryProtected);
+        }
+        // Coarse owner-or-granter gate (§14.5). This and the early returns above
+        // drop `tx` → ROLLBACK, so a refused revoke records nothing.
         if caller_id != owner_id && caller_id != granted_by {
             return Err(DeleteWrapError::NotAuthorized);
         }
@@ -1212,9 +1346,26 @@ impl Store for PgStore {
         .bind(&file_id[..])
         .bind(version)
         .bind(&recipient_id[..])
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .map_err(store_err(op))?;
+        .map_err(serr)?;
+
+        // What makes the absence readable as deliberate. ON CONFLICT because the
+        // owner may re-share to a recipient they revoked and then revoke again,
+        // hitting this PK a second time — aborting the caller's txn over an
+        // already-true fact would deny them that second revoke.
+        sqlx::query(
+            "INSERT INTO wrap_revocations (file_id, file_version, recipient_id) \
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(&file_id[..])
+        .bind(version)
+        .bind(&recipient_id[..])
+        .execute(&mut *tx)
+        .await
+        .map_err(serr)?;
+
+        tx.commit().await.map_err(serr)?;
         Ok(())
     }
 
@@ -1419,6 +1570,26 @@ impl Store for PgStore {
             .execute(&mut *tx)
             .await
             .map_err(serr)?;
+
+        // Everything is gone; record THAT — for every id in the delete set, not
+        // just the target. The rows above are the only evidence the file existed,
+        // so without this a backup restore would merge it straight back as a
+        // zombie feed entry over ciphertext that no longer exists anywhere. Same
+        // txn, so the tombstone and the delete are one atomic fact.
+        //
+        // ON CONFLICT is not defensive padding: a client-generated `file_id` can
+        // be re-created after a delete (stage_version re-inserts files/genesis
+        // with ON CONFLICT DO NOTHING and consults no tombstone), so the second
+        // delete of a reused id would hit the PK → DeleteError::Store → HTTP 500,
+        // and the owner could never delete their own file again.
+        sqlx::query(
+            "INSERT INTO file_tombstones (file_id) SELECT unnest($1::bytea[]) \
+             ON CONFLICT (file_id) DO NOTHING",
+        )
+        .bind(&target_slices)
+        .execute(&mut *tx)
+        .await
+        .map_err(serr)?;
 
         tx.commit().await.map_err(serr)?;
         Ok(blob_refs)

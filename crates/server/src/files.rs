@@ -145,6 +145,16 @@ pub enum StageError {
     SizeBoundExceeded,
     /// No recovery wrap present (Phase 3 requires self + recovery, §12.2).
     MissingRecoveryWrap,
+    /// A staged wrap set exactly ONE half of the recovery pair — either
+    /// `recipient_type == 2` with a non-sentinel `recipient_id`, or
+    /// `recipient_id == RECOVERY_ID` with `recipient_type != 2`. Postgres has
+    /// refused that row since the baseline (`migrations/0001_baseline.sql:253`,
+    /// the biconditional `(recipient_type = 2) = (recipient_id = 00..00)` CHECK)
+    /// and `maxsecu_encoding` refuses to DECODE the matching `Grant`
+    /// (`encoding/src/structs.rs:203`, `DecodeError::RecoveryIdMismatch`), so the
+    /// half-shape is inert everywhere it lands. Rejecting it here makes the
+    /// MemoryStore agree with Postgres and turns a `500` into a `400` (→ 400).
+    MismatchedRecoveryWrap,
     /// `proposed_version` ≠ the manifest's `version`.
     VersionMismatch,
     /// Version 1 stage without a genesis, or a `version == 1` manifest with none.
@@ -219,6 +229,24 @@ pub enum DeleteWrapError {
     /// The caller is neither the file owner nor the wrap's `granted_by` — the
     /// coarse owner-or-granter gate (→ 403).
     NotAuthorized,
+    /// The target is the **recovery** recipient (`RECOVERY_ID`, or a stored wrap
+    /// whose `recipient_type == 2`). Refused for EVERY caller, owner included
+    /// (→ 403, distinct from [`NotAuthorized`](Self::NotAuthorized) so the two
+    /// are separable in logs).
+    ///
+    /// Why the escrow wrap is not the owner's to remove: `add_wrap` hard-rejects
+    /// `recipient_id == RECOVERY_ID` in BOTH stores (`store.rs` / `pg.rs`), so
+    /// nothing can put the wrap back at the current version once it is gone —
+    /// the file becomes permanently unreadable by the recovery key while it stays
+    /// perfectly readable by its owner. That is a one-way, irreversible blinding
+    /// of the escrow, and on Postgres it also writes an append-only
+    /// `wrap_revocations` tombstone that can never be removed.
+    ///
+    /// Deliberately **asymmetric** with `add_wrap`, which answers `400` for the
+    /// same recipient: there the *body* is malformed (a re-share may not target
+    /// recovery at all), here the request is well-formed and the caller is
+    /// authorized for the route but not for this target.
+    RecoveryProtected,
     /// A backend fault (→ 500, logged).
     Store(StoreError),
 }
@@ -280,17 +308,69 @@ pub enum VersionSelector {
     Specific(u64),
 }
 
-/// Filter/limit for `GET /v1/files` listing (api.md §8.6 / D35).
+/// The listing's sort order (`GET /v1/files?sort=`). Server-side since the feed
+/// pager became numbered pages — a client that only sorts the page it was handed
+/// cannot order the whole set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListSort {
+    /// `updated_at DESC, file_id ASC` — the historical (and default) order.
+    #[default]
+    Newest,
+    /// `updated_at ASC, file_id ASC`.
+    Oldest,
+}
+
+/// Filter/limit/page for `GET /v1/files` listing (api.md §8.6 / D35).
+///
+/// `offset`/`sort`/`owner_only` were added with server-side paging; every field
+/// has a defined meaning at its zero value (`offset = 0`, `Newest`, `false`), so
+/// a caller that does not set them gets exactly the pre-paging behaviour.
+///
+/// There is deliberately **no `Default` impl**: `caller_id`'s zero value is
+/// `RECOVERY_ID` (16 zero bytes, `maxsecu_encoding::RECOVERY_ID`), i.e. the
+/// escrow principal that sees every file, so `..Default::default()` would be a
+/// silent escrow-wide listing. Use [`ListFilter::for_caller`], or an exhaustive
+/// struct literal — which is also what forces every call site to be revisited
+/// when a field is added here.
 #[derive(Debug, Clone)]
 pub struct ListFilter {
     /// Restrict to one `file_type` (1=video 2=image 3=blog), or all if `None`.
     pub file_type: Option<i16>,
     /// Max entries to return.
     pub limit: usize,
+    /// 0-based item offset into the ordered result set (the page start).
+    ///
+    /// NOT skip-free under concurrency: the sort key `files.updated_at` is
+    /// MUTABLE — `finalize_version` bumps it, and so does `add_wrap`, i.e. every
+    /// re-share. A re-share landing while a user pages can move an item across a
+    /// page boundary, so that item is seen twice or missed. Accepted, and stated
+    /// in `docs/api.md`: the alternative (sort by the immutable `created_at`)
+    /// would stop a re-shared file surfacing in the recipient's feed.
+    pub offset: u64,
+    /// Order over the whole matching set (not just the returned page).
+    pub sort: ListSort,
+    /// `true` restricts the listing to files whose `owner_id == caller_id`
+    /// ("My Content"). `false` = every file the caller can see.
+    pub owner_only: bool,
     /// The authenticated session principal. The listing returns ONLY files this
     /// caller holds a wrap for (their own posts + anything shared to them) — a file
     /// with no wrap for the caller is omitted (no oracle; matches the open path).
     pub caller_id: [u8; 16],
+}
+
+impl ListFilter {
+    /// The pre-paging defaults for `caller_id`: all types, 50 entries, page 0,
+    /// newest-first, not owner-restricted.
+    pub fn for_caller(caller_id: [u8; 16]) -> Self {
+        ListFilter {
+            file_type: None,
+            limit: 50,
+            offset: 0,
+            sort: ListSort::Newest,
+            owner_only: false,
+            caller_id,
+        }
+    }
 }
 
 /// Decode and coarse-validate a staging request (api.md §8.1/§8.2). Pure: no DB,
@@ -326,10 +406,26 @@ pub fn parse_stage(input: StageInput) -> Result<ParsedStage, StageError> {
     }
     // Recovery wrap must be present (Phase 3 wraps to self + recovery, §12.2); the
     // client also asserts `recovery_present` in the signed manifest — coarse mirror.
+    //
+    // The two halves of "this is the recovery wrap" are checked as a PAIR, not as
+    // an OR. `recipient_type == 2 ⇔ recipient_id == RECOVERY_ID` is the exact
+    // biconditional Postgres has enforced on `file_key_wraps` since the baseline
+    // (migrations/0001_baseline.sql:253) and that `encoding` enforces when it
+    // decodes a `Grant` (encoding/src/structs.rs:203). Accepting either half
+    // alone here let a MemoryStore-backed server take a file whose "recovery
+    // wrap" is addressed to a real user id (nothing the escrow key can open —
+    // the file is silently unrecoverable) or one that claims the sentinel id
+    // under a user type. Half-shapes are rejected outright; a wrap must set both
+    // halves or neither.
+    for w in &input.wraps {
+        if (w.recipient_type == 2) != (w.recipient_id == RECOVERY_ID.0) {
+            return Err(StageError::MismatchedRecoveryWrap);
+        }
+    }
     let has_recovery = input
         .wraps
         .iter()
-        .any(|w| w.recipient_type == 2 || w.recipient_id == RECOVERY_ID.0);
+        .any(|w| w.recipient_type == 2 && w.recipient_id == RECOVERY_ID.0);
     if !has_recovery {
         return Err(StageError::MissingRecoveryWrap);
     }
@@ -662,6 +758,58 @@ mod tests {
         let mut input = v1_input(1 << 20);
         input.wraps = vec![self_wrap()]; // no recovery recipient
         assert_eq!(parse_stage(input), Err(StageError::MissingRecoveryWrap));
+    }
+
+    /// F5.3 — the recovery-wrap check used to be an **OR**
+    /// (`recipient_type == 2 || recipient_id == RECOVERY_ID`), so a file whose
+    /// only "recovery" wrap set just ONE half satisfied it.
+    ///
+    /// Half A: `recipient_type = 2` (recovery) addressed to a REAL user id. The
+    /// escrow key cannot open it — the server has accepted a file with no usable
+    /// recovery wrap at all, and the loss is silent and permanent (a file's wrap
+    /// set is fixed at its version; only the owner could re-upload).
+    #[test]
+    fn recovery_type_with_a_non_sentinel_recipient_is_rejected() {
+        let mut input = v1_input(1 << 20);
+        let mut half = recovery_wrap();
+        half.recipient_id = OWNER; // type says recovery, id says a real user
+        input.wraps = vec![self_wrap(), half];
+        assert_eq!(
+            parse_stage(input),
+            Err(StageError::MismatchedRecoveryWrap),
+            "recipient_type = 2 with a non-RECOVERY_ID recipient is the exact row \
+             Postgres refuses (0001_baseline.sql:253) and the exact Grant the \
+             encoder refuses to decode (structs.rs:203)"
+        );
+    }
+
+    /// Half B: the sentinel `RECOVERY_ID` under `recipient_type = 1` (user).
+    /// Mirror image of half A, and equally refused by the Postgres CHECK.
+    #[test]
+    fn sentinel_recipient_under_a_user_type_is_rejected() {
+        let mut input = v1_input(1 << 20);
+        let mut half = self_wrap();
+        half.recipient_id = RECOVERY_ID.0; // id says recovery, type says user
+        input.wraps = vec![half, recovery_wrap()];
+        assert_eq!(
+            parse_stage(input),
+            Err(StageError::MismatchedRecoveryWrap),
+            "recipient_id = RECOVERY_ID under recipient_type = 1 is the other half \
+             of the biconditional Postgres enforces"
+        );
+    }
+
+    /// The paired shape — both halves set — is still accepted, unchanged. This is
+    /// what every shipped client posts (`client-app/src/commands/upload.rs`
+    /// derives `recipient_id` from `recipient_type == "recovery"`), so it must
+    /// keep parsing forever.
+    #[test]
+    fn the_paired_recovery_wrap_is_still_accepted() {
+        let parsed = parse_stage(v1_input(1 << 20)).expect("the paired shape parses");
+        assert!(parsed
+            .wraps
+            .iter()
+            .any(|w| w.recipient_type == 2 && w.recipient_id == RECOVERY_ID.0));
     }
 
     #[test]

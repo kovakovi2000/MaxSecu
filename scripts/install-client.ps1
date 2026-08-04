@@ -89,8 +89,43 @@ param(
     # (recovery_key.blob / recovery_pin.bin / register.key), and the recovery pin
     # embedded into the client crate. Its own parameter set, so no other args are
     # required. Idempotent -- absent files are simply reported and skipped.
+    # It RESCUES dist\<client>\keystore\ to dist\_keystore-rescue-<stamp>\ first --
+    # that folder holds the Argon2id-sealed private key of whoever signed in from
+    # the admin app, and there is no server-side copy of it (see section 1b).
     [Parameter(Mandatory = $true, ParameterSetName = 'Reset')]
-    [switch] $Reset
+    [switch] $Reset,
+
+    # Put the operator's COLD recovery keyblob where the client actually reads it,
+    # then exit (no build, no ceremony, no network -- so it works on a fresh PC that
+    # has only this checkout, a client folder and the cold blob).
+    #
+    # THE DEFECT THIS CLOSES: the ceremony writes the sealed blob to
+    # <repo-root>\recovery_key.blob (section 4 below), but the client looks for it at
+    # <client-folder>\recovery\recovery_key_blob -- a different folder AND a different
+    # filename (crates\client-app\src\commands\recovery_login.rs:60
+    # `dir.join("recovery").join("recovery_key_blob")`, probed on launch by
+    # crates\client-app\src\commands\startup.rs:31). Without this switch nobody can
+    # reach the recovery sign-in screen without reading the source.
+    #
+    # The bytes are copied VERBATIM (the Argon2id seal is never touched) and the
+    # SHA-256 is re-checked afterwards; the copy is then ACL-locked to this Windows
+    # account. The handout ZIP still never contains it -- that stays deliberate.
+    [Parameter(Mandatory = $true, ParameterSetName = 'StageRecovery')]
+    [string] $StageRecoveryKey,
+
+    # Remove a previously staged recovery keyblob from a client folder (overwrite,
+    # then delete) and exit. Run it the moment the recovery session is over: the
+    # staged file is a full copy of the master key, and key + passphrase together
+    # decrypt everything.
+    [Parameter(Mandatory = $true, ParameterSetName = 'UnstageRecovery')]
+    [switch] $UnstageRecoveryKey,
+
+    # Which client folder to stage into / clean. Default: dist\MaxSecuClient (the
+    # admin working client this script lays out). Point it at an unzipped handout
+    # folder to run the recovery session from that copy instead.
+    [Parameter(ParameterSetName = 'StageRecovery')]
+    [Parameter(ParameterSetName = 'UnstageRecovery')]
+    [string] $ClientDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -108,6 +143,75 @@ function Fail {
     exit 1
 }
 
+# Resolve the client folder the recovery keyblob is staged into / removed from.
+# Defaults to the admin working client this script lays out (dist\MaxSecuClient).
+# Fails closed unless the folder actually holds maxsecu-client-app.exe: the client
+# resolves every portable path relative to the folder the EXE sits in
+# (crates\client-app\src\main.rs:36-39 current_exe().parent()), so a keyblob dropped
+# anywhere else is simply never read -- a silent no-op is the worst outcome here.
+function Resolve-ClientDir {
+    param([string] $Requested, [string] $RepoRoot)
+    $dir = $Requested
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = Join-Path $RepoRoot 'dist\MaxSecuClient' }
+    if (-not (Test-Path $dir)) {
+        Fail "No client folder at '$dir'. Pass -ClientDir <folder> pointing at the folder that holds maxsecu-client-app.exe -- that is dist\MaxSecuClient after a normal install, or the MaxSecuClient folder a handout ZIP unzips to."
+    }
+    $dir = (Resolve-Path $dir).Path
+    if (-not (Test-Path (Join-Path $dir 'maxsecu-client-app.exe'))) {
+        Fail "'$dir' does not contain maxsecu-client-app.exe. The client reads its recovery keyblob from <folder-holding-the-exe>\recovery\recovery_key_blob, so a key placed here would never be found. Point -ClientDir at the folder the exe sits in."
+    }
+    return $dir
+}
+
+# Restrict a FOLDER to this Windows account: drop inherited permissions and grant
+# inheritable FullControl to just you, SYSTEM and Administrators -- by SID, so it
+# behaves the same on a non-English Windows. Returns $true only when icacls reported
+# success. Best-effort by design: a filesystem that cannot carry an ACL (a FAT32 or
+# exFAT USB stick) must never abort a recovery session, so the caller warns instead.
+#
+# FOLDER only, and never with /T: icacls cannot put (OI)(CI) inheritance flags on a
+# FILE, and applying them down a tree leaves the file with an EMPTY DACL -- locking
+# out its own owner. Harden the folder first, then let a freshly-copied file inherit.
+function Set-OwnerOnlyAcl {
+    param([string] $Path)
+    $ok = $false
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $meSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        & icacls $Path /inheritance:r /grant:r "*${meSid}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
+        $ok = ($LASTEXITCODE -eq 0)
+    } catch {
+        $ok = $false
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return $ok
+}
+
+# Undo Set-OwnerOnlyAcl: put the inherited permissions back on the folder and its
+# contents. Used only when the hardened ACL turns out to exclude the running token.
+function Reset-InheritedAcl {
+    param([string] $Path)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & icacls $Path /reset /T /C /Q | Out-Null } catch { } finally { $ErrorActionPreference = $prev }
+}
+
+# Can this process actually open and read the file? A hardened ACL that excludes the
+# running token would otherwise look like a successful stage and only surface later
+# as "No recovery key file on this device" at the sign-in screen.
+function Test-FileReadable {
+    param([string] $Path)
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try { [void]$fs.ReadByte() } finally { $fs.Dispose() }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 # ---------------------------------------------------------------------------
 # 1. Resolve paths (server address/port/fingerprint are parsed after the reset block)
 # ---------------------------------------------------------------------------
@@ -121,11 +225,54 @@ Write-Host "Repo root: $Root"
 if ($Reset) {
     Write-Section 'Resetting the client (removing built app + security files)'
 
+    # SAFETY FIRST: dist\<client>\keystore\ holds the Argon2id-sealed PRIVATE KEY of
+    # whoever signed in from that client. There is no server-side copy and no admin
+    # escape hatch, so deleting dist\ wholesale destroys that account's identity for
+    # good (this has already cost one real account). Rescue every non-empty keystore
+    # to dist\_keystore-rescue-<stamp>\<client>\keystore\ BEFORE clearing dist\, then
+    # delete everything else under dist\. The rescue stays inside the gitignored
+    # dist\ tree at the same ACL, so nothing is newly exposed and nothing can be
+    # committed. Deliberately NOT rescued: a staged recovery\recovery_key_blob (see
+    # -StageRecoveryKey) -- that is a copy of the cold master key and must not
+    # linger; the cold original is the authoritative one.
+    $DistDir = Join-Path $Root 'dist'
+    $RescueRoot = ''
+    if (Test-Path $DistDir) {
+        $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+        foreach ($candidate in @(Get-ChildItem -Path $DistDir -Directory -ErrorAction SilentlyContinue)) {
+            if ($candidate.Name -like '_keystore-rescue-*') { continue }
+            $ks = Join-Path $candidate.FullName 'keystore'
+            if (-not (Test-Path $ks)) { continue }
+            if (@(Get-ChildItem -Path $ks -File -Recurse -Force -ErrorAction SilentlyContinue).Count -eq 0) { continue }
+            if ([string]::IsNullOrEmpty($RescueRoot)) {
+                $RescueRoot = Join-Path $DistDir ('_keystore-rescue-' + $stamp)
+                New-Item -ItemType Directory -Path $RescueRoot -Force | Out-Null
+            }
+            $dest = Join-Path $RescueRoot $candidate.Name
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            Copy-Item -Path $ks -Destination $dest -Recurse -Force
+            Write-Host "  rescued  $ks -> $dest\keystore" -ForegroundColor Green
+        }
+
+        foreach ($child in @(Get-ChildItem -Path $DistDir -Force -ErrorAction SilentlyContinue)) {
+            if ($child.Name -like '_keystore-rescue-*') { continue }
+            Remove-Item -Path $child.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        # No rescue to keep -> remove dist\ entirely, exactly as before.
+        if (@(Get-ChildItem -Path $DistDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+            Remove-Item -Path $DistDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "  removed  $DistDir"
+        } else {
+            Write-Host "  cleared  $DistDir (kept only the keystore rescue)"
+        }
+    } else {
+        Write-Host "  absent   $DistDir" -ForegroundColor DarkGray
+    }
+
     # State this PC accumulated. NOT the git-tracked source, and NOT the build
     # caches (target\, node_modules\) -- those are just caches; a rebuild refreshes
     # them and deleting them only costs you a slow recompile.
     $targets = @(
-        (Join-Path $Root 'dist'),
         (Join-Path $Root 'recovery_key.blob'),
         (Join-Path $Root 'recovery_pin.bin'),
         (Join-Path $Root 'register.key'),
@@ -148,9 +295,20 @@ if ($Reset) {
     Write-Host ''
     Write-Host 'Client state removed. This PC is back to zero.' -ForegroundColor Green
     Write-Host ''
+    if (-not [string]::IsNullOrEmpty($RescueRoot)) {
+        Write-Host 'KEYSTORE RESCUED -- your sealed sign-in key was NOT deleted:' -ForegroundColor Green
+        Write-Host "      $RescueRoot"
+        Write-Host '      That folder is the ONLY copy of that account''s private key. To keep'
+        Write-Host '      signing in as the same user, copy its keystore\ back into the rebuilt'
+        Write-Host '      client folder before you launch the app. Delete the rescue once you'
+        Write-Host '      are sure you no longer need it -- it is still your sealed private key.'
+        Write-Host ''
+    }
     Write-Host 'NOTE: this erased recovery_key.blob, the embedded recovery pin, AND the' -ForegroundColor Yellow
     Write-Host '      offline-D5 directory root (d5_key.blob / d5_recovery.blob) -- the' -ForegroundColor Yellow
     Write-Host '      master keys to the OLD server. Only do this to abandon that server.' -ForegroundColor Yellow
+    Write-Host '      Any recovery keyblob staged into a client folder was removed too;' -ForegroundColor Yellow
+    Write-Host '      your COLD recovery_key.blob (the offline original) is untouched.' -ForegroundColor Yellow
     Write-Host ''
     Write-Host 'If you unzipped/copied the admin app elsewhere (e.g. your Desktop) and'
     Write-Host 'signed in there, delete that copy too -- it keeps its own login data.'
@@ -160,6 +318,160 @@ if ($Reset) {
     Write-Host ''
     Write-Host 'To build again from scratch (re-run install-server first for a fresh token):' -ForegroundColor Cyan
     Write-Host '  .\scripts\install-client.ps1 -ConnectionCode <addr:port#cert-fp> -Token <token>'
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# 1c. Recovery-keyblob staging (-StageRecoveryKey / -UnstageRecoveryKey).
+#
+#     THE DELIVERY GAP THIS CLOSES. The ceremony (section 4) writes the sealed cold
+#     recovery key to <repo-root>\recovery_key.blob, and the operator is told to move
+#     that file to offline storage. But the CLIENT looks for it at
+#         <folder-holding-the-exe>\recovery\recovery_key_blob
+#     (crates\client-app\src\commands\recovery_login.rs:60 -- note the different
+#     FOLDER and the different FILENAME: no dot, "blob" last). That path is what
+#     crates\client-app\src\commands\startup.rs:31 probes to decide the app opens on
+#     the recovery sign-in screen. Nothing in the install path, the handout ZIP or
+#     the docs ever bridged the two, so an operator restoring on a fresh PC could not
+#     reach recovery at all without reading Rust source.
+#
+#     Deliberately NOT done automatically at install time: the blob is the crown
+#     jewel (key + passphrase = plaintext of every file, forever). It belongs in cold
+#     storage, and lands in a live client folder only when the operator explicitly
+#     asks for it, for the length of one session.
+# ---------------------------------------------------------------------------
+if (-not [string]::IsNullOrWhiteSpace($StageRecoveryKey)) {
+    Write-Section 'Staging the cold recovery keyblob into a client folder'
+
+    if (-not (Test-Path $StageRecoveryKey)) {
+        Fail "No file at '$StageRecoveryKey'. Pass the sealed recovery keyblob the ceremony wrote -- it is named recovery_key.blob and you moved it to cold/offline storage (a USB stick, typically)."
+    }
+    $SrcBlob = (Resolve-Path $StageRecoveryKey).Path
+    if ((Get-Item -Path $SrcBlob) -is [System.IO.DirectoryInfo]) {
+        Fail "'$SrcBlob' is a folder. Pass the recovery_key.blob FILE itself."
+    }
+    $SrcBytes = [System.IO.File]::ReadAllBytes($SrcBlob)
+
+    # Fail closed on the wrong file rather than let the operator discover it as the
+    # deliberately opaque "recovery_failed" at the sign-in screen. The recovery key is
+    # a client-core keyblob: magic "MXKB", 157 bytes for a classical identity and 221
+    # for a PQ (ML-KEM) one (crates\client-core\src\keyblob.rs -- MAGIC/BLOB_V1_LEN/
+    # BLOB_V2_LEN). The two easy mistakes are the directory-root blobs, which sit in
+    # the same folder and use a DISTINCT magic "MXD5" (crates\client-core\src\
+    # seedblob.rs), and recovery_pin.bin, which is a bare public-key pin.
+    $Magic = ''
+    if ($SrcBytes.Length -ge 4) { $Magic = [System.Text.Encoding]::ASCII.GetString($SrcBytes, 0, 4) }
+    if ($Magic -eq 'MXD5') {
+        Fail "'$SrcBlob' is a DIRECTORY-ROOT blob (magic MXD5) -- that is d5_key.blob or d5_recovery.blob, not the recovery key. They live beside each other; stage recovery_key.blob instead. Nothing was staged."
+    }
+    if ($Magic -ne 'MXKB') {
+        Fail "'$SrcBlob' is not a MaxSecu recovery keyblob (expected the magic MXKB, found '$Magic'). recovery_pin.bin and directory_pub.der are NOT the recovery key. Nothing was staged."
+    }
+    if ($SrcBytes.Length -ne 157 -and $SrcBytes.Length -ne 221) {
+        Fail "'$SrcBlob' carries the MXKB magic but is $($SrcBytes.Length) bytes (expected 157 or 221) -- it looks truncated or corrupt. Use your cold backup copy. Nothing was staged."
+    }
+
+    $ClientPath   = Resolve-ClientDir -Requested $ClientDir -RepoRoot $Root
+    $RecoveryDir  = Join-Path $ClientPath 'recovery'
+    # EXACTLY the name the client reads -- recovery_key_blob, not recovery_key.blob.
+    $RecoveryDest = Join-Path $RecoveryDir 'recovery_key_blob'
+
+    # Restrict the FOLDER first, then drop a FRESH file into it so the copy inherits
+    # the restricted ACL. Without this the copy inherits whatever dist\ grants, which
+    # on a secondary or shared drive can include Users. (Removing any previous file
+    # first is what makes the inherit happen -- overwriting in place keeps the old
+    # ACL.) This never changes how the blob is sealed; it only narrows who can read
+    # the bytes on this PC.
+    New-Item -ItemType Directory -Path $RecoveryDir -Force | Out-Null
+    $AclOk = Set-OwnerOnlyAcl -Path $RecoveryDir
+    Remove-Item -Path $RecoveryDest -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path $SrcBlob -Destination $RecoveryDest -Force
+
+    # The staged copy must be READABLE by this account. A hardened ACL that excluded
+    # the running token would look like a successful stage and then fail at the
+    # sign-in screen as "no recovery key file on this device", which is exactly the
+    # dead end this whole switch exists to remove. If that happens, undo the
+    # hardening, re-copy, and carry on with a warning -- never leave an unusable file.
+    if (-not (Test-FileReadable -Path $RecoveryDest)) {
+        Reset-InheritedAcl -Path $RecoveryDir
+        $AclOk = $false
+        Remove-Item -Path $RecoveryDest -Force -ErrorAction SilentlyContinue
+        Copy-Item -Path $SrcBlob -Destination $RecoveryDest -Force
+        if (-not (Test-FileReadable -Path $RecoveryDest)) {
+            Remove-Item -Path $RecoveryDest -Force -ErrorAction SilentlyContinue
+            Fail "Staged the keyblob to '$RecoveryDest' but this account cannot read it back, even after restoring the inherited permissions. The unreadable copy was deleted; nothing is staged. Check the folder's permissions, or stage into a client folder you own."
+        }
+    }
+
+    # The seal must cross UNCHANGED: this is a byte copy, nothing re-wraps or re-keys
+    # it, so the same passphrase opens it. Prove that rather than assert it.
+    $SrcHash = (Get-FileHash -Path $SrcBlob -Algorithm SHA256).Hash.ToLowerInvariant()
+    $DstHash = (Get-FileHash -Path $RecoveryDest -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($SrcHash -ne $DstHash) {
+        Remove-Item -Path $RecoveryDest -Force -ErrorAction SilentlyContinue
+        Fail "The staged copy does not match the source (sha256 $DstHash != $SrcHash). The bad copy was deleted; nothing is staged."
+    }
+
+    Write-Host ''
+    Write-Host "Staged: $RecoveryDest" -ForegroundColor Green
+    Write-Host "  sha256 $($SrcHash.Substring(0,12))... matches the source -- the Argon2id seal is byte-identical,"
+    Write-Host '  so the SAME recovery passphrase opens it. Nothing was re-wrapped or re-keyed.'
+    if ($AclOk) {
+        Write-Host '  Access restricted to your Windows account (inherited permissions removed).'
+    } else {
+        Write-Host '  WARNING: could not restrict the file permissions -- the copy inherits the' -ForegroundColor Yellow
+        Write-Host '           folder ACL. Do not leave it on a shared drive, and unstage as soon' -ForegroundColor Yellow
+        Write-Host '           as the session is over.' -ForegroundColor Yellow
+    }
+    Write-Host ''
+    Write-Host 'NEXT:' -ForegroundColor Cyan
+    Write-Host ('  1. Run  ' + (Join-Path $ClientPath 'maxsecu-client-app.exe'))
+    Write-Host '     It now opens on the RECOVERY sign-in screen (a recovery keyblob outranks'
+    Write-Host '     a registration key on startup).'
+    Write-Host '  2. On a PC that has never registered there is no saved server yet: open'
+    Write-Host '     "Server -- set or change" on that screen and paste your connection code'
+    Write-Host '     (addr:port#fingerprint) first, then enter the recovery passphrase.'
+    Write-Host '  3. When you are finished, remove the staged copy:'
+    Write-Host ('        .\scripts\install-client.ps1 -UnstageRecoveryKey -ClientDir "' + $ClientPath + '"')
+    Write-Host ''
+    Write-Host 'This staged file is a FULL copy of your master key. Whoever holds it AND the' -ForegroundColor Yellow
+    Write-Host 'passphrase can read every file of every user. Your cold original is untouched --' -ForegroundColor Yellow
+    Write-Host 'keep it offline, and never put this copy in anything you hand out.' -ForegroundColor Yellow
+    exit 0
+}
+
+if ($UnstageRecoveryKey) {
+    Write-Section 'Removing a staged recovery keyblob from a client folder'
+
+    $ClientPath   = Resolve-ClientDir -Requested $ClientDir -RepoRoot $Root
+    $RecoveryDir  = Join-Path $ClientPath 'recovery'
+    $RecoveryDest = Join-Path $RecoveryDir 'recovery_key_blob'
+
+    if (-not (Test-Path $RecoveryDest)) {
+        Write-Host "No staged recovery keyblob at $RecoveryDest -- nothing to remove."
+    } else {
+        # Overwrite before unlinking so the sealed bytes are not left sitting in the
+        # freed extent. BEST EFFORT ONLY: on an SSD (wear levelling) or a
+        # copy-on-write/journalling filesystem the old extent can survive. The real
+        # protection is, as always, the Argon2id seal plus your passphrase.
+        try {
+            $Len = (Get-Item -Path $RecoveryDest).Length
+            $Buf = New-Object byte[] $Len
+            $Rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            try { $Rng.GetBytes($Buf) } finally { $Rng.Dispose() }
+            [System.IO.File]::WriteAllBytes($RecoveryDest, $Buf)
+        } catch {
+            Write-Host 'Could not overwrite the staged copy first; deleting it anyway.' -ForegroundColor Yellow
+        }
+        Remove-Item -Path $RecoveryDest -Force
+        Write-Host "Removed: $RecoveryDest" -ForegroundColor Green
+    }
+
+    if ((Test-Path $RecoveryDir) -and (@(Get-ChildItem -Path $RecoveryDir -Force -ErrorAction SilentlyContinue).Count -eq 0)) {
+        Remove-Item -Path $RecoveryDir -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host 'That client opens on its normal sign-in screen again.'
+    Write-Host 'Your COLD recovery_key.blob was never touched -- it stays your only master key.'
     exit 0
 }
 
@@ -684,6 +996,22 @@ $StartHere = Join-Path $ShareClient 'START-HERE.txt'
 $StartHereText = ($StartHereLines -join "`r`n") + "`r`n"
 [System.IO.File]::WriteAllText($StartHere, $StartHereText, (New-Object System.Text.UTF8Encoding($false)))
 
+# FAIL CLOSED before zipping: the handout must never carry a secret. The copies
+# above are explicit (exe + ui\ + the two pins), so this should never fire -- it is
+# a standing assertion, added because dist\MaxSecuClient can now legitimately hold a
+# staged recovery\recovery_key_blob (-StageRecoveryKey). If a future edit ever stages
+# a client FOLDER wholesale instead of naming files, this stops the crown jewel, the
+# directory root, a keystore or a registration key reaching every user.
+$Leaks = @(Get-ChildItem -Path $ShareClient -Recurse -Force -File -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -eq 'recovery_key_blob' -or $_.Name -eq 'local_key_blob' -or
+        $_.Name -eq 'register.key' -or $_.Name -eq 'recovery_pin.bin' -or
+        $_.Extension -eq '.blob'
+    })
+if ($Leaks.Count -gt 0) {
+    Fail ("Refusing to build the handout ZIP -- secret-shaped files are in the staged tree:`n  " + (($Leaks | ForEach-Object { $_.FullName }) -join "`n  "))
+}
+
 # Zip only the clean staged MaxSecuClient folder.
 $ShareZip = Join-Path $DistDir 'MaxSecuClient-share.zip'
 if (Test-Path $ShareZip) {
@@ -731,6 +1059,17 @@ Write-Host "        $RecoveryBlob"
 Write-Host "        $(Join-Path $Root 'd5_recovery.blob')   (the directory root backup)"
 Write-Host '    Remember the recovery passphrase you just typed. Together they are the'
 Write-Host '    ONLY way to recover the account AND the directory root -- there is no backup.'
+Write-Host ''
+Write-Host '  * TO USE IT LATER (breakglass sign-in, on this PC or a fresh one): the client'
+Write-Host '    reads the recovery key from <client folder>\recovery\recovery_key_blob, which'
+Write-Host '    is a DIFFERENT folder and a DIFFERENT filename from the recovery_key.blob'
+Write-Host '    above. Do not copy it by hand -- run:'
+Write-Host '        .\scripts\install-client.ps1 -StageRecoveryKey <path-to-recovery_key.blob>'
+Write-Host '    (add -ClientDir <folder> to stage into an unzipped handout copy instead of'
+Write-Host '    dist\MaxSecuClient). The app then opens on the recovery sign-in screen. When'
+Write-Host '    the session is done, remove the copy again:'
+Write-Host '        .\scripts\install-client.ps1 -UnstageRecoveryKey'
+Write-Host '    The handout ZIP never contains the recovery key -- that is deliberate.'
 Write-Host ''
 Write-Host 'BECOME THE ADMIN:' -ForegroundColor Cyan
 Write-Host "  * Run the admin client and enroll (the FIRST person to enroll becomes admin):"

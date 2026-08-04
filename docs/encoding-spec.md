@@ -113,6 +113,14 @@ Not used in v1: write is owner-only, so there are no write-grants. Type id `0x00
 ### `fingerprint_input` — `0x000C` (§7.1)
 `enc_pub:X25519Pub` · `sig_pub:Ed25519Pub`  → `fingerprint = SHA-256(canonical(fingerprint_input))`
 
+### `bundle_body` — `0x000E`
+`members:u16 count` ‖ `count` × (`file_id:Id` · `file_type:FileType`)
+*(The encrypted, author-signed **content** stream of a bundle file: an ordered list of member files, each a fixed 17-byte inline pair with no `type_id` of its own. Order is authoritative and preserved verbatim — unlike a manifest's `set`-style `streams`, the codec neither sorts nor de-duplicates. The count is a `u16` so a bundle may carry more than 255 members. Minimum-member and other policy checks belong to higher layers, not this codec.)*
+
+### `backup_index` — `0x000F`
+`git_sha:text` · `entries:u32 count` ‖ `count` × (`path:text` · `len:u64` · `digest:Hash`) · `parts:u32 count` ‖ `count` × (`len:u64` · `digest:Hash`) · `created_at:Timestamp`
+*(The authenticated table of contents of one sealed `MXBU` server-backup bundle — the plaintext `manifest.json` beside the bundle is only an untrusted hint, and restore aborts when the two disagree. It carries **metadata and digests only, never a part's payload**: `decode` runs the §7.5 re-encode guard, which allocates a second copy of its input, so an embedded payload would cost ~3N and destroy the format's O(part size) RAM budget. An entry's offset is the running sum of the preceding `len`s, and a part's index is its position — neither is stored, so neither can disagree with the thing that defines it. Both counts are `u32`, not `bundle_body`'s `u16`: `part_index` is a `u32` in the AEAD's part AAD, and a `u16` would cap a bundle at 65 535 parts. Order is authoritative for both lists.)*
+
 > **Anchored control-log (§7.6).** `revocation`, `reinstatement`, and `key_compromise` form **one** append-only hash chain: each record's `prev_head = SHA-256(canonical(previous record))`, first record uses `GENESIS_HEAD`. The current head is what the external sink anchors and clients verify against (`docs/sink-interface.md`).
 
 ---
@@ -127,9 +135,12 @@ Not used in v1: write is owner-only, so there are no write-grants. Type id `0x00
 | `0x0004` | *reserved* (write_grant, removed D29) | `0x000B` | chunk_aad |
 | `0x0005` | genesis | `0x000C` | fingerprint_input |
 | `0x0006` | revocation | `0x000D` | Stream (manifest sub-struct) |
-| `0x0007` | reinstatement | | |
+| `0x0007` | reinstatement | `0x000E` | bundle_body |
+| | | `0x000F` | backup_index |
 
 Unknown id → reject. The id makes a value of one type structurally unusable as another (defeats cross-type signature transplant *before* the domain label is even considered).
+
+> **This table is the allocator — keep it current.** It went one release stale once (`bundle_body` took `0x000E` in code without ever landing here), and the next implementer to read this section for "the next free id" would have picked `0x000E` and collided with the body of every bundle post already on the server. `is_registered()` is a hand-written `matches!`, not an exhaustive match, so nothing in the compiler catches that. The authority is `crates/encoding/src/structs.rs`; this table must agree with it, and `crates/compat/tests/value_locks.rs` freezes both.
 
 ---
 
@@ -189,7 +200,7 @@ Every vector below MUST be **rejected** (or, for the positive cases, produce the
 
 ## 9. Phase-0 exit criteria (mirrors `DESIGN.md` §17)
 
-- [ ] Encoder + strict decoder implemented in the Rust core for all twelve structures (§4).
+- [ ] Encoder + strict decoder implemented in the Rust core for all fourteen structures (§4).
 - [ ] Property tests pass: `decode∘encode` identity; `encode∘decode` identity on all accepted inputs (the canonical guard, §7.5).
 - [ ] **All V-1 … V-13 adversarial vectors reject; both positive vectors match byte-for-byte.**
 - [ ] Domain-separated, length-framed `signing_input` (§6) wired into every Ed25519 sign/verify call; HPKE `info` and AEAD `AAD` wired to `canonical(wrap_context)` / `canonical(chunk_aad)`.

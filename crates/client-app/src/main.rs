@@ -141,7 +141,9 @@ fn main() {
         .manage(seal.clone())
         .manage(media_cache)
         .manage(thumb_cache)
-        .manage(maxsecu_client_app::disk_free::DiskFreeEstimate(disk_free_est))
+        .manage(maxsecu_client_app::disk_free::DiskFreeEstimate(
+            disk_free_est,
+        ))
         .manage(maxsecu_client_app::directory::DirectoryCache::new())
         .manage(maxsecu_client_app::commands::pool::AppPool::new(pool_cap))
         .setup(move |app| {
@@ -211,6 +213,10 @@ fn main() {
             maxsecu_client_app::commands::renew::renew_delegation,
             maxsecu_client_app::commands::recovery_login::request_recovery_challenge,
             maxsecu_client_app::commands::recovery_login::answer_recovery_challenge,
+            maxsecu_client_app::commands::recovery_login::end_recovery_session,
+            maxsecu_client_app::commands::bootstrap::set_server_from_code,
+            maxsecu_client_app::commands::bootstrap::pinned_fingerprint,
+            maxsecu_client_app::commands::bootstrap::pinned_server_hints,
             maxsecu_client_app::commands::upload::stage_upload,
             maxsecu_client_app::commands::upload::stage_bundle,
             maxsecu_client_app::commands::upload::confirm_upload,

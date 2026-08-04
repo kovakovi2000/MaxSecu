@@ -17,14 +17,15 @@ use std::path::PathBuf;
 use maxsecu_compat::{read, read_str, CHECKLIST};
 use maxsecu_crypto::{derive_key, deserialize_hybrid_wrap, hkdf_sha256_32, Argon2Params, Dek};
 use maxsecu_encoding::structs::{
-    AuthProofContext, BundleBody, ChunkAad, DirBinding, FingerprintInput, Genesis, Grant,
-    KeyCompromise, Manifest, Reinstatement, Revocation, Stream, WrapContext, MLKEM768_PUB_LEN,
+    AuthProofContext, BackupIndex, BundleBody, ChunkAad, DirBinding, FingerprintInput, Genesis,
+    Grant, KeyCompromise, Manifest, Reinstatement, Revocation, Stream, WrapContext,
+    MLKEM768_PUB_LEN,
 };
 use maxsecu_encoding::types::{Compression, FileType, RecipientType, Role, StreamType};
 use maxsecu_encoding::{decode, labels, Canonical, DecodeError, SUITE_V1, SUITE_V2};
 
 // ===========================================================================
-// (B1) The 13 canonical type_ids — the struct registry (encoding-spec §5)
+// (B1) The 14 canonical type_ids — the struct registry (encoding-spec §5)
 // ===========================================================================
 
 /// Every registered `type_id`. A `type_id` is the first two bytes of EVERY
@@ -76,6 +77,11 @@ fn compat_type_ids_are_frozen() {
     lock!(FingerprintInput, 0x000C, "identity fingerprint input");
     lock!(Stream, 0x000D, "manifest stream entry");
     lock!(BundleBody, 0x000E, "bundle body (every bundle post)");
+    lock!(
+        BackupIndex,
+        0x000F,
+        "backup index (the sealed server-backup bundle's authenticated table of contents)"
+    );
 }
 
 /// `0x0004` was `write_grant`, removed by D29. It must stay **unregistered** and
@@ -569,8 +575,10 @@ fn compat_blob_ref_scheme_is_frozen() {
 // ===========================================================================
 
 /// `crates/encoding/tests/fixtures/canonical_vectors.tsv` is the repo's ONE
-/// pre-existing frozen wire fixture (12 of the 13 registered structs; the 13th,
-/// `BundleBody`, is frozen in `compat/fixtures/encoding/bundle_body.bin`).
+/// pre-existing frozen wire fixture (12 of the 14 registered structs; the other
+/// two are frozen here — `BundleBody` (`0x000E`) in
+/// `compat/fixtures/encoding/bundle_body.bin` and `BackupIndex` (`0x000F`) in
+/// `compat/fixtures/backup/backup_index_v1.bin`).
 ///
 /// The encoding crate's own test asserts today's `encode()` still *produces*
 /// those bytes. This asserts the other, load-bearing direction: today's strict
@@ -633,4 +641,204 @@ fn compat_canonical_vectors_tsv_still_decodes() {
         seen >= 14,
         "the canonical vector file lost entries (saw {seen})"
     );
+}
+
+// ===========================================================================
+// (B10) MXBU backup bundle (surface #12) — never opens as MXD5 or MXKB
+// ===========================================================================
+
+/// `MXBU` (the sealed server-backup bundle) shares its 45-byte self-describing
+/// header shape and its Argon2id KDF with `MXD5` (seedblob) and `MXKB` (keyblob);
+/// only the 4 magic bytes — bound into every part's AEAD AAD — keep the three
+/// apart. A crossover would hand one family's reader another family's key material.
+///
+/// **Differential probe, NOT variant-assertion.** The naive check ("assert the
+/// error is `CorruptPart`") is HALF-VACUOUS: `MxbuOpener::from_part`'s length gate
+/// and its magic gate BOTH return `CorruptPart`, and `unseal_seed`'s exact-93
+/// length gate fires *before* it ever reads the magic (`seedblob.rs:75-80`), so a
+/// wrong-magic blob can be rejected with the magic having never mattered. Instead:
+/// take one buffer whose length CLEARS the reader's minimum, swap ONLY the 4 magic
+/// bytes, and assert the error **moves** — which proves the magic did the
+/// rejecting, not the length.
+#[test]
+fn compat_mxbu_mxd5_mxkb_are_mutually_unopenable() {
+    use maxsecu_client_core::{keyblob, unseal_seed, ClientError};
+    use maxsecu_server::backup::format::{MxbuError, MxbuOpener};
+
+    // `MxbuOpener::from_part` never gates the passphrase on open, so any string does.
+    const PW: &str = "differential-probe-passphrase";
+
+    // ---- MXBU reader direction ------------------------------------------------
+    // A 93-byte buffer: 93 >= MXBU's 61-byte minimum (45 header + 16 tag), so the
+    // length gate is CLEARED and whatever rejects each probe below is provably the
+    // magic (or the header it then exposes), never the length.
+    let mut buf = vec![0u8; 93];
+
+    // Probe A — shaped like MXD5 (version 1, (m,t,p) all zero). With the MXD5 magic
+    // it is `CorruptPart` (wrong magic); swap to MXBU and the SAME bytes clear the
+    // magic gate and die at the header's zeroed Argon params -> `BelowArgonFloor`.
+    buf[4] = 1;
+    buf[0..4].copy_from_slice(b"MXD5");
+    let mxd5_magic = MxbuOpener::from_part(PW, &buf).map(|_| ());
+    buf[0..4].copy_from_slice(b"MXBU");
+    let mxbu_magic = MxbuOpener::from_part(PW, &buf).map(|_| ());
+    assert_eq!(mxd5_magic, Err(MxbuError::CorruptPart));
+    assert_eq!(mxbu_magic, Err(MxbuError::BelowArgonFloor));
+    assert_ne!(
+        mxd5_magic, mxbu_magic,
+        "\n\nMXBU/MXD5 domain separation is only length-deep: swapping ONLY the magic did \
+         not move the MXBU reader's error, so the magic is not what rejects an MXD5 blob fed \
+         to it — a seedblob could then cross into the backup reader. {CHECKLIST}\n"
+    );
+
+    // Probe B — shaped like MXKB v2 (version byte 2). MXKB magic -> `CorruptPart`;
+    // swap to MXBU and the SAME bytes clear the magic gate and die at the version ->
+    // `UnsupportedVersion(2)`. Either way the error moves off `CorruptPart`.
+    buf[4] = 2;
+    buf[0..4].copy_from_slice(b"MXKB");
+    let mxkb_magic = MxbuOpener::from_part(PW, &buf).map(|_| ());
+    buf[0..4].copy_from_slice(b"MXBU");
+    let mxbu_magic2 = MxbuOpener::from_part(PW, &buf).map(|_| ());
+    assert_eq!(mxkb_magic, Err(MxbuError::CorruptPart));
+    assert_eq!(mxbu_magic2, Err(MxbuError::UnsupportedVersion(2)));
+    assert_ne!(
+        mxkb_magic, mxbu_magic2,
+        "\n\nMXBU/MXKB domain separation is only length-deep: swapping ONLY the magic did \
+         not move the MXBU reader's error. {CHECKLIST}\n"
+    );
+
+    // ---- reverse: an MXBU blob must never open as MXD5 (unseal_seed) -----------
+    // 93 is EXACTLY unseal_seed's required length, so its length gate passes and the
+    // rejection below is the MAGIC gate. Differential: the SAME 93 bytes with the
+    // correct MXD5 magic clear the magic gate and are rejected LATER (below-floor
+    // params) — so 93 truly cleared the length gate, and the magic is the separator.
+    let mut sb = vec![0u8; 93];
+    sb[4] = 1;
+    sb[0..4].copy_from_slice(b"MXBU");
+    let mxbu_as_seed = unseal_seed(PW, &sb);
+    sb[0..4].copy_from_slice(b"MXD5");
+    let mxd5_as_seed = unseal_seed(PW, &sb);
+    assert!(
+        matches!(mxbu_as_seed, Err(ClientError::CorruptBlob)),
+        "\n\nDOMAIN SEPARATION BROKEN: an MXBU backup part was accepted (or mis-rejected) as \
+         an MXD5 seedblob. Only the magic separates them at equal length. {CHECKLIST}\n"
+    );
+    assert!(
+        !matches!(mxd5_as_seed, Err(ClientError::CorruptBlob)),
+        "\n\nunseal_seed rejected the MXD5-magic probe with the SAME `CorruptBlob` its exact-93 \
+         LENGTH gate returns, so the reverse probe proves nothing about the magic (the \
+         half-vacuous trap). It must clear the magic gate and fail later (below floor). \
+         {CHECKLIST}\n"
+    );
+    assert!(matches!(mxd5_as_seed, Err(ClientError::BelowArgonFloor)));
+
+    // ---- reverse: an MXBU blob must never open as MXKB (keyblob::unlock) -------
+    // `keyblob::unlock` checks magic BEFORE the per-version exact length, so give it
+    // a valid v1 length (157) and the differential lands cleanly: MXBU magic ->
+    // `CorruptBlob` (magic gate); the SAME bytes with MXKB magic clear it and die at
+    // the zeroed Argon params -> `BelowArgonFloor`.
+    let mut kb = vec![0u8; 157]; // keyblob BLOB_V1_LEN
+    kb[4] = 1;
+    kb[0..4].copy_from_slice(b"MXBU");
+    let mxbu_as_keyblob = keyblob::unlock(PW, &kb);
+    kb[0..4].copy_from_slice(b"MXKB");
+    let mxkb_as_keyblob = keyblob::unlock(PW, &kb);
+    assert!(
+        matches!(mxbu_as_keyblob, Err(ClientError::CorruptBlob)),
+        "\n\nDOMAIN SEPARATION BROKEN: an MXBU backup part was accepted (or mis-rejected) as \
+         an MXKB keyblob. {CHECKLIST}\n"
+    );
+    assert!(
+        !matches!(mxkb_as_keyblob, Err(ClientError::CorruptBlob)),
+        "\n\nkeyblob::unlock rejected the MXKB-magic probe with the same `CorruptBlob` it gives \
+         a wrong magic, so the probe does not isolate the magic. {CHECKLIST}\n"
+    );
+    assert!(matches!(mxkb_as_keyblob, Err(ClientError::BelowArgonFloor)));
+}
+
+// ===========================================================================
+// (B11) `_backup/<stamp>/…` can never collide with a user's blob_ref
+// ===========================================================================
+
+/// The sealed backup bundle rides the cold tier under `_backup/<stamp>/…`, right
+/// alongside users' blobs (`{root}/{blob_ref}/{index}`). A collision would let a
+/// crafted `file_id` clobber a bundle, or a bundle path shadow a real chunk. It
+/// cannot happen — and the reason is the BUILDER's output shape, not any path
+/// guard: `files::blob_ref` (`files.rs:414`) is the SOLE production builder and
+/// emits `hex(file_id)/version/stream_type`, whose first segment is ALWAYS 32
+/// lowercase hex chars (`[u8; 16]` -> 32 hex). Nothing re-validates the prefix on
+/// read (`stream_dir` / `guard_blob_ref` only reject non-`Normal` path
+/// components), so asserting on a guard would pin the wrong thing. This drives the
+/// real `parse_stage` over a frozen manifest — exactly where a scheme change shows.
+#[test]
+fn compat_backup_prefix_cannot_collide_with_a_blob_ref() {
+    let exp: serde_json::Value =
+        serde_json::from_slice(&read("blobref", "blobref_manifest.expect.json")).expect("json");
+    let manifest_bytes = read("blobref", "blobref_manifest.bin");
+
+    let mut file_id = [0u8; 16];
+    file_id.copy_from_slice(&hex::decode(exp["file_id"].as_str().unwrap()).unwrap());
+    let mut caller_id = [0u8; 16];
+    caller_id.copy_from_slice(&hex::decode(exp["caller_id"].as_str().unwrap()).unwrap());
+    let version = exp["version"].as_u64().unwrap();
+
+    let parsed = maxsecu_server::parse_stage(maxsecu_server::StageInput {
+        file_id,
+        caller_id,
+        file_type_advisory: 1,
+        genesis: None, // a rotation (vN) — no genesis, a pure decode
+        manifest_bytes,
+        manifest_sig: [0u8; 64],
+        wraps: vec![maxsecu_server::WrapInput {
+            recipient_id: [0u8; 16],
+            recipient_type: 2, // the recovery wrap parse_stage requires
+            wrapped_dek: vec![0u8; 80],
+            wrap_alg: 1,
+            granted_by: caller_id,
+            grant_bytes: Vec::new(),
+            grant_sig: [0u8; 64],
+        }],
+        stream_totals: Vec::new(),
+        proposed_version: version,
+        listed: true,
+        bundle_id: None,
+    })
+    .expect("a manifest a real server already staged must still parse");
+
+    assert!(
+        !parsed.streams.is_empty(),
+        "the frozen manifest has streams"
+    );
+    for s in &parsed.streams {
+        let first = s
+            .blob_ref
+            .split('/')
+            .next()
+            .expect("a blob_ref has segments");
+        assert_eq!(
+            first.len(),
+            32,
+            "\n\nA blob_ref's first segment is no longer 32 hex chars (got {first:?}). The \
+             backup prefix `_backup` is 7 chars, so today it can NEVER be mistaken for a \
+             blob_ref; a builder that emits a shorter or variable first segment breaks that, \
+             and a crafted file_id could collide with — and clobber — a sealed backup bundle \
+             sitting on the cold tier. {CHECKLIST}\n"
+        );
+        assert!(
+            first
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "a blob_ref's first segment is not lowercase hex: {first:?}. {CHECKLIST}"
+        );
+        assert!(
+            !s.blob_ref.starts_with("_backup"),
+            "a real blob_ref begins with `_backup` — it collides with the backup prefix. \
+             {CHECKLIST}"
+        );
+    }
+
+    // Stated plainly: the reserved backup prefix is not a 32-hex-char segment, so
+    // the builder's output and `_backup/<stamp>/…` occupy disjoint namespaces.
+    assert_ne!("_backup".len(), 32);
+    assert!(!"_backup".bytes().all(|b| b.is_ascii_hexdigit()));
 }

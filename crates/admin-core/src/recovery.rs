@@ -5,8 +5,15 @@
 //! `recovery_priv`, checks it against the manifest `dek_commit`, then re-wraps it
 //! to the new recipient's directory-verified `enc_pub` and signs a **recovery-
 //! operator grant** with the admin's *own* `sig` key (`granted_by = admin_id`).
-//! Only the resulting ciphertext + grant cross the air gap; `recovery_priv` never
-//! touches a networked machine. The grant is honored for **this** version on
+//! Only the resulting ciphertext + grant cross the air gap; **within this
+//! ceremony** `recovery_priv` never touches a networked machine — that is the
+//! property the air gap buys, and this module is the offline half that preserves
+//! it. It is **not** a claim about the recovery key in general: since 2026-08-01
+//! the same cold keyblob may also be unsealed by the shipped client to open an
+//! online recovery session that browses, downloads and shares every file over the
+//! network (`server/http.rs::RecoveryOkSession`, spec §0 D6 / DESIGN §6.3). Air-
+//! gapped custody is the recommended model, not the only one. The grant this
+//! module issues is honored for **this** version on
 //! download but is **not** carry-forward-eligible (R24, §12.3a/§12.9) — that
 //! exclusion lives in the rotation carry-forward selection, not here.
 

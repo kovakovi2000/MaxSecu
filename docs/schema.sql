@@ -89,6 +89,31 @@ CREATE TABLE auth_nonces (                       -- single-use login challenges 
   expires_at   TIMESTAMPTZ NOT NULL,
   used_at      TIMESTAMPTZ                        -- set on first successful proof; reuse rejected
 );
+-- The login hot path looks this table up by USERNAME, not by its `nonce` PK:
+-- `outstanding_nonces` runs WHERE username = $1 AND used_at IS NULL AND expires_at > $2
+-- on every POST /v1/session/proof.
+--
+-- `USING hash`, NOT btree, and that is load-bearing: `username` is unbounded TEXT
+-- and `pg::nonce_key_col` hex-encodes it (2x), while a btree index entry is capped
+-- at 2704 bytes. Rows written before the HTTP bound existed can exceed that, and an
+-- abandoned challenge keeps `used_at` NULL forever, so such a row falls INSIDE this
+-- partial index — a btree here failed to build on a real database ("index row
+-- requires 128016 bytes, maximum size is 8191"), which would abort the upgrade AND
+-- any restore of a bundle carrying such a row. A hash index stores a 32-bit hash,
+-- so it has no entry-size ceiling; it supports exactly the `=` this query does, and
+-- the AM sets `xs_recheck`, so a hash collision is re-checked against the heap and
+-- never returns a wrong row. WAL-logged and crash-safe since PG 10 (prod = PG 14).
+-- See migrations/0003_auth_nonce_lookup.sql for the full reproduction.
+--
+-- PARTIAL on `used_at IS NULL`: the predicate appears verbatim in the query, and it
+-- keeps the index to the UNCONSUMED challenges. It is NOT self-bounding, though —
+-- an abandoned challenge stays open forever (a challenge is issued even for an
+-- unknown name, no oracle, §9.3). What actually keeps both this index and the heap
+-- small is the background prune (`Store::prune_expired_auth_rows`, driven hourly by
+-- portable-server's `spawn_auth_prune`), which deletes `sessions` / `auth_nonces`
+-- rows more than 7 days past `expires_at`. That prune is the ONLY delete either
+-- table has: consumption is an UPDATE, and no request path ever deletes.
+CREATE INDEX auth_nonces_open_idx ON auth_nonces USING hash (username) WHERE used_at IS NULL;  -- outstanding_nonces: WHERE username = $1 AND used_at IS NULL
 
 CREATE TABLE sessions (                           -- channel-bound tokens (§9.2 / api.md §1.5)
   token_hash    BYTEA PRIMARY KEY CHECK (octet_length(token_hash) = 32),  -- store only a hash of the token
@@ -238,6 +263,57 @@ CREATE TABLE file_key_wraps (
   CHECK ( (recipient_type = 2) = (recipient_id = decode('00000000000000000000000000000000','hex')) )  -- recovery <=> RECOVERY_ID (encoding-spec V-11)
 );
 CREATE INDEX wraps_recipient_idx ON file_key_wraps(recipient_id);        -- "files I can read" + sharing-graph projection
+
+-- ============================================================================
+-- 11.2a / 11.3a  the two absences that MEAN something (restore-merge gates)
+-- ============================================================================
+-- Everywhere else here a row IS the fact. In the file family the opposite is also
+-- true: a delete is a HARD delete (delete_file physically removes files/genesis/
+-- versions under the `maxsecu.allow_owner_delete` carve-out, cascading to streams
+-- + wraps, and purges the blobs from both tiers), and a revocation is the ABSENCE
+-- of a file_key_wraps row. Both leave nothing behind but a missing row.
+--
+-- That is fine while the database only moves forward. It stops being fine the
+-- moment a backup can be restored into it: a merge re-inserts whatever the bundle
+-- still holds, resurrecting a file its owner destroyed (a zombie feed entry over
+-- ciphertext that no longer exists anywhere) and handing a de-authorized
+-- recipient their wrapped DEK back. These tables are what the merge reads to tell
+-- "missing because it was lost" from "missing because a user removed it".
+--
+-- No FK to `files` on either: the parent row is gone by design.
+--
+-- Both carry the SHARED maxsecu_forbid_update_delete guard rather than a
+-- dedicated one. That is load-bearing — the shared guard raises unconditionally
+-- and never reads `maxsecu.allow_owner_delete`, so a tombstone stays immutable
+-- even inside delete_file's own GUC-enabled transaction, the one place the rest
+-- of the file family is deletable. BEFORE UPDATE OR DELETE only; INSERT is
+-- unaffected.
+
+CREATE TABLE file_tombstones (                   -- the owner destroyed this file; delete is forever
+  file_id     BYTEA PRIMARY KEY CHECK (octet_length(file_id) = 16),  -- the deleted file; no FK — its `files` row is gone
+  deleted_at  TIMESTAMPTZ NOT NULL DEFAULT now()                     -- advisory (§7.5); the row's existence is the fact, not its time
+);
+-- Append-only: a delete cannot be un-recorded. See the shared-guard note above —
+-- this holds even under `maxsecu.allow_owner_delete`.
+CREATE TRIGGER file_tombstones_immutable BEFORE UPDATE OR DELETE ON file_tombstones
+  FOR EACH ROW EXECUTE FUNCTION maxsecu_forbid_update_delete();
+
+-- Written ONLY by the recipient-scoped soft-revoke (`delete_wrap`), never by
+-- `finalize_version`: finalize drops the PRIOR version's wraps, but that is
+-- version supersession, not revocation — it is recipient-blind and every
+-- recipient keeps access through the new version's own wrap. Recording it there
+-- would make every rotation look like a revocation and permanently block the
+-- merge of wraps nobody ever revoked.
+CREATE TABLE wrap_revocations (                  -- this recipient's read access was taken away
+  file_id       BYTEA NOT NULL CHECK (octet_length(file_id) = 16),
+  file_version  BIGINT NOT NULL,
+  recipient_id  BYTEA NOT NULL CHECK (octet_length(recipient_id) = 16),  -- a user_id, or RECOVERY_ID (00..00)
+  revoked_at    TIMESTAMPTZ NOT NULL DEFAULT now(),                      -- advisory (§7.5)
+  PRIMARY KEY (file_id, file_version, recipient_id)                      -- mirrors file_key_wraps' PK
+);
+-- Append-only: a revocation cannot be un-recorded.
+CREATE TRIGGER wrap_revocations_immutable BEFORE UPDATE OR DELETE ON wrap_revocations
+  FOR EACH ROW EXECUTE FUNCTION maxsecu_forbid_update_delete();
 
 -- ============================================================================
 -- 11.5 / 11.5a / 11.7(D28)  control_log — ONE append-only hash chain

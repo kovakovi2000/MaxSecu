@@ -22,6 +22,22 @@ pub async fn search_local(
         .identity
         .as_ref()
         .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-    let idx = index::load(&dir.0, identity)?;
+    // Namespaced per principal so a recovery session never reads (and fails closed
+    // on) a user's index, and vice versa — but a MISSING principal is not an error
+    // here. This is a purely local read of `<dir>/index/search.idx`; it only ever
+    // needed an unlocked identity, and "unlocked but not connected" is a normal,
+    // reachable state (`unlock_keystore` sets `identity` on its own; `principal` is
+    // not set until `connect`). Requiring one would be a new failure mode for an
+    // ordinary offline user.
+    //
+    // Defaulting that state to the USER namespace is exact, not a guess: a recovery
+    // identity is only ever installed TOGETHER with `Principal::Recovery`, under one
+    // lock (`answer_recovery_challenge`), so an identity without a principal is
+    // always a keystore identity — and the user file is the one this command has
+    // always read.
+    let idx = match guard.principal.as_ref() {
+        Some(principal) => index::load_for(&dir.0, identity, principal)?,
+        None => index::load(&dir.0, identity)?,
+    };
     Ok(idx.search(&req.query))
 }

@@ -6,7 +6,7 @@
 use crate::delegation::DelegationCtx;
 use crate::error::{AuthError, ChallengeError, ProveError, StoreError};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
-use crate::store::{SessionRecord, Store};
+use crate::store::{PruneCounts, SessionRecord, Store};
 use maxsecu_crypto::{random_array, sha256, SigningKey, VerifyingKey};
 use maxsecu_encoding::labels;
 use maxsecu_encoding::structs::AuthProofContext;
@@ -330,7 +330,38 @@ impl<S: Store> AuthService<S> {
     pub async fn logout(&self, token: &[u8; 32]) -> Result<(), StoreError> {
         self.store.revoke_session(&sha256(token)).await
     }
+
+    /// One bounded housekeeping pass over `sessions` / `auth_nonces`, applying
+    /// this crate's prune policy ([`AUTH_PRUNE_GRACE_MS`], [`AUTH_PRUNE_BATCH`]).
+    /// The policy lives here, beside the TTLs it has to dominate, so the two can
+    /// be read — and tested — against each other in one place.
+    ///
+    /// Called ONLY from a background tick, never from a request path. It returns
+    /// its error instead of mapping it to a status because the caller's correct
+    /// response is "log it and try again next tick"; a failed prune must never
+    /// become a failed login.
+    pub async fn prune_expired_auth_rows(&self, now_ms: u64) -> Result<PruneCounts, StoreError> {
+        self.store
+            .prune_expired_auth_rows(now_ms, AUTH_PRUNE_GRACE_MS, AUTH_PRUNE_BATCH)
+            .await
+    }
 }
+
+/// How far past its own `expires_at` a `sessions` / `auth_nonces` row must be
+/// before the background prune may delete it: **7 days**.
+///
+/// This is not a tuning knob, it is the safety margin. It is ~168x the 60-minute
+/// session TTL and ~10,080x the 60-second nonce TTL, so a row this old cannot
+/// still be in flight for any reader under any clock skew this system tolerates
+/// — deleting it is unobservable rather than merely unlikely. It also keeps a
+/// week of expired rows around for after-the-fact inspection. Widen it freely;
+/// narrowing it towards the TTLs is what would make the prune racy.
+pub const AUTH_PRUNE_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// Rows the prune may delete from each table per pass. Caps the work — and so
+/// the lock and transaction duration — of a single statement. Whatever is left
+/// over is simply picked up on the next tick.
+pub const AUTH_PRUNE_BATCH: u32 = 5_000;
 
 /// Verify an Ed25519 login proof over `canonical(auth_proof_context)` under the
 /// `"MaxSecu-auth-v1"` label (encoding-spec §6). The `server_id` is the server's
@@ -571,5 +602,92 @@ mod tests {
                 .err(),
             Some(AuthError::Unauthorized)
         );
+    }
+
+    /// The grace window is only safe because it dwarfs the TTLs it has to outlive.
+    /// Bolt that relationship to the constants, so a future TTL bump — or a
+    /// "let's prune more aggressively" edit — has to walk past it deliberately.
+    #[test]
+    fn the_prune_grace_window_dwarfs_both_ttls() {
+        let cfg = AuthConfig::default();
+        assert!(
+            AUTH_PRUNE_GRACE_MS >= cfg.session_ttl_ms.saturating_mul(24),
+            "grace ({AUTH_PRUNE_GRACE_MS} ms) must dwarf the {} ms session TTL, or the \
+             prune could race a reader",
+            cfg.session_ttl_ms
+        );
+        assert!(
+            AUTH_PRUNE_GRACE_MS >= cfg.nonce_ttl_ms.saturating_mul(24),
+            "grace ({AUTH_PRUNE_GRACE_MS} ms) must dwarf the {} ms nonce TTL",
+            cfg.nonce_ttl_ms
+        );
+        // Compile-time: narrowing the constant below seven days does not get to
+        // wait for a test run.
+        const {
+            assert!(
+                AUTH_PRUNE_GRACE_MS >= 7 * 24 * 60 * 60 * 1_000,
+                "at least the seven days the design fixed"
+            )
+        };
+    }
+
+    /// The property that matters to a user: a prune running while they are logged
+    /// in does not log them out. Their session is minted, the prune sweeps, and
+    /// the very same token still validates on the very same channel.
+    ///
+    /// EVERY CLOCK BELOW IS `SWEEP`, deliberately. An earlier version minted a
+    /// 60-minute session at `TS`, swept at exactly `TS + 3_600_000` and then
+    /// re-validated at `TS + 1`. At the sweep instant that session was already
+    /// expired (`validate_session` rejects on `expires_at_ms <= now_ms`), so the
+    /// test asserted nothing about a *live* session — it only ever proved the
+    /// point at a different, earlier instant than the one it swept at. `SWEEP` is
+    /// therefore set half a TTL in, where the session is unambiguously live, and
+    /// liveness is asserted at that same instant both before and after the sweep
+    /// so "it was alive" is measured rather than assumed.
+    #[tokio::test]
+    async fn a_prune_never_signs_out_a_live_session() {
+        let svc = service();
+        let user = enroll(svc.store(), "alice", 0x01);
+        let ch = svc.challenge("alice", TS).await.unwrap();
+        let proof = make_proof(&user.sk, svc.server_id(), &EXPORTER, &ch.nonce, TS);
+        let token = svc.prove("alice", TS, &proof, &EXPORTER, TS).await.unwrap();
+
+        // Half a session TTL in: 30 minutes of a 60-minute session remain, and
+        // the row is 7 days + 30 minutes short of the grace window.
+        const SWEEP: u64 = TS + 1_800_000;
+        assert_eq!(
+            svc.validate_session(token.as_bytes(), &EXPORTER, SWEEP)
+                .await
+                .unwrap(),
+            user.rec.user_id,
+            "precondition: the session really is LIVE at the instant we sweep"
+        );
+
+        let swept = svc.prune_expired_auth_rows(SWEEP).await.unwrap();
+        assert_eq!(
+            swept,
+            crate::store::PruneCounts::default(),
+            "nothing minted this recently is prunable"
+        );
+        assert_eq!(
+            svc.validate_session(token.as_bytes(), &EXPORTER, SWEEP)
+                .await
+                .unwrap(),
+            user.rec.user_id,
+            "the live session is untouched by the prune"
+        );
+    }
+
+    /// A prune fault is returned, not panicked and not swallowed: the background
+    /// task's contract is to log it and retry next tick, and it can only do that
+    /// if the error reaches it intact.
+    #[tokio::test]
+    async fn a_prune_fault_surfaces_as_an_error_for_the_caller_to_log() {
+        let svc = AuthService::new(FaultyStore, AuthConfig::default());
+        let err = svc
+            .prune_expired_auth_rows(TS)
+            .await
+            .expect_err("a faulting backend must surface");
+        assert_eq!(err.context(), "prune_expired_auth_rows");
     }
 }

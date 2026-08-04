@@ -1,6 +1,11 @@
 import { Router, type Route } from "../core/router.ts";
 import { call, on } from "../core/rpc.ts";
-import { getUsername } from "../core/session.ts";
+import { clearPrincipal, getPrincipalKind, hasPrincipal } from "../core/session.ts";
+// The recovery route gate lives in core/ so it is unit-testable — this module
+// imports Tauri (via core/rpc.ts) and cannot be loaded in plain Node. `admin` is
+// deliberately NOT gated: a recovery session really can mint a registration key.
+// See core/recovery-routes.ts for the end-to-end citation chain.
+import { isRouteHiddenFor } from "../core/recovery-routes.ts";
 import "./status-pill.ts";
 import "./connect-screen.ts";
 import "./recovery-login-screen.ts";
@@ -50,6 +55,11 @@ export class AppShell extends HTMLElement {
           <ram-gauge id="ram"></ram-gauge>
         </div>
       </header>
+      <div id="recovery-banner" class="recovery-banner" role="status" aria-live="polite" hidden>
+        <strong class="rb-label">RECOVERY SESSION</strong>
+        <span class="rb-copy">Signed in with the cold recovery key — you can see, open and download everyone's content, and you can invite a new user from Admin. You cannot post or delete, and sharing is not available from a recovery session.</span>
+        <button id="rb-end" type="button" class="danger">End recovery session</button>
+      </div>
       <div class="status-strip" role="region" aria-label="Status">
         <status-pill id="pill"></status-pill>
         <span id="sync-ind" class="sync-ind" role="status" aria-live="polite">Zero-knowledge session</span>
@@ -78,6 +88,9 @@ export class AppShell extends HTMLElement {
     const busyOverlay = this.querySelector("#busy-overlay") as HTMLElement;
     const busyTitle = this.querySelector("#busy-title") as HTMLElement;
     const busyKicker = this.querySelector(".busy-kicker") as HTMLElement;
+    const recoveryBanner = this.querySelector("#recovery-banner") as HTMLElement;
+    const recoveryEnd = this.querySelector("#rb-end") as HTMLButtonElement;
+    const syncInd = this.querySelector("#sync-ind") as HTMLElement;
 
     const syncHeaderHeight = () => {
       this.style.setProperty("--mx-header-height", `${Math.ceil(header.getBoundingClientRect().height)}px`);
@@ -117,21 +130,46 @@ export class AppShell extends HTMLElement {
         : null;
     });
 
-    new Router((incomingRoute) => {
+    const applyRoute = (incomingRoute: Route) => {
       let r = incomingRoute;
-      const hasSession = getUsername().trim().length > 0;
+      const hasSession = hasPrincipal();
+      const kind = getPrincipalKind();
+      const isRecovery = kind === "recovery";
       const publicRoute = r === "connect" || r === "recovery" || r === "register";
       if (!hasSession && !publicRoute) {
         r = "connect";
         if (location.hash !== "#/connect") history.replaceState(null, "", "#/connect");
       }
+      // Same shape as the not-signed-in redirect above: hiding the nav links does
+      // not stop a manual hash, a stale deep-link or the back button, so a
+      // recovery principal is bounced off its dead-end routes onto the feed.
+      if (isRouteHiddenFor(kind, r)) {
+        r = "feed";
+        if (location.hash !== "#/feed") history.replaceState(null, "", "#/feed");
+      }
 
       const showAppChrome = hasSession && r !== "connect"
         && r !== "recovery" && r !== "register";
       this.toggleAttribute("data-app-chrome", showAppChrome);
+      // A recovery session must never be mistaken for an ordinary one: a
+      // persistent banner (not a toast) plus a reworded resting status line, and
+      // an attribute the skins can hook. The banner stays visible on EVERY route
+      // while the principal is recovery, so "End recovery session" is always
+      // one click away.
+      this.toggleAttribute("data-principal-recovery", isRecovery);
+      recoveryBanner.hidden = !isRecovery;
+      // Assign only on a real change: #sync-ind is an aria-live region, and
+      // rewriting its text node on every route change can make a screen reader
+      // re-announce identical text. At HEAD it was written once, at first render.
+      const syncText = isRecovery
+        ? "Recovery session — view + invite"
+        : "Zero-knowledge session";
+      if (syncInd.textContent !== syncText) syncInd.textContent = syncText;
       this.querySelectorAll<HTMLAnchorElement>(".nav-rail a").forEach((a) => {
-        const isActive = showAppChrome && (a.getAttribute("data-route") === r
-          || (r === "mine" && a.getAttribute("data-route") === "mine"));
+        const route = a.getAttribute("data-route") as Route;
+        a.hidden = isRouteHiddenFor(kind, route);
+        const isActive = showAppChrome && (route === r
+          || (r === "mine" && route === "mine"));
         a.toggleAttribute("aria-current", isActive);
         a.classList.toggle("active", isActive);
       });
@@ -162,6 +200,28 @@ export class AppShell extends HTMLElement {
       const main = outlet.querySelector<HTMLElement>("#main");
       main?.focus();
       refreshFrontendDeco();
+    };
+    new Router(applyRoute);
+
+    // "End recovery session": tell the backend to tear the session down —
+    // `end_recovery_session` (NOT the plain `logout`) is what also drops the
+    // parked authenticated channel and zeroizes the cold recovery Identity — then
+    // forget the UI-side principal and return to the recovery gate. The local
+    // teardown runs even if the backend call rejects, so the UI can never be left
+    // claiming a session the user asked to end.
+    recoveryEnd.addEventListener("click", async () => {
+      recoveryEnd.disabled = true;
+      try {
+        await call("end_recovery_session");
+      } catch {
+        // Best-effort: the Rust side tears down locally regardless.
+      }
+      clearPrincipal();
+      // Setting an unchanged hash fires no hashchange, so re-render directly when
+      // we are already on the recovery gate.
+      if (location.hash === "#/recovery") applyRoute("recovery");
+      else location.hash = "#/recovery";
+      recoveryEnd.disabled = false;
     });
 
     // Startup precedence (spec §0-D7): on a fresh launch route to the recovery

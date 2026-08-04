@@ -39,7 +39,9 @@ use maxsecu_client_app::config::{FragmentCacheLocation, RouteMode, SettingsConfi
 use maxsecu_client_app::session::{build_session_challenge_body, build_session_prove_body};
 use maxsecu_client_app::upload::{stage_body, StageFlags};
 use maxsecu_client_app::upload_staging::StagingStore;
-use maxsecu_client_app::{config, contacts, index, keystore, layout, ram, recovery_pin, tofu, transparency};
+use maxsecu_client_app::{
+    config, contacts, index, keystore, layout, ram, recovery_pin, tofu, transparency,
+};
 
 use maxsecu_client_core::transparency::{KtCheckpoint, KtCheckpointStore};
 use maxsecu_client_core::{keyblob, Identity};
@@ -171,8 +173,12 @@ fn assert_superset(what: &str, blast: &str, frozen: &BTreeSet<String>, now: &BTr
 fn verify_corpus_lock_recursive(area_name: &str) {
     let dir = compat::area(area_name);
     let lock_path = dir.join("corpus.lock");
-    let lock = std::fs::read_to_string(&lock_path)
-        .unwrap_or_else(|e| panic!("missing corpus lock {}: {e}. {CHECKLIST}", lock_path.display()));
+    let lock = std::fs::read_to_string(&lock_path).unwrap_or_else(|e| {
+        panic!(
+            "missing corpus lock {}: {e}. {CHECKLIST}",
+            lock_path.display()
+        )
+    });
 
     let mut locked: Vec<(String, String)> = Vec::new();
     for line in lock.lines() {
@@ -186,7 +192,11 @@ fn verify_corpus_lock_recursive(area_name: &str) {
             _ => panic!("malformed line in {}: {line:?}", lock_path.display()),
         }
     }
-    assert!(!locked.is_empty(), "{} is empty. {CHECKLIST}", lock_path.display());
+    assert!(
+        !locked.is_empty(),
+        "{} is empty. {CHECKLIST}",
+        lock_path.display()
+    );
 
     for (name, want) in &locked {
         let got = compat::sha256_hex(&read_sub(area_name, name));
@@ -246,8 +256,14 @@ fn compat_corpus_is_locked() {
 #[test]
 fn compat_canonical_pin_v1_classical_and_hybrid_still_parse() {
     for (fixture, expect) in [
-        ("canonical_pin_v1_classical.bin", "canonical_pin_v1_classical.expect.json"),
-        ("canonical_pin_v1_hybrid.bin", "canonical_pin_v1_hybrid.expect.json"),
+        (
+            "canonical_pin_v1_classical.bin",
+            "canonical_pin_v1_classical.expect.json",
+        ),
+        (
+            "canonical_pin_v1_hybrid.bin",
+            "canonical_pin_v1_hybrid.expect.json",
+        ),
     ] {
         let bytes = compat::read(PIN, fixture);
         let want = read_json(PIN, expect);
@@ -277,7 +293,10 @@ fn compat_canonical_pin_v1_classical_and_hybrid_still_parse() {
         });
         assert_eq!(hex(&parsed.enc_pub), want["enc_pub_hex"].as_str().unwrap());
         match want["mlkem_pub_hex"].as_str() {
-            None => assert!(parsed.mlkem_pub.is_none(), "{fixture}: unexpected ML-KEM half"),
+            None => assert!(
+                parsed.mlkem_pub.is_none(),
+                "{fixture}: unexpected ML-KEM half"
+            ),
             Some(h) => assert_eq!(
                 hex(&parsed.mlkem_pub.expect("hybrid pin carries an ML-KEM key")),
                 h,
@@ -289,8 +308,12 @@ fn compat_canonical_pin_v1_classical_and_hybrid_still_parse() {
 
         // `canonical_pin` must still RE-ENCODE the frozen bytes exactly (the ONE encoder
         // shared by maxsecu-setup, the server endpoint and this client).
-        let re = recovery_pin::canonical_pin(&parsed.enc_pub, parsed.mlkem_pub.as_ref().map(|m| &m[..]));
-        assert_eq!(re, bytes, "\n\n{fixture}: canonical_pin no longer re-encodes the frozen pin. {CHECKLIST}\n");
+        let re =
+            recovery_pin::canonical_pin(&parsed.enc_pub, parsed.mlkem_pub.as_ref().map(|m| &m[..]));
+        assert_eq!(
+            re, bytes,
+            "\n\n{fixture}: canonical_pin no longer re-encodes the frozen pin. {CHECKLIST}\n"
+        );
 
         // The install-client verify step hashes the embedded pin (`--print-recovery-pin-fp`).
         assert_eq!(
@@ -319,9 +342,14 @@ fn compat_pin_bootstrap_connection_code_is_stable() {
          matches what their server prints — every new install fails its pin check, and \
          the in-band bootstrap (`maxsecu-setup fetch-pins`) is dead.\n{CHECKLIST}\n"
     );
-    assert_eq!(code.len(), 32, "the connection code is exactly 32 base32 chars");
+    assert_eq!(
+        code.len(),
+        32,
+        "the connection code is exactly 32 base32 chars"
+    );
     assert!(
-        code.chars().all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)),
+        code.chars()
+            .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)),
         "RFC 4648 base32 alphabet, uppercase, no padding: {code}"
     );
 }
@@ -333,7 +361,11 @@ fn compat_pin_bootstrap_connection_code_is_stable() {
 /// Fixed RAM bounds so the migration assertions are machine-independent (the live
 /// `normalized()` clamps against the box's actual RAM).
 fn fixed_limits() -> ram::RamLimits {
-    ram::RamLimits { default_mb: 1024, min_mb: 64, max_mb: 8192 }
+    ram::RamLimits {
+        default_mb: 1024,
+        min_mb: 64,
+        max_mb: 8192,
+    }
 }
 
 #[test]
@@ -352,7 +384,8 @@ fn compat_settings_current_file_still_loads() {
     // A settings.json that fails to parse silently reverts to defaults — the user's
     // route, theme and cache prefs vanish with no error. Assert we did NOT default.
     assert_ne!(
-        s, SettingsConfig::default(),
+        s,
+        SettingsConfig::default(),
         "\n\nThe frozen settings.json parsed as DEFAULTS.\n\
          BLAST RADIUS: `SettingsConfig::load` swallows a parse error and returns \
          `default()` — so a field rename silently RESETS every user's preferences \
@@ -394,12 +427,21 @@ fn compat_settings_legacy_file_still_migrates() {
          (`PerformanceSettingsWire`). BLAST RADIUS: every pre-rework user's cache budget \
          silently resets.\n{CHECKLIST}\n"
     );
-    assert_eq!(n.performance.thumb_cache_cap_mb as u64, want["thumb_cache_cap_mb"].as_u64().unwrap());
+    assert_eq!(
+        n.performance.thumb_cache_cap_mb as u64,
+        want["thumb_cache_cap_mb"].as_u64().unwrap()
+    );
     assert_eq!(n.connection.route_mode, RouteMode::TorOnly);
-    assert!(n.connection.use_tor, "`use_tor` stays synced for older readers");
+    assert!(
+        n.connection.use_tor,
+        "`use_tor` stays synced for older readers"
+    );
     // The dead key must never be written back out.
     let re = serde_json::to_string(&n).unwrap();
-    assert!(!re.contains("ram_cache_cap_mb"), "the legacy key re-serialized: {re}");
+    assert!(
+        !re.contains("ram_cache_cap_mb"),
+        "the legacy key re-serialized: {re}"
+    );
 }
 
 /// Forward-compat: a file written by a NEWER client (unknown keys) must not brick
@@ -408,7 +450,12 @@ fn compat_settings_legacy_file_still_migrates() {
 #[test]
 fn compat_settings_with_unknown_future_key_still_loads() {
     let dir = tmp_dir("settings-future");
-    place(STATE, "settings_future_key.json", &dir, "config/settings.json");
+    place(
+        STATE,
+        "settings_future_key.json",
+        &dir,
+        "config/settings.json",
+    );
     let s = SettingsConfig::load(&dir);
     assert_eq!(
         s.appearance.theme, "light",
@@ -485,11 +532,18 @@ fn compat_contacts_still_unseal() {
     });
     let want = read_json(STATE, "contacts.expect.json");
     let list = store.list();
-    assert_eq!(list.len(), want.as_array().unwrap().len(), "contacts were dropped. {CHECKLIST}");
+    assert_eq!(
+        list.len(),
+        want.as_array().unwrap().len(),
+        "contacts were dropped. {CHECKLIST}"
+    );
     for (got, exp) in list.iter().zip(want.as_array().unwrap()) {
         assert_eq!(got.username, exp["username"].as_str().unwrap());
         assert_eq!(hex(&got.user_id), exp["user_id_hex"].as_str().unwrap());
-        assert_eq!(hex(&got.fingerprint), exp["fingerprint_hex"].as_str().unwrap());
+        assert_eq!(
+            hex(&got.fingerprint),
+            exp["fingerprint_hex"].as_str().unwrap()
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -517,7 +571,11 @@ fn compat_search_index_still_unseals() {
         assert_eq!(got.title, exp["title"].as_str().unwrap());
     }
     // The index still SEARCHES (the consumer, not just the decoder).
-    assert_eq!(idx.search("sunset").len(), 1, "the frozen index no longer searches. {CHECKLIST}");
+    assert_eq!(
+        idx.search("sunset").len(),
+        1,
+        "the frozen index no longer searches. {CHECKLIST}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -557,7 +615,12 @@ fn compat_staging_record_still_deserializes() {
     let dir = tmp_dir("staging");
     let want = read_json(STATE, "staging_record.expect.json");
     let file_id_hex = want["file_id_hex"].as_str().unwrap();
-    place(STATE, "staging_record.json", &dir, &format!("staging/{file_id_hex}/record.json"));
+    place(
+        STATE,
+        "staging_record.json",
+        &dir,
+        &format!("staging/{file_id_hex}/record.json"),
+    );
 
     let store = StagingStore::new(dir.join("staging"));
     let mut file_id = [0u8; 16];
@@ -576,16 +639,23 @@ fn compat_staging_record_still_deserializes() {
     assert_eq!(hex(&rec.file_id), file_id_hex);
     assert_eq!(rec.file_type, want["file_type"].as_str().unwrap());
     assert_eq!(rec.title, want["title"].as_str().unwrap());
-    assert_eq!(rec.content_chunk_count, want["content_chunk_count"].as_u64().unwrap());
+    assert_eq!(
+        rec.content_chunk_count,
+        want["content_chunk_count"].as_u64().unwrap()
+    );
     assert_eq!(rec.progress, want["progress"].as_u64().unwrap());
     assert_eq!(rec.wraps.len(), want["wraps"].as_u64().unwrap() as usize);
-    assert_eq!(rec.small_streams.len(), want["small_streams"].as_u64().unwrap() as usize);
+    assert_eq!(
+        rec.small_streams.len(),
+        want["small_streams"].as_u64().unwrap() as usize
+    );
     assert!(
         rec.small_streams.iter().all(|s| s.stream_type != 1),
         "the security invariant broke: a staged SMALL stream must never be `content` (1)"
     );
     // The RESUME wire body still builds from that record (the finalize path).
-    let body = maxsecu_client_app::commands::upload::stage_body_from_record(&rec, StageFlags::default());
+    let body =
+        maxsecu_client_app::commands::upload::stage_body_from_record(&rec, StageFlags::default());
     let frozen = frozen_keys("wire/stage_files_body.keys.json");
     assert_superset(
         "POST /v1/files (resumed from staging record)",
@@ -624,7 +694,10 @@ fn compat_client_app_keystore_opens_frozen_keyblobs() {
         let path = entry.expect("dir entry").path();
         // Track 1 names them `keyblob_v*.bin`; accept `.blob` too so a rename there
         // cannot silently switch this gate off.
-        if !matches!(path.extension().and_then(|e| e.to_str()), Some("bin" | "blob")) {
+        if !matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("bin" | "blob")
+        ) {
             continue;
         }
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
@@ -657,9 +730,11 @@ fn compat_client_app_keystore_opens_frozen_keyblobs() {
 
         // Cross-check against Track 1's expectation file (their key names; `_hex`
         // suffixes accepted too, in case they rename).
-        let exp: Value = serde_json::from_slice(&std::fs::read(area.join(format!("{stem}.expect.json"))).unwrap_or_else(
-            |_| panic!("{stem} has no sibling expect.json — nothing to compare. {CHECKLIST}"),
-        ))
+        let exp: Value = serde_json::from_slice(
+            &std::fs::read(area.join(format!("{stem}.expect.json"))).unwrap_or_else(|_| {
+                panic!("{stem} has no sibling expect.json — nothing to compare. {CHECKLIST}")
+            }),
+        )
         .expect("expect.json");
         let want = |k: &str| -> Option<String> {
             exp.get(k)
@@ -668,13 +743,25 @@ fn compat_client_app_keystore_opens_frozen_keyblobs() {
                 .map(str::to_owned)
         };
         if let Some(w) = want("enc_pub") {
-            assert_eq!(hex(&id.enc_pub_bytes()), w, "{stem}: enc_pub changed on unlock. {CHECKLIST}");
+            assert_eq!(
+                hex(&id.enc_pub_bytes()),
+                w,
+                "{stem}: enc_pub changed on unlock. {CHECKLIST}"
+            );
         }
         if let Some(w) = want("sig_pub") {
-            assert_eq!(hex(&id.sig_pub_bytes()), w, "{stem}: sig_pub changed on unlock. {CHECKLIST}");
+            assert_eq!(
+                hex(&id.sig_pub_bytes()),
+                w,
+                "{stem}: sig_pub changed on unlock. {CHECKLIST}"
+            );
         }
         if let Some(w) = want("fingerprint") {
-            assert_eq!(hex(&id.fingerprint()), w, "{stem}: the identity FINGERPRINT changed. {CHECKLIST}");
+            assert_eq!(
+                hex(&id.fingerprint()),
+                w,
+                "{stem}: the identity FINGERPRINT changed. {CHECKLIST}"
+            );
         }
         // v1 = classical (no ML-KEM); v2 = PQ. BOTH must still log in: an existing v1
         // user must not be locked out by the PQ work, and a v2 user must keep their
@@ -693,7 +780,11 @@ fn compat_client_app_keystore_opens_frozen_keyblobs() {
                          `pq_key_missing`, and they cannot open PQ-hybrid wraps.\n{CHECKLIST}\n"
                     )
                 });
-                assert_eq!(hex(&maxsecu_crypto::sha256(&mlkem)), w, "{stem}: the ML-KEM key changed. {CHECKLIST}");
+                assert_eq!(
+                    hex(&maxsecu_crypto::sha256(&mlkem)),
+                    w,
+                    "{stem}: the ML-KEM key changed. {CHECKLIST}"
+                );
             }
         }
         checked += 1;
@@ -760,12 +851,26 @@ fn compat_value_lock_seal_labels() {
 #[test]
 fn compat_value_lock_canonical_pin_shape() {
     let classical = recovery_pin::canonical_pin(&[0u8; 32], None);
-    assert_eq!(classical.len(), 33, "a classical pin is 33 bytes. {CHECKLIST}");
-    assert_eq!(classical[32], 0x00, "the ML-KEM absent tag is 0x00. {CHECKLIST}");
+    assert_eq!(
+        classical.len(),
+        33,
+        "a classical pin is 33 bytes. {CHECKLIST}"
+    );
+    assert_eq!(
+        classical[32], 0x00,
+        "the ML-KEM absent tag is 0x00. {CHECKLIST}"
+    );
 
     let hybrid = recovery_pin::canonical_pin(&[0u8; 32], Some(&[0u8; 1184]));
-    assert_eq!(hybrid.len(), 1217, "a hybrid pin is 32 + 1 + 1184 = 1217 bytes. {CHECKLIST}");
-    assert_eq!(hybrid[32], 0x01, "the ML-KEM present tag is 0x01. {CHECKLIST}");
+    assert_eq!(
+        hybrid.len(),
+        1217,
+        "a hybrid pin is 32 + 1 + 1184 = 1217 bytes. {CHECKLIST}"
+    );
+    assert_eq!(
+        hybrid[32], 0x01,
+        "the ML-KEM present tag is 0x01. {CHECKLIST}"
+    );
 
     // The decoder accepts ONLY those two shapes (fail-closed on anything else): a
     // widened parser would let a malformed/truncated pin through.
@@ -779,7 +884,9 @@ fn compat_value_lock_canonical_pin_shape() {
 fn compat_value_lock_app_dir_layout() {
     let dir = tmp_dir("layout");
     layout::ensure_portable_layout(&dir).unwrap();
-    for sub in ["config", "keystore", "index", "cache", "logs", "staging", "webview"] {
+    for sub in [
+        "config", "keystore", "index", "cache", "logs", "staging", "webview",
+    ] {
         assert!(
             dir.join(sub).is_dir(),
             "\n\nThe app-dir layout lost `{sub}/`.\n\
@@ -789,8 +896,10 @@ fn compat_value_lock_app_dir_layout() {
         );
     }
     // The keystore path is the one a real user's identity already sits at.
-    assert!(keystore::keystore_path(&dir).ends_with("keystore/local_key_blob")
-        || keystore::keystore_path(&dir).ends_with("keystore\\local_key_blob"));
+    assert!(
+        keystore::keystore_path(&dir).ends_with("keystore/local_key_blob")
+            || keystore::keystore_path(&dir).ends_with("keystore\\local_key_blob")
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -824,7 +933,11 @@ fn compat_value_lock_pinned_file_shapes() {
     // sink.json keys + sink_custodians.der = N × 32 raw bytes (len % 32 == 0).
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     std::fs::write(cfg.join("sink_root.der"), cert.cert.der()).unwrap();
-    std::fs::write(cfg.join("sink.json"), br#"{"addr":"127.0.0.1:9443","server_name":"localhost"}"#).unwrap();
+    std::fs::write(
+        cfg.join("sink.json"),
+        br#"{"addr":"127.0.0.1:9443","server_name":"localhost"}"#,
+    )
+    .unwrap();
     std::fs::write(cfg.join("sink_custodians.der"), [0x11u8; 32]).unwrap();
     let pins = config::load_sink_pins(&dir).unwrap_or_else(|e| {
         panic!(
@@ -1006,7 +1119,11 @@ fn compat_wire_upload_and_share_bodies_still_carry_every_key() {
         recovery_mlkem_pub: None,
         created_at: Timestamp(1_719_500_000_000),
     };
-    let streams = maxsecu_client_app::upload::prepare_blog_streams(b"hello".to_vec(), "Hi", &["t".to_owned()]);
+    let streams = maxsecu_client_app::upload::prepare_blog_streams(
+        b"hello".to_vec(),
+        "Hi",
+        &["t".to_owned()],
+    );
     let bundle = build_upload(&params, &streams).expect("build_upload");
 
     // POST /v1/files — the body that CREATES the file record.
@@ -1021,7 +1138,8 @@ fn compat_wire_upload_and_share_bodies_still_carry_every_key() {
     // VALUE LOCK: `file_id`/`file_type` are the keys the whole record is stored under —
     // a wrong value here mis-identifies or mis-buckets the file with every key present.
     assert_eq!(
-        body["file_id"], hex(&[0xF1u8; 16]),
+        body["file_id"],
+        hex(&[0xF1u8; 16]),
         "\n\n`POST /v1/files` must send `file_id` as the lowercase-hex client id — the server \
          keys the whole record (streams, wraps, chunks) on it.\n{CHECKLIST}\n"
     );
@@ -1097,13 +1215,17 @@ fn compat_wire_upload_and_share_bodies_still_carry_every_key() {
         wrap_body["recipient_type"], "user",
         "a reshare always targets a USER (never the recovery sentinel)"
     );
-    assert_eq!(wrap_body["wrap_alg"], 1, "`wrap_alg` is the frozen wrap-algorithm id");
+    assert_eq!(
+        wrap_body["wrap_alg"], 1,
+        "`wrap_alg` is the frozen wrap-algorithm id"
+    );
     // VALUE LOCK: every value the server's `add_wrap` handler reads must be the exact
     // bytes of the wrap it is derived from — a wrong value under a correct key silently
     // ships a wrap the recipient (or the grant chain) cannot open. Computed from the
     // real builder INPUT (`bundle.wraps[0]`), so a field swap or re-encode is caught.
     assert_eq!(
-        wrap_body["recipient_id"], hex(&w0.recipient_id.0),
+        wrap_body["recipient_id"],
+        hex(&w0.recipient_id.0),
         "\n\n`recipient_id` must be the lowercase-hex id the wrap was built FOR — a wrong id \
          binds the grant to the wrong account.\n{CHECKLIST}\n"
     );
@@ -1207,7 +1329,10 @@ fn compat_emit_fixtures() {
     // the params travel WITH the blob, so a floor-cost blob is the fast, valid choice.
     let blob = keyblob::seal(STATE_PASSPHRASE, &id, maxsecu_client_core::ARGON2_FLOOR).unwrap();
     write(&state_dir.join("identity_v2.keyblob"), &blob);
-    write(&state_dir.join("identity_v2.passphrase.txt"), STATE_PASSPHRASE.as_bytes());
+    write(
+        &state_dir.join("identity_v2.passphrase.txt"),
+        STATE_PASSPHRASE.as_bytes(),
+    );
     write_json(
         &state_dir.join("identity_v2.expect.json"),
         &json!({
@@ -1278,20 +1403,37 @@ fn compat_emit_fixtures() {
     // --- surface 11: the four identity-sealed stores ------------------------
     {
         let mut store = tofu::TofuStore::open(&work, &id).unwrap();
-        store.check_or_pin("alice", &[0xE1; 32], &[0x51; 32]).unwrap();
+        store
+            .check_or_pin("alice", &[0xE1; 32], &[0x51; 32])
+            .unwrap();
         store.check_or_pin("bob", &[0xE2; 32], &[0x52; 32]).unwrap();
         let mut expect = serde_json::Map::new();
-        for (u, e, s) in [("alice", [0xE1u8; 32], [0x51u8; 32]), ("bob", [0xE2u8; 32], [0x52u8; 32])] {
-            expect.insert(u.to_owned(), Value::String(hex(&tofu::key_fingerprint(&e, &s))));
+        for (u, e, s) in [
+            ("alice", [0xE1u8; 32], [0x51u8; 32]),
+            ("bob", [0xE2u8; 32], [0x52u8; 32]),
+        ] {
+            expect.insert(
+                u.to_owned(),
+                Value::String(hex(&tofu::key_fingerprint(&e, &s))),
+            );
         }
-        copy(&work.join("tofu").join("pins.tofu"), &state_dir.join("tofu_pins.tofu"));
-        write_json(&state_dir.join("tofu_pins.expect.json"), &Value::Object(expect));
+        copy(
+            &work.join("tofu").join("pins.tofu"),
+            &state_dir.join("tofu_pins.tofu"),
+        );
+        write_json(
+            &state_dir.join("tofu_pins.expect.json"),
+            &Value::Object(expect),
+        );
     }
     {
         let mut store = contacts::ContactStore::open(&work, &id).unwrap();
         store.upsert("alice", [0x0A; 16], [0xF1; 32]).unwrap();
         store.upsert("bob", [0x0B; 16], [0xF2; 32]).unwrap();
-        copy(&work.join("contacts").join("contacts.bin"), &state_dir.join("contacts.bin"));
+        copy(
+            &work.join("contacts").join("contacts.bin"),
+            &state_dir.join("contacts.bin"),
+        );
         write_json(
             &state_dir.join("contacts.expect.json"),
             &json!([
@@ -1315,7 +1457,10 @@ fn compat_emit_fixtures() {
             tags: vec!["draft".into()],
         });
         index::save(&work, &id, &idx).unwrap();
-        copy(&work.join("index").join("search.idx"), &state_dir.join("search_index.idx"));
+        copy(
+            &work.join("index").join("search.idx"),
+            &state_dir.join("search_index.idx"),
+        );
         write_json(
             &state_dir.join("search_index.expect.json"),
             &json!([
@@ -1326,10 +1471,17 @@ fn compat_emit_fixtures() {
     }
     {
         let mut store = transparency::DiskKtCheckpointStore::open(&work, &id).unwrap();
-        let cp = KtCheckpoint { tree_size: 42, root: [0xC1; 32], sig: [0xC2; 64] };
+        let cp = KtCheckpoint {
+            tree_size: 42,
+            root: [0xC1; 32],
+            sig: [0xC2; 64],
+        };
         store.update(cp);
         store.persist().unwrap();
-        copy(&work.join("kt").join("checkpoint.kt"), &state_dir.join("kt_checkpoint.kt"));
+        copy(
+            &work.join("kt").join("checkpoint.kt"),
+            &state_dir.join("kt_checkpoint.kt"),
+        );
         write_json(
             &state_dir.join("kt_checkpoint.expect.json"),
             &json!({ "tree_size": 42, "root_hex": hex(&[0xC1u8; 32]), "sig_hex": hex(&[0xC2u8; 64]) }),
@@ -1375,7 +1527,10 @@ fn compat_emit_fixtures() {
         let staging = StagingStore::new(work.join("staging"));
         staging.persist(&rec).unwrap();
         copy(
-            &work.join("staging").join(hex(&rec.file_id)).join("record.json"),
+            &work
+                .join("staging")
+                .join(hex(&rec.file_id))
+                .join("record.json"),
             &state_dir.join("staging_record.json"),
         );
         write_json(
@@ -1411,26 +1566,52 @@ fn compat_emit_fixtures() {
             recovery_mlkem_pub: None,
             created_at: Timestamp(1_719_500_000_000),
         };
-        let streams =
-            maxsecu_client_app::upload::prepare_blog_streams(b"hello".to_vec(), "Hi", &["t".to_owned()]);
+        let streams = maxsecu_client_app::upload::prepare_blog_streams(
+            b"hello".to_vec(),
+            "Hi",
+            &["t".to_owned()],
+        );
         let bundle = build_upload(&params, &streams).unwrap();
         let files_body = stage_body(&bundle, StageFlags::default());
 
         let sets: [(&str, Value); 7] = [
-            ("wire/register_body.keys.json", build_register_body("alice", &wire_id, "k")),
-            ("wire/session_challenge_body.keys.json", build_session_challenge_body("alice")),
-            ("wire/session_prove_body.keys.json", build_session_prove_body("alice", 1, "p")),
-            ("wire/recovery_verify_body.keys.json", build_recovery_verify_body("cid", "p", 1)),
+            (
+                "wire/register_body.keys.json",
+                build_register_body("alice", &wire_id, "k"),
+            ),
+            (
+                "wire/session_challenge_body.keys.json",
+                build_session_challenge_body("alice"),
+            ),
+            (
+                "wire/session_prove_body.keys.json",
+                build_session_prove_body("alice", 1, "p"),
+            ),
+            (
+                "wire/recovery_verify_body.keys.json",
+                build_recovery_verify_body("cid", "p", 1),
+            ),
             ("wire/stage_files_body.keys.json", files_body.clone()),
-            ("wire/stage_files_stream.keys.json", files_body["streams"][0].clone()),
-            ("wire/stage_files_wrap.keys.json", files_body["wraps"][0].clone()),
+            (
+                "wire/stage_files_stream.keys.json",
+                files_body["streams"][0].clone(),
+            ),
+            (
+                "wire/stage_files_wrap.keys.json",
+                files_body["wraps"][0].clone(),
+            ),
         ];
         for (rel, body) in sets {
             let keys: Vec<String> = keys_of(&body).into_iter().collect();
             write_json(&state_dir.join(rel), &json!(keys));
         }
-        let keys: Vec<String> = keys_of(&build_add_wrap_body(&bundle.wraps[0])).into_iter().collect();
-        write_json(&state_dir.join("wire/add_wrap_body.keys.json"), &json!(keys));
+        let keys: Vec<String> = keys_of(&build_add_wrap_body(&bundle.wraps[0]))
+            .into_iter()
+            .collect();
+        write_json(
+            &state_dir.join("wire/add_wrap_body.keys.json"),
+            &json!(keys),
+        );
     }
 
     // --- the per-area corpus.lock -------------------------------------------
@@ -1438,7 +1619,11 @@ fn compat_emit_fixtures() {
     emit_lock(&state_dir);
     let _ = std::fs::remove_dir_all(&work);
 
-    eprintln!("emitted:\n  {}\n  {}", pin_dir.display(), state_dir.display());
+    eprintln!(
+        "emitted:\n  {}\n  {}",
+        pin_dir.display(),
+        state_dir.display()
+    );
 }
 
 fn write(path: &Path, bytes: &[u8]) {
@@ -1456,7 +1641,8 @@ fn write_json(path: &Path, v: &Value) {
 
 fn copy(from: &Path, to: &Path) {
     std::fs::create_dir_all(to.parent().unwrap()).unwrap();
-    std::fs::copy(from, to).unwrap_or_else(|e| panic!("copy {} → {}: {e}", from.display(), to.display()));
+    std::fs::copy(from, to)
+        .unwrap_or_else(|e| panic!("copy {} → {}: {e}", from.display(), to.display()));
 }
 
 fn emit_lock(dir: &Path) {

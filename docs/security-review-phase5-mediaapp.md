@@ -38,7 +38,7 @@
 ## 4. Residuals / deferrals (intentional, security-neutral)
 
 - **Real Tor transport** — the toggle is a disabled placeholder (Phase-1 deferral).
-- **Shamir K-of-N recovery UI** (`admin-core::recovery`) — an ops ceremony; `export_keystore` is the Phase-5 portable-backup path.
+- ~~**Shamir K-of-N recovery UI** (`admin-core::recovery`) — an ops ceremony~~ — **RETIRED (noted 2026-08-01):** the Shamir UI and `crypto::shamir` were removed with T6; recovery custody is a single Argon2id-sealed `recovery_key.blob` (`DESIGN.md` §16.3). `export_keystore` is still the Phase-5 portable-backup path.
 - **Full axe-core-in-jsdom a11y check** — the components import the Tauri API, so a full DOM render needs a Tauri-API mock + jsdom harness; the dependency-free structural lint is the Phase-5 CI guard.
 - **RAM-cache cap enforcement** — Phase 5 persists the preference; wiring it to an actual bounded in-memory cache is a later perf slice (no client-side blob cache exists yet to bound).
 - **Cosmetic:** `change_password` maps a (rare) corrupt-blob `reseal` error to `unauthorized` rather than a distinct corruption code; a leftover `local_key_blob.tmp` is not cleaned up on a `rename` failure (keystore ops are non-concurrent). Neither affects security.

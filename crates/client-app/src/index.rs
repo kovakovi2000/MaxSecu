@@ -3,12 +3,13 @@
 //! identity via HKDF-SHA256, sealed with the crypto AEAD (`seal`/`open`). Only
 //! `SearchHit`s of matches ever leave the TCB — never the whole index.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use maxsecu_client_core::Identity;
 
+use crate::commands::auth::Principal;
 use crate::dto::SearchHit;
 use crate::error::UiError;
 
@@ -68,11 +69,37 @@ fn index_key(identity: &Identity) -> zeroize::Zeroizing<[u8; 32]> {
     ))
 }
 
+/// The sealed index file for `principal`. The USER path is unchanged
+/// (`<dir>/index/search.idx`); the RECOVERY principal gets a NEW sibling, because
+/// these bytes are sealed under an identity-derived key at a FIXED path — a
+/// recovery login in a folder an ordinary user has signed into would otherwise
+/// collide with (and fail closed on) that user's index. Add-only: no existing file
+/// is read differently, renamed, or rewritten.
+fn index_file(dir: &Path, principal: &Principal) -> PathBuf {
+    let name = match principal {
+        Principal::User { .. } => "search.idx",
+        Principal::Recovery => "search.recovery.idx",
+    };
+    dir.join("index").join(name)
+}
+
 /// Load + decrypt the index from `<dir>/index/search.idx`, or an empty index if
 /// absent. A decryption/parse failure is a sanitized error (corrupt/foreign).
 pub fn load(dir: &Path, identity: &Identity) -> Result<SearchIndex, UiError> {
-    let path = dir.join("index").join("search.idx");
-    let sealed = match std::fs::read(&path) {
+    load_at(&dir.join("index").join("search.idx"), identity)
+}
+
+/// [`load`] for the principal that is actually signed in (see [`index_file`]).
+pub fn load_for(
+    dir: &Path,
+    identity: &Identity,
+    principal: &Principal,
+) -> Result<SearchIndex, UiError> {
+    load_at(&index_file(dir, principal), identity)
+}
+
+fn load_at(path: &Path, identity: &Identity) -> Result<SearchIndex, UiError> {
+    let sealed = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SearchIndex::default()),
         Err(_) => {
@@ -98,8 +125,24 @@ pub fn load(dir: &Path, identity: &Identity) -> Result<SearchIndex, UiError> {
 
 /// Encrypt + persist the index to `<dir>/index/search.idx` (creates `index/`).
 pub fn save(dir: &Path, identity: &Identity, index: &SearchIndex) -> Result<(), UiError> {
-    let idx_dir = dir.join("index");
-    std::fs::create_dir_all(&idx_dir)
+    save_at(&dir.join("index").join("search.idx"), identity, index)
+}
+
+/// [`save`] for the principal that is actually signed in (see [`index_file`]).
+pub fn save_for(
+    dir: &Path,
+    identity: &Identity,
+    principal: &Principal,
+    index: &SearchIndex,
+) -> Result<(), UiError> {
+    save_at(&index_file(dir, principal), identity, index)
+}
+
+fn save_at(path: &Path, identity: &Identity, index: &SearchIndex) -> Result<(), UiError> {
+    let idx_dir = path
+        .parent()
+        .ok_or_else(|| UiError::new("index_failed", "Could not write the index."))?;
+    std::fs::create_dir_all(idx_dir)
         .map_err(|_| UiError::new("index_failed", "Could not write the index."))?;
     let plain = zeroize::Zeroizing::new(
         serde_json::to_vec(index)
@@ -111,7 +154,7 @@ pub fn save(dir: &Path, identity: &Identity, index: &SearchIndex) -> Result<(), 
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ct);
-    std::fs::write(idx_dir.join("search.idx"), out)
+    std::fs::write(path, out)
         .map_err(|_| UiError::new("index_failed", "Could not write the index."))
 }
 

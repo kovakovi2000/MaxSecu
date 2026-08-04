@@ -20,6 +20,13 @@ pub(crate) fn member_views_from_body(
             file_type: file_type_name(m.file_type),
             title: String::new(),
             thumbnail_b64: None,
+            // 0 = UNKNOWN, and the UI must then send no version at all (see the
+            // contract on the field). The signed `BundleBody` carries only
+            // `{file_id, file_type}` per member — there is no version in it to
+            // supply, and inventing one here would be a lie about signed content.
+            // The UI learns the real version from the first successful open and
+            // remembers it for the rest of the session.
+            version: 0,
         })
         .collect()
 }
@@ -35,9 +42,10 @@ use maxsecu_encoding::types::{FileType, StreamType};
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
 use crate::commands::connection::{reauth, server_of};
-use crate::commands::feed::{hex16, now_ms};
+use crate::commands::feed::{hex16, now_ms, reauth_channel};
+use crate::commands::pool::{get_on_pooled_channel, AppPool};
 use crate::config::load_directory_pub;
-use crate::download::{build_download_bundle, parse_file_view};
+use crate::download::{build_download_bundle, parse_file_view, ParsedView};
 use crate::dto::OpenContentRequest;
 use crate::error::UiError;
 use crate::http_client::get_json;
@@ -50,7 +58,7 @@ use crate::http_client::get_json;
 ///
 /// Mirrors the viewer's verify ladder (`open_content_inner`) by orchestrating the
 /// SAME shared primitives — `resolve_and_verify_author_logged`,
-/// `enforce_author_transparency`, `resolve_my_user_id`, `build_download_bundle`,
+/// `enforce_author_transparency`, `resolve_me`, `build_download_bundle`,
 /// `viewer::run_open` — including the direct-link retry-once-forced-proxy
 /// fallback. The bundle is bound to the REQUESTED `req_file_id` inside `run_open`
 /// (via `build_verify_ctx`). Intentionally UNCACHED: the content caches store
@@ -62,27 +70,87 @@ pub(crate) async fn open_bundle_members(
     session: &State<'_, Session>,
     connect_lock: &State<'_, ConnectLock>,
 ) -> Result<(BundleBody, u64, bool), UiError> {
-    // Standalone entry (e.g. the `open_bundle` command): mint a channel-bound
-    // authed connection via the ConnectLock, then run the shared verify on it.
+    // Standalone entry over a FRESH `reauth` channel, for the callers that do not
+    // hold a pool handle (the share flow's member fan-out). `open_bundle` itself
+    // goes through [`open_bundle_members_pooled`] — prefer that one; this path
+    // spends one of the account's ≤30 challenges per minute.
     let server = server_of(&dir.0)?;
     let (mut sender, host, token) = reauth(&dir.0, &server, session, connect_lock).await?;
-    open_bundle_members_on(&mut sender, &host, &token, req_file_id, dir, session).await
+    let (status, view_json) = get_json(
+        &mut sender,
+        &format!("/v1/files/{req_file_id}?version=latest"),
+        Some(&token),
+        &host,
+    )
+    .await?;
+    if status != hyper::StatusCode::OK {
+        return Err(UiError::new("fetch_failed", "That item is not available."));
+    }
+    let view = parse_file_view(&view_json)?;
+    open_bundle_members_on(&mut sender, &host, &token, req_file_id, &view, dir, session).await
+}
+
+/// The same open, but over a channel BORROWED from the authed-connection pool
+/// instead of a fresh login. Opening a bundle used to mint a whole login, and the
+/// Stacked view then opens one per member on top of that — a handful of clicks
+/// exhausted the server's 30-challenges-per-account-per-minute allowance, which the
+/// client then reported as "Sign-in failed." The §8.5 view GET doubles as the
+/// pool's channel-health check (see [`get_on_pooled_channel`]) and its result is
+/// handed to the shared verify, so the whole open costs ONE §8.5 round trip.
+pub(crate) async fn open_bundle_members_pooled(
+    req_file_id: &str,
+    dir: &State<'_, AppDir>,
+    session: &State<'_, Session>,
+    connect_lock: &State<'_, ConnectLock>,
+    pool: &State<'_, AppPool>,
+) -> Result<(BundleBody, u64, bool), UiError> {
+    let server = server_of(&dir.0)?;
+    let principal = { session.0.lock().await.principal.clone() }
+        .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
+    let (mut chan, view_json) = get_on_pooled_channel(
+        pool,
+        &principal,
+        &format!("/v1/files/{req_file_id}?version=latest"),
+        UiError::new("fetch_failed", "That item is not available."),
+        || reauth_channel(&dir.0, &server, session, connect_lock),
+    )
+    .await?;
+    let view = parse_file_view(&view_json)?;
+    let host = chan.host.clone();
+    let token = chan.token.clone();
+    open_bundle_members_on(
+        &mut chan.sender,
+        &host,
+        &token,
+        req_file_id,
+        &view,
+        dir,
+        session,
+    )
+    .await
 }
 
 /// Verify + decrypt a bundle over an ALREADY-authed channel `(sender, host,
-/// token)`, returning its signed member list + verified version. Split out of
-/// [`open_bundle_members`] so a caller that already holds a warm authed channel
-/// — notably `decrypt_card`, which fans out CONCURRENTLY across the feed — can
-/// reuse that channel INSTEAD of taking the single global `ConnectLock`. That
-/// removes the nested-reauth lock contention that previously made a bundle
-/// card's member fetch lose the lock under a concurrent feed load and silently
-/// fall back to zero counts (a sticky, cached blank). The standalone entry above
-/// preserves the exact old behaviour for the `open_bundle` command.
+/// token)` whose §8.5 `view` the caller has already fetched, returning its signed
+/// member list + verified version. Split out of [`open_bundle_members`] so a caller
+/// that already holds a warm authed channel — notably `decrypt_card`, which fans
+/// out CONCURRENTLY across the feed — can reuse that channel INSTEAD of taking the
+/// single global `ConnectLock`. That removes the nested-reauth lock contention that
+/// previously made a bundle card's member fetch lose the lock under a concurrent
+/// feed load and silently fall back to zero counts (a sticky, cached blank).
+///
+/// The `view` is passed IN rather than fetched here because every caller has just
+/// fetched exactly this record (same file id) to validate its pooled channel —
+/// re-fetching it was a second §8.5 round trip per bundle card, and taking the
+/// caller's view also makes the whole open read ONE consistent record instead of
+/// two that a concurrent re-share could split across versions.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_bundle_members_on(
     sender: &mut hyper::client::conn::http1::SendRequest<http_body_util::Full<hyper::body::Bytes>>,
     host: &str,
     token: &str,
     req_file_id: &str,
+    view: &ParsedView,
     dir: &State<'_, AppDir>,
     session: &State<'_, Session>,
 ) -> Result<(BundleBody, u64, bool), UiError> {
@@ -97,23 +165,12 @@ pub(crate) async fn open_bundle_members_on(
     let verifier =
         crate::directory::build_delegated_verifier(&mut *sender, host, pinned, now).await?;
 
-    let username = {
+    let principal = {
         let s = session.0.lock().await;
-        s.username.clone()
+        s.principal.clone()
     }
     .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
 
-    let (status, view_json) = get_json(
-        &mut *sender,
-        &format!("/v1/files/{req_file_id}?version=latest"),
-        Some(token),
-        host,
-    )
-    .await?;
-    if status != hyper::StatusCode::OK {
-        return Err(UiError::new("fetch_failed", "That item is not available."));
-    }
-    let view = parse_file_view(&view_json)?;
     let manifest: Manifest =
         decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
     // A bundle only: reject any other served record type up front (defense in
@@ -136,17 +193,13 @@ pub(crate) async fn open_bundle_members_on(
     // present in the directory KT log (opt-in; see the viewer's use of this).
     crate::commands::feed::enforce_author_transparency(&dir.0, session.inner(), author_binding)
         .await?;
-    let my_id = crate::directory::resolve_my_user_id(
-        &mut *sender,
-        host,
-        &username,
-        &verifier,
-        &mut trust,
-        now,
-    )
-    .await?;
+    let me =
+        crate::directory::resolve_me(&mut *sender, host, &principal, &verifier, &mut trust, now)
+            .await?;
 
-    let route_mode = crate::config::SettingsConfig::load(&dir.0).connection.route_mode;
+    let route_mode = crate::config::SettingsConfig::load(&dir.0)
+        .connection
+        .route_mode;
     let direct_http = crate::direct_link::shared_direct_http();
 
     let (bundle, used_direct) = build_download_bundle(
@@ -154,7 +207,7 @@ pub(crate) async fn open_bundle_members_on(
         host,
         token,
         req_file_id,
-        &view,
+        view,
         route_mode,
         direct_http,
     )
@@ -171,7 +224,7 @@ pub(crate) async fn open_bundle_members_on(
             .identity
             .as_ref()
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-        crate::commands::viewer::run_open(identity, file_id, &author, my_id, &bundle)
+        crate::commands::viewer::run_open(identity, file_id, &author, me, &bundle)
     };
     let opened = match attempt {
         Ok(o) => o,
@@ -181,7 +234,7 @@ pub(crate) async fn open_bundle_members_on(
                 host,
                 token,
                 req_file_id,
-                &view,
+                view,
                 crate::config::RouteMode::PreferServer,
                 None,
             )
@@ -191,7 +244,7 @@ pub(crate) async fn open_bundle_members_on(
                 .identity
                 .as_ref()
                 .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-            crate::commands::viewer::run_open(identity, file_id, &author, my_id, &bundle)
+            crate::commands::viewer::run_open(identity, file_id, &author, me, &bundle)
                 .map_err(|_| e)?
         }
         Err(e) => return Err(e),
@@ -208,7 +261,7 @@ pub(crate) async fn open_bundle_members_on(
         decode(&content.plaintext).map_err(|_| UiError::new("untrusted", "Malformed bundle."))?;
     // Ownership (bundles Task 6.2): the caller authored this bundle iff their id
     // matches the verified author. Gates the owner-only "Delete bundle" action.
-    let mine = my_id == author.user_id;
+    let mine = me.id().0 == author.user_id;
     Ok((body, opened.version, mine))
 }
 
@@ -222,9 +275,10 @@ pub async fn open_bundle(
     dir: State<'_, AppDir>,
     session: State<'_, Session>,
     connect_lock: State<'_, ConnectLock>,
+    pool: State<'_, AppPool>,
 ) -> Result<BundleView, UiError> {
     let (body, version, mine) =
-        open_bundle_members(&req.file_id, &dir, &session, &connect_lock).await?;
+        open_bundle_members_pooled(&req.file_id, &dir, &session, &connect_lock, &pool).await?;
     Ok(BundleView {
         file_id: req.file_id,
         file_type: file_type_name(FileType::Bundle),

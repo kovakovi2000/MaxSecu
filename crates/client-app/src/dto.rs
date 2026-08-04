@@ -60,7 +60,9 @@ pub enum FeedFilter {
     Blog,
 }
 
-/// Client-side sort over the listing.
+/// Sort over the listing. Applied SERVER-side (`sort=newest|oldest`) by a server
+/// that paginates; re-applied client-side only on the legacy (non-paginating)
+/// path — see `commands::feed::page_from_json`.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum FeedSort {
@@ -68,12 +70,27 @@ pub enum FeedSort {
     OldestFirst,
 }
 
+/// The `list_feed` request. `filter`/`sort` are the two fields the shipped
+/// `ui/dist` already sends; EVERY paging field below is `#[serde(default)]
+/// Option<…>` (exactly like the pre-existing `limit`) so an exe upgraded WITHOUT
+/// its `ui/dist` rebuild still binds and behaves as it does today.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListFeedRequest {
     pub filter: FeedFilter,
     pub sort: FeedSort,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// 0-based item offset into the ordered result set. Absent ⇒ 0 (page 1).
+    #[serde(default)]
+    pub offset: Option<u32>,
+    /// An opaque continuation token exactly as a previous response returned it in
+    /// `next_cursor`. When present it SUPERSEDES `offset` (server-side rule).
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// `Some(true)` ⇒ send `owner=me`, restricting the listing to files owned by
+    /// the calling principal. Absent/`Some(false)` ⇒ today's unrestricted view.
+    #[serde(default)]
+    pub owner_me: Option<bool>,
 }
 
 /// One feed entry — listing metadata only (no decrypted values). The card is
@@ -85,6 +102,27 @@ pub struct FeedEntryDto {
     pub version: u64,
     pub updated_at: u64,
     pub has_thumbnail: bool,
+}
+
+/// One page of the feed listing — the response envelope `list_feed` returns
+/// instead of a bare `Vec<FeedEntryDto>`. The bare array had nowhere to carry a
+/// cursor or a total, so paging REQUIRES this envelope.
+///
+/// `total: None` is the load-bearing old-server signal: an un-upgraded server
+/// (prod `41912da`) silently IGNORES `offset`/`cursor` and returns page 1
+/// forever, and its response body has no `total` key at all. The UI MUST read
+/// `total == null` as "this server does not paginate", render NO pager, and never
+/// ask for `offset > 0`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FeedPageDto {
+    pub entries: Vec<FeedEntryDto>,
+    /// The opaque continuation token for the NEXT page under the same
+    /// (type, sort, owner) triple, or `None` when this is the last page — or when
+    /// the server does not paginate at all.
+    pub next_cursor: Option<String>,
+    /// Items matching (type, owner) IGNORING limit/offset, or `None` when the
+    /// server did not report one (⇒ it does not paginate).
+    pub total: Option<u64>,
 }
 
 /// A decrypted, verified feed card — render-ready, no key material.
@@ -183,6 +221,25 @@ pub struct BundleMemberView {
     pub file_type: String,
     pub title: String,
     pub thumbnail_b64: Option<String>,
+    /// The member's content version, or `0` for "not known here". Real versions
+    /// start at 1 (`stage_version` commits `version: 1` first and visibility is
+    /// `current_version >= 1`), so `0` can never collide with a real one.
+    ///
+    /// Why it exists: `open_content` / `decrypt_card` take an OPTIONAL `version`
+    /// and, when it is present, short-circuit on the content cache BEFORE any
+    /// network or reauth (`commands::viewer::open_content_inner`). Bundle members
+    /// had no version to pass, so every member open — including every step of the
+    /// viewer's next/previous walk — was a full round trip.
+    ///
+    /// CONTRACT FOR THE UI: when this is `0`, send NO version at all. Sending
+    /// `Some(0)` is strictly worse than sending nothing, because it misses the
+    /// pre-network cache AND makes `open_content_inner` skip its second,
+    /// post-view-fetch cache check (that one is gated on `req.version.is_none()`).
+    ///
+    /// Purely ADDITIVE on a Serialize-only seam DTO — not a stored, wire or DB
+    /// format and not one of the frozen surfaces; an already-shipped `ui/dist`
+    /// that does not know the key simply ignores it.
+    pub version: u64,
 }
 
 /// A verified, opened bundle: its own id/type/version plus the ordered member
@@ -573,6 +630,32 @@ mod reshare_dto_tests {
         let back2: BundlePreview =
             serde_json::from_str(&serde_json::to_string(&prev).unwrap()).unwrap();
         assert_eq!(back2, prev);
+    }
+
+    #[test]
+    fn bundle_member_view_carries_an_additive_version() {
+        // ADDITIVE on a Serialize-only seam DTO: every pre-existing key is
+        // untouched and `version` is simply one more, so an already-shipped
+        // `ui/dist` that does not know the key keeps working unchanged.
+        let m = BundleMemberView {
+            file_id: "ab".repeat(8),
+            file_type: "image".into(),
+            title: String::new(),
+            thumbnail_b64: None,
+            version: 0,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(v["file_id"], "ab".repeat(8));
+        assert_eq!(v["file_type"], "image");
+        assert_eq!(v["title"], "");
+        assert!(v["thumbnail_b64"].is_null());
+        // 0 is the "not known here" sentinel — real versions start at 1, so it
+        // can never collide with one. The UI's contract is to send NO version
+        // when it sees 0 (see the field docs: `Some(0)` would disable BOTH cache
+        // checks in `open_content_inner`).
+        assert_eq!(v["version"], 0);
+        assert_eq!(v.as_object().unwrap().len(), 5);
     }
 
     #[test]

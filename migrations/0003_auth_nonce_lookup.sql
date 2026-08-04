@@ -1,0 +1,137 @@
+-- migrations/0003_auth_nonce_lookup.sql — index the login hot path.
+--
+-- `auth_nonces` had exactly one index: the primary key on `nonce`. But the
+-- lookup that runs on every login is by USERNAME, not by nonce —
+-- `PgStore::outstanding_nonces` (crates/server/src/pg.rs):
+--
+--     SELECT nonce FROM auth_nonces
+--      WHERE username = $1 AND used_at IS NULL AND expires_at > $2
+--
+-- reached from POST /v1/session/proof, i.e. once per TLS channel mint (several
+-- per app open). With no index on `username` that is a sequential scan of the
+-- whole table.
+--
+-- That mattered because the table only ever grew: consumption is an UPDATE
+-- (`SET used_at = now()`), and a challenge is issued even for an unknown
+-- username (no user-existence oracle, §9.3), so abandoned nonces accumulated
+-- too. Login latency grew with the heap.
+--
+-- ============================================================================
+-- WHY `USING hash`, AND NOT THE OBVIOUS BTREE
+-- ============================================================================
+--
+-- The first draft of this migration was a plain btree:
+--
+--     CREATE INDEX auth_nonces_open_idx ON auth_nonces (username) WHERE used_at IS NULL;
+--
+-- That version CANNOT BE APPLIED to some databases that exist today, and a
+-- migration that can fail is an upgrade that can fail. `auth_nonces.username` is
+-- unbounded `TEXT` — until the bound added alongside this migration
+-- (`MAX_SESSION_USERNAME_BYTES`, crates/server/src/http.rs) one unauthenticated
+-- POST /v1/session/challenge could write a multi-megabyte claimed name, and
+-- `pg::nonce_key_col` hex-encodes it, doubling the stored length. A btree index
+-- entry is capped at 2704 bytes (1/3 of an 8 KiB page). An abandoned challenge
+-- keeps `used_at` NULL forever, so such a row sits squarely INSIDE the partial
+-- index. Reproduced on PG 14.13 against a real 0001+0002 database, applying this
+-- file exactly the way migrations/apply.sh applies it:
+--
+--     applying 0003_auth_nonce_lookup.sql
+--     ERROR:  index row requires 128016 bytes, maximum size is 8191
+--     apply-exit=1
+--     index_present = 0
+--
+-- apply.sh then returns 1 and scripts/upgrade-server.sh restores the previous
+-- binary and exits. The box survives — but it can NEVER BE UPGRADED AGAIN until
+-- a human hand-deletes a row from Postgres, and there is no admin escape hatch
+-- by design. The new HTTP bound does not rescue it: it only stops FUTURE rows,
+-- and the background prune that would eventually remove the old one runs inside
+-- a server that upgrade-server.sh has already STOPPED before it applies
+-- migrations.
+--
+-- The same ceiling also breaks DISASTER RECOVERY, which no migration-time guard
+-- could fix: `backup::merge::merge_auth_nonces` inserts a bundle's `username`
+-- values verbatim inside the restore transaction, so a bundle captured from a
+-- pre-0003 database would abort the ENTIRE restore when merged into a 0003
+-- database. Deleting the offending rows at migration time is therefore not a
+-- fix at all — it addresses the upgrade and leaves the restore broken.
+--
+-- A hash index removes the ceiling instead of working around it. It stores a
+-- 32-bit hash of the value, never the value, so there is no index-entry size
+-- limit to exceed: the abusive 128 000-character row above indexes fine, and a
+-- restore may re-insert one at any time. Properties that make this the right
+-- tool and not a trick:
+--
+--   * IT IS EXACTLY THE OPERATOR WE USE. A hash index supports `=` and nothing
+--     else. `outstanding_nonces` does `username = $1` — exact equality — and
+--     nothing anywhere sorts, ranges over, or pattern-matches this column.
+--   * NO COLLISION FALSE-POSITIVES. The AM sets `xs_recheck`, so the executor
+--     re-applies `username = $1` to the heap tuple. Demonstrated with a real
+--     32-bit collision (two different names with the same `hashtext`):
+--         Index Scan using auth_nonces_open_idx on auth_nonces (actual rows=1)
+--           Index Cond: (username = '75736572323236313030'::text)
+--           Rows Removed by Index Recheck: 1
+--     The wrong row is fetched and then discarded; the query result is identical
+--     to a seq scan's. (A collision costs one extra heap fetch. On 32 bits with
+--     a few hundred open challenges that is never.)
+--   * CRASH-SAFE AND WAL-LOGGED. Hash indexes have been WAL-logged since
+--     PostgreSQL 10 (which is also when `CREATE INDEX ... USING hash` stopped
+--     emitting "hash indexes are not WAL-logged and their use is discouraged").
+--     Production is Ubuntu 22.04's `postgresql` = PG 14, and CI is `postgres:14`,
+--     so every targeted version is well past that. Verified by crashing a 14.13
+--     cluster with `pg_ctl stop -m immediate` after a CHECKPOINT + 20 000 inserts
+--     — i.e. with the index pages reachable only through WAL — and confirming
+--     after `redo done` that all 20 000 rows were still found BY INDEX SCAN.
+--   * THE PLANNER ACTUALLY USES IT, with default settings, on the real query
+--     against a 60 000-row table:
+--         Index Scan using auth_nonces_open_idx on auth_nonces (actual rows=1)
+--           Index Cond: (username = '757365723737'::text)
+--           Filter: (expires_at > now())
+--
+-- STILL PARTIAL on `used_at IS NULL`. That predicate appears verbatim in the
+-- query, so the planner can use the index; and it keeps the index to the
+-- UNCONSUMED challenges, which is a small fraction of the heap. Note what it
+-- does NOT do: the predicate is not self-bounding. An abandoned challenge keeps
+-- `used_at` NULL forever, so open rows accumulate on their own. What keeps this
+-- index small is the background prune added alongside it
+-- (`Store::prune_expired_auth_rows`, driven by `portable-server`'s
+-- `spawn_auth_prune`), which deletes `sessions` / `auth_nonces` rows more than
+-- seven days past their `expires_at` — including unconsumed ones. Removing that
+-- prune would let this index grow without limit again.
+--
+-- `expires_at` is deliberately NOT in the index (a hash index cannot hold it
+-- anyway, and it is a range test): the executor applies it to the handful of
+-- rows the username+open lookup returns.
+--
+-- COMPATIBILITY. This adds an index and nothing else: no new column, no new
+-- constraint, no changed row, no deleted row, no changed query. An OLD server
+-- binary meeting this database sees the identical rows it saw before (an index
+-- is invisible to SQL semantics); a NEW binary meeting an OLD, un-migrated
+-- database still works, because the query is the same query — it is merely
+-- slower without the index. Every row that could be stored before can still be
+-- stored, including one a pre-0003 backup bundle carries in. Nothing
+-- re-enrolls, re-keys, re-uploads or re-shares. It is a surface-#9 (DB schema)
+-- change only in the bookkeeping sense: it must ship as a migration so an
+-- upgraded server and a fresh install stay the same product.
+--
+-- PLAIN `CREATE INDEX`, NEVER `CONCURRENTLY`. migrations/apply.sh wraps this file
+-- in ONE transaction together with its `schema_migrations` row
+-- (`printf 'BEGIN;\n'` / `cat "$dir/$name"` / INSERT / `printf 'COMMIT;\n'`,
+-- apply.sh:182-188) and REFUSES any migration that manages its own transaction
+-- (apply.sh:163). `CREATE INDEX CONCURRENTLY` cannot run inside a transaction, so
+-- it is not an option here — and it is not needed: the plain form's ACCESS
+-- EXCLUSIVE lock costs nothing because scripts/upgrade-server.sh has already run
+-- `systemctl stop maxsecu-server` (:795) before it applies migrations (:850) and
+-- only restarts afterwards (:1131). No client is connected while this runs, and
+-- the table is small enough that the build is instant regardless.
+--
+-- Written in the baseline's idempotent style (`IF NOT EXISTS`) and with no
+-- BEGIN;/COMMIT; of its own. Mirrored into docs/schema.sql (there, per that
+-- file's own style, without `IF NOT EXISTS` — it only ever loads into an empty
+-- database; the resulting catalog is identical, which is exactly what
+-- crates/compat/tests/schema_equivalence.rs proves against a live Postgres).
+
+-- ============================================================================
+-- auth_nonces — the open-challenge lookup (login hot path)
+-- ============================================================================
+
+CREATE INDEX IF NOT EXISTS auth_nonces_open_idx ON auth_nonces USING hash (username) WHERE used_at IS NULL;  -- outstanding_nonces: WHERE username = $1 AND used_at IS NULL

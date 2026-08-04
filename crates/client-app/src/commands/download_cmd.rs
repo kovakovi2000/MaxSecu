@@ -19,17 +19,15 @@ use maxsecu_encoding::structs::Manifest;
 use maxsecu_encoding::types::{FileType, StreamType};
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
-use crate::commands::connection::{reauth, server_of};
-use crate::commands::feed::{hex, hex16, now_ms};
+use crate::commands::connection::server_of;
+use crate::commands::feed::{hex, hex16, now_ms, reauth_channel};
+use crate::commands::pool::{get_on_pooled_channel, AppPool};
 use crate::commands::viewer::run_open;
 use crate::config::{load_directory_pub, RouteMode, SettingsConfig};
-use crate::directory::{
-    resolve_and_verify_author_logged, resolve_my_user_id, VerifiedAuthor,
-};
+use crate::directory::{resolve_and_verify_author_logged, resolve_me, Recipient, VerifiedAuthor};
 use crate::download::{build_download_bundle, build_stream_header, parse_file_view};
 use crate::dto::DownloadRequest;
 use crate::error::UiError;
-use crate::http_client::get_json;
 
 /// Suggest a save-as filename for a downloaded post from its authenticated
 /// metadata JSON (`{"title","tags"}` for image/blog/video, `{"title","tags",
@@ -116,7 +114,12 @@ impl AtomicFile {
         let save_path = PathBuf::from(save_path);
         let tmp = temp_sibling(&save_path);
         let file = std::fs::File::create(&tmp).map_err(|_| write_failed())?;
-        Ok(Self { tmp, save_path, file, committed: false })
+        Ok(Self {
+            tmp,
+            save_path,
+            file,
+            committed: false,
+        })
     }
 
     fn write_all(&mut self, buf: &[u8]) -> Result<(), UiError> {
@@ -184,6 +187,7 @@ pub async fn download_content(
     dir: State<'_, AppDir>,
     session: State<'_, Session>,
     connect_lock: State<'_, ConnectLock>,
+    pool: State<'_, AppPool>,
 ) -> Result<String, UiError> {
     // Validate the REQUESTED id up front: it is the id the served record must bind
     // to (via `build_verify_ctx`) and it is interpolated into the request URL.
@@ -194,29 +198,40 @@ pub async fn download_content(
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
 
-    let username = {
+    let principal = {
         let s = session.0.lock().await;
-        s.username.clone()
+        s.principal.clone()
     }
     .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
 
     let server = server_of(&dir.0)?;
-    let (mut sender, host, token) = reauth(&dir.0, &server, &session, &connect_lock).await?;
+    // BORROW a warm authed channel instead of minting a login per download. A
+    // "Download all" over a bundle fires one of these per member — a login each was
+    // the fastest way to spend the server's 30-challenges-per-minute budget.
+    //
+    // The §8.5 view GET is the pool's channel-health check and so runs FIRST (same
+    // order `decrypt_card` uses); the D5 delegation hop follows on the validated
+    // channel, still BEFORE any binding is verified.
+    //
+    // NB the guard is held for the WHOLE download, including the chunk loop of a
+    // large video — that is deliberate (the channel is exclusively ours while we
+    // stream over it) and is why the pool floors its cap at two channels, so a long
+    // download can never hold the only one.
+    let (mut chan, view_json) = get_on_pooled_channel(
+        &pool,
+        &principal,
+        &format!("/v1/files/{file_id_hex}?version=latest"),
+        UiError::new("fetch_failed", "That item is not available."),
+        || reauth_channel(&dir.0, &server, &session, &connect_lock),
+    )
+    .await?;
+    let host = chan.host.clone();
+    let token = chan.token.clone();
     // Offline-D5 hop (spec §3/§7): build the effective directory verifier over the
     // pinned connection; fail closed on a bad/expired delegation before any decode.
     let verifier =
-        crate::directory::build_delegated_verifier(&mut sender, &host, pinned, now).await?;
+        crate::directory::build_delegated_verifier(&mut chan.sender, &host, pinned, now).await?;
 
-    let (status, view_json) = get_json(
-        &mut sender,
-        &format!("/v1/files/{file_id_hex}?version=latest"),
-        Some(&token),
-        &host,
-    )
-    .await?;
-    if status != hyper::StatusCode::OK {
-        return Err(UiError::new("fetch_failed", "That item is not available."));
-    }
     let view = parse_file_view(&view_json)?;
     let manifest: Manifest =
         decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
@@ -233,7 +248,7 @@ pub async fn download_content(
     // D5-verify the author binding (fail-closed) BEFORE any decode/decrypt, then
     // enforce key-transparency (opt-in) exactly as the viewer/player do.
     let (author, author_binding) = resolve_and_verify_author_logged(
-        &mut sender,
+        &mut chan.sender,
         &host,
         &hex(&manifest.author_id.0),
         &verifier,
@@ -243,8 +258,15 @@ pub async fn download_content(
     .await?;
     crate::commands::feed::enforce_author_transparency(&dir.0, session.inner(), author_binding)
         .await?;
-    let my_id =
-        resolve_my_user_id(&mut sender, &host, &username, &verifier, &mut trust, now).await?;
+    let me = resolve_me(
+        &mut chan.sender,
+        &host,
+        &principal,
+        &verifier,
+        &mut trust,
+        now,
+    )
+    .await?;
 
     let route_mode = SettingsConfig::load(&dir.0).connection.route_mode;
 
@@ -253,14 +275,14 @@ pub async fn download_content(
         // stream plaintext, and write it whole.
         FileType::Image | FileType::Blog => {
             download_whole(
-                &mut sender,
+                &mut chan.sender,
                 &host,
                 &token,
                 &req,
                 file_id,
                 &view,
                 &author,
-                my_id,
+                me,
                 &session,
                 route_mode,
             )
@@ -271,7 +293,7 @@ pub async fn download_content(
         // chunk to disk, one chunk in RAM.
         FileType::Video | FileType::Generic => {
             download_streaming(
-                &mut sender,
+                &mut chan.sender,
                 &host,
                 &token,
                 &req,
@@ -279,7 +301,7 @@ pub async fn download_content(
                 &file_id_hex,
                 &view,
                 &author,
-                my_id,
+                me,
                 &session,
                 route_mode,
             )
@@ -303,7 +325,7 @@ async fn download_whole(
     file_id: [u8; 16],
     view: &crate::download::ParsedView,
     author: &VerifiedAuthor,
-    my_id: [u8; 16],
+    me: Recipient,
     session: &State<'_, Session>,
     route_mode: RouteMode,
 ) -> Result<String, UiError> {
@@ -328,7 +350,7 @@ async fn download_whole(
             .identity
             .as_ref()
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-        run_open(identity, file_id, author, my_id, &bundle)
+        run_open(identity, file_id, author, me, &bundle)
     };
     let opened = match attempt {
         Ok(o) => o,
@@ -348,7 +370,7 @@ async fn download_whole(
                 .identity
                 .as_ref()
                 .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-            run_open(identity, file_id, author, my_id, &bundle).map_err(|_| e)?
+            run_open(identity, file_id, author, me, &bundle).map_err(|_| e)?
         }
         Err(e) => return Err(e),
     };
@@ -380,7 +402,7 @@ async fn download_streaming(
     file_id_hex: &str,
     view: &crate::download::ParsedView,
     author: &VerifiedAuthor,
-    my_id: [u8; 16],
+    me: Recipient,
     session: &State<'_, Session>,
     route_mode: RouteMode,
 ) -> Result<String, UiError> {
@@ -389,9 +411,16 @@ async fn download_streaming(
     // Header (small streams only — no content fetched). Prefer the direct route.
     // Use the canonical lowercase `file_id_hex` EVERYWHERE (header + every content
     // chunk) so header and chunk URLs never diverge in casing.
-    let (header, header_used_direct) =
-        build_stream_header(sender, host, token, file_id_hex, view, route_mode, direct_http)
-            .await?;
+    let (header, header_used_direct) = build_stream_header(
+        sender,
+        host,
+        token,
+        file_id_hex,
+        view,
+        route_mode,
+        direct_http,
+    )
+    .await?;
 
     // Derive the decryptor under the session lock (sync verify; the identity borrow
     // never spans an await). A direct-sourced header that fails verification is
@@ -404,7 +433,7 @@ async fn download_streaming(
                 .identity
                 .as_ref()
                 .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-            let ctx = crate::directory::build_verify_ctx(file_id, author, my_id, identity);
+            let ctx = crate::directory::build_verify_ctx(file_id, author, me, identity);
             open_content_decryptor(&ctx, &header)
         };
         match attempt {
@@ -425,7 +454,7 @@ async fn download_streaming(
                     .identity
                     .as_ref()
                     .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-                let ctx = crate::directory::build_verify_ctx(file_id, author, my_id, identity);
+                let ctx = crate::directory::build_verify_ctx(file_id, author, me, identity);
                 open_content_decryptor(&ctx, &header)
                     .map_err(|_| UiError::new("verify_failed", "This item failed verification."))?
             }
@@ -482,7 +511,12 @@ async fn download_streaming(
                     .await?;
                     used_direct = false; // exactly one retry
                 }
-                Err(_) => return Err(UiError::new("verify_failed", "This item failed verification.")),
+                Err(_) => {
+                    return Err(UiError::new(
+                        "verify_failed",
+                        "This item failed verification.",
+                    ))
+                }
             }
         };
         sink.write_all(&plaintext)?;
@@ -512,7 +546,10 @@ mod tests {
     fn generic_falls_back_to_title_then_default() {
         // Generic with no filename → sanitized title (no forced extension).
         let no_name = br#"{"title":"Report 2026","tags":[]}"#;
-        assert_eq!(suggested_filename(FileType::Generic, no_name), "Report 2026");
+        assert_eq!(
+            suggested_filename(FileType::Generic, no_name),
+            "Report 2026"
+        );
         // Generic with neither → the safe default.
         let bare = br#"{"title":"","tags":[]}"#;
         assert_eq!(suggested_filename(FileType::Generic, bare), "download.bin");
@@ -538,7 +575,10 @@ mod tests {
 
     #[test]
     fn malformed_metadata_yields_a_safe_default() {
-        assert_eq!(suggested_filename(FileType::Video, b"not json"), "download.mp4");
+        assert_eq!(
+            suggested_filename(FileType::Video, b"not json"),
+            "download.mp4"
+        );
     }
 
     fn unique_dir(tag: &str) -> PathBuf {
@@ -573,7 +613,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
             .collect();
-        assert!(leftovers.is_empty(), "no .part temp should remain after commit");
+        assert!(
+            leftovers.is_empty(),
+            "no .part temp should remain after commit"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -593,13 +636,20 @@ mod tests {
             // Simulate a mid-download error: drop the sink WITHOUT commit.
         }
         // The original is untouched (never truncated) and no temp remains.
-        assert_eq!(std::fs::read(&save).unwrap(), b"ORIGINAL", "original must survive an aborted download");
+        assert_eq!(
+            std::fs::read(&save).unwrap(),
+            b"ORIGINAL",
+            "original must survive an aborted download"
+        );
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
             .collect();
-        assert!(leftovers.is_empty(), "aborted download must leave no .part temp");
+        assert!(
+            leftovers.is_empty(),
+            "aborted download must leave no .part temp"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

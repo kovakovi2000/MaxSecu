@@ -6,6 +6,9 @@ export interface AuthStateMsg { state: string }
 // --- Trusted-server recovery login (spec §6) DTO mirrors ---
 // No key material ever crosses the seam: only an opaque status + the public
 // server_id. The cold recovery private key + the challenge nonce stay in Rust.
+// DO NOT WIDEN either shape: `dto.rs` asserts both serialize to exactly two
+// fields. Anything the recovery screen additionally needs gets its own command
+// (`set_server_from_code` takes a scalar `code` and returns nothing).
 export interface RecoveryChallengeDto { status: string; server_id: string }
 export interface RecoveryLoginDto { status: string; server_id: string }
 
@@ -25,6 +28,19 @@ export interface FeedEntry {
   version: number;
   updated_at: number;
   has_thumbnail: boolean;
+}
+
+// One page of the feed listing — the envelope `list_feed` returns (mirrors Rust
+// `FeedPageDto`). A bare array had nowhere to carry a cursor or a total.
+//
+// `total === null` is THE OLD-SERVER SIGNAL and is load-bearing: an un-upgraded
+// server (prod 41912da) silently ignores `offset`/`cursor` and returns page 1
+// forever, and its body has no `total` key. On seeing null the UI MUST render no
+// pager and never request offset > 0 — i.e. behave exactly as it does today.
+export interface FeedPage {
+  entries: FeedEntry[];
+  next_cursor: string | null;
+  total: number | null;
 }
 
 export interface Card {
@@ -109,6 +125,20 @@ export interface BundleMemberView {
   file_type: string;
   title: string;
   thumbnail_b64: string | null;
+  // The member's content version, or 0 for "not known here" (real versions start
+  // at 1, so 0 can never collide with one). Mirrors Rust `BundleMemberView.version`.
+  //
+  // CONTRACT: when this is 0 the UI must send NO version at all. `open_content`
+  // short-circuits on the content cache BEFORE any network/reauth when a version
+  // is present, but its SECOND (post-fetch) cache check is gated on the version
+  // being absent — so passing 0 loses both and is strictly worse than passing
+  // nothing. Read it through `memberVersion()` in bundle-screen.ts, which applies
+  // that rule and also folds in versions learned from a successful open.
+  //
+  // Optional on the TS side because an exe whose ui/dist post-dates its Rust half
+  // (or the reverse) must not blow up on a missing key: an absent version reads
+  // exactly like 0 — unknown.
+  version?: number;
 }
 
 export interface BundleView {

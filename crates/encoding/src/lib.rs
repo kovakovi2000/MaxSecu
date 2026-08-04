@@ -45,7 +45,7 @@ pub const SUITE_V2: u16 = 0x0002;
 /// A top-level signed/hashed structure: a `u16 type_id` (§5) followed by its
 /// fields in declared order. There is exactly one canonical byte form per value.
 ///
-/// Only this crate implements `Canonical` (the 13 structures of §4); callers
+/// Only this crate implements `Canonical` (the 14 structures of §4); callers
 /// use [`encode`] / [`decode`].
 pub trait Canonical: Sized {
     /// The `u16` registry codepoint (encoding-spec §5).
@@ -59,6 +59,13 @@ pub trait Canonical: Sized {
 /// Is `id` a defined struct codepoint? `0x0004` (write_grant, removed D29) is
 /// reserved and is **not** registered — it is rejected like any unknown id
 /// (encoding-spec §5, V-2/V-13).
+///
+/// This list is hand-maintained and the compiler cannot check it: it is a
+/// `matches!`, not an exhaustive dispatch, so a newly registered struct that is
+/// missing here still encodes and decodes correctly and every test stays green.
+/// The only cost is a mis-classified diagnostic — a wrong-but-known id would be
+/// reported as `UnknownTypeId` rather than `WrongTypeId` — which is why each new
+/// codepoint gets a test that pins the distinction.
 const fn is_registered(id: u16) -> bool {
     matches!(
         id,
@@ -75,6 +82,7 @@ const fn is_registered(id: u16) -> bool {
             | 0x000C
             | 0x000D
             | 0x000E
+            | 0x000F
     )
 }
 

@@ -34,6 +34,7 @@ use maxsecu_client_core::transparency::{
 use maxsecu_client_core::Identity;
 use maxsecu_crypto::merkle::verify_inclusion;
 
+use crate::commands::auth::Principal;
 use crate::config::SinkPins;
 use crate::error::UiError;
 
@@ -77,8 +78,31 @@ impl DiskKtCheckpointStore {
     /// (`server_untrusted`) on a decrypt/parse error (corrupt, or written by a
     /// foreign identity) — never silently discards a pinned checkpoint.
     pub fn open(dir: &Path, identity: &Identity) -> Result<Self, UiError> {
+        Self::open_at(dir.join("kt").join("checkpoint.kt"), identity)
+    }
+
+    /// [`Self::open`] for the principal that is actually signed in. The USER path is
+    /// unchanged (`<dir>/kt/checkpoint.kt`); the RECOVERY principal gets a NEW
+    /// sibling. These bytes are sealed under an identity-derived key at a FIXED
+    /// path, and this open is `?`-propagated into the whole browse path, so without
+    /// the split a recovery login in a folder an ordinary user has signed into would
+    /// hit the documented "written by a foreign identity" branch and fail closed —
+    /// blocking every card on a deployment with a pinned KT log key. Add-only: no
+    /// existing file is read differently, renamed, or rewritten.
+    pub fn open_for(
+        dir: &Path,
+        identity: &Identity,
+        principal: &Principal,
+    ) -> Result<Self, UiError> {
+        let name = match principal {
+            Principal::User { .. } => "checkpoint.kt",
+            Principal::Recovery => "checkpoint.recovery.kt",
+        };
+        Self::open_at(dir.join("kt").join(name), identity)
+    }
+
+    fn open_at(path: PathBuf, identity: &Identity) -> Result<Self, UiError> {
         let key = seal_key(identity);
-        let path = dir.join("kt").join("checkpoint.kt");
         let latest = match std::fs::read(&path) {
             Ok(sealed) => Some(decrypt_checkpoint(&key, &sealed)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,

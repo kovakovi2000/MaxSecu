@@ -14,7 +14,7 @@ use crate::blob::BlobStore;
 use crate::error::{AuthError, ChallengeError, ControlAppendError, ProveError};
 use crate::files::{
     parse_stage, AddWrapError, DeleteError, DeleteWrapError, DiscardError, FinalizeError,
-    GenesisInput, ListFilter, StageError, StageInput, VersionSelector, WrapInput,
+    GenesisInput, ListFilter, ListSort, StageError, StageInput, VersionSelector, WrapInput,
 };
 use crate::store::{FileView, Store};
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Json, Path, Query, State};
@@ -24,6 +24,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Router};
 use base64::engine::general_purpose::STANDARD as B64;
+// The listing cursor only: base64url WITHOUT padding, so the token is safe to
+// paste back into a query string verbatim (no `+`, `/` or `=`). Every `_b64`
+// wire field keeps using standard base64 (`B64`) — this is a new, opaque,
+// server-defined token, not a change to any frozen field.
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
 use maxsecu_crypto::{random_array, VerifyingKey};
 use maxsecu_encoding::labels::DIRBINDING;
@@ -803,10 +808,68 @@ struct ChallengeRes {
     expires_in_s: u64,
 }
 
+/// Ceiling on the claimed `username` the **unauthenticated session routes**
+/// (`POST /v1/session/challenge` and `POST /v1/session/proof`) will accept, in
+/// **raw request bytes**.
+///
+/// **Why a bound exists at all.** Both routes are reachable with no proof, no
+/// account and no user-existence oracle (§9.3), and both spend the claimed name
+/// on storage that outlives the request:
+///
+/// * `challenge` writes it verbatim into `auth_nonces` (`pg::insert_nonce`,
+///   hex-encoded into the `TEXT` column, so 2× the raw length);
+/// * *both* routes key the in-memory issuance/backoff limiter with it
+///   (`ratelimit.rs`: `admit_challenge`, and `record_proof`, which is reached on
+///   **every** `prove` — including a failing one — via
+///   `accounts.entry(username.to_owned())`).
+///
+/// The `auth_nonces` row is now swept by the background prune, but the limiter
+/// map is **never evicted** (see the note in `ratelimit.rs`), so an unbounded
+/// name on either route is an unbounded permanent allocation. Without a bound
+/// the only ceiling was the global 8 MiB body limit below: one unauthenticated
+/// request could pin 8 MiB of RSS forever, and N of them N × 8 MiB.
+///
+/// **Why THIS number cannot lock anyone out.** The only way a `users` row can
+/// come into existence is `POST /v1/users`, which already rejects a username
+/// whose NFC form exceeds [`maxsecu_encoding::MAX_TEXT`] (1024 bytes) via
+/// `Text::new` (see `register`). That route then stores the RAW request bytes,
+/// which may be the canonically-decomposed form of that name; canonical
+/// composition shrinks UTF-8 by at most 3× (the worst case is U+212A KELVIN
+/// SIGN, 3 bytes → `K`, 1 byte), so no storable username can exceed
+/// `3 * MAX_TEXT` raw bytes. `4 * MAX_TEXT` is strictly above that ceiling with
+/// a whole `MAX_TEXT` of margin, so this check cannot reject a name any account
+/// could actually hold. It rejects only strings that could never have been
+/// registered — and therefore could never have logged in. The same reasoning
+/// covers `prove`: a name this check rejects has no `sig_pub` on record, so its
+/// only possible outcome was the uniform `401`.
+///
+/// **RECONCILIATION WITH THE `auth_nonces` INDEX.** `migrations/0003` indexes
+/// `auth_nonces.username`, so a name this bound *accepts* must also be a name
+/// the index can *store* — otherwise there would be a band of usernames that
+/// turn a `200` into a `500` on an unauthenticated route. That is exactly why
+/// `auth_nonces_open_idx` is a **hash** index and not a btree: a hash index
+/// stores a 32-bit hash, so it has **no index-entry size limit at all** and this
+/// constant has no upper partner to stay under. Had it stayed a btree, its
+/// 2704-byte entry cap against a hex-encoded (2×) column would have made the
+/// index limit `1352` raw bytes — a third of this bound — and the band between
+/// them would have 500'd. The two limits are reconciled by there being only one:
+/// this one. Raising it is safe for the index at any value; the only thing it
+/// trades is how much limiter memory one request can pin.
+const MAX_SESSION_USERNAME_BYTES: usize = 4 * maxsecu_encoding::MAX_TEXT;
+
 async fn challenge<S: Store>(
     State(st): State<AppState<S>>,
     Json(req): Json<ChallengeReq>,
 ) -> Response {
+    // Bound the claimed name BEFORE any store I/O or limiter bookkeeping: the
+    // `auth_nonces` row a challenge writes outlives the request and the limiter
+    // key outlives the process, so an unbounded name is an unbounded permanent
+    // write (see the const above for why this limit strands no existing
+    // account). Same bare-400 shape `register` and `prove` already use for a
+    // malformed body — no new error code, no body.
+    if req.username.len() > MAX_SESSION_USERNAME_BYTES {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     // A well-formed challenge is returned for unknown usernames too (§9.3),
     // unless the per-account issuance cap throttles it (429, parameters §3).
     match st.auth.challenge(&req.username, now_ms()).await {
@@ -841,6 +904,15 @@ async fn prove<S: Store>(
     Extension(exporter): Extension<TlsExporter>,
     Json(req): Json<ProveReq>,
 ) -> Response {
+    // Same bound, same constant, same bare-400 shape as `challenge`. `prove` is
+    // just as unauthenticated, and it ALWAYS reaches
+    // `limiter.record_proof(username, ..)` — on the failing path too — which
+    // does `accounts.entry(username.to_owned())` into a map nothing ever
+    // evicts. Unbounded, one request permanently allocates up to the 8 MiB body
+    // limit. Checked before `prove` is called, so the allocation never happens.
+    if req.username.len() > MAX_SESSION_USERNAME_BYTES {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let Some(proof) = b64_fixed::<64>(&req.proof_b64) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -871,7 +943,7 @@ async fn prove<S: Store>(
 
 async fn logout<S: Store + 'static>(
     State(st): State<AppState<S>>,
-    session: AuthedSession,
+    session: RecoveryOkSession,
 ) -> StatusCode {
     match st.auth.logout(&session.token).await {
         Ok(()) => StatusCode::NO_CONTENT,
@@ -1239,10 +1311,18 @@ fn stage_status(e: StageError) -> Response {
         AlreadyFinalized => StatusCode::CONFLICT.into_response(),
         Store(e) => internal_error(e),
         // Every remaining cause is a malformed/inconsistent request.
-        BadManifest | BadGenesis | FileIdMismatch | ChunkSizeOutOfRange | MissingRecoveryWrap
-        | VersionMismatch | GenesisRequired | GenesisUnexpected => {
-            StatusCode::BAD_REQUEST.into_response()
-        }
+        // `MismatchedRecoveryWrap` joins them: on Postgres that body already
+        // failed the `file_key_wraps` biconditional CHECK and surfaced as a 500,
+        // so this only moves an already-refused request to its accurate code.
+        BadManifest
+        | BadGenesis
+        | FileIdMismatch
+        | ChunkSizeOutOfRange
+        | MissingRecoveryWrap
+        | MismatchedRecoveryWrap
+        | VersionMismatch
+        | GenesisRequired
+        | GenesisUnexpected => StatusCode::BAD_REQUEST.into_response(),
     }
 }
 
@@ -1520,7 +1600,7 @@ async fn put_chunk<S: Store + 'static>(
 /// recipient of a finalized version; otherwise `404` (no oracle).
 async fn get_chunk<S: Store + 'static>(
     State(st): State<AppState<S>>,
-    session: AuthedSession,
+    session: RecoveryOkSession,
     Path((file_id_hex, version, stream_type, index)): Path<(String, u64, String, u64)>,
 ) -> Response {
     let (Some(file_id), Some(stype)) = (
@@ -1577,7 +1657,7 @@ struct ChunkStatusOut {
 /// oracle). The state is a known, accepted popularity side-channel (§15.3).
 async fn chunk_status<S: Store + 'static>(
     State(st): State<AppState<S>>,
-    session: AuthedSession,
+    session: RecoveryOkSession,
     Path((file_id_hex, version, stream_type, index)): Path<(String, u64, String, u64)>,
 ) -> Response {
     let (Some(file_id), Some(stype)) = (
@@ -1777,7 +1857,7 @@ fn file_view_to_res(v: FileView) -> FileRes {
 /// missing file/version and a caller with no wrap — no access oracle.
 async fn get_file<S: Store + 'static>(
     State(st): State<AppState<S>>,
-    session: AuthedSession,
+    session: RecoveryOkSession,
     Path(file_id_hex): Path<String>,
     Query(q): Query<GetFileQuery>,
 ) -> Response {
@@ -1810,6 +1890,11 @@ async fn get_file<S: Store + 'static>(
 /// inert — the recipient re-verifies the grant chain (§12.5/P4.1).
 async fn add_wrap<S: Store + 'static>(
     State(st): State<AppState<S>>,
+    // NOT `RecoveryOkSession`, and that is a CLOSED decision (2026-08-02), not a
+    // pending item: a recovery-issued grant is unverifiable by its recipient, and
+    // `add_wrap` replaces destructively, so admitting the recovery principal here
+    // would cost an existing user access to data they already uploaded. Full
+    // reasoning in that type's doc comment.
     session: AuthedSession,
     Path(file_id_hex): Path<String>,
     Json(req): Json<WrapReq>,
@@ -1848,7 +1933,13 @@ async fn add_wrap<S: Store + 'static>(
 
 /// `DELETE /v1/files/{file_id}/wraps/{recipient_id}` — soft revoke (api.md
 /// §10.2). Server-side denial only (§12.8). `204` on success; `403` if the
-/// caller is neither owner nor the wrap's granter; `404` if absent; `500` fault.
+/// caller is neither owner nor the wrap's granter, and `403 recovery_protected`
+/// if the TARGET is the recovery recipient (refused for every caller, owner
+/// included); `404` if absent; `500` fault.
+///
+/// The recovery guard runs HERE, before the store call, so a refused request
+/// emits no `SoftRevoke` audit edge — the revoke never happened and the sharing
+/// graph must not record that it did.
 async fn delete_wrap<S: Store + 'static>(
     State(st): State<AppState<S>>,
     session: AuthedSession,
@@ -1860,6 +1951,12 @@ async fn delete_wrap<S: Store + 'static>(
     let Some(recipient) = hex_fixed::<16>(&recipient_hex) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    // Layer 1 of 3 (the others are in `MemoryStore`/`PgStore`). Stripping the
+    // recovery wrap is a one-way blinding of the escrow: `add_wrap` hard-rejects
+    // `RECOVERY_ID` in both stores, so nothing can put it back at this version.
+    if recipient == maxsecu_encoding::RECOVERY_ID.0 {
+        return recovery_protected();
+    }
     match st
         .auth
         .store()
@@ -1880,9 +1977,26 @@ async fn delete_wrap<S: Store + 'static>(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(DeleteWrapError::NotAuthorized) => StatusCode::FORBIDDEN.into_response(),
+        Err(DeleteWrapError::RecoveryProtected) => recovery_protected(),
         Err(DeleteWrapError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(DeleteWrapError::Store(e)) => internal_error(e),
     }
+}
+
+/// The soft-revoke refusal for the recovery recipient: `403` with a stable,
+/// distinct code so it is separable in logs from an ordinary ownership `403`
+/// (which stays bodiless).
+///
+/// `403`, not `400`: the request is well-formed and the caller IS authorized for
+/// the route — just not for this target. Deliberately asymmetric with
+/// `add_wrap`, which answers `400` for the same recipient because there the body
+/// itself is invalid (a re-share may never target recovery, §12.9).
+fn recovery_protected() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "code": "recovery_protected" })),
+    )
+        .into_response()
 }
 
 /// `DELETE /v1/files/{file_id}` — remove a file, owner-only. For a
@@ -1996,11 +2110,26 @@ async fn list_recipients<S: Store + 'static>(
     }
 }
 
+/// `GET /v1/files` query. EVERY field is optional and unknown parameters are
+/// ignored (no `deny_unknown_fields`; `serde_urlencoded` drops what it does not
+/// know) — a pre-paging client sends only `type`/`limit` and gets exactly the
+/// pre-paging behaviour.
 #[derive(Deserialize)]
 struct ListQuery {
     #[serde(rename = "type")]
     file_type: Option<String>,
     limit: Option<usize>,
+    /// 0-based item offset. Ignored when a valid `cursor` is also present.
+    offset: Option<u32>,
+    /// An opaque continuation token, exactly as returned in `next_cursor`.
+    /// SUPERSEDES `offset` when present and valid; malformed ⇒ `400`.
+    cursor: Option<String>,
+    /// `newest` (default) | `oldest`. Anything else ⇒ `400`.
+    sort: Option<String>,
+    /// `me` restricts to files the caller OWNS ("My Content"). Anything else ⇒
+    /// `400`. Deliberately not an arbitrary user id — that would be an
+    /// enumeration oracle over other people's posts.
+    owner: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2015,17 +2144,128 @@ struct ListEntryRes {
 #[derive(Serialize)]
 struct ListRes {
     files: Vec<ListEntryRes>,
+    /// Non-null iff more entries exist AFTER this page under the same
+    /// `(type, sort, owner)` triple. Was ALWAYS null before server-side paging;
+    /// populating it is additive (the frozen fixture's `null` pins only that the
+    /// KEY exists — `compat/tests/http_wire.rs`, `Value::Null => {}`).
     next_cursor: Option<String>,
+    /// Entries matching the filter with `limit`/`offset` ignored — what a
+    /// numbered pager divides by `limit`. NEW, additive: an old client parses
+    /// this body as an untyped `serde_json::Value` and reads only `files`
+    /// (`client-app/src/commands/feed.rs`), so an extra key cannot break it.
+    ///
+    /// Its ABSENCE is the version signal in the other direction: a client talking
+    /// to a server that predates paging sees no `total`, and must then render no
+    /// pager at all rather than requesting `offset > 0` from a server that would
+    /// silently ignore it and serve page 1 forever.
+    total: u64,
 }
 
-/// `GET /v1/files?type=&limit=` — D35 listing (api.md §8.6). `file_type` +
-/// small-stream structure/sizes only; never values.
+/// Cursor payload version. Bumping it is how a future cursor layout stays
+/// distinguishable from this one; `1` is the only value emitted or accepted.
+const CURSOR_V: &str = "1";
+
+/// The normalized `(type, sort, owner)` triple a cursor is bound to, as a
+/// 16-hex-char SHA-256 prefix. Built from the SERVER's canonical spellings (the
+/// `file_type_name` codepoint, not the caller's raw string), so two spellings of
+/// the same filter cannot mint two different fingerprints.
+fn cursor_fp(file_type: Option<i16>, sort: ListSort, owner_only: bool) -> String {
+    let t = file_type.map(file_type_name).unwrap_or("");
+    let s = match sort {
+        ListSort::Newest => "newest",
+        ListSort::Oldest => "oldest",
+    };
+    let o = if owner_only { "me" } else { "" };
+    let digest = maxsecu_crypto::sha256(format!("type={t};sort={s};owner={o}").as_bytes());
+    hex_encode(&digest)[..16].to_owned()
+}
+
+/// `base64url-unpadded("1|<next_offset>|<query_fp>")`. Opaque to clients, but
+/// deterministic and self-validating: the fingerprint lets the server refuse a
+/// cursor replayed under a DIFFERENT filter loudly, instead of silently serving
+/// the wrong page of a different result set.
+fn encode_cursor(next_offset: u64, fp: &str) -> String {
+    B64URL.encode(format!("{CURSOR_V}|{next_offset}|{fp}").as_bytes())
+}
+
+/// Why a cursor was refused. Both map to `400`; the codes are distinct so
+/// "you changed the filter" is separable from "that is not a cursor".
+enum CursorError {
+    /// Undecodable, wrong version, or a `next_offset` outside the `offset`
+    /// parameter's own `u32` domain.
+    Malformed,
+    /// Well-formed, but minted for a different `(type, sort, owner)` triple.
+    QueryMismatch,
+}
+
+/// Decode a cursor and bind it to the CURRENT request's filter.
+fn decode_cursor(cursor: &str, want_fp: &str) -> Result<u64, CursorError> {
+    let raw = B64URL
+        .decode(cursor.as_bytes())
+        .map_err(|_| CursorError::Malformed)?;
+    let s = std::str::from_utf8(&raw).map_err(|_| CursorError::Malformed)?;
+    let mut parts = s.split('|');
+    let (Some(v), Some(off), Some(fp), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(CursorError::Malformed);
+    };
+    if v != CURSOR_V {
+        return Err(CursorError::Malformed);
+    }
+    // Parsed as u32 — the same domain as the `offset` parameter. A cursor is
+    // server-minted but an authenticated caller can forge one (the fingerprint
+    // binds the FILTER, not the offset), so the bound also caps how large an
+    // `OFFSET` anyone can push into Postgres.
+    let offset: u32 = off.parse().map_err(|_| CursorError::Malformed)?;
+    if fp != want_fp {
+        return Err(CursorError::QueryMismatch);
+    }
+    Ok(offset as u64)
+}
+
+/// A `400` carrying a stable machine code (the bodiless `400`s elsewhere on this
+/// route stay as they are — these are all NEW parameters, so no shipped client
+/// can hit them).
+fn bad_query(code: &'static str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "code": code })),
+    )
+        .into_response()
+}
+
+/// `GET /v1/files?type=&limit=&offset=&cursor=&sort=&owner=` — D35 listing
+/// (api.md §8.6). `file_type` + small-stream structure/sizes only; never values.
+///
+/// Paging is OFFSET + `total` (with an opaque cursor layered on top) rather than
+/// a pure keyset cursor, because the feed pager is NUMBERED (`<< 1 2 3 4 >>`):
+/// it needs random access to page N and a page count, neither of which a keyset
+/// cursor can give. The cost is stated plainly in `docs/api.md` — `updated_at`
+/// is mutable (`finalize_version` and every `add_wrap` bump it), so a re-share
+/// landing mid-walk can move an item across a page boundary and that item is
+/// seen twice or missed. Accepted: sorting by the immutable `created_at` instead
+/// would stop a re-shared file ever surfacing in the recipient's feed.
 async fn list_files<S: Store + 'static>(
     State(st): State<AppState<S>>,
-    session: AuthedSession,
+    session: RecoveryOkSession,
     Query(q): Query<ListQuery>,
 ) -> Response {
-    // An unknown type filter matches nothing rather than erroring the browse.
+    // Validated first: both feed the cursor fingerprint. Rejecting a bad value of
+    // a BRAND-NEW parameter is not a tightening — no shipped client sends either.
+    let sort = match q.sort.as_deref() {
+        None | Some("newest") => ListSort::Newest,
+        Some("oldest") => ListSort::Oldest,
+        Some(_) => return bad_query("bad_sort"),
+    };
+    let owner_only = match q.owner.as_deref() {
+        None => false,
+        Some("me") => true,
+        Some(_) => return bad_query("bad_owner"),
+    };
+    // An unknown type filter matches nothing rather than erroring the browse
+    // (unchanged). `total` is 0 to match: the pager must render zero pages, not
+    // fall back to "no total ⇒ this server does not paginate".
     let file_type = match q.file_type.as_deref() {
         None => None,
         Some(s) => match file_type_code(s) {
@@ -2034,24 +2274,43 @@ async fn list_files<S: Store + 'static>(
                 return Json(ListRes {
                     files: Vec::new(),
                     next_cursor: None,
+                    total: 0,
                 })
                 .into_response()
             }
         },
     };
+    // UNCHANGED. 50/200 are a shipped contract: tools/live-smoke and the bundle
+    // e2e ask for limit=200 and must keep getting 200. Lowering either is a
+    // tightening.
     let limit = q.limit.unwrap_or(50).min(200);
+    let fp = cursor_fp(file_type, sort, owner_only);
+    // A valid cursor SUPERSEDES `offset`; an invalid one is a loud 400 rather
+    // than a silently wrong page.
+    let offset = match q.cursor.as_deref() {
+        Some(c) => match decode_cursor(c, &fp) {
+            Ok(o) => o,
+            Err(CursorError::Malformed) => return bad_query("bad_cursor"),
+            Err(CursorError::QueryMismatch) => return bad_query("cursor_query_mismatch"),
+        },
+        None => q.offset.unwrap_or(0) as u64,
+    };
     match st
         .auth
         .store()
         .list_files(ListFilter {
             file_type,
             limit,
+            offset,
+            sort,
+            owner_only,
             caller_id: session.user_id,
         })
         .await
     {
-        Ok(entries) => {
-            let files = entries
+        Ok(page) => {
+            let files: Vec<ListEntryRes> = page
+                .entries
                 .iter()
                 .map(|e| {
                     let mut streams = serde_json::Map::new();
@@ -2070,9 +2329,16 @@ async fn list_files<S: Store + 'static>(
                     }
                 })
                 .collect();
+            let next_offset = offset.saturating_add(files.len() as u64);
+            // `!files.is_empty()` is an anti-livelock guard, not decoration: with
+            // `limit=0` the page is empty while `total > 0`, and a cursor that
+            // does not advance would loop a paging client forever.
+            let next_cursor = (!files.is_empty() && next_offset < page.total)
+                .then(|| encode_cursor(next_offset, &fp));
             Json(ListRes {
                 files,
-                next_cursor: None,
+                next_cursor,
+                total: page.total,
             })
             .into_response()
         }
@@ -2120,11 +2386,14 @@ async fn resolve_session<S: Store + 'static>(
 /// An authenticated, channel-bound session for **file/content** endpoints,
 /// resolved from the `Authorization: MaxSecu-Session <hex>` header and validated
 /// against the live connection's exporter (api.md §1.5/§2.3). Rejects with `401`
-/// on any auth failure, and **`403` for the recovery principal**: a recovery
-/// session (spec §9) authorizes admin SERVER actions only and is NOT a
-/// file-read/write principal — barring it here (rather than relying on it
-/// happening to own no files) keeps every current and future file endpoint out
-/// of the recovery session's blast radius.
+/// on any auth failure, and **`403` for the recovery principal**.
+///
+/// This is the **deny-by-default** half of the recovery policy: barring the
+/// principal here (rather than relying on it happening to own no files) keeps
+/// every current and future file endpoint out of the recovery session's blast
+/// radius **unless that handler deliberately opts out** by taking
+/// [`RecoveryOkSession`] instead. See that type for the five handlers that do,
+/// and for why the escrow is reachable online at all.
 pub struct AuthedSession {
     pub user_id: [u8; 16],
     pub token: [u8; 32],
@@ -2146,6 +2415,112 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AuthedSession {
     }
 }
 
+/// A channel-bound session for the file/content endpoints that the **recovery
+/// principal is explicitly allowed to reach**. Identical to [`AuthedSession`] in
+/// every respect except that it does **not** bar `RECOVERY_ID`.
+///
+/// It is an **allowlist, applied per handler** — five of them, and no others:
+///
+/// | handler | route | why |
+/// |---|---|---|
+/// | `list_files` | `GET /v1/files` | see every file |
+/// | `get_file` | `GET /v1/files/{id}` | metadata + the caller's own wrap |
+/// | `get_chunk` | `GET .../chunks/{i}` | fetch ciphertext |
+/// | `chunk_status` | `GET .../chunks/{i}/status` | resume/tier probe |
+/// | `logout` | `POST /v1/session/logout` | let a recovery session end itself |
+///
+/// `list_recipients` is deliberately NOT in the set: it is owner-only *inside the
+/// store* (`list_recipients(file_id, caller_id)` yields `None` for a non-owner),
+/// so admitting the extractor would buy a `404` and nothing else.
+///
+/// ## `add_wrap` — BARRED. This is a closed decision (owner, 2026-08-02)
+///
+/// Sharing from a recovery session is **not supported**, and this is settled, not
+/// deferred. The owner originally asked for it; the reasoning below is why the
+/// answer is final rather than a roadmap item. Admitting the recovery principal
+/// here would **destroy an existing user's access to data they already
+/// uploaded** — the one thing this project treats as non-negotiable:
+///
+///  * a recipient cannot verify a recovery-issued grant. `check_ancestor_fields`
+///    in `client-core`'s download path rejects any ancestor whose `recipient_type`
+///    is not `User` (`client-core/src/download.rs`), and the server's
+///    `ancestor_chain` serves exactly the recovery wrap's grant as that ancestor;
+///  * and even setting that aside, no CLIENT has a trusted path to a recovery
+///    signing key. The key EXISTS server-side — `RecoveryAccount` holds an
+///    Ed25519 `sig_pub` (`store.rs`) and login verifies against it — but nothing
+///    publishes it to a client: `GET /v1/recovery/pubkey` serves `enc_pub` (+
+///    optional `mlkem_pub`) and no `sig_pub`, the embedded pin omits it too, and
+///    every client open path passes no-op granter/admin resolvers. So a walk over
+///    `granted_by = RECOVERY_ID` terminates in `GrantChainBroken`. ("No signing
+///    key exists" would be wrong; "no client-trusted path to it" is the fact.);
+///  * and `add_wrap` is idempotent **by replace** in BOTH stores — each drops any
+///    existing row for that `recipient_id` before pushing the new one. So a
+///    recovery re-share to somebody who ALREADY had working access would swap
+///    their good grant for an unopenable one, silently and irreversibly.
+///
+/// The third point is what makes this permanent rather than a missing feature:
+/// the destructive-replace hazard is inherent to a principal whose grants nobody
+/// can verify, so "ship it once the chain verifies" would still need a
+/// server-side REPLACE refusal on top. A client-side refusal is not a security
+/// boundary, so the bar lives here.
+///
+/// WHY AN ALLOWLIST AND NOT A RELAXED `AuthedSession`. Deleting the `RECOVERY_ID`
+/// check in `AuthedSession` would open all of its handlers *and* would silently
+/// open every handler added in the future. Keeping the bar there and opting five
+/// handlers out of it preserves **deny-by-default**: a new file endpoint is closed
+/// to the recovery principal until someone deliberately names this extractor.
+/// `create_file`, `stage_version`, `put_chunk`, `finalize_version` (no uploading),
+/// `delete_wrap`, `discard_file` (no destroying other people's data), `add_wrap`
+/// (see above) and `direct_link` (it brokers a bearer cold-tier URL that outlives
+/// the session) therefore stay barred.
+///
+/// SECURITY DELTA, STATED PLAINLY — this is a deliberate, owner-approved
+/// widening of the escrow, not an oversight. A session token cannot be stolen and
+/// replayed: it is bound to the TLS exporter of the connection that minted it
+/// (`auth.rs`), and the only way to mint one is to hold the recovery *private
+/// keys* — the login nonce is encrypted to `acct.enc_pub` and the proof verified
+/// against `acct.sig_pub` (`recovery.rs`). So every holder of a live recovery
+/// session already holds the cold key. The real delta is therefore about reach,
+/// not about who: **recovery key + network reach now yields complete, remote
+/// plaintext of every file, with no operator involvement.** Previously the same
+/// key-holder had to convene the air-gapped §12.7 ceremony to read anything.
+/// It does NOT yield the power to grant — see the `add_wrap` section above.
+///
+/// Two consequences worth stating because they are not obvious:
+///
+///  * reads are **not** audited and **not** rate-limited — no read path in this
+///    server is, for any principal — so a bulk escrow browse leaves no trace.
+///    And when a cold tier is configured, `get_chunk` is not side-effect-free:
+///    it rehydrates and may offload capacity victims, exactly as it does for an
+///    ordinary caller.
+///  * the recovery principal separately satisfies [`AdminSession`], which has
+///    admitted it since long before this extractor existed. So a recovery session
+///    can also **mint registration keys** — i.e. invite users. That is not new,
+///    but it is easy to miss when reasoning about this type in isolation.
+pub struct RecoveryOkSession {
+    pub user_id: [u8; 16],
+    #[allow(dead_code)] // mirrors AuthedSession; not every such handler needs it
+    pub token: [u8; 32],
+}
+
+impl<S: Store + 'static> FromRequestParts<AppState<S>> for RecoveryOkSession {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState<S>,
+    ) -> Result<Self, StatusCode> {
+        // Built on the shared resolver, like `AuthedSession` and `AdminSession`.
+        // Deliberately applies NO principal policy: every authenticated principal,
+        // including `RECOVERY_ID`, is admitted. Both store layers are already
+        // recipient-generic (they select the wrap whose `recipient_id` equals the
+        // caller), so a recovery caller naturally sees every file and receives the
+        // recovery wrap as its own — no store or SQL change is required.
+        let (user_id, token) = resolve_session(parts, state).await?;
+        Ok(RecoveryOkSession { user_id, token })
+    }
+}
+
 /// A channel-bound session authorized for **admin server actions**. Two disjoint
 /// principals satisfy it:
 ///
@@ -2160,11 +2535,12 @@ impl<S: Store + 'static> FromRequestParts<AppState<S>> for AuthedSession {
 ///    login), so admitting it here does not touch the user admin path below.
 ///
 /// This is the coarse server gate; the client re-verifies every control-log
-/// record's authenticity independently. It grants admin SERVER actions ONLY (e.g.
-/// minting user-role registration keys) — file/content endpoints use
-/// `AuthedSession`, which bars the recovery principal — and never yields any
-/// private key. Rejects `401` (not a session) or `403` (authenticated but not
-/// authorized as admin).
+/// record's authenticity independently. It grants admin SERVER actions (e.g.
+/// minting user-role registration keys) and never yields any private key. It does
+/// not grant file access: that is governed separately, by `AuthedSession` (which
+/// bars the recovery principal) and its five-handler opt-out
+/// [`RecoveryOkSession`]. Rejects `401` (not a session) or `403` (authenticated
+/// but not authorized as admin).
 pub struct AdminSession {
     pub user_id: [u8; 16],
     #[allow(dead_code)] // mirrors AuthedSession; kept for symmetry / future use
@@ -2326,6 +2702,328 @@ mod tests {
             900,
             "login must report the configured 900 s TTL, not a hardcoded 3600"
         );
+    }
+
+    /// `POST /v1/session/challenge` bounds the claimed username — and the bound
+    /// is provably above every username that could ever have been registered.
+    ///
+    /// The route used to hand `req.username` straight to `insert_nonce` with no
+    /// length check at all, so the only ceiling was the global 8 MiB body limit:
+    /// ONE unauthenticated request could write a multi-megabyte `auth_nonces`
+    /// row, and nothing in this system ever deletes an `auth_nonces` row. The
+    /// issuance cap does not help — `ratelimit.rs` keys on the CLAIMED name and
+    /// has no per-source cap, so a prober cycling names bypasses it entirely.
+    ///
+    /// Rejecting anything is a tightening of a frozen surface (`/v1` HTTP JSON),
+    /// so the crucial half of this test is the *upper* half: the largest name
+    /// `POST /v1/users` could ever have stored must still be served.
+    #[tokio::test]
+    async fn challenge_bounds_the_claimed_username() {
+        let (router, _sk) = app(EXPORTER);
+
+        // (1) An ordinary username is completely unaffected.
+        let (st, ch) = post_json(
+            &router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": "alice" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "an ordinary username must still work");
+        assert!(b64_fixed::<32>(ch["nonce_b64"].as_str().unwrap()).is_some());
+
+        // (2) An UNKNOWN username is still answered with a real challenge: the
+        // bound must not become a user-existence oracle (§9.3).
+        let (st, ch) = post_json(
+            &router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": "ghost" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "no user-existence oracle");
+        assert!(b64_fixed::<32>(ch["nonce_b64"].as_str().unwrap()).is_some());
+
+        // (3) THE COMPAT ASSERTION. `register` admits a username iff
+        // `Text::new` does, i.e. iff its NFC form is ≤ MAX_TEXT — and it then
+        // stores the RAW bytes, which can be up to 3× longer than that NFC form.
+        // U+212A KELVIN SIGN is that 3× worst case: 3 raw UTF-8 bytes each,
+        // composing to a 1-byte `K`. So this is the LONGEST raw username any
+        // account on this server could possibly hold …
+        let worst_case: String = "\u{212A}".repeat(maxsecu_encoding::MAX_TEXT);
+        assert_eq!(worst_case.len(), 3 * maxsecu_encoding::MAX_TEXT);
+        // … and `register` would indeed have accepted it (its NFC form is
+        // exactly MAX_TEXT bytes), so it is a name that can really exist.
+        assert!(
+            Text::new(&worst_case).is_ok(),
+            "precondition: this is a name POST /v1/users would have accepted"
+        );
+        // … therefore the challenge route MUST still serve it. If this ever
+        // fails, some real account has just been locked out permanently.
+        let (st, ch) = post_json(
+            &router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": worst_case }),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "the longest registerable username must still be able to log in"
+        );
+        assert!(b64_fixed::<32>(ch["nonce_b64"].as_str().unwrap()).is_some());
+
+        // (4) The limit itself is INCLUSIVE — behaviour is unchanged at or under
+        // it, so the boundary can never shave a byte off a real name.
+        let at_limit = "u".repeat(MAX_SESSION_USERNAME_BYTES);
+        let (st, ch) = post_json(
+            &router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": at_limit }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "a name AT the limit is still served");
+        assert!(b64_fixed::<32>(ch["nonce_b64"].as_str().unwrap()).is_some());
+
+        // (5) One byte over ⇒ the same bare 400 `prove`/`register` already use
+        // for a malformed body. No new error code, no body.
+        let over = "u".repeat(MAX_SESSION_USERNAME_BYTES + 1);
+        let (st, body) = post_json(
+            &router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": over }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "one byte over the limit");
+        assert_eq!(body, serde_json::Value::Null, "the 400 carries no body");
+
+        // (6) The abuse case the bound exists for: half a megabyte of "username",
+        // which used to become a permanent, un-prunable `auth_nonces` row.
+        let absurd = "z".repeat(512 * 1024);
+        let (st, _) = post_json(
+            &router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": absurd }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "a 512 KiB username");
+    }
+
+    /// The companion to [`challenge_bounds_the_claimed_username`]: the rejection
+    /// happens BEFORE anything reaches the database.
+    ///
+    /// Proven twice, because "no row exists" and "the store was never called"
+    /// are different claims and only the second rules out a write that was
+    /// rolled back or overwritten:
+    ///
+    ///  * over a real `MemoryStore`, no nonce row exists for the rejected name
+    ///    (with an accepted name as the control, so the assertion isn't vacuous);
+    ///  * over `FaultyStore`, whose `insert_nonce` always errors, an acceptable
+    ///    name yields 500 — the store WAS reached — while an over-long name
+    ///    yields 400. A 400 there is only reachable if the handler returned
+    ///    before making any store call at all.
+    #[tokio::test]
+    async fn challenge_rejects_an_over_long_username_before_any_store_write() {
+        let over = "u".repeat(MAX_SESSION_USERNAME_BYTES + 1);
+
+        // ---- (a) a real store: no row is written for the rejected name ----
+        let auth = Arc::new(AuthService::new(MemoryStore::new(), AuthConfig::default()));
+        let live_router = router(AppState {
+            auth: Arc::clone(&auth),
+            blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
+            max_file_bytes: None,
+        })
+        .layer(Extension(TlsExporter(EXPORTER)));
+
+        let (st, _) = post_json(
+            &live_router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": &over }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(
+            auth.store()
+                .outstanding_nonces(&over, 0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rejected challenge must not leave a nonce row behind"
+        );
+        // Control: the same route DOES write a row for an acceptable name, so
+        // the emptiness above is the guard working, not an assertion that can
+        // never fail.
+        let (st, _) = post_json(
+            &live_router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": "alice" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            auth.store()
+                .outstanding_nonces("alice", 0)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "control: an accepted challenge writes exactly one nonce row"
+        );
+
+        // ---- (b) a faulting store: 400 proves `insert_nonce` was never called ----
+        let faulty_router = router(AppState {
+            auth: Arc::new(AuthService::new(FaultyStore, AuthConfig::default())),
+            blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
+            max_file_bytes: None,
+        })
+        .layer(Extension(TlsExporter(EXPORTER)));
+
+        let (st, _) = post_json(
+            &faulty_router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": "alice" }),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "control: an acceptable name does reach the (faulting) insert_nonce"
+        );
+
+        let (st, _) = post_json(
+            &faulty_router,
+            "/v1/session/challenge",
+            serde_json::json!({ "username": &over }),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "an over-long name is rejected BEFORE insert_nonce — a 500 here \
+             would mean the store had been reached"
+        );
+    }
+
+    /// `POST /v1/session/proof` carries the SAME bound as `/v1/session/challenge`
+    /// — same constant, same bare 400 — and for a reason the challenge route does
+    /// not even have.
+    ///
+    /// `prove` is just as unauthenticated, and it is the *worse* of the two
+    /// leaks: it always reaches `limiter.record_proof(username, ..)` (the
+    /// failing path included), which does `accounts.entry(username.to_owned())`
+    /// into a `HashMap` that has no eviction anywhere. `admit_proof` only reads,
+    /// so a brand-new key is never in backoff — nothing throttles the first
+    /// request for a name. Unbounded, ONE request permanently allocated up to
+    /// the 8 MiB body limit, and N requests N × 8 MiB.
+    ///
+    /// As with `challenge`, the crucial half is the upper one: rejecting is a
+    /// tightening of a frozen surface, so the longest name that could ever have
+    /// been registered must still reach the auth state machine.
+    #[tokio::test]
+    async fn prove_bounds_the_claimed_username() {
+        let (router, _sk) = app(EXPORTER);
+        let dummy = b64encode(&[0u8; 64]);
+
+        // (1) THE COMPAT ASSERTION. The 3× worst case (U+212A KELVIN SIGN) is the
+        // longest raw username `POST /v1/users` could have stored. It must reach
+        // the auth logic — i.e. come back as the uniform 401, NOT as a 400.
+        let worst_case: String = "\u{212A}".repeat(maxsecu_encoding::MAX_TEXT);
+        assert_eq!(worst_case.len(), 3 * maxsecu_encoding::MAX_TEXT);
+        assert!(Text::new(&worst_case).is_ok(), "precondition: registerable");
+        let (st, _) = post_json(
+            &router,
+            "/v1/session/proof",
+            serde_json::json!({ "username": worst_case, "timestamp": 0, "proof_b64": dummy }),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "the longest registerable username must still be able to attempt a login"
+        );
+
+        // (2) The limit is INCLUSIVE: at the limit the request is still handled
+        // by the auth path (401), never shaved off by the boundary.
+        let at_limit = "u".repeat(MAX_SESSION_USERNAME_BYTES);
+        let (st, _) = post_json(
+            &router,
+            "/v1/session/proof",
+            serde_json::json!({ "username": at_limit, "timestamp": 0, "proof_b64": dummy }),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "a name AT the limit is served"
+        );
+
+        // (3) One byte over ⇒ the same bare 400, no body — the exact shape
+        // `challenge` uses. Not an oracle: the answer depends only on length.
+        let over = "u".repeat(MAX_SESSION_USERNAME_BYTES + 1);
+        let (st, body) = post_json(
+            &router,
+            "/v1/session/proof",
+            serde_json::json!({ "username": &over, "timestamp": 0, "proof_b64": dummy }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "one byte over the limit");
+        assert_eq!(body, serde_json::Value::Null, "the 400 carries no body");
+
+        // (4) The abuse case: half a megabyte of "username", which used to be
+        // permanently retained as a rate-limiter key.
+        let absurd = "z".repeat(512 * 1024);
+        let (st, _) = post_json(
+            &router,
+            "/v1/session/proof",
+            serde_json::json!({ "username": absurd, "timestamp": 0, "proof_b64": dummy }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "a 512 KiB username");
+
+        // (5) The rejection happens BEFORE the handler calls into `AuthService`
+        // at all — which is what keeps the name out of the limiter map. Over a
+        // store whose every call faults, an acceptable name yields 500 (the auth
+        // path WAS entered) while an over-long one yields 400, and a 400 there is
+        // reachable only by returning before `prove` was ever called.
+        let faulty_router = router_with_faulty_store();
+        let (st, _) = post_json(
+            &faulty_router,
+            "/v1/session/proof",
+            serde_json::json!({ "username": "alice", "timestamp": 0, "proof_b64": dummy }),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "control: an acceptable name does enter AuthService::prove"
+        );
+        let (st, _) = post_json(
+            &faulty_router,
+            "/v1/session/proof",
+            serde_json::json!({ "username": &over, "timestamp": 0, "proof_b64": dummy }),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "an over-long name is rejected BEFORE AuthService::prove — a 500 \
+             here would mean the limiter had already taken the key"
+        );
+    }
+
+    /// A router over `FaultyStore`: every store call errors, so reaching the
+    /// store is observable as a 500 and *not* reaching it as anything else.
+    fn router_with_faulty_store() -> axum::Router {
+        router(AppState {
+            auth: Arc::new(AuthService::new(FaultyStore, AuthConfig::default())),
+            blobs: Arc::new(MemoryBlobStore::new()),
+            audit: Arc::new(crate::audit::NullAuditSink),
+            direct_links_enabled: false,
+            max_file_bytes: None,
+        })
+        .layer(Extension(TlsExporter(EXPORTER)))
     }
 
     /// The ms→s conversion both session-minting paths share (see
@@ -3719,14 +4417,11 @@ mod tests {
         assert!(auth.store().get_file_meta(m2).await.unwrap().is_none());
         let listed = auth
             .store()
-            .list_files(ListFilter {
-                file_type: None,
-                limit: 50,
-                caller_id: owner,
-            })
+            .list_files(ListFilter::for_caller(owner))
             .await
             .unwrap();
-        assert!(listed.is_empty());
+        assert!(listed.entries.is_empty());
+        assert_eq!(listed.total, 0);
     }
 
     #[tokio::test]
@@ -4567,5 +5262,68 @@ mod tests {
         let ctx = Arc::new(crate::delegation::DelegationCtx::dev(d5_pub, cert));
         let router = prod_app(ctx, Arc::new(d5), d5_pub);
         assert_eq!(register_admin(&router).await.1, StatusCode::CREATED);
+    }
+
+    // ---- F3a: the listing cursor codec ----
+
+    /// The cursor is opaque to clients but it is still a FORMAT: a token handed
+    /// out by one build is replayed against the next. This pins the exact bytes
+    /// (`base64url-unpadded("1|<offset>|<fp>")`) and the version byte, so a
+    /// refactor that changes the layout has to do it deliberately.
+    #[test]
+    fn cursor_round_trips_and_pins_its_layout() {
+        let fp = cursor_fp(Some(3), ListSort::Newest, false);
+        assert_eq!(fp.len(), 16, "the fingerprint is 16 hex chars of sha256");
+        let tok = encode_cursor(50, &fp);
+        // Safe to paste straight back into a query string: no `+`, `/` or `=`.
+        assert!(!tok.contains('+') && !tok.contains('/') && !tok.contains('='));
+        let raw = String::from_utf8(B64URL.decode(tok.as_bytes()).unwrap()).unwrap();
+        assert_eq!(raw, format!("1|50|{fp}"));
+        assert_eq!(decode_cursor(&tok, &fp).ok(), Some(50));
+    }
+
+    /// The fingerprint is what makes "reuse a cursor after changing the filter"
+    /// a loud error instead of a silently wrong page of a DIFFERENT result set.
+    /// Every component of the triple must move it.
+    #[test]
+    fn cursor_fingerprint_separates_every_query_component() {
+        let base = cursor_fp(Some(3), ListSort::Newest, false);
+        for other in [
+            cursor_fp(None, ListSort::Newest, false),    // type
+            cursor_fp(Some(1), ListSort::Newest, false), // a DIFFERENT type
+            cursor_fp(Some(3), ListSort::Oldest, false), // sort
+            cursor_fp(Some(3), ListSort::Newest, true),  // owner
+        ] {
+            assert_ne!(base, other);
+        }
+        // …and a cursor minted under one triple is refused under another.
+        let tok = encode_cursor(2, &base);
+        assert!(matches!(
+            decode_cursor(&tok, &cursor_fp(Some(1), ListSort::Newest, false)),
+            Err(CursorError::QueryMismatch)
+        ));
+    }
+
+    /// Every malformed shape is `Malformed` (→ `400 bad_cursor`), never a silent
+    /// fallback to offset 0 — a cursor that "works" by starting over would hand a
+    /// paging client an infinite loop over page 1.
+    #[test]
+    fn a_malformed_cursor_is_never_silently_accepted() {
+        let fp = cursor_fp(None, ListSort::Newest, false);
+        for bad in [
+            "not base64!!".to_owned(),                    // undecodable
+            B64URL.encode(b"1|50"),                       // too few fields
+            B64URL.encode(b"1|50|aa|bb"),                 // too many fields
+            B64URL.encode(format!("2|50|{fp}")),          // unknown version
+            B64URL.encode(format!("1|nope|{fp}")),        // non-numeric offset
+            B64URL.encode(format!("1|-1|{fp}")),          // negative offset
+            B64URL.encode(format!("1|99999999999|{fp}")), // outside the u32 domain
+            B64URL.encode([0xFF, 0xFE, 0xFD]),            // not UTF-8
+        ] {
+            assert!(
+                matches!(decode_cursor(&bad, &fp), Err(CursorError::Malformed)),
+                "{bad} must be rejected as malformed"
+            );
+        }
     }
 }

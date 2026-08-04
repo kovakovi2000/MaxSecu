@@ -214,6 +214,22 @@ $UpgradeHereText = ($UpgradeHereLines -join "`r`n") + "`r`n"
 # 4. Zip only the staged upgrade payload folder.
 # ---------------------------------------------------------------------------
 Write-Section 'Building the ZIP'
+
+# FAIL CLOSED before zipping: an upgrade bundle must never carry a secret either.
+# Step 3 copies an explicit list (exe + ui\), so this should never fire -- it is a
+# standing assertion, added because a client folder can now legitimately hold a
+# staged recovery\recovery_key_blob (install-client.ps1 -StageRecoveryKey) and this
+# ZIP is handed to every existing user.
+$Leaks = @(Get-ChildItem -Path $UpgradeClient -Recurse -Force -File -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -eq 'recovery_key_blob' -or $_.Name -eq 'local_key_blob' -or
+        $_.Name -eq 'register.key' -or $_.Name -eq 'recovery_pin.bin' -or
+        $_.Extension -eq '.blob'
+    })
+if ($Leaks.Count -gt 0) {
+    Fail ("Refusing to build the upgrade ZIP -- secret-shaped files are in the staged tree:`n  " + (($Leaks | ForEach-Object { $_.FullName }) -join "`n  "))
+}
+
 if ([string]::IsNullOrWhiteSpace($Out)) { $Out = Join-Path $DistDir 'MaxSecuClient-upgrade.zip' }
 $OutDir = Split-Path $Out -Parent
 if ($OutDir -and -not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }

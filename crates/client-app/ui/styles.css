@@ -2890,3 +2890,279 @@ app-shell[data-app-chrome] > .busy-overlay {
     justify-self: start;
   }
 }
+
+/* ---------- Recovery session (cold recovery key) ----------
+   The shell renders #recovery-banner with the `hidden` attribute in its STATIC
+   markup and only ever un-hides it via `banner.hidden = !isRecovery`, so for an
+   ordinary session the global `[hidden] { display: none !important; }` above
+   wins on specificity + !important and this whole block paints nothing. It reads
+   as an alarm strip, not as ordinary chrome: a recovery session sees everyone's
+   content and must never be mistaken for a normal sign-in. */
+.recovery-banner {
+  position: sticky;
+  top: var(--mx-header-height, 0px);
+  z-index: 19;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--mx-space-3);
+  padding: 0.6rem clamp(1rem, 3vw, 2rem);
+  border-bottom: 2px solid var(--mx-warn);
+  color: var(--mx-text);
+  font-size: var(--mx-fs-1);
+  background:
+    repeating-linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--mx-warn) 20%, transparent) 0 12px,
+      color-mix(in srgb, var(--mx-warn) 7%, transparent) 12px 24px
+    ),
+    var(--mx-base-2);
+  box-shadow: var(--mx-elev-1);
+}
+.recovery-banner .rb-label {
+  font-family: var(--mx-font-tech);
+  letter-spacing: 0.08em;
+  color: var(--mx-warn);
+  white-space: nowrap;
+}
+.recovery-banner .rb-copy {
+  flex: 1 1 20rem;
+  color: var(--mx-text);
+}
+.recovery-banner #rb-end {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* Recovery gate: the passphrase card and the (usually collapsed) connection-code
+   panel share ONE grid column, so .auth-stage keeps exactly its two children. */
+.recovery-column {
+  display: grid;
+  gap: var(--mx-space-4);
+  align-content: center;
+  min-width: 0;
+}
+.recovery-server {
+  display: block;
+  align-self: start;
+}
+.recovery-server summary {
+  cursor: pointer;
+  font-family: var(--mx-font-tech);
+  letter-spacing: 0.04em;
+}
+.recovery-server > :not(summary) {
+  margin-top: var(--mx-space-3);
+}
+
+/* ---------- Numbered pager (F3) — feed pages + bundle member pages ----------
+   ONE control, two hosts: #fd-pager (feed-screen) and #bd-pager (bundle-screen),
+   both built by core/pager.ts. The buttons are ordinary <button>s so they inherit
+   each skin's button treatment; only layout, the current-page mark, the disabled
+   ends and the ellipsis slot are defined here.
+   NOTE: `.pager { display: flex }` outranks the UA's `[hidden] { display: none }`,
+   so the explicit `[hidden]` rule below is what actually keeps a non-paginating
+   server's feed looking exactly as it does today. */
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  margin: 1.25rem 0 0.4rem;
+  padding: 0;
+}
+.pager[hidden] { display: none; }
+.pager-btn {
+  min-width: 2.5rem;
+  min-height: 2.3rem;
+  padding: 0.4rem 0.7rem;
+  font-family: var(--mx-font-tech);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.pager-btn.pager-step { min-width: auto; }
+.pager-btn.active,
+.pager-btn[aria-current="page"] {
+  color: var(--mx-on-bright);
+  background: linear-gradient(135deg, var(--mx-neon-cyan), var(--mx-neon-lime));
+  border-color: color-mix(in srgb, var(--mx-neon-cyan) 48%, transparent);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--mx-neon-cyan) 18%, transparent);
+}
+.pager-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+.pager-gap {
+  padding: 0 0.15rem;
+  color: var(--mx-muted);
+  font-family: var(--mx-font-tech);
+  user-select: none;
+}
+@media (max-width: 720px) {
+  .pager { gap: 0.25rem; }
+  .pager-btn { min-width: 2.1rem; padding: 0.35rem 0.5rem; }
+}
+
+/* ---------- Stacked container + bundle walk nav + Download-all report ----------
+   Everything below is purely additive: none of these selectors carried a rule in
+   this sheet before.
+
+   `.bundle-stack` — bundle-screen.ts sets `#bd-members.className = "bundle-stack"`
+   for Stacked mode (`bundle-gallery` for Gallery), but the only stacked rule this
+   sheet has ever had is `.bundle-stacked` above, a class nothing in the app sets.
+   Stacked mode therefore fell back to raw block flow: no gap between members and
+   no scroll anchoring under the sticky header. `.bundle-stacked` is left exactly
+   as it is (harmless, and still correct should anything ever adopt it); these
+   rules give the class the component actually sets the same treatment.
+
+   `.bundle-dl-report` is a `section[aria-labelledby]`, so it already inherits the
+   Panels/forms shell; this only restates the bundle screen's own panel language
+   (cut radius, cyan rim, panel fill) and lays out the report's parts.
+
+   `.bundle-dl-failures` names the members the user did NOT get, so it is a real
+   error surface and never colour-only: a solid error rule down the left edge, a
+   round "!" seal, and an error-coloured item label all carry the same message. */
+.bundle-stack {
+  display: grid;
+  gap: clamp(1rem, 2vw, 1.35rem);
+}
+.bundle-stack > section {
+  min-width: 0;
+  scroll-margin-top: 7rem;
+}
+
+/* Not-yet-mounted Stacked member: a dashed "slot" holding the shimmer skeleton
+   plus its explicit Load control, so an un-opened row still reads as a member. */
+.bundle-stack-pending {
+  display: grid;
+  gap: var(--mx-space-3);
+  align-content: center;
+  padding: var(--mx-space-4);
+  border: 1px dashed color-mix(in srgb, var(--mx-neon-cyan) 32%, var(--mx-border));
+  border-radius: var(--mx-cut-radius);
+  background: color-mix(in srgb, var(--mx-surface-2) 58%, transparent);
+  box-shadow: var(--mx-inset);
+}
+.bundle-stack-pending skeleton-card { display: block; }
+.bundle-stack-pending > button { justify-self: center; }
+
+/* Next/Previous walk over a bundle's members, above .viewer-frame. */
+.viewer-bundle-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--mx-space-3);
+  margin: var(--mx-space-3) 0 var(--mx-space-4);
+  padding: 0.3rem 0.42rem;
+  border: 1px solid color-mix(in srgb, var(--mx-neon-cyan) 22%, var(--mx-border));
+  border-radius: var(--mx-radius-sm);
+  background: color-mix(in srgb, var(--mx-surface-2) 76%, transparent);
+  box-shadow: var(--mx-inset);
+}
+.viewer-bundle-nav[hidden] { display: none; }
+.viewer-bundle-nav button { min-height: 2.35rem; }
+/* An end of the walk: the global `button:disabled` fade is reinforced with a
+   flattened rim and faint label so "unavailable" is not carried by opacity alone. */
+.viewer-bundle-nav button:disabled {
+  color: var(--mx-faint);
+  border-color: color-mix(in srgb, var(--mx-border) 55%, transparent);
+  background: color-mix(in srgb, var(--mx-surface-1) 60%, transparent);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+.viewer-bundle-pos {
+  color: var(--mx-muted);
+  font-family: var(--mx-font-tech);
+  font-size: var(--mx-fs-1);
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Download-all outcome panel. */
+.bundle-dl-report {
+  display: grid;
+  gap: var(--mx-space-3);
+  margin: 0 0 var(--mx-space-5);
+  border-color: color-mix(in srgb, var(--mx-neon-cyan) 24%, var(--mx-border));
+  border-radius: var(--mx-cut-radius);
+  background: var(--mx-panel-bg);
+  box-shadow: var(--mx-elev-1), var(--mx-inset);
+}
+.bundle-dl-report[hidden] { display: none; }
+.bundle-dl-report h2 {
+  margin: 0;
+  font-family: var(--mx-font-display);
+  font-size: var(--mx-fs-3);
+  letter-spacing: -0.03em;
+}
+.bundle-dl-report > p[role="status"] {
+  margin: 0;
+  color: var(--mx-text);
+  font-weight: 850;
+}
+/* Per-item ticker: a machine readout, and gone entirely once emptied. */
+.bundle-dl-progress {
+  margin: 0;
+  color: var(--mx-muted);
+  font-family: var(--mx-font-tech);
+  font-size: var(--mx-fs-1);
+  font-variant-numeric: tabular-nums;
+}
+.bundle-dl-progress:empty { display: none; }
+
+.bundle-dl-failures {
+  display: grid;
+  gap: var(--mx-space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.bundle-dl-failures:empty { display: none; }
+.bundle-dl-failures li {
+  position: relative;
+  padding: 0.55rem 0.7rem 0.55rem 2.15rem;
+  border: 1px solid color-mix(in srgb, var(--mx-err) 42%, transparent);
+  border-left: 4px solid var(--mx-err);
+  border-radius: var(--mx-radius-sm);
+  background: color-mix(in srgb, var(--mx-err) 13%, transparent);
+  font-size: var(--mx-fs-1);
+  line-height: 1.45;
+}
+.bundle-dl-failures li::before {
+  content: "!";
+  position: absolute;
+  left: 0.72rem;
+  top: 0.62rem;
+  display: grid;
+  place-items: center;
+  width: 1.05rem;
+  height: 1.05rem;
+  border-radius: 50%;
+  background: var(--mx-err);
+  color: var(--mx-on-danger);
+  font-family: var(--mx-font-tech);
+  font-size: 0.72rem;
+  font-weight: 950;
+  line-height: 1;
+}
+.bundle-dl-failures strong {
+  color: var(--mx-err);
+  font-weight: 900;
+}
+.bundle-dl-failures span {
+  color: var(--mx-muted);
+  font-family: var(--mx-font-tech);
+}
+.bundle-dl-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--mx-space-2);
+}

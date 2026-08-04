@@ -3939,3 +3939,305 @@ share-dialog .sd-note {
   color: var(--mx-info) !important;
   border-color: rgba(70, 43, 25, 0.42) !important;
 }
+
+/* ---------- Recovery session (cold recovery key) ----------
+   The shell renders #recovery-banner with the `hidden` attribute in its STATIC
+   markup and only ever un-hides it via `banner.hidden = !isRecovery`, so for an
+   ordinary session the global `[hidden] { display: none !important; }` above
+   wins on specificity + !important and this whole block paints nothing. It reads
+   as an alarm strip, not as ordinary chrome: a recovery session sees everyone's
+   content and must never be mistaken for a normal sign-in. */
+.recovery-banner {
+  position: sticky;
+  top: var(--mx-header-height, 0px);
+  z-index: 19;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--mx-space-3);
+  padding: 0.6rem clamp(1rem, 3vw, 2rem);
+  border-bottom: 2px solid var(--mx-warn);
+  color: var(--mx-text);
+  font-size: var(--mx-fs-1);
+  background:
+    repeating-linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--mx-warn) 20%, transparent) 0 12px,
+      color-mix(in srgb, var(--mx-warn) 7%, transparent) 12px 24px
+    ),
+    var(--mx-base-2);
+  box-shadow: var(--mx-elev-1);
+}
+.recovery-banner .rb-label {
+  font-family: var(--mx-font-tech);
+  letter-spacing: 0.08em;
+  color: var(--mx-warn);
+  white-space: nowrap;
+}
+.recovery-banner .rb-copy {
+  flex: 1 1 20rem;
+  color: var(--mx-text);
+}
+.recovery-banner #rb-end {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* Recovery gate: the passphrase card and the (usually collapsed) connection-code
+   panel share ONE grid column, so .auth-stage keeps exactly its two children. */
+.recovery-column {
+  display: grid;
+  gap: var(--mx-space-4);
+  align-content: center;
+  min-width: 0;
+}
+.recovery-server {
+  display: block;
+  align-self: start;
+}
+.recovery-server summary {
+  cursor: pointer;
+  font-family: var(--mx-font-tech);
+  letter-spacing: 0.04em;
+}
+.recovery-server > :not(summary) {
+  margin-top: var(--mx-space-3);
+}
+
+/* ---------- Numbered pager (F3) — feed pages + bundle member pages ----------
+   ONE control, two hosts: #fd-pager (feed-screen) and #bd-pager (bundle-screen),
+   both built by core/pager.ts. The buttons are ordinary <button>s so they inherit
+   each skin's button treatment; only layout, the current-page mark, the disabled
+   ends and the ellipsis slot are defined here.
+   NOTE: `.pager { display: flex }` outranks the UA's `[hidden] { display: none }`,
+   so the explicit `[hidden]` rule below is what actually keeps a non-paginating
+   server's feed looking exactly as it does today. */
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  margin: 1.25rem 0 0.4rem;
+  padding: 0;
+}
+.pager[hidden] { display: none; }
+.pager-btn {
+  min-width: 2.5rem;
+  min-height: 2.3rem;
+  padding: 0.4rem 0.7rem;
+  font-family: var(--mx-font-tech);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.pager-btn.pager-step { min-width: auto; }
+.pager-btn.active,
+.pager-btn[aria-current="page"] {
+  color: var(--mx-on-bright);
+  background: linear-gradient(135deg, var(--mx-neon-cyan), var(--mx-neon-lime));
+  border-color: color-mix(in srgb, var(--mx-neon-cyan) 48%, transparent);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--mx-neon-cyan) 18%, transparent);
+}
+.pager-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+.pager-gap {
+  padding: 0 0.15rem;
+  color: var(--mx-muted);
+  font-family: var(--mx-font-tech);
+  user-select: none;
+}
+@media (max-width: 720px) {
+  .pager { gap: 0.25rem; }
+  .pager-btn { min-width: 2.1rem; padding: 0.35rem 0.5rem; }
+}
+
+/* Slot3 (parchment/ink) skin: the generic `button` rule paints every button with
+   an !important background, so the current-page mark must restate itself the
+   same way the nav/active-toggle overrides above do. */
+.pager-btn.active,
+.pager-btn[aria-current="page"] {
+  color: #f1dfb0 !important;
+  background: linear-gradient(135deg, #5f1f19, #87501c) !important;
+  border-color: rgba(49, 27, 11, 0.62) !important;
+  box-shadow: 0 0 0 1px rgba(232, 204, 137, 0.15), 0 8px 16px rgba(55, 31, 12, 0.24) !important;
+}
+.pager-btn:disabled {
+  opacity: 0.4;
+  filter: sepia(0.3) saturate(0.7);
+}
+.pager-gap { color: var(--mx-ink-soft); }
+
+/* ---------- Stacked container + bundle walk nav + Download-all report ----------
+   Purely additive: none of these selectors carried a rule in this sheet before.
+
+   `.bundle-stack` — bundle-screen.ts sets `#bd-members.className = "bundle-stack"`
+   for Stacked mode (`bundle-gallery` for Gallery), but the only stacked rule this
+   sheet has ever had is `.bundle-stacked`, a class nothing in the app sets. Stacked
+   mode therefore fell back to raw block flow: no gap between the parchment member
+   slips and no scroll anchoring under the sticky header. `.bundle-stacked` is left
+   exactly as it is above; these rules give the class the component actually sets
+   the same treatment. (`.bundle-stack-item` is already a parchment card via the
+   shared primitives — only its container was missing.)
+
+   `#bd-dl-report` is a `section[aria-labelledby]`, so the double-ruled parchment
+   panel already lands on it from the shared primitives; only the report's internal
+   rhythm and its own parts are defined here.
+
+   `.bundle-dl-failures` names the members the user did NOT get. On parchment that
+   is a struck entry in the ledger: ink-red double rule, a wax "!" seal and a red
+   label, so it never depends on colour alone. Several declarations need
+   `!important` for the same reason the button/nav overrides above do — the shared
+   parchment primitives are themselves `!important`. */
+.bundle-stack {
+  display: grid;
+  gap: clamp(1rem, 2vw, 1.35rem);
+}
+.bundle-stack > section {
+  min-width: 0;
+  scroll-margin-top: 7rem;
+}
+
+/* Not-yet-mounted Stacked member: an unrevealed square of the map — dashed ink
+   rule around the shimmer skeleton and its explicit Load control. */
+.bundle-stack-pending {
+  display: grid;
+  gap: var(--mx-space-3);
+  align-content: center;
+  padding: var(--mx-space-4);
+  border: 2px dashed rgba(67, 38, 15, 0.38);
+  border-radius: 1rem;
+  background:
+    radial-gradient(circle at 12% 16%, rgba(91, 51, 19, 0.09), transparent 6rem),
+    linear-gradient(135deg, rgba(235, 212, 158, 0.34), transparent 46%, rgba(88, 50, 19, 0.08)),
+    var(--mx-surface-2);
+  box-shadow: var(--mx-inset);
+}
+.bundle-stack-pending skeleton-card { display: block; }
+.bundle-stack-pending > button { justify-self: center; }
+
+/* Next/Previous walk over a bundle's members, above .viewer-frame. */
+.viewer-bundle-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--mx-space-3);
+  margin: var(--mx-space-3) 0 var(--mx-space-4);
+  padding: 0.32rem 0.48rem;
+  border: 2px double var(--mx-border-strong);
+  border-radius: 0.85rem;
+  background:
+    linear-gradient(135deg, rgba(242, 221, 171, 0.44), transparent 48%, rgba(118, 70, 25, 0.1)),
+    var(--mx-surface-2);
+  box-shadow: var(--mx-elev-1), var(--mx-inset);
+}
+.viewer-bundle-nav[hidden] { display: none; }
+.viewer-bundle-nav button { min-height: 2.35rem; }
+/* An end of the walk: faded ink on a dashed rule, matching how
+   `.pager-btn:disabled` above fades rather than greys out on this sheet. */
+.viewer-bundle-nav button:disabled {
+  opacity: 0.6;
+  filter: sepia(0.3) saturate(0.6);
+  cursor: not-allowed;
+  color: rgba(61, 35, 18, 0.5) !important;
+  border: 1px dashed rgba(67, 38, 15, 0.34) !important;
+  background: linear-gradient(135deg, rgba(226, 202, 149, 0.5), rgba(190, 155, 98, 0.34)) !important;
+  box-shadow: none !important;
+}
+.viewer-bundle-pos {
+  color: var(--mx-ink-soft);
+  font-family: var(--mx-font-display);
+  font-size: var(--mx-fs-1);
+  font-style: italic;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Download-all outcome panel (the parchment slip comes from the primitives). */
+.bundle-dl-report {
+  display: grid;
+  gap: var(--mx-space-3);
+  margin: 0 0 var(--mx-space-5);
+}
+.bundle-dl-report[hidden] { display: none; }
+.bundle-dl-report h2 {
+  margin: 0;
+  color: var(--mx-ink);
+  font-family: var(--mx-font-display);
+  font-size: var(--mx-fs-3);
+  letter-spacing: 0.01em;
+}
+.bundle-dl-report > p[role="status"] {
+  margin: 0;
+  color: var(--mx-ink);
+  font-weight: 800;
+}
+.bundle-dl-progress {
+  margin: 0;
+  color: var(--mx-ink-soft);
+  font-family: var(--mx-font-display);
+  font-size: var(--mx-fs-1);
+  font-style: italic;
+  font-variant-numeric: tabular-nums;
+}
+.bundle-dl-progress:empty { display: none; }
+
+.bundle-dl-failures {
+  display: grid;
+  gap: var(--mx-space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.bundle-dl-failures:empty { display: none; }
+.bundle-dl-failures li {
+  position: relative;
+  padding: 0.55rem 0.7rem 0.55rem 2.2rem;
+  border: 2px double rgba(125, 33, 27, 0.54);
+  border-left: 5px solid var(--mx-ink-red);
+  border-radius: 0.7rem;
+  background:
+    radial-gradient(circle at 0% 50%, rgba(125, 33, 27, 0.14), transparent 9rem),
+    linear-gradient(135deg, rgba(246, 226, 178, 0.5), rgba(214, 176, 112, 0.34));
+  color: var(--mx-ink);
+  font-size: var(--mx-fs-1);
+  line-height: 1.45;
+}
+.bundle-dl-failures li::before {
+  content: "!";
+  position: absolute;
+  left: 0.7rem;
+  top: 0.6rem;
+  display: grid;
+  place-items: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  border: 1px solid rgba(49, 27, 11, 0.4);
+  border-radius: 50%;
+  background: var(--mx-ink-red);
+  color: var(--mx-on-danger);
+  font-family: var(--mx-font-display);
+  font-size: 0.74rem;
+  font-weight: 900;
+  line-height: 1;
+}
+.bundle-dl-failures strong {
+  color: var(--mx-ink-red);
+  font-weight: 900;
+}
+.bundle-dl-failures span {
+  color: var(--mx-ink-soft);
+  font-style: italic;
+}
+.bundle-dl-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--mx-space-2);
+}

@@ -43,8 +43,9 @@ use crate::error::UiError;
 use crate::http_client::post_json;
 use crate::session::make_proof;
 
-use super::auth::{AppDir, ConnectLock, Session};
+use super::auth::{AppDir, ConnectLock, Principal, Session};
 use super::connection::{open_conn, server_of};
+use super::pool::AppPool;
 
 /// The single sanitized recovery-login failure. Unwrap failure (wrong/corrupt key
 /// file), a rejected/expired/replayed proof, and a network fault all collapse to
@@ -240,6 +241,25 @@ pub async fn verify_exchange(
         .ok_or_else(recovery_failed)
 }
 
+/// Run BOTH halves of the recovery handshake over one already-connected,
+/// channel-bound sender and return the ADMIN session token. A thin combinator over
+/// [`request_challenge_exchange`] + [`verify_exchange`] — deliberately NO new
+/// crypto, so the challenge unwrap and the channel-bound proof stay in exactly one
+/// place shared by the two-step UI flow and by
+/// [`crate::commands::connection::reauth`] (which must re-prove the recovery key on
+/// every fresh channel, exactly as a user login does). The unwrapped nonce is
+/// zeroized when the local `challenge` drops.
+pub(crate) async fn recovery_reauth_exchange(
+    sender: &mut SendRequest<Full<Bytes>>,
+    host: &str,
+    recovery: &Identity,
+    exporter: &[u8; 32],
+    now_ms: u64,
+) -> Result<String, UiError> {
+    let challenge = request_challenge_exchange(sender, host, recovery).await?;
+    verify_exchange(sender, host, recovery, &challenge, exporter, now_ms).await
+}
+
 /// Parse a 32-char lowercase-hex `challenge_id` to 16 bytes. `None` (fail closed)
 /// on any non-hex / wrong-length input.
 fn hex16(s: &str) -> Option<[u8; 16]> {
@@ -269,14 +289,12 @@ struct Challenged {
 }
 
 /// An established recovery session: only the live authenticated channel + the
-/// opaque token — NO key material. Kept so the channel-bound admin token stays
-/// usable for a later admin action (routing through it is a future task).
+/// opaque token — NO key material. Kept so the channel-bound session token stays
+/// usable; [`end_recovery_session`] spends it to log the session out over the very
+/// channel it is bound to.
 struct Authenticated {
-    #[allow(dead_code)]
     sender: SendRequest<Full<Bytes>>,
-    #[allow(dead_code)]
     host: String,
-    #[allow(dead_code)]
     token: String,
 }
 
@@ -285,9 +303,8 @@ struct Authenticated {
 enum Phase {
     Idle,
     Challenged(Box<Challenged>),
-    // Held (not yet read) purely to keep the channel-bound admin connection alive
-    // after a successful recovery login; admin routing over it is a future task.
-    #[allow(dead_code)]
+    // Keeps the channel-bound session's connection alive after a successful recovery
+    // login, so `end_recovery_session` can revoke that exact session server-side.
     Authenticated(Box<Authenticated>),
 }
 
@@ -386,21 +403,25 @@ pub async fn answer_recovery_challenge(
 
     let server_id = challenge.server_id.clone();
     let result = verify_exchange(&mut sender, &host, &identity, &challenge, &exporter, now).await;
-    // Explicitly drop the cold private key + nonce NOW (both zeroize on drop),
-    // before touching the shared session state.
-    drop(identity);
+    // The nonce is single-use: drop (zeroize) it the moment the proof has been sent,
+    // whatever the outcome.
     drop(challenge);
 
+    // On FAILURE this returns with `identity` still owned by THIS frame, so the cold
+    // private key drops (and zeroizes) here and never reaches the shared session.
     let token = result?;
 
-    // Store the admin token where a normal session lives (the UI never sees it).
+    // Store the admin token where a normal session lives (the UI never sees it), and
+    // — unlike before — KEEP the unlocked recovery `Identity` in the session. Every
+    // downstream open (`build_verify_ctx`) and every `reauth` reads it from there, so
+    // discarding it is what used to make a recovery login a dead end. It still never
+    // crosses the Tauri seam, and `end_recovery_session` (or `logout`) drops it.
     {
         let mut s = session.0.lock().await;
         s.token = Some(token.clone());
         s.server_id = server_id.clone();
-        // Recovery sessions have no user binding; leave `username`/`identity` as-is
-        // (a recovery login neither unlocks a user identity nor supports the
-        // username-based `reauth` path — admin routing over this channel is Task 13).
+        s.principal = Some(Principal::Recovery);
+        s.identity = Some(identity);
     }
     // Keep the live authenticated channel alive so the channel-bound admin token
     // stays usable (dropping the sender would close the connection and void it).
@@ -413,6 +434,108 @@ pub async fn answer_recovery_challenge(
         status: "admin-session".into(),
         server_id,
     })
+}
+
+/// `end_recovery_session` — the explicit terminator for a recovery session. Tells
+/// the server to forget THE SESSION THIS APP IS HOLDING (`POST /v1/session/logout`,
+/// which now admits `RECOVERY_ID`) over the channel that session is bound to, then
+/// drops EVERY trace locally: the parked channel, the token, the pooled channels,
+/// and — the point of this command — the cold recovery `Identity`, which zeroizes
+/// on drop. Best-effort on the network half: a server that is unreachable must
+/// never strand the private key in this process's RAM, so the local teardown runs
+/// unconditionally.
+///
+/// It refuses unless the RECOVERY principal is the one signed in. It is reachable
+/// from the shell whenever the UI thinks a recovery session is up, and running it
+/// against an ordinary user would silently sign that user out (revoking their token
+/// and dropping their unlocked keystore identity, forcing a re-unlock). Wrong-state
+/// refusal shape mirrors this module's sibling, `answer_recovery_challenge`'s
+/// `no_challenge`: a `no_*` code naming the missing precondition.
+///
+/// The server-side logout is deliberately NOT a `reauth`: `reauth` for a recovery
+/// principal runs the whole `/v1/recovery/{challenge,verify}` handshake and MINTS A
+/// NEW SESSION, so logging out over it would revoke a session created one line
+/// earlier and leave the real one alive. The session token in [`SessionInner`] is
+/// channel-bound to the parked [`Authenticated`] channel, so that channel is the
+/// only place it can be spent — and when it is gone, minting a replacement session
+/// just to revoke it is theatre. In that case we tear down locally and report the
+/// degraded outcome (`recovery_logout_offline`) rather than claiming a clean logout.
+///
+/// Deliberately separate from [`super::auth::logout`], which stays purely local so
+/// a normal user's logout gains no network call that could hang or fail.
+#[tauri::command]
+pub async fn end_recovery_session(
+    session: tauri::State<'_, Session>,
+    recovery: tauri::State<'_, RecoveryLogin>,
+    pool: tauri::State<'_, AppPool>,
+) -> Result<(), UiError> {
+    // Refuse for anyone but the recovery principal — including the not-signed-in
+    // state, where there is nothing to end but there may well be an unlocked
+    // keystore identity that must NOT be discarded.
+    if !session.0.lock().await.is_recovery() {
+        return Err(UiError::new(
+            "no_recovery_session",
+            "No recovery session is active.",
+        ));
+    }
+
+    // Take the parked authenticated channel OUT (leaving Idle) so it is dropped —
+    // and the connection closed — on every path below.
+    let parked = std::mem::replace(&mut *recovery.0.lock().await, Phase::Idle);
+    let told_server = match parked {
+        Phase::Authenticated(a) => {
+            let Authenticated {
+                mut sender,
+                host,
+                token,
+            } = *a;
+            // This token IS `SessionInner.token` (`answer_recovery_challenge` stored
+            // a clone of it) and it is bound to THIS channel — so this, and only
+            // this, revokes the session the app has actually been using.
+            let ok = matches!(
+                post_json(
+                    &mut sender,
+                    "/v1/session/logout",
+                    &serde_json::json!({}),
+                    Some(&token),
+                    &host,
+                )
+                .await,
+                Ok((status, _)) if status.is_success()
+            );
+            // `sender` drops here: the channel closes, so the channel-bound token is
+            // unusable from anywhere else even if the POST above failed.
+            ok
+        }
+        // No parked channel (never authenticated, or superseded by a fresh
+        // challenge). The held token is bound to a channel we no longer have, so
+        // there is nothing to spend it on.
+        _ => false,
+    };
+
+    // Local teardown — UNCONDITIONAL, whatever the network half did.
+    // ORDER IS LOAD-BEARING, and it matters more here than anywhere else: every
+    // pooled channel was minted by a RECOVERY reauth, so its token can open every
+    // user's content. Clear the session FIRST so no acquire can still mint one,
+    // THEN drain (see the full argument in `commands::auth::logout`).
+    {
+        let mut s = session.0.lock().await;
+        s.token = None;
+        s.identity = None; // drop ⇒ zeroize the cold recovery key
+        s.server_id.clear();
+        s.principal = None;
+    }
+    pool.drain_idle();
+    if told_server {
+        Ok(())
+    } else {
+        // Honest, not silent: this device is fully torn down, but the server may
+        // still hold the session row until it expires. The UI tears down regardless.
+        Err(UiError::new(
+            "recovery_logout_offline",
+            "Recovery session ended on this device; the server could not be told.",
+        ))
+    }
 }
 
 fn now_ms() -> u64 {

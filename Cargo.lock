@@ -1355,6 +1355,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tokio-rustls",
+ "zeroize",
 ]
 
 [[package]]

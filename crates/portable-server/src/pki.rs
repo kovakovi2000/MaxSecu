@@ -21,6 +21,36 @@ pub fn ensure_dev_cert(layout: &Layout, public_addr: Option<&str>) -> std::io::R
     if layout.cert_der_path().exists() && layout.cert_key_path().exists() {
         return Ok(());
     }
+
+    // MINTING A NEW SERVER IDENTITY. Say so, loudly, naming the absolute path.
+    //
+    // Reaching here means no cert was found where we looked -- which is correct and
+    // expected on a genuine first install, and a DISASTER otherwise: a new key pair
+    // is a new server identity, and every client that pinned the old cert fails the
+    // TLS handshake permanently, with no re-pin path and no admin escape hatch.
+    //
+    // The realistic way to get here by accident is the data dir resolving somewhere
+    // unintended: MAXSECU_DATA_DIR is relative to the CURRENT DIRECTORY when unset,
+    // so running the binary from the source tree (or any other cwd) silently points
+    // it at an empty directory. This warning is what turns that from a silent
+    // catastrophe into an obvious one. It only ever ADDS output, so it cannot change
+    // the behaviour of an existing deployment.
+    let shown = layout
+        .cert_der_path()
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf()))
+        .unwrap_or_else(|| layout.cert_der_path().to_path_buf());
+    eprintln!("============================================================");
+    eprintln!("MINTING A NEW TLS CERTIFICATE AND SERVER IDENTITY");
+    eprintln!("  data dir: {}", shown.display());
+    eprintln!("  No existing cert was found there, so a NEW key pair is being");
+    eprintln!("  generated. If this server already had users, STOP NOW: a new cert");
+    eprintln!("  locks out every client that pinned the old one, permanently.");
+    eprintln!("  Expected on a first install. Otherwise check MAXSECU_DATA_DIR --");
+    eprintln!("  it is resolved relative to the current directory when unset.");
+    eprintln!("============================================================");
+
     let mut sans = vec![
         san_for("localhost"),
         // Loopback IP literal → IP SAN.

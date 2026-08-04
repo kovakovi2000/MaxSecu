@@ -27,7 +27,7 @@ use maxsecu_crypto::{EncPublicKey, WrappedDek};
 use maxsecu_encoding::structs::WrapContext;
 use maxsecu_encoding::types::{Id, RecipientType, Suite, Timestamp};
 
-use crate::commands::auth::{AppDir, ConnectLock, Session};
+use crate::commands::auth::{AppDir, ConnectLock, Principal, Session};
 use crate::commands::connection::{open_conn, reauth, server_of};
 use crate::config::load_directory_pub;
 use crate::directory::{resolve_my_binding, resolve_recovery_pin};
@@ -246,8 +246,22 @@ async fn resolve_recipients(
     let pinned = load_directory_pub(app_dir)?;
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
-    let username = { session.0.lock().await.username.clone() }
-        .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
+    let who = { session.0.lock().await.principal.clone() };
+    let username = match who {
+        Some(Principal::User { username }) => username,
+        // Uploading needs a published USER binding to own the file, which the
+        // recovery account does not have — and the server hard-403s `RECOVERY_ID` on
+        // `create_file`/`stage_version`/`finalize_version`/`put_chunk` anyway. Refuse
+        // HERE, before a long/expensive prepare+transcode, with an honest code rather
+        // than dying on an opaque `pending` at the directory GET below.
+        Some(Principal::Recovery) => {
+            return Err(UiError::new(
+                "recovery_read_only",
+                "The recovery account cannot upload.",
+            ))
+        }
+        None => return Err(UiError::new("locked", "Sign in first.")),
+    };
     let server = server_of(app_dir)?;
     let (mut sender, host, _exporter) = open_conn(app_dir, &server).await?;
     // Offline-D5 hop (spec §3/§7): resolve the effective directory verifier over the

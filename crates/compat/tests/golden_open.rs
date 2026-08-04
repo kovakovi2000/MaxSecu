@@ -34,8 +34,8 @@ use maxsecu_compat::{area, fixtures_root, read, read_str, sha256_hex, verify_cor
 use maxsecu_crypto::{
     deserialize_hybrid_wrap, generate_enc_keypair, generate_mlkem_keypair, open_chunk, sha256,
     sign_delegation, unwrap_dek, unwrap_dek_hybrid, verify_delegation, wrap_dek, wrap_dek_hybrid,
-    Dek, EncSecretKey, HybridEncPublicKey, HybridEncSecretKey, SigningKey, VerifyingKey,
-    WrappedDek, ARGON2_FLOOR,
+    Argon2Params, Dek, EncSecretKey, HybridEncPublicKey, HybridEncSecretKey, SigningKey,
+    VerifyingKey, WrappedDek, ARGON2_FLOOR,
 };
 use maxsecu_encoding::structs::{
     BundleBody, BundleMember, DirBinding, Manifest, Stream, WrapContext,
@@ -46,15 +46,16 @@ use maxsecu_encoding::types::{
 use maxsecu_encoding::{decode, encode, labels};
 use serde_json::{json, Value};
 
-/// The six corpus areas this track owns. (`http/`, `pin/` and `client-state/`
+/// The seven corpus areas this track owns. (`http/`, `pin/` and `client-state/`
 /// belong to other tracks and are locked by their own tests.)
-const AREAS: [&str; 6] = [
+const AREAS: [&str; 7] = [
     "encoding",
     "crypto",
     "keyblob",
     "seedblob",
     "delegation",
     "blobref",
+    "backup",
 ];
 
 // ---------------------------------------------------------------------------
@@ -652,6 +653,161 @@ fn compat_frozen_bundle_body_still_decodes() {
 }
 
 // ===========================================================================
+// (A7) MXBU sealed server-backup bundle — frozen surface #12
+// ===========================================================================
+
+/// A frozen multi-part `MXBU` server-backup bundle still unseals under today's
+/// `MxbuOpener`, to the exact original plaintext of every part.
+///
+/// This is the sealed run-state bundle a `backup-server.sh` run leaves in the
+/// operator's cold tier (Dropbox / fs). It is the ONE thing in the system that is
+/// not client-encrypted before it egresses — it carries the TLS private key, the
+/// operational signing seed, the Dropbox refresh token and a whole `pg_dump` — so
+/// a reader that can no longer open it means the rollback fails at the exact
+/// moment the operator reaches for it. The bytes were minted by
+/// `compat_emit_backup_fixtures` from the DOCUMENTED byte layout (never
+/// `MxbuSealer`), so this proves today's reader opens FOREIGN bytes, not a
+/// round-trip of today's writer — the `2a626d6` failure mode.
+#[test]
+fn compat_frozen_backup_still_unseals() {
+    use maxsecu_server::backup::format::MxbuOpener;
+
+    let exp = expect("backup", "backup_v1.expect.json");
+    let bundle = read("backup", "backup_v1.bin");
+    let pw = read_str("backup", "backup_v1.passphrase.txt");
+
+    let parts = field(&exp, "parts").as_array().expect("parts[] array");
+    assert!(
+        parts.len() >= 2,
+        "the backup fixture must be MULTI-part (it exercises nonce_for(index=1), the \
+         is_last AAD, and multi-part open — a one-part fixture is weaker)"
+    );
+
+    // `backup_v1.bin` is the bundle's parts concatenated; each part's stored length
+    // is frozen in the expectation, so walk them in order. The key is derived ONCE
+    // from the first part (every part repeats the 45-byte header) — exactly what a
+    // restorer walking `BackupIndex::parts` does.
+    let mut opener: Option<MxbuOpener> = None;
+    let mut off = 0usize;
+    for p in parts {
+        let plen = u64_field(p, "part_len") as usize;
+        assert!(
+            off + plen <= bundle.len(),
+            "a frozen part_len runs past the bundle — fixture corruption"
+        );
+        let part = &bundle[off..off + plen];
+        off += plen;
+
+        if opener.is_none() {
+            opener = Some(MxbuOpener::from_part(&pw, part).unwrap_or_else(|e| {
+                panic!(
+                    "\n\nFROZEN SERVER-BACKUP BUNDLE HEADER NO LONGER PARSES: \
+                     compat/fixtures/backup/backup_v1.bin — {e}\n\
+                     This is a sealed MXBU bundle an operator has sitting in their cold tier. \
+                     If today's code cannot even derive its key, no rollback or dead-box \
+                     rebuild can read it — the recovery path fails exactly when it is needed. \
+                     see docs/compat/CHECKLIST.md\n"
+                )
+            }));
+        }
+        let idx = u64_field(p, "index") as u32;
+        let is_last = field(p, "is_last").as_bool().expect("is_last bool");
+        let pt = opener
+            .as_ref()
+            .unwrap()
+            .open_part(idx, is_last, part)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "\n\nFROZEN SERVER-BACKUP PART NO LONGER OPENS: part {idx} of \
+                     compat/fixtures/backup/backup_v1.bin — {e}\n\
+                     The MXBU seal changed — its Argon2id KDF, the 45-byte header-as-AAD, the \
+                     `nonce_base ⊕ part_index` nonce construction, or the `part_index ‖ is_last` \
+                     AAD framing. Every backup bundle already written is now unopenable, so \
+                     rollback and dead-box rebuild both fail. This cannot ship. \
+                     see docs/compat/CHECKLIST.md\n"
+                )
+            });
+        assert_eq!(
+            hex_of(&pt),
+            field(p, "plaintext").as_str().unwrap(),
+            "frozen backup part {idx} opened to the WRONG plaintext — silent bundle corruption"
+        );
+    }
+    assert_eq!(
+        off,
+        bundle.len(),
+        "the fixture bundle has trailing bytes past its last part"
+    );
+}
+
+/// A frozen `BackupIndex` (`type_id 0x000F`) still decodes, field for field.
+///
+/// The index is what every bundle's part 0 carries: the git SHA a `--only code`
+/// rollback checks out, the entry table a restore writes back to disk, and the
+/// per-part ciphertext digests every payload part is checked against before it is
+/// opened. `backup_v1.bin` above freezes the MXBU *seal* and nothing more — its
+/// part plaintexts are prose — so without this the wire framing of the container
+/// inside the seal is unpinned, and the one thing a round-trip cannot catch is
+/// exactly what would break it: reordering `entries` against `parts`, narrowing a
+/// `len`, or changing how `path` is length-prefixed all keep `encode`/`decode`
+/// agreeing with each other while making every bundle already sitting in an
+/// operator's cold tier unreadable.
+///
+/// The bytes were written by `build_backup_index` from the DOCUMENTED layout
+/// (`docs/encoding-spec.md` §4 `backup_index`), never by `encode()`.
+#[test]
+fn compat_frozen_backup_index_still_decodes() {
+    use maxsecu_encoding::structs::BackupIndex;
+
+    let exp = expect("backup", "backup_index_v1.expect.json");
+    let bytes = read("backup", "backup_index_v1.bin");
+
+    assert_eq!(
+        u16::from_be_bytes([bytes[0], bytes[1]]) as u64,
+        u64_field(&exp, "type_id"),
+        "the frozen backup index does not start with type_id 0x000F"
+    );
+
+    let idx: BackupIndex = decode(&bytes).unwrap_or_else(|e| {
+        panic!(
+            "\n\nFROZEN BACKUP INDEX NO LONGER DECODES — {e}\n\
+             The BackupIndex is the authenticated table of contents inside part 0 of EVERY \
+             sealed MXBU bundle. `backup::read_index` decodes it before anything else can \
+             happen, so if these bytes stop decoding, every bundle an operator already has \
+             on their cold tier becomes unlistable and unrestorable — rollback and dead-box \
+             rebuild both fail at the first step. This cannot ship. \
+             see docs/compat/CHECKLIST.md\n"
+        )
+    });
+
+    assert_eq!(
+        idx.git_sha.as_str(),
+        field(&exp, "git_sha").as_str().unwrap()
+    );
+    assert_eq!(idx.created_at.0, u64_field(&exp, "created_at"));
+
+    let entries = field(&exp, "entries").as_array().unwrap();
+    assert_eq!(idx.entries.len(), entries.len());
+    for (got, want) in idx.entries.iter().zip(entries) {
+        // Zipped in order on purpose: `entries` order IS the payload order an
+        // entry's offset is the running sum of, so a codec that sorted or
+        // de-duplicated would put a restored file's bytes at the wrong offset.
+        assert_eq!(got.path.as_str(), field(want, "path").as_str().unwrap());
+        assert_eq!(got.len, u64_field(want, "len"));
+        assert_eq!(got.digest, Bytes32(arr32(want, "digest")));
+    }
+
+    let parts = field(&exp, "parts").as_array().unwrap();
+    assert_eq!(idx.parts.len(), parts.len());
+    for (got, want) in idx.parts.iter().zip(parts) {
+        // A part's index is its POSITION here, and that index is bound into the
+        // part's AEAD AAD and nonce — so this order is load-bearing too.
+        assert_eq!(got.len, u64_field(want, "len"));
+        assert_eq!(got.digest, Bytes32(arr32(want, "digest")));
+    }
+}
+
+// ===========================================================================
 // The generator. NOT part of the gate — run once, commit the bytes.
 // ===========================================================================
 
@@ -718,6 +874,100 @@ fn build_keyblob(
     let ct = maxsecu_crypto::seal(&key, &nonce, &header, &pt);
     let mut out = header;
     out.extend_from_slice(&ct);
+    out
+}
+
+/// Build one stored `MXBU` backup part **from the documented byte layout** (frozen
+/// surface #12), NOT by calling `MxbuSealer`. It mirrors
+/// `crates/server/src/backup/format.rs`'s `build_part` test helper and
+/// `build_keyblob` above: an independent second writer, so the gate proves today's
+/// reader opens FOREIGN bytes instead of round-tripping our own `seal` (which would
+/// let both halves drift together). The construction is normative in the design
+/// spec's "MXBU v1" section — if the layout drifts, the reader stops opening this:
+///
+/// ```text
+/// header = "MXBU" ‖ version=1 ‖ m_kib u32 BE ‖ t u32 BE ‖ p u32 BE ‖ salt[16] ‖ nonce_base[12]   (45)
+/// aad    = header ‖ part_index u32 BE ‖ is_last u8
+/// nonce  = nonce_base with part_index.to_be_bytes() XORed into bytes 8..12   (TLS 1.3 record nonce)
+/// part   = header ‖ AES-256-GCM(derive_key(pw, salt, params), nonce, aad, plaintext)
+/// ```
+fn build_backup_part(
+    pw: &str,
+    params: Argon2Params,
+    salt: &[u8; 16],
+    nonce_base: &[u8; 12],
+    part_index: u32,
+    is_last: bool,
+    pt: &[u8],
+) -> Vec<u8> {
+    let mut header = Vec::with_capacity(45);
+    header.extend_from_slice(b"MXBU");
+    header.push(1);
+    header.extend_from_slice(&params.m_kib.to_be_bytes());
+    header.extend_from_slice(&params.t.to_be_bytes());
+    header.extend_from_slice(&params.p.to_be_bytes());
+    header.extend_from_slice(salt);
+    header.extend_from_slice(nonce_base);
+    assert_eq!(header.len(), 45);
+
+    let mut aad = header.clone();
+    aad.extend_from_slice(&part_index.to_be_bytes());
+    aad.push(u8::from(is_last));
+
+    let key = maxsecu_crypto::derive_key(pw.as_bytes(), salt, params).expect("floor params");
+    let mut nonce = *nonce_base;
+    for (b, x) in nonce[8..].iter_mut().zip(part_index.to_be_bytes()) {
+        *b ^= x;
+    }
+    let ct = maxsecu_crypto::seal(&key, &nonce, &aad, pt);
+
+    let mut out = header;
+    out.extend_from_slice(&ct);
+    out
+}
+
+/// Build the canonical bytes of a `BackupIndex` (`type_id 0x000F`) **from the
+/// documented byte layout** — `docs/encoding-spec.md` §2 (primitives) and §4
+/// (`backup_index`) — NOT by calling `encode()`. Same discipline as
+/// `build_keyblob` and `build_backup_part`: an independent second writer, so the
+/// gate proves today's strict `decode` still accepts FOREIGN bytes instead of
+/// round-tripping our own encoder, which would let writer and reader drift
+/// together and stay green while a real operator's bundle rotted.
+///
+/// ```text
+/// 0x000F u16 BE
+///   git_sha    : u32 BE len ‖ utf8
+///   entries    : u32 BE count ‖ count × (path: u32 BE len ‖ utf8, len: u64 BE, digest[32])
+///   parts      : u32 BE count ‖ count × (len: u64 BE, digest[32])
+///   created_at : u64 BE
+/// ```
+fn build_backup_index(
+    git_sha: &str,
+    entries: &[(&str, u64, [u8; 32])],
+    parts: &[(u64, [u8; 32])],
+    created_at: u64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x000Fu16.to_be_bytes());
+
+    out.extend_from_slice(&(git_sha.len() as u32).to_be_bytes());
+    out.extend_from_slice(git_sha.as_bytes());
+
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (path, len, digest) in entries {
+        out.extend_from_slice(&(path.len() as u32).to_be_bytes());
+        out.extend_from_slice(path.as_bytes());
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(digest);
+    }
+
+    out.extend_from_slice(&(parts.len() as u32).to_be_bytes());
+    for (len, digest) in parts {
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(digest);
+    }
+
+    out.extend_from_slice(&created_at.to_be_bytes());
     out
 }
 
@@ -1202,6 +1452,119 @@ fn compat_emit_fixtures() {
         "wrote the frozen corpus under {}",
         fixtures_root().display()
     );
+}
+
+/// Mint the `backup` area — the frozen `MXBU` server-backup bundle (surface #12) —
+/// and it alone.
+///
+/// SEPARATE from `compat_emit_fixtures` ON PURPOSE. That generator is
+/// all-or-nothing and NON-deterministic: it regenerates every identity with fresh
+/// `random_array()` key material, so running it to add this one area would rewrite
+/// all the OTHER areas' bytes, move every sha256 in every `corpus.lock`, and trip
+/// both the corpus lock and the pre-push hook. This emitter writes only
+/// `compat/fixtures/backup/*` and re-locks just that area. Run it ONCE:
+///
+/// ```text
+/// cargo test -p maxsecu-compat --test golden_open compat_emit_backup_fixtures -- --ignored
+/// ```
+///
+/// (Once `backup` is in `AREAS`, a later `compat_emit_fixtures` run also
+/// `create_dir_all`s + `emit_corpus_lock`s it — harmless, it re-hashes what is on
+/// disk — but the two generators must never both AUTHOR these bytes.)
+#[test]
+#[ignore = "run with --ignored ONCE to mint the MXBU backup fixture; the gate never regenerates \
+            (regenerating an existing fixture is a corpus.lock failure by design)"]
+fn compat_emit_backup_fixtures() {
+    std::fs::create_dir_all(area("backup")).expect("create the backup fixture area");
+
+    let params = ARGON2_FLOOR; // keeps the gate fast; the desktop target is 256 MiB / ~1s
+    let pw = "compat-fixture-backup-bundle-passphrase"; // >= 12 chars (MIN_PASSPHRASE_CHARS)
+                                                        // Fixed salt + nonce_base: the fixture is minted once and frozen, so a
+                                                        // deterministic bundle is preferable to a random one.
+    let salt = [0xBAu8; 16];
+    let nonce_base = [0xBCu8; 12];
+
+    // A MULTI-part bundle. Part 0 (is_last = false) exercises nonce_for(0) and the
+    // is_last = false AAD; part 1 (is_last = true) exercises nonce_for(1), the
+    // is_last = true AAD, and the multi-part open. Distinct lengths, too.
+    let payloads: [(&[u8], bool); 2] = [
+        (
+            b"MXBU compat fixture -- server-backup bundle frame 0 of 2 (not the last part)"
+                .as_slice(),
+            false,
+        ),
+        (
+            b"MXBU compat fixture -- final frame 1 of 2 (is_last)".as_slice(),
+            true,
+        ),
+    ];
+
+    let mut bundle: Vec<u8> = Vec::new();
+    let mut parts_json: Vec<Value> = Vec::new();
+    for (index, &(pt, is_last)) in payloads.iter().enumerate() {
+        let part = build_backup_part(pw, params, &salt, &nonce_base, index as u32, is_last, pt);
+        parts_json.push(json!({
+            "index": index,
+            "is_last": is_last,
+            "part_len": part.len(),
+            "plaintext": hex_of(pt),
+        }));
+        bundle.extend_from_slice(&part);
+    }
+
+    write("backup", "backup_v1.bin", &bundle);
+    write("backup", "backup_v1.passphrase.txt", pw.as_bytes());
+    write_json(
+        "backup",
+        "backup_v1.expect.json",
+        &json!({
+            "format": "MXBU",
+            "magic": "MXBU",
+            "version": 1,
+            "argon": { "m_kib": params.m_kib, "t": params.t, "p": params.p },
+            "header_len": 45,
+            "passphrase_file": "backup_v1.passphrase.txt",
+            "parts": parts_json,
+        }),
+    );
+
+    // The bundle's authenticated table of contents, frozen SEPARATELY from the
+    // seal above. `backup_v1.bin` pins the MXBU envelope and nothing else — its
+    // part plaintexts are prose, so no byte in it constrains how a `BackupIndex`
+    // is framed. Two entries and two parts (with different values), so list ORDER
+    // is observable: swapping `entries` and `parts`, narrowing a `len`, or
+    // changing the `path` encoding would all still round-trip through today's
+    // `encode`/`decode` pair while leaving every bundle already in an operator's
+    // Dropbox with an undecodable part 0.
+    let index_entries: [(&str, u64, [u8; 32]); 2] = [
+        ("tls/key.der", 1191, [0x11; 32]),
+        ("config/operational_secret.bin", 32, [0x22; 32]),
+    ];
+    let index_parts: [(u64, [u8; 32]); 2] = [(8_388_653, [0x33; 32]), (4_096, [0x44; 32])];
+    let index_git_sha = "0123456789abcdef0123456789abcdef01234567";
+    let index_bytes = build_backup_index(index_git_sha, &index_entries, &index_parts, CREATED_AT);
+    write("backup", "backup_index_v1.bin", &index_bytes);
+    write_json(
+        "backup",
+        "backup_index_v1.expect.json",
+        &json!({
+            "type_id": 15,
+            "git_sha": index_git_sha,
+            "entries": index_entries.iter().map(|(path, len, digest)| json!({
+                "path": path,
+                "len": len,
+                "digest": hex_of(digest),
+            })).collect::<Vec<_>>(),
+            "parts": index_parts.iter().map(|(len, digest)| json!({
+                "len": len,
+                "digest": hex_of(digest),
+            })).collect::<Vec<_>>(),
+            "created_at": CREATED_AT,
+        }),
+    );
+
+    emit_corpus_lock("backup");
+    eprintln!("wrote the backup corpus under {}", area("backup").display());
 }
 
 /// `<filename>  <sha256-hex>`, sorted by filename, LF endings, no self-entry.

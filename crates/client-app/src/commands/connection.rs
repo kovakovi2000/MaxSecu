@@ -14,7 +14,7 @@ use crate::session;
 use crate::state::{AuthState, ConnectionState, EVT_AUTH, EVT_CONNECTION};
 use crate::transport::{self, Transport};
 
-use super::auth::{AppDir, ConnectLock, Session};
+use super::auth::{AppDir, ConnectLock, Principal, Session};
 
 #[tauri::command]
 pub async fn connect(
@@ -122,7 +122,9 @@ pub(crate) async fn open_conn(
     //    same way. TorOnly dials a Tor circuit and layers the SAME pinned TLS +
     //    RFC 5705 exporter; it NEVER falls back to a direct dial (that would leak
     //    the client IP). PreferServer/PreferDropbox dial TCP directly.
-    let mode = crate::config::SettingsConfig::load(dir).connection.route_mode;
+    let mode = crate::config::SettingsConfig::load(dir)
+        .connection
+        .route_mode;
     let (tls, exporter) = if mode == crate::config::RouteMode::TorOnly {
         let tor = crate::tor::global()
             .ok_or_else(|| UiError::new("tor_unavailable", "Tor routing is not available."))?;
@@ -192,7 +194,9 @@ async fn connect_inner(
             s.identity = Some(id);
             s.server_id = login.server_id.clone();
             s.token = Some(login.token.clone());
-            s.username = Some(req.username.clone());
+            s.principal = Some(Principal::User {
+                username: req.username.clone(),
+            });
             login
         }
         Err(e) => {
@@ -211,9 +215,24 @@ async fn connect_inner(
 
 /// Re-authenticate on a FRESH channel and return that live authenticated channel
 /// plus a token bound to it. Channel-bound sessions can't be reused across
-/// connections, so each authenticated command mints its own. Serialized with
-/// `connect` via the ConnectLock; the unlocked identity is borrowed transiently
+/// connections, so a channel that must be minted mints its own login. Serialized
+/// with `connect` via the ConnectLock; the unlocked identity is borrowed transiently
 /// and ALWAYS restored before returning.
+///
+/// **This is the expensive path** — a TLS dial plus `challenge`+`proof`, and one of
+/// the ≤30 challenges the server admits per account per minute. Authed READ commands
+/// must not call it directly; they borrow a warm channel from
+/// [`crate::commands::pool`], which calls this only on a cold/expired/drained pool.
+///
+/// **ONE attempt, no internal wait.** A `429` (the server's anti-automation
+/// throttle, `session::RATE_LIMITED`) is returned as-is, carrying its
+/// `retry_after_s`. Waiting it out HERE would mean sleeping deep inside the pool's
+/// auth gate while holding one of its permits — one throttled cold mint would stall
+/// every other borrower behind it — so the bounded wait+retry lives in
+/// [`crate::commands::pool::AuthedPool::acquire`] instead, where the gate and the
+/// permit are released first. Callers that reach this function DIRECTLY (the write
+/// paths: upload / share / delete / admin / renew) therefore surface the throttle to
+/// the UI, which names the interval, rather than blocking the command for it.
 pub(crate) async fn reauth(
     dir: &std::path::Path,
     server: &str,
@@ -232,9 +251,9 @@ pub(crate) async fn reauth(
     // several reauth-bound calls should queue briefly, not fail. Still fails
     // closed if a real `connect` holds the lock past the budget.
     let _guard = connect_lock.acquire_reauth().await?;
-    let username = {
+    let principal = {
         let s = session.0.lock().await;
-        s.username
+        s.principal
             .clone()
             .ok_or_else(|| UiError::new("locked", "Sign in first."))?
     };
@@ -249,11 +268,30 @@ pub(crate) async fn reauth(
             .take()
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?
     };
-    let result =
-        crate::session::login_exchange(&mut sender, &id, &username, &host, &exporter, ts).await;
+    // The ONLY per-principal difference is WHICH channel-bound exchange proves the
+    // key on this fresh connection; both are driven by their existing exchange
+    // helpers (never a copy of the proof crypto), and both discard the server_id
+    // (`reauth` only needs the token).
+    let result = match &principal {
+        Principal::User { username } => {
+            crate::session::login_exchange(&mut sender, &id, username, &host, &exporter, ts)
+                .await
+                .map(|login| login.token)
+        }
+        Principal::Recovery => {
+            crate::commands::recovery_login::recovery_reauth_exchange(
+                &mut sender,
+                &host,
+                &id,
+                &exporter,
+                ts,
+            )
+            .await
+        }
+    };
     session.0.lock().await.identity = Some(id); // restore regardless of outcome
-    let login = result?;
-    Ok((sender, host, login.token))
+    let token = result?;
+    Ok((sender, host, token))
 }
 
 /// Load the configured connect ADDRESS (`host:port`) that `reauth`/`connect`

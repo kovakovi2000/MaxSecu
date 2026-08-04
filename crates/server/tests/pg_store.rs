@@ -16,11 +16,20 @@ use maxsecu_encoding::types::{
 };
 use maxsecu_encoding::{encode, RECOVERY_ID};
 use maxsecu_server::{
-    parse_stage, AddWrapError, AuthConfig, AuthService, DeleteError, DeleteWrapError,
-    EnrollOutcome, FinalizeError, GenesisInput, ListFilter, PgStore, RecoveryAccount,
-    SessionRecord, StageError, StageInput, Store, StoredBinding, VersionSelector, WrapInput,
+    parse_stage, router, AddWrapError, AppState, AuthConfig, AuthService, DeleteError,
+    DeleteWrapError, EnrollOutcome, FinalizeError, GenesisInput, ListFilter, ListSort,
+    MemoryBlobStore, NullAuditSink, PgStore, RecoveryAccount, SessionRecord, StageError,
+    StageInput, Store, StoredBinding, TlsExporter, VersionSelector, WrapInput, AUTH_PRUNE_BATCH,
+    AUTH_PRUNE_GRACE_MS,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::header::AUTHORIZATION;
+use axum::http::{Request, StatusCode};
+use axum::{Extension, Router};
+use tower::ServiceExt; // oneshot
 
 const SCHEMA_SQL: &str = include_str!("../../../docs/schema.sql");
 const EXPORTER: [u8; 32] = [0xE7; 32];
@@ -1047,39 +1056,37 @@ async fn listing_filters_by_type_in_postgres() {
     let all = db
         .store
         .list_files(ListFilter {
-            file_type: None,
             limit: 10,
-            caller_id: owner,
+            ..ListFilter::for_caller(owner)
         })
         .await
         .unwrap();
-    assert_eq!(all.len(), 2);
-    assert_eq!(all[0].file_id, video); // newest first
-    assert!(all[0].small_streams.iter().all(|(t, _)| *t != 1)); // content excluded
+    assert_eq!(all.entries.len(), 2);
+    assert_eq!(all.entries[0].file_id, video); // newest first
+    assert_eq!(all.total, 2, "`total` counts the same set as the page");
+    assert!(all.entries[0].small_streams.iter().all(|(t, _)| *t != 1)); // content excluded
 
     let blogs = db
         .store
         .list_files(ListFilter {
             file_type: Some(FileType::Blog as u8 as i16),
             limit: 10,
-            caller_id: owner,
+            ..ListFilter::for_caller(owner)
         })
         .await
         .unwrap();
-    assert_eq!(blogs.len(), 1);
-    assert_eq!(blogs[0].file_id, blog);
+    assert_eq!(blogs.entries.len(), 1);
+    assert_eq!(blogs.entries[0].file_id, blog);
+    assert_eq!(blogs.total, 1, "`total` is filtered by type too");
 
     // A caller with no wrap for these files sees nothing (caller-scoped listing).
     let stranger = db
         .store
-        .list_files(ListFilter {
-            file_type: None,
-            limit: 50,
-            caller_id: [0x77u8; 16],
-        })
+        .list_files(ListFilter::for_caller([0x77u8; 16]))
         .await
         .unwrap();
-    assert!(stranger.is_empty(), "pg listing is caller-scoped");
+    assert!(stranger.entries.is_empty(), "pg listing is caller-scoped");
+    assert_eq!(stranger.total, 0, "`total` is caller-scoped too");
 
     db.teardown().await;
 }
@@ -1126,16 +1133,276 @@ async fn listing_excludes_bundle_members_in_postgres() {
 
     let all = db
         .store
+        .list_files(ListFilter::for_caller(owner))
+        .await
+        .unwrap();
+    assert_eq!(all.entries.len(), 1);
+    assert_eq!(all.entries[0].file_id, bundle);
+    assert_eq!(all.total, 1, "an unlisted member is out of `total` too");
+    assert!(all.entries.iter().all(|e| e.file_id != member)); // member hidden
+
+    db.teardown().await;
+}
+
+// ---- F3a: server-side paging / sort / owner filter over Postgres ----
+
+/// Stage v1 of `file` owned by `owner`, finalize it, and PIN `files.updated_at`
+/// — the listing's sort key — to exactly `at_ms`.
+///
+/// The explicit `UPDATE` is not belt-and-braces: `PgStore::finalize_version`
+/// stamps `updated_at = now()` (the DATABASE clock) and ignores its `now_ms`
+/// argument, where `MemoryStore::finalize_version` uses `now_ms`. In production
+/// those coincide (both are "now"), but a test that wants a deterministic order
+/// has to set the column itself rather than assume the argument reaches it.
+async fn seed_finalized(db: &TestDb, file: [u8; 16], owner: [u8; 16], ftype: FileType, at_ms: u64) {
+    let p = parse_stage(pg_stage(
+        file,
+        1,
+        owner,
+        Some(pg_genesis(file, owner)),
+        ftype,
+    ))
+    .unwrap();
+    db.store.stage_version(p, TS).await.unwrap();
+    db.store
+        .finalize_version(file, 1, owner, at_ms)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE files SET updated_at = to_timestamp($2::double precision / 1000.0) WHERE file_id = $1")
+        .bind(&file[..])
+        .bind(at_ms as f64)
+        .execute(db.store.pool())
+        .await
+        .unwrap();
+}
+
+/// F3a — OFFSET paging, `sort`, `owner=me` and `total` over REAL Postgres.
+///
+/// The load-bearing assertion is the PARTITION: in a quiescent set, the pages
+/// together are exactly the whole set, with no duplicate and no gap. An ORDER BY
+/// that is not total (no `file_id` tiebreak) fails precisely here, and it fails
+/// as *silently missing user content*.
+#[tokio::test]
+async fn listing_pages_sorts_and_filters_by_owner_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let other = [0x22u8; 16];
+    db.seed_user(owner, "owner").await;
+    db.seed_user(other, "other").await;
+
+    // Five files owned by `owner`, finalized at strictly increasing times …
+    let mine: Vec<[u8; 16]> = (0..5u8).map(|i| [0xA0 + i; 16]).collect();
+    for (i, id) in mine.iter().enumerate() {
+        seed_finalized(&db, *id, owner, FileType::Blog, TS + 100 + (i as u64) * 10).await;
+    }
+    // … and one owned by SOMEBODY ELSE, re-shared to `owner`. Visible to `owner`
+    // (they hold a wrap) but it must drop out under `owner=me`. Its `updated_at`
+    // lands on the add_wrap timestamp — oldest of the six.
+    let foreign = [0xEEu8; 16];
+    seed_finalized(&db, foreign, other, FileType::Blog, TS + 50).await;
+    db.store
+        .add_wrap(foreign, wrap_row(owner, other, 0xB0), other, TS + 60)
+        .await
+        .unwrap();
+
+    // Newest-first over the whole visible set.
+    let newest_all: Vec<[u8; 16]> = vec![mine[4], mine[3], mine[2], mine[1], mine[0], foreign];
+
+    let page1 = db
+        .store
         .list_files(ListFilter {
-            file_type: None,
-            limit: 50,
-            caller_id: owner,
+            limit: 2,
+            ..ListFilter::for_caller(owner)
         })
         .await
         .unwrap();
-    assert_eq!(all.len(), 1);
-    assert_eq!(all[0].file_id, bundle);
-    assert!(all.iter().all(|e| e.file_id != member)); // member hidden from the feed
+    assert_eq!(page1.total, 6, "`total` must ignore `limit`");
+    assert_eq!(
+        page1.entries.iter().map(|e| e.file_id).collect::<Vec<_>>(),
+        newest_all[0..2]
+    );
+
+    // Pages 2 and 3, then the PARTITION check.
+    let mut walked: Vec<[u8; 16]> = page1.entries.iter().map(|e| e.file_id).collect();
+    for off in [2u64, 4] {
+        let p = db
+            .store
+            .list_files(ListFilter {
+                limit: 2,
+                offset: off,
+                ..ListFilter::for_caller(owner)
+            })
+            .await
+            .unwrap();
+        assert_eq!(p.total, 6, "`total` must ignore `offset` too");
+        walked.extend(p.entries.iter().map(|e| e.file_id));
+    }
+    assert_eq!(
+        walked, newest_all,
+        "three pages of 2 must partition the set: no duplicate, no gap"
+    );
+
+    // An offset past the end is an empty page, not an error — and `total` still
+    // reports the real size, so a pager can clamp instead of hanging.
+    let past = db
+        .store
+        .list_files(ListFilter {
+            limit: 2,
+            offset: 999,
+            ..ListFilter::for_caller(owner)
+        })
+        .await
+        .unwrap();
+    assert!(past.entries.is_empty());
+    assert_eq!(past.total, 6);
+
+    // `sort=oldest` is the exact reverse of `sort=newest` (no ties here, so the
+    // shared `file_id ASC` tiebreak cannot make them differ).
+    let oldest = db
+        .store
+        .list_files(ListFilter {
+            limit: 50,
+            sort: ListSort::Oldest,
+            ..ListFilter::for_caller(owner)
+        })
+        .await
+        .unwrap();
+    let mut reversed = newest_all.clone();
+    reversed.reverse();
+    assert_eq!(
+        oldest.entries.iter().map(|e| e.file_id).collect::<Vec<_>>(),
+        reversed
+    );
+    assert_eq!(oldest.total, 6, "`total` is sort-independent");
+
+    // `owner=me` — "My Content": the caller's OWN posts only. The re-shared file
+    // is in the plain feed and absent here, and `total` shrinks with it (else the
+    // pager renders a page that does not exist).
+    let mut owned = db
+        .store
+        .list_files(ListFilter {
+            limit: 50,
+            owner_only: true,
+            ..ListFilter::for_caller(owner)
+        })
+        .await
+        .unwrap();
+    assert_eq!(owned.total, 5, "`total` follows the owner filter");
+    assert_eq!(owned.entries.len(), 5);
+    assert!(
+        owned.entries.iter().all(|e| e.file_id != foreign),
+        "a file shared TO me is not a file I own"
+    );
+    owned.entries.sort_by_key(|e| e.file_id);
+    assert_eq!(
+        owned.entries.iter().map(|e| e.file_id).collect::<Vec<_>>(),
+        mine
+    );
+
+    // `owner=me` composes with `type` and with paging.
+    let owned_page = db
+        .store
+        .list_files(ListFilter {
+            file_type: Some(FileType::Blog as u8 as i16),
+            limit: 2,
+            offset: 4,
+            owner_only: true,
+            ..ListFilter::for_caller(owner)
+        })
+        .await
+        .unwrap();
+    assert_eq!(owned_page.total, 5);
+    assert_eq!(
+        owned_page
+            .entries
+            .iter()
+            .map(|e| e.file_id)
+            .collect::<Vec<_>>(),
+        vec![mine[0]],
+        "the last page of the owner-filtered set is the single oldest own file"
+    );
+
+    db.teardown().await;
+}
+
+/// The honest cost of OFFSET paging over a MUTABLE sort key, asserted as the
+/// behaviour that actually happens rather than papered over.
+///
+/// `files.updated_at` is bumped by `finalize_version` AND by `add_wrap` — i.e.
+/// by every re-share. So a re-share landing between two page fetches reorders
+/// the set under the pager: an item already shown on page 1 slides down into
+/// page 2 (shown TWICE) and the item that was going to be on page 2 is pushed to
+/// the top, past the reader (never shown).
+///
+/// ACCEPTED, not fixed: the only stable alternative is to sort by the immutable
+/// `created_at`, which would stop a re-shared file surfacing in the recipient's
+/// feed at all — a product regression, and a schema change besides. This test
+/// exists so the trade-off cannot quietly become a stability claim nobody checked.
+#[tokio::test]
+async fn a_reshare_mid_walk_can_repeat_and_skip_a_page_entry_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let bob = [0x22u8; 16];
+    db.seed_user(owner, "owner").await;
+    db.seed_user(bob, "bob").await;
+
+    // f1 … f4, newest-first order f4, f3, f2, f1.
+    let f: Vec<[u8; 16]> = (1..=4u8).map(|i| [0xC0 + i; 16]).collect();
+    for (i, id) in f.iter().enumerate() {
+        seed_finalized(&db, *id, owner, FileType::Blog, TS + 100 + (i as u64) * 10).await;
+    }
+
+    let page1 = db
+        .store
+        .list_files(ListFilter {
+            limit: 2,
+            ..ListFilter::for_caller(owner)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        page1.entries.iter().map(|e| e.file_id).collect::<Vec<_>>(),
+        vec![f[3], f[2]]
+    );
+
+    // The reader is now looking at page 1. A re-share of the OLDEST file lands.
+    db.store
+        .add_wrap(f[0], wrap_row(bob, owner, 0xB0), owner, TS + 500)
+        .await
+        .unwrap();
+    // Order is now f1, f4, f3, f2 — everything after f1 shifted one slot down.
+
+    let page2 = db
+        .store
+        .list_files(ListFilter {
+            limit: 2,
+            offset: 2,
+            ..ListFilter::for_caller(owner)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        page2.entries.iter().map(|e| e.file_id).collect::<Vec<_>>(),
+        vec![f[2], f[1]],
+        "offset 2 of the REORDERED set"
+    );
+
+    // The consequence, as an assertion rather than a comment:
+    let seen: Vec<[u8; 16]> = page1
+        .entries
+        .iter()
+        .chain(page2.entries.iter())
+        .map(|e| e.file_id)
+        .collect();
+    assert_eq!(
+        seen.iter().filter(|id| **id == f[2]).count(),
+        2,
+        "f3 was on page 1 and slid into page 2 — the reader sees it TWICE"
+    );
+    assert!(
+        !seen.contains(&f[0]),
+        "f1 was pushed to the top of the set, above the reader — it is MISSED"
+    );
 
     db.teardown().await;
 }
@@ -1364,14 +1631,1004 @@ async fn delete_finalized_file_cascades_in_postgres() {
         .unwrap()
         .is_some());
     let listed = fresh
-        .list_files(ListFilter {
-            file_type: None,
-            limit: 50,
-            caller_id: owner,
-        })
+        .list_files(ListFilter::for_caller(owner))
         .await
         .unwrap();
-    assert!(listed.is_empty()); // all remaining files are unlisted members
+    assert!(listed.entries.is_empty()); // all remaining files are unlisted members
+
+    db.teardown().await;
+}
+
+// ---- migration 0002: file_tombstones + wrap_revocations ----
+
+// Absence is meaningful in the file family, and until 0002 nothing recorded it: a
+// hard-deleted file and a soft-revoked wrap are both represented ONLY by a row
+// that is no longer there. A backup restore that merges back what the bundle
+// still holds would therefore resurrect a file its owner destroyed, and hand a
+// de-authorized recipient their wrapped DEK back — silently, on a file that was
+// never deleted. These two tables are the record that makes those absences
+// survivable. Nothing on the serving path reads them; they are written here and
+// read by the restore merge, which is why they carry no Store method.
+
+/// Both tables are append-only under the SHARED `maxsecu_forbid_update_delete`
+/// guard, which — unlike the dedicated `file_genesis_guard()` /
+/// `file_versions_guard()` — never consults `maxsecu.allow_owner_delete`. So a
+/// tombstone is immutable even inside `delete_file`'s own GUC-enabled
+/// transaction, the one place where the rest of the file family is deletable.
+#[tokio::test]
+async fn tombstones_stay_immutable_inside_the_owner_delete_guc_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let file = [0xD1u8; 16];
+    db.seed_user(owner, "owner_tomb_immut").await;
+
+    let p = parse_stage(pg_stage(
+        file,
+        1,
+        owner,
+        Some(pg_genesis(file, owner)),
+        FileType::Blog,
+    ))
+    .unwrap();
+    db.store.stage_version(p, TS).await.unwrap();
+    db.store
+        .finalize_version(file, 1, owner, TS + 1)
+        .await
+        .unwrap();
+    db.store.delete_file(file, owner).await.unwrap();
+
+    // The exact carve-out delete_file itself runs under. If the tombstone were
+    // guarded by one of the GUC-aware guards, this would succeed and a restore
+    // could be talked into forgetting the delete.
+    let mut tx = db.store.pool().begin().await.unwrap();
+    sqlx::query("SET LOCAL maxsecu.allow_owner_delete = 'on'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let err = sqlx::query("DELETE FROM file_tombstones WHERE file_id = $1")
+        .bind(&file[..])
+        .execute(&mut *tx)
+        .await
+        .expect_err("a tombstone must not be deletable, GUC or no GUC");
+    assert!(
+        err.to_string()
+            .contains("append-only table file_tombstones"),
+        "expected the shared append-only guard to raise, got: {err}"
+    );
+    drop(tx);
+
+    let mut tx = db.store.pool().begin().await.unwrap();
+    sqlx::query("SET LOCAL maxsecu.allow_owner_delete = 'on'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let err = sqlx::query("UPDATE file_tombstones SET deleted_at = now() WHERE file_id = $1")
+        .bind(&file[..])
+        .execute(&mut *tx)
+        .await
+        .expect_err("a tombstone must not be updatable");
+    assert!(
+        err.to_string()
+            .contains("append-only table file_tombstones"),
+        "expected the shared append-only guard to raise, got: {err}"
+    );
+    drop(tx);
+
+    db.teardown().await;
+}
+
+/// `delete_file` deletes a SET — the target plus every bundle member it owns — so
+/// every id in that set needs its own tombstone. A member left untombstoned is a
+/// member a restore would resurrect on its own, orphaned from the bundle that
+/// gave it meaning.
+#[tokio::test]
+async fn delete_file_tombstones_every_owned_target_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let stranger = [0x22u8; 16];
+    db.seed_user(owner, "owner_tomb_set").await;
+    db.seed_user(stranger, "stranger_tomb_set").await;
+    let bundle = [0xC1u8; 16];
+    let m1 = [0xC2u8; 16];
+    let foreign = [0xC4u8; 16]; // stranger's file, pointed at owner's bundle
+
+    let pb = parse_stage(pg_stage_listed(
+        bundle,
+        1,
+        owner,
+        Some(pg_genesis(bundle, owner)),
+        FileType::Bundle,
+        true,
+    ))
+    .unwrap();
+    db.store.stage_version(pb, TS).await.unwrap();
+    db.store
+        .finalize_version(bundle, 1, owner, TS + 1)
+        .await
+        .unwrap();
+    for (m, who) in [(m1, owner), (foreign, stranger)] {
+        let pm = parse_stage(StageInput {
+            bundle_id: Some(bundle),
+            ..pg_stage_listed(m, 1, who, Some(pg_genesis(m, who)), FileType::Blog, false)
+        })
+        .unwrap();
+        db.store.stage_version(pm, TS).await.unwrap();
+        db.store.finalize_version(m, 1, who, TS + 2).await.unwrap();
+    }
+
+    // A refused delete must leave no trace: the early return rolls the txn back,
+    // so a non-owner cannot write a tombstone for someone else's file.
+    assert_eq!(
+        db.store.delete_file(bundle, [0x77; 16]).await,
+        Err(DeleteError::NotFound)
+    );
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM file_tombstones")
+        .fetch_one(db.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "a rejected delete must not tombstone anything");
+
+    db.store.delete_file(bundle, owner).await.unwrap();
+
+    // Durability via a fresh pool: the fact lives in the DB, not in this process.
+    let fresh = db.reopen().await;
+    for (id, want, why) in [
+        (bundle, 1i64, "the deleted target"),
+        (m1, 1i64, "an owned bundle member that cascaded"),
+        (
+            foreign,
+            0i64,
+            "a foreign-owned member, which the owner-scoped cascade never touched",
+        ),
+    ] {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM file_tombstones WHERE file_id = $1")
+            .bind(&id[..])
+            .fetch_one(fresh.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, want, "tombstone for {why} — expected {want}");
+    }
+
+    db.teardown().await;
+}
+
+/// A `file_id` is client-generated and `stage_version` re-creates a deleted one
+/// with no tombstone check, so the same id can be deleted twice. Under a plain
+/// INSERT the second delete hits the PK, `DeleteError::Store` becomes an HTTP
+/// 500, and the owner can NEVER delete that file again — an owner locked out of
+/// their own delete by the very table meant to protect them.
+#[tokio::test]
+async fn deleting_a_recreated_file_id_tombstones_idempotently_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let file = [0xD2u8; 16];
+    db.seed_user(owner, "owner_tomb_reuse").await;
+
+    for round in 0..2 {
+        let p = parse_stage(pg_stage(
+            file,
+            1,
+            owner,
+            Some(pg_genesis(file, owner)),
+            FileType::Blog,
+        ))
+        .unwrap();
+        db.store.stage_version(p, TS).await.unwrap();
+        db.store
+            .finalize_version(file, 1, owner, TS + 1)
+            .await
+            .unwrap();
+        db.store.delete_file(file, owner).await.unwrap_or_else(|e| {
+            panic!(
+                "delete #{} of a re-created file_id failed: {e:?}",
+                round + 1
+            )
+        });
+    }
+
+    // Still exactly one tombstone: the id is the identity, and the first delete
+    // already recorded it.
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM file_tombstones WHERE file_id = $1")
+        .bind(&file[..])
+        .fetch_one(db.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+
+    db.teardown().await;
+}
+
+/// The revocation record and the wrap's removal must land together. They do only
+/// because `delete_wrap` now runs in a transaction — before 0002 its statements
+/// were three separate autocommits, and a crash between the DELETE and this
+/// INSERT would leave the wrap gone with no record, so a later restore would
+/// re-insert it and hand the de-authorized recipient their DEK back.
+#[tokio::test]
+async fn delete_wrap_records_a_revocation_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let r = [0x22u8; 16];
+    let file = [0xD3u8; 16];
+    db.seed_user(owner, "owner_revoke_rec").await;
+
+    let p = parse_stage(pg_stage(
+        file,
+        1,
+        owner,
+        Some(pg_genesis(file, owner)),
+        FileType::Blog,
+    ))
+    .unwrap();
+    db.store.stage_version(p, TS).await.unwrap();
+    db.store
+        .finalize_version(file, 1, owner, TS + 1)
+        .await
+        .unwrap();
+    db.store
+        .add_wrap(file, wrap_row(r, owner, 0xB0), owner, TS + 2)
+        .await
+        .unwrap();
+
+    // A refused revoke must record nothing — the authz gate returns before the
+    // txn commits, so an unrelated caller cannot poison the restore with a
+    // revocation that never happened.
+    assert_eq!(
+        db.store.delete_wrap(file, r, [0x88; 16]).await,
+        Err(DeleteWrapError::NotAuthorized)
+    );
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM wrap_revocations")
+        .fetch_one(db.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "a rejected revoke must not record a revocation");
+
+    db.store.delete_wrap(file, r, owner).await.unwrap();
+
+    // Keyed to the version the wrap actually lived on (files.current_version),
+    // which is what the restore merge gates on.
+    let fresh = db.reopen().await;
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wrap_revocations \
+         WHERE file_id = $1 AND file_version = $2 AND recipient_id = $3",
+    )
+    .bind(&file[..])
+    .bind(1i64)
+    .bind(&r[..])
+    .fetch_one(fresh.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 1);
+
+    db.teardown().await;
+}
+
+/// F2 — the escrow wrap cannot be revoked, and the refusal leaves NOTHING behind.
+///
+/// This is the load-bearing test of the fix. The DELETE and the
+/// `wrap_revocations` INSERT live in one transaction, so a guard placed *after*
+/// the INSERT would still "refuse" the request while leaving a permanent
+/// tombstone — and that table is append-only (the `maxsecu_forbid_update_delete`
+/// trigger), so nobody could ever remove it. A later restore-merge reads that
+/// tombstone as "the recovery wrap was revoked on purpose" and drops the wrap for
+/// good. Asserting only that the wrap ROW survives would pass against exactly
+/// that broken ordering; the `wrap_revocations` count is what catches it.
+///
+/// The blinding itself is unrecoverable online: `add_wrap` hard-rejects
+/// `recipient_id == RECOVERY_ID` in both stores, so nothing can put the wrap back
+/// at the file's current version.
+#[tokio::test]
+async fn the_recovery_wrap_cannot_be_revoked_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let r = [0x22u8; 16];
+    let file = [0xD9u8; 16];
+    db.seed_user(owner, "owner_recovery_wrap").await;
+
+    let p = parse_stage(pg_stage(
+        file,
+        1,
+        owner,
+        Some(pg_genesis(file, owner)),
+        FileType::Blog,
+    ))
+    .unwrap();
+    db.store.stage_version(p, TS).await.unwrap();
+    db.store
+        .finalize_version(file, 1, owner, TS + 1)
+        .await
+        .unwrap();
+
+    // The OWNER — the most privileged caller this route has — is refused.
+    assert_eq!(
+        db.store.delete_wrap(file, RECOVERY_ID.0, owner).await,
+        Err(DeleteWrapError::RecoveryProtected),
+        "not even the owner may strip the escrow wrap"
+    );
+
+    // (1) the wrap ROW survived …
+    let fresh = db.reopen().await;
+    let wraps: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM file_key_wraps \
+         WHERE file_id = $1 AND file_version = 1 AND recipient_id = $2",
+    )
+    .bind(&file[..])
+    .bind(&RECOVERY_ID.0[..])
+    .fetch_one(fresh.pool())
+    .await
+    .unwrap();
+    assert_eq!(wraps, 1, "the recovery wrap must still be there");
+
+    // (2) … AND no tombstone was written. Without this assertion the test passes
+    // even when the guard runs after the INSERT — the exact bug it exists for.
+    let tombs: i64 = sqlx::query_scalar("SELECT count(*) FROM wrap_revocations")
+        .fetch_one(fresh.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        tombs, 0,
+        "a refused revoke must leave NO wrap_revocations row — that table is \
+         append-only, so a stray tombstone is permanent and a restore-merge \
+         would read it as a deliberate revocation of the escrow wrap"
+    );
+
+    // (3) the recovery principal can still OPEN the file (the point of the wrap).
+    assert!(db
+        .store
+        .get_file(file, VersionSelector::Latest, RECOVERY_ID.0)
+        .await
+        .unwrap()
+        .is_some());
+
+    // (4) no over-blocking: an ORDINARY recipient is still revocable, and THAT
+    // one does record its tombstone.
+    db.store
+        .add_wrap(file, wrap_row(r, owner, 0xB0), owner, TS + 2)
+        .await
+        .unwrap();
+    db.store.delete_wrap(file, r, owner).await.unwrap();
+    let tombs: i64 = sqlx::query_scalar("SELECT count(*) FROM wrap_revocations")
+        .fetch_one(db.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        tombs, 1,
+        "the guard must not break ordinary soft-revoke or its revocation record"
+    );
+
+    db.teardown().await;
+}
+
+/// Re-sharing to a recipient you previously revoked, then revoking again, hits
+/// the same `(file_id, file_version, recipient_id)` PK a second time. Without
+/// `ON CONFLICT DO NOTHING` that aborts the caller's transaction and the owner
+/// cannot re-revoke someone they chose to give a second chance.
+#[tokio::test]
+async fn re_revoking_a_re_shared_recipient_does_not_abort_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let r = [0x22u8; 16];
+    let file = [0xD4u8; 16];
+    db.seed_user(owner, "owner_rerevoke").await;
+
+    let p = parse_stage(pg_stage(
+        file,
+        1,
+        owner,
+        Some(pg_genesis(file, owner)),
+        FileType::Blog,
+    ))
+    .unwrap();
+    db.store.stage_version(p, TS).await.unwrap();
+    db.store
+        .finalize_version(file, 1, owner, TS + 1)
+        .await
+        .unwrap();
+
+    for round in 0..2 {
+        db.store
+            .add_wrap(file, wrap_row(r, owner, 0xB0), owner, TS + 2)
+            .await
+            .unwrap();
+        db.store
+            .delete_wrap(file, r, owner)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "revoke #{} of a re-shared recipient failed: {e:?}",
+                    round + 1
+                )
+            });
+    }
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM wrap_revocations WHERE file_id = $1")
+        .bind(&file[..])
+        .fetch_one(db.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        n, 1,
+        "the revocation is a fact about a recipient, not a counter"
+    );
+
+    db.teardown().await;
+}
+
+/// `finalize_version` drops the PRIOR version's wraps — that is supersession, not
+/// revocation: it is recipient-blind, and every recipient keeps access through
+/// the new version's own wrap. Recording it here would make every rotation look
+/// like a revocation and permanently block the merge of wraps nobody revoked.
+#[tokio::test]
+async fn finalize_version_records_no_revocation_in_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let r = [0x22u8; 16];
+    let file = [0xD5u8; 16];
+    db.seed_user(owner, "owner_rotate_norec").await;
+
+    let p1 = parse_stage(pg_stage(
+        file,
+        1,
+        owner,
+        Some(pg_genesis(file, owner)),
+        FileType::Blog,
+    ))
+    .unwrap();
+    db.store.stage_version(p1, TS).await.unwrap();
+    db.store
+        .finalize_version(file, 1, owner, TS + 1)
+        .await
+        .unwrap();
+    db.store
+        .add_wrap(file, wrap_row(r, owner, 0xB0), owner, TS + 2)
+        .await
+        .unwrap();
+
+    // Rotate to v2: v1's wraps (including R's) are deleted by supersession.
+    let p2 = parse_stage(pg_stage(file, 2, owner, None, FileType::Blog)).unwrap();
+    db.store.stage_version(p2, TS + 3).await.unwrap();
+    db.store
+        .finalize_version(file, 2, owner, TS + 4)
+        .await
+        .unwrap();
+
+    let gone: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM file_key_wraps WHERE file_id = $1 AND file_version = 1",
+    )
+    .bind(&file[..])
+    .fetch_one(db.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(gone, 0, "supersession really did drop v1's wraps");
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM wrap_revocations")
+        .fetch_one(db.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        n, 0,
+        "a rotation is not a revocation — recording one here would make every \
+         rotation permanently un-mergeable"
+    );
+
+    db.teardown().await;
+}
+
+// ---- F3a: the opaque list cursor, end to end (real Postgres + real router) ----
+
+/// `GET /v1/files` paging over the HTTP surface, backed by a live Postgres.
+///
+/// The store-level tests above prove the SQL; this one proves the wire contract
+/// the client actually codes against:
+///
+///  * `next_cursor` is populated (it was hardcoded `null` before) and round-trips
+///    to the next page;
+///  * the two pages PARTITION the set;
+///  * `total` is present and ignores `limit`/`offset` — its ABSENCE is how an
+///    upgraded client detects an un-upgraded server and renders no pager at all,
+///    so it must never be omitted here;
+///  * a cursor replayed under a DIFFERENT `type` is a loud `400`, not a silently
+///    wrong page of a different result set;
+///  * `sort`/`owner` reject an unknown value.
+#[tokio::test]
+async fn list_paging_and_cursor_over_http_and_postgres() {
+    let db = db_or_skip!();
+    let owner = [0x11u8; 16];
+    let other = [0x22u8; 16];
+    db.seed_user(owner, "owner_http_pager").await;
+    db.seed_user(other, "other_http_pager").await;
+
+    // Three blogs owned by `owner`, one video, and one foreign blog shared to
+    // `owner` (so `owner=me` has something to exclude).
+    let blogs: Vec<[u8; 16]> = (0..3u8).map(|i| [0x30 + i; 16]).collect();
+    for (i, id) in blogs.iter().enumerate() {
+        seed_finalized(&db, *id, owner, FileType::Blog, TS + 100 + (i as u64) * 10).await;
+    }
+    let video = [0x40u8; 16];
+    seed_finalized(&db, video, owner, FileType::Video, TS + 200).await;
+    let foreign = [0x50u8; 16];
+    seed_finalized(&db, foreign, other, FileType::Blog, TS + 40).await;
+    db.store
+        .add_wrap(foreign, wrap_row(owner, other, 0xB0), other, TS + 45)
+        .await
+        .unwrap();
+
+    // A session bound to the fixed test exporter — the same thing a real login
+    // mints, without replaying the whole enrollment.
+    let token = [0x5Au8; 32];
+    let token_hex = hex(&token);
+    db.store
+        .insert_session(
+            sha256(&token),
+            SessionRecord {
+                // 2100-01-01, not u64::MAX: the ms→TIMESTAMPTZ conversion is a
+                // real date, and the validator compares against the wall clock.
+                user_id: owner,
+                tls_exporter: EXPORTER,
+                expires_at_ms: 4_102_444_800_000,
+                revoked: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let app = router(AppState {
+        auth: Arc::new(AuthService::new(db.store.clone(), AuthConfig::default())),
+        blobs: Arc::new(MemoryBlobStore::new()),
+        audit: Arc::new(NullAuditSink),
+        direct_links_enabled: false,
+        max_file_bytes: None,
+    })
+    .layer(Extension(TlsExporter(EXPORTER)));
+
+    let ids = |v: &serde_json::Value| -> Vec<String> {
+        v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["file_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // --- page 1 of the blogs (3 own + 1 shared = 4) ---
+    let (st, p1) = list_http(&app, "/v1/files?type=blog&limit=2", &token_hex).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(p1["total"].as_u64().unwrap(), 4, "`total` ignores `limit`");
+    assert_eq!(ids(&p1).len(), 2);
+    let cursor = p1["next_cursor"]
+        .as_str()
+        .expect("more entries exist, so next_cursor must be populated")
+        .to_owned();
+
+    // --- page 2 via the cursor ---
+    let (st, p2) = list_http(
+        &app,
+        &format!("/v1/files?type=blog&limit=2&cursor={cursor}"),
+        &token_hex,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(p2["total"].as_u64().unwrap(), 4);
+    assert_eq!(ids(&p2).len(), 2);
+    assert!(
+        p2["next_cursor"].is_null(),
+        "the last page must not hand out a cursor"
+    );
+
+    // --- the two pages PARTITION the set ---
+    let mut walked = ids(&p1);
+    walked.extend(ids(&p2));
+    let mut sorted = walked.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 4, "no entry appears on both pages");
+    assert!(
+        !walked.iter().any(|f| f == &hex(&video)),
+        "the type filter still holds across pages"
+    );
+
+    // --- offset= reaches the same page the cursor did ---
+    let (st, by_offset) = list_http(&app, "/v1/files?type=blog&limit=2&offset=2", &token_hex).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        ids(&by_offset),
+        ids(&p2),
+        "cursor and offset must address the same page"
+    );
+
+    // --- a cursor replayed under a DIFFERENT type is refused, loudly ---
+    let (st, body) = list_http(
+        &app,
+        &format!("/v1/files?type=video&limit=2&cursor={cursor}"),
+        &token_hex,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "a cursor minted for type=blog must not silently page a type=video set"
+    );
+    assert_eq!(body["code"], "cursor_query_mismatch");
+
+    // …and so is a cursor replayed under a different sort or owner filter.
+    for uri in [
+        format!("/v1/files?type=blog&limit=2&sort=oldest&cursor={cursor}"),
+        format!("/v1/files?type=blog&limit=2&owner=me&cursor={cursor}"),
+    ] {
+        let (st, body) = list_http(&app, &uri, &token_hex).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(body["code"], "cursor_query_mismatch", "{uri}");
+    }
+
+    // --- a malformed cursor is a distinct 400 ---
+    let (st, body) = list_http(&app, "/v1/files?limit=2&cursor=%21%21not-b64", &token_hex).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "bad_cursor");
+
+    // --- unknown sort / owner values are refused (both are NEW parameters, so no
+    //     shipped client can hit this) ---
+    let (st, body) = list_http(&app, "/v1/files?sort=sideways", &token_hex).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "bad_sort");
+    let (st, body) = list_http(&app, "/v1/files?owner=someone-else", &token_hex).await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "`owner` is not an arbitrary user id — that would be an enumeration oracle"
+    );
+    assert_eq!(body["code"], "bad_owner");
+
+    // --- owner=me drops the file that was shared TO the caller ---
+    let (st, mine) = list_http(&app, "/v1/files?type=blog&owner=me&limit=50", &token_hex).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(mine["total"].as_u64().unwrap(), 3);
+    assert!(
+        !ids(&mine).contains(&hex(&foreign)),
+        "a file shared TO me is not a file I own"
+    );
+
+    // --- an unknown type still matches nothing rather than erroring the browse,
+    //     and reports total = 0 (NOT an absent `total`, which an upgraded client
+    //     reads as "this server does not paginate") ---
+    let (st, none) = list_http(&app, "/v1/files?type=nonsense", &token_hex).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(ids(&none).is_empty());
+    assert!(none["next_cursor"].is_null());
+    assert_eq!(none["total"].as_u64().unwrap(), 0);
+
+    // --- the pre-paging request shape is UNCHANGED: no offset, no cursor, no
+    //     sort, no owner, and the 50/200 limit contract intact ---
+    let (st, legacy) = list_http(&app, "/v1/files?limit=200", &token_hex).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        ids(&legacy).len(),
+        5,
+        "limit=200 must still be honoured — live-smoke and the bundle e2e send it"
+    );
+    assert!(legacy["next_cursor"].is_null());
+
+    db.teardown().await;
+}
+
+/// `GET` a listing URI with a session token, returning `(status, body)`.
+async fn list_http(app: &Router, uri: &str, token: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(AUTHORIZATION, format!("MaxSecu-Session {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    };
+    (status, json)
+}
+
+// ---------------------------------------------------------------------------
+// The bounded, expiry-only auth-row prune, over REAL Postgres.
+//
+// `sessions` and `auth_nonces` are the only two tables the server ever wrote
+// without ever deleting from: a logout is an UPDATE of `revoked_at`, a consumed
+// nonce is an UPDATE of `used_at`. These tests are the whole delete surface, and
+// every one of them fails without the prune.
+//
+// They mirror `store.rs`'s `prune_tests` shape for shape, deliberately: the
+// safety argument only holds if both backings agree on what "prunable" means,
+// and only Postgres exercises the epoch-ms -> TIMESTAMPTZ cutoff conversion.
+// ---------------------------------------------------------------------------
+
+const PRUNE_HOUR_MS: u64 = 3_600_000;
+/// Expired long enough ago to be prunable.
+const PRUNE_LONG_DEAD: u64 = TS - AUTH_PRUNE_GRACE_MS - PRUNE_HOUR_MS;
+/// Expired, but only an hour ago — inside the grace window.
+const PRUNE_JUST_DEAD: u64 = TS - PRUNE_HOUR_MS;
+/// Still valid.
+const PRUNE_LIVE: u64 = TS + PRUNE_HOUR_MS;
+
+fn prune_session(expires_at_ms: u64) -> SessionRecord {
+    SessionRecord {
+        user_id: [0xA1; 16],
+        tls_exporter: EXPORTER,
+        expires_at_ms,
+        // Only `insert_session`'s four written columns matter here; `revoked_at`
+        // is set by `revoke_session`, never by the insert.
+        revoked: false,
+    }
+}
+
+async fn row_count(db: &TestDb, table: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+        .fetch_one(db.store.pool())
+        .await
+        .unwrap()
+}
+
+async fn nonce_exists(db: &TestDb, nonce: &[u8; 32]) -> bool {
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM auth_nonces WHERE nonce = $1")
+        .bind(&nonce[..])
+        .fetch_one(db.store.pool())
+        .await
+        .unwrap();
+    n == 1
+}
+
+/// The four shapes, over real SQL: only a row that is expired **and** past the
+/// grace window is deleted. The other three — expired-but-recent, unexpired, and
+/// revoked-but-unexpired — all survive.
+#[tokio::test]
+async fn prune_removes_only_rows_expired_beyond_the_grace_window_in_postgres() {
+    let db = db_or_skip!();
+
+    let long_dead = [0x01; 32];
+    let just_dead = [0x02; 32];
+    let live = [0x03; 32];
+    let revoked_live = [0x04; 32];
+    for (h, exp) in [
+        (long_dead, PRUNE_LONG_DEAD),
+        (just_dead, PRUNE_JUST_DEAD),
+        (live, PRUNE_LIVE),
+        (revoked_live, PRUNE_LIVE),
+    ] {
+        db.store
+            .insert_session(h, prune_session(exp))
+            .await
+            .unwrap();
+    }
+    // A real logout: revoked in the DB, but nowhere near expiry.
+    db.store.revoke_session(&revoked_live).await.unwrap();
+
+    let n_long_dead = [0x11; 32];
+    let n_just_dead = [0x12; 32];
+    let n_live = [0x13; 32];
+    let n_used_live = [0x14; 32];
+    for (n, exp) in [
+        (n_long_dead, PRUNE_LONG_DEAD),
+        (n_just_dead, PRUNE_JUST_DEAD),
+        (n_live, PRUNE_LIVE),
+        (n_used_live, PRUNE_LIVE),
+    ] {
+        db.store.insert_nonce(n, "alice", exp).await.unwrap();
+    }
+    // A real login: consumed, but nowhere near expiry.
+    db.store.consume_nonce(&n_used_live).await.unwrap();
+
+    let c = db
+        .store
+        .prune_expired_auth_rows(TS, AUTH_PRUNE_GRACE_MS, AUTH_PRUNE_BATCH)
+        .await
+        .unwrap();
+    assert_eq!(
+        (c.sessions, c.nonces),
+        (1, 1),
+        "exactly one row per table was prunable"
+    );
+
+    assert!(
+        db.store.get_session(&long_dead).await.unwrap().is_none(),
+        "a session expired beyond the grace window is deleted"
+    );
+    assert!(
+        db.store.get_session(&just_dead).await.unwrap().is_some(),
+        "a session expired only an hour ago is INSIDE the grace window and survives"
+    );
+    assert!(
+        db.store.get_session(&live).await.unwrap().is_some(),
+        "an unexpired session survives — deleting one would sign out a working user"
+    );
+
+    // The one that would be a security bug. A revoked-but-unexpired row MUST
+    // stay, because the restore merge re-inserts the backup bundle's copy with a
+    // bare ON CONFLICT DO NOTHING: with the live row gone there is nothing to
+    // conflict with, and the pre-logout copy (revoked_at NULL) comes back as a
+    // working token.
+    let still = db
+        .store
+        .get_session(&revoked_live)
+        .await
+        .unwrap()
+        .expect("a revoked, unexpired session must still be present");
+    assert!(
+        still.revoked,
+        "and it must still be revoked — the row keeps its revoked_at"
+    );
+
+    assert!(
+        !nonce_exists(&db, &n_long_dead).await,
+        "a nonce expired beyond the grace window is deleted"
+    );
+    for n in [&n_just_dead, &n_live, &n_used_live] {
+        assert!(
+            nonce_exists(&db, n).await,
+            "every other nonce shape survives, consumed or not"
+        );
+    }
+    assert_eq!(
+        db.store.outstanding_nonces("alice", TS).await.unwrap(),
+        vec![n_live],
+        "and a login in flight still finds its challenge"
+    );
+
+    db.teardown().await;
+}
+
+/// Neither `revoked_at` nor `used_at` may appear in the predicate in *either*
+/// direction: a revoked session and a consumed nonce that are also long expired
+/// go on their expiry alone, exactly like their untouched twins. Resurrecting one
+/// of *those* from a backup is inert — it returns with its original past
+/// `expires_at`, which every reader already rejects.
+#[tokio::test]
+async fn revoked_and_used_rows_are_pruned_on_expiry_alone_in_postgres() {
+    let db = db_or_skip!();
+
+    let revoked_long_dead = [0x21; 32];
+    db.store
+        .insert_session(revoked_long_dead, prune_session(PRUNE_LONG_DEAD))
+        .await
+        .unwrap();
+    db.store.revoke_session(&revoked_long_dead).await.unwrap();
+
+    let used_long_dead = [0x22; 32];
+    db.store
+        .insert_nonce(used_long_dead, "alice", PRUNE_LONG_DEAD)
+        .await
+        .unwrap();
+    db.store.consume_nonce(&used_long_dead).await.unwrap();
+
+    let c = db
+        .store
+        .prune_expired_auth_rows(TS, AUTH_PRUNE_GRACE_MS, AUTH_PRUNE_BATCH)
+        .await
+        .unwrap();
+    assert_eq!((c.sessions, c.nonces), (1, 1));
+    assert_eq!(row_count(&db, "sessions").await, 0);
+    assert_eq!(row_count(&db, "auth_nonces").await, 0);
+
+    db.teardown().await;
+}
+
+/// The grace boundary is strict, and it survives the epoch-ms -> TIMESTAMPTZ
+/// conversion: `expires_at == now - grace` stays, one millisecond older goes.
+#[tokio::test]
+async fn the_grace_boundary_is_exclusive_in_postgres() {
+    let db = db_or_skip!();
+    let on_the_line = [0x31; 32];
+    db.store
+        .insert_session(on_the_line, prune_session(TS - AUTH_PRUNE_GRACE_MS))
+        .await
+        .unwrap();
+
+    let c = db
+        .store
+        .prune_expired_auth_rows(TS, AUTH_PRUNE_GRACE_MS, AUTH_PRUNE_BATCH)
+        .await
+        .unwrap();
+    assert_eq!(
+        c.sessions, 0,
+        "a row exactly `grace` old is not yet past the window"
+    );
+    let c = db
+        .store
+        .prune_expired_auth_rows(TS + 1, AUTH_PRUNE_GRACE_MS, AUTH_PRUNE_BATCH)
+        .await
+        .unwrap();
+    assert_eq!(c.sessions, 1, "one millisecond later it is");
+
+    db.teardown().await;
+}
+
+/// The batch bound is a real `LIMIT`, and the leftovers are picked up on the next
+/// pass. This is what keeps the very first prune of a table that has never been
+/// pruned from becoming one long transaction holding row locks while logins wait.
+#[tokio::test]
+async fn a_prune_pass_is_bounded_and_resumes_in_postgres() {
+    let db = db_or_skip!();
+    for i in 0..5u8 {
+        let mut h = [0u8; 32];
+        h[0] = i;
+        db.store
+            .insert_session(h, prune_session(PRUNE_LONG_DEAD))
+            .await
+            .unwrap();
+        db.store
+            .insert_nonce(h, "alice", PRUNE_LONG_DEAD)
+            .await
+            .unwrap();
+    }
+
+    let first = db
+        .store
+        .prune_expired_auth_rows(TS, AUTH_PRUNE_GRACE_MS, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (first.sessions, first.nonces),
+        (2, 2),
+        "capped at the batch limit"
+    );
+    assert_eq!(row_count(&db, "sessions").await, 3);
+
+    let second = db
+        .store
+        .prune_expired_auth_rows(TS, AUTH_PRUNE_GRACE_MS, 2)
+        .await
+        .unwrap();
+    assert_eq!((second.sessions, second.nonces), (2, 2));
+    let third = db
+        .store
+        .prune_expired_auth_rows(TS, AUTH_PRUNE_GRACE_MS, 2)
+        .await
+        .unwrap();
+    assert_eq!((third.sessions, third.nonces), (1, 1), "the remainder");
+    let fourth = db
+        .store
+        .prune_expired_auth_rows(TS, AUTH_PRUNE_GRACE_MS, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (fourth.sessions, fourth.nonces),
+        (0, 0),
+        "and then it is idempotently empty"
+    );
+    assert_eq!(row_count(&db, "sessions").await, 0);
+    assert_eq!(row_count(&db, "auth_nonces").await, 0);
+
+    db.teardown().await;
+}
+
+/// A clock earlier than the grace window itself must prune nothing rather than
+/// everything — the cutoff saturates at zero instead of wrapping around.
+#[tokio::test]
+async fn an_absurdly_early_clock_prunes_nothing_in_postgres() {
+    let db = db_or_skip!();
+    db.store
+        .insert_session([0x41; 32], prune_session(1))
+        .await
+        .unwrap();
+    db.store.insert_nonce([0x42; 32], "alice", 1).await.unwrap();
+
+    let c = db
+        .store
+        .prune_expired_auth_rows(0, AUTH_PRUNE_GRACE_MS, AUTH_PRUNE_BATCH)
+        .await
+        .unwrap();
+    assert_eq!(
+        (c.sessions, c.nonces),
+        (0, 0),
+        "now_ms=0 must not underflow into a cutoff that empties both tables"
+    );
+    assert_eq!(row_count(&db, "sessions").await, 1);
+    assert_eq!(row_count(&db, "auth_nonces").await, 1);
 
     db.teardown().await;
 }

@@ -49,7 +49,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
 use maxsecu_admin_core::{CoSign, ControlChain, DirectorySigner, RevokeParams};
-use maxsecu_client_app::commands::auth::{Session, SessionInner};
+use maxsecu_client_app::commands::auth::{Principal, Session, SessionInner};
 use maxsecu_client_app::commands::share::{build_add_wrap_body, run_reshare_batch};
 use maxsecu_client_app::config::{client_config_for_pinned_root, load_sink_pins};
 use maxsecu_client_app::directory::resolve_recipient;
@@ -625,7 +625,9 @@ impl Fixture {
         let owner_sig_pub = owner.sig_pub_bytes();
         let session = Session(Mutex::new(SessionInner {
             identity: Some(owner),
-            username: Some("owner".to_owned()),
+            principal: Some(Principal::User {
+                username: "owner".to_owned(),
+            }),
             ..Default::default()
         }));
 

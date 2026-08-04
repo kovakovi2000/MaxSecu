@@ -33,6 +33,12 @@ serde_json = { workspace = true }
 # server crate already resolves (no TLS — the demo DB is a 127.0.0.1 loopback /
 # WSL-forwarded connection), so cargo-deny sees no new external version.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+# The backup subcommands hold two secrets in this process: the bundle passphrase
+# and the scratch-database URL (which carries the DB password). Both arrive on
+# stdin and must not be left in freed heap for a core dump or a swapped page to
+# hand back. Same 1.x maxsecu-crypto already resolves, so cargo-deny sees no new
+# external version.
+zeroize = "1"
 
 [dev-dependencies]
 # HTTP client plane for the Phase-6 boot smoke test (the same hyper/http stack the

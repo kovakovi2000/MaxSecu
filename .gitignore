@@ -61,3 +61,20 @@ target-repro-b/
 /register.key
 /.server-fresh/
 /client/
+
+# Scratch session handoffs under docs/ (`_handoff-*.md`). These are notes written for
+# the NEXT session — environment walls, command sequences, loose ends — not documentation
+# of the product. They go stale the moment the work lands, so they must never be committed:
+# whatever in them is durable belongs in the design spec, the runbook, or project memory.
+/docs/_handoff-*.md
+
+# Offline-D5 ceremony artifacts, written to the repo root by scripts/install-client.ps1
+# (maxsecu-setup defaults them alongside `--out $Root`). d5_key.blob / d5_recovery.blob
+# ARE the directory trust root -- the air-gapped D5 secret whose public half is pinned
+# into every client; directory_pub.der is that pin; connection_code.txt carries the
+# server address + cert fingerprint handed to users. `install-client.ps1 -Reset` deletes
+# exactly this set (install-client.ps1:129-137). Never source, never committed.
+/d5_key.blob
+/d5_recovery.blob
+/directory_pub.der
+/connection_code.txt

@@ -120,15 +120,19 @@ export function makePool(size: number): Pool {
 // `feed_concurrency` change). The backend clamps `feed_concurrency` to 1..=8 and
 // `setSize` floors it at 1.
 //
-// KNOWN LIMITATION (cold-mint reauth race): only `decrypt_card` uses the backend
-// authed-connection pool (Task 7.0). Every OTHER authed command
-// (open_content/download/share/delete/list_feed/etc.) still calls
-// `reauth`, which `try_lock`s the ConnectLock + borrows the non-Clone identity.
-// So while cards decode concurrently AMONG THEMSELVES over the pool's warm
-// channels, a pool COLD-MINT (first feed load, or after a 401-drain) itself calls
-// `reauth` and can transiently race a concurrent `serial`-command `reauth` → a
-// fail-closed `busy`/`locked` error (retriable; card-retry handles the flush
-// path). Once the pool is warm, card decodes don't reauth and don't contend.
-// Fully removing this edge needs ALL authed commands routed through the backend
-// pool — a larger follow-up, intentionally out of scope for Task 7.2.
+// COLD-MINT REAUTH RACE — NARROWED, not gone. This comment used to say that
+// `decrypt_card` was the ONLY command on the backend authed-connection pool
+// (Task 7.0); that is no longer true. `list_feed`, `decrypt_card`, `open_content`,
+// `open_bundle`, `download_content` and `open_video` all borrow through
+// `get_on_pooled_channel` now — which is what stopped a bundle open from spending
+// one full login per member against the server's cap of 30 challenges per account
+// per 60 s.
+// What remains: the WRITE and admin paths (share/upload/delete/admin/renew, and
+// `open_bundle_members`'s standalone non-pooled entry) still call `reauth`, which
+// `try_lock`s the ConnectLock + borrows the non-Clone identity. So a pool
+// COLD-MINT (first feed load, or after a 401-drain) — itself a `reauth` — can
+// still transiently race one of those → a fail-closed `busy`/`locked` error
+// (retriable; card-retry handles the flush path). Once the pool is warm, reads
+// don't reauth and don't contend. Fully removing this edge needs the write paths
+// pooled too.
 export const decodePool: Pool = makePool(4);

@@ -95,16 +95,6 @@ fn unpinned_client_config() -> Result<Arc<ClientConfig>, String> {
     Ok(Arc::new(cfg))
 }
 
-/// Normalize a fingerprint for comparison: uppercase, then strip every char not in
-/// the RFC 4648 base32 alphabet `[A-Z2-7]` (so copy-introduced dashes/spaces/newlines
-/// do not break the compare). Mirrors the spec's normalization rule.
-fn normalize_fp(s: &str) -> String {
-    s.to_ascii_uppercase()
-        .chars()
-        .filter(|c| c.is_ascii_uppercase() || ('2'..='7').contains(c))
-        .collect()
-}
-
 /// Fetch `/v1/bootstrap/pins` from `server` (dial target `ADDR:PORT`) over an
 /// UNpinned TLS connection using `host` as the SNI/Host header, verify the returned
 /// pin(s) against `fingerprint`, and — ONLY on a match — write the pin file(s).
@@ -198,14 +188,14 @@ pub async fn fetch_and_verify(
 
     // --- fingerprint gate (authenticate the PAYLOAD) ------------------------
     let computed = maxsecu_crypto::pin_fingerprint(&cert, &dir);
-    if normalize_fp(&computed) != normalize_fp(fingerprint) {
+    if maxsecu_crypto::normalize_fp(&computed) != maxsecu_crypto::normalize_fp(fingerprint) {
         return Err(format!(
             "fingerprint MISMATCH — refusing to trust these pins. \
              expected {}, server's pins hash to {}. \
              Wrong address, wrong/stale connection code, or a man-in-the-middle. \
              Nothing was written.",
-            normalize_fp(fingerprint),
-            normalize_fp(&computed),
+            maxsecu_crypto::normalize_fp(fingerprint),
+            maxsecu_crypto::normalize_fp(&computed),
         ));
     }
 

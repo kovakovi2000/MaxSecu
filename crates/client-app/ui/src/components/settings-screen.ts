@@ -2,6 +2,7 @@ import { call } from "../core/rpc.ts";
 import { settingsStore, updateSettings, loadAndApplySettings } from "../core/settings.ts";
 import { getFrontend, applyFrontend, normalizeFrontend } from "../core/frontends.ts";
 import { DEFAULTS } from "../core/settings-store-instance.ts";
+import { getPrincipalKind } from "../core/session.ts";
 import type { Settings, RamLimits } from "../core/types.ts";
 
 // Settings (spec §5/§7): appearance / accessibility / performance / behavior /
@@ -126,6 +127,14 @@ export class SettingsScreen extends HTMLElement {
         </div>
       </main>`;
     (this.querySelector("#main") as HTMLElement).focus();
+
+    // "Change password" / "Export keystore" act on <app-dir>/keystore, which a
+    // recovery-key device need not have at all (they would fail no_keystore /
+    // unauthorized). Everything else here is local-only and works fine in a
+    // recovery session, so only this one fieldset is hidden.
+    if (getPrincipalKind() === "recovery") {
+      (this.querySelector(".account-card") as HTMLElement).hidden = true;
+    }
 
     const prefForm = this.querySelector("#set-form") as HTMLElement;
     prefForm.addEventListener("change", (e) => this.onPrefChange(e));

@@ -10,14 +10,34 @@
 //! followed by the real `build_upload` + `run_pipeline`. Two gates:
 //!
 //! - GATE MATCH: when the server serves a recovery pubkey that EQUALS the embedded
-//!   pin, the upload proceeds and the produced recovery wrap **decrypts** with the
-//!   test pin's reconstructed PRIVATE key (recovering the exact file DEK) — proving
-//!   the standing recovery account can read every upload. Because the embedded test
-//!   pin is HYBRID and `Identity::generate()` is PQ-enrolled, the file is Suite::V2,
-//!   so the PQ (ML-KEM) recovery wrap is exercised.
+//!   pin, the upload proceeds, the server view carries a recovery grant, and the
+//!   recovery wrap the pipeline produced **decrypts** with the test pin's
+//!   reconstructed PRIVATE key, recovering the exact file DEK. Because the embedded
+//!   test pin is HYBRID and `Identity::generate()` is PQ-enrolled, the file is
+//!   Suite::V2, so the PQ (ML-KEM) recovery wrap is exercised.
 //! - GATE MISMATCH: when the server serves a recovery pubkey that DIFFERS from the
 //!   embedded pin, the gate fails closed with a `server_untrusted` error and NO
 //!   bytes are staged/stored (the would-be file id is absent server-side → 404).
+//!
+//! ## SCOPE — what this file does NOT prove (it used to claim otherwise)
+//!
+//! This is an **upload-gate** test. It proves the client wraps to the pin it
+//! verified, and that the wrap opens under that pin's private half. It does NOT
+//! prove that the standing recovery ACCOUNT can read an upload off the server:
+//!
+//!  * the DEK opened below comes from the in-process `bundle` the pipeline just
+//!    built locally, not from anything the server sent back;
+//!  * this file never performs a recovery LOGIN, and cannot: `register_recovery`
+//!    below registers the account with a placeholder `sig_pub` whose private half
+//!    nobody holds, so the channel-bound `/v1/recovery/verify` proof is impossible
+//!    here by construction.
+//!
+//! The wire-bound version of that claim — a real recovery login, then
+//! `GET /v1/files/{id}` + `GET .../chunks/{i}` with the RECOVERY token, opening the
+//! SERVER-SERVED wrap against the SERVER-SERVED manifest — lives in
+//! [`full_flow_e2e`](../full_flow_e2e.rs), and only there. An earlier revision of
+//! this header asserted "proving the standing recovery account can read every
+//! upload"; nothing in this file ever tested that.
 //!
 //! Run (client-app is linked with the NON-SECURE test pin — see the `unpinned-dev`
 //! feature wired onto the `maxsecu-client-app` dev-dependency in this crate's
@@ -57,7 +77,8 @@ use maxsecu_server::{
 /// The single-use registration key seeded server-side and presented at enrollment.
 const REG_KEY: &str = "reg-key-t8-001";
 const TS: u64 = 1_719_500_000_000;
-const BLOG_BODY: &[u8] = b"Dear diary, a T8 upload the standing recovery account must be able to read.";
+const BLOG_BODY: &[u8] =
+    b"Dear diary, a T8 upload the standing recovery account must be able to read.";
 
 // ---- TLS harness (copied from upload_e2e.rs) ----
 
@@ -347,7 +368,7 @@ async fn recovery_wrap_targets_embedded_pin_and_decrypts() {
         maxsecu_client_app::upload::StageFlags::default(),
     )
     .await
-        .unwrap();
+    .unwrap();
 
     // The server persisted a recovery grant (the upload really wrapped to the pin).
     let (st, view) = get_json(
@@ -363,9 +384,27 @@ async fn recovery_wrap_targets_embedded_pin_and_decrypts() {
     );
 
     // The PRODUCED recovery wrap must decrypt with the test pin's reconstructed
-    // PRIVATE key, recovering the exact file DEK. (The standard file view does not
-    // serve the recovery wrapped-DEK — only the recovery account's own endpoint
-    // does — so we open the wrap the pipeline produced in `bundle`.)
+    // PRIVATE key, recovering the exact file DEK.
+    //
+    // NOTE ON WHAT IS BEING OPENED, and on a claim this comment used to make. The
+    // wrap below is the one `build_upload` produced IN PROCESS — this is an
+    // upload-gate assertion, not a server-read assertion. The old comment justified
+    // that by saying the standard file view does not serve the recovery
+    // wrapped-DEK, and that "the recovery account's own endpoint" does. BOTH halves
+    // were wrong:
+    //
+    //  * there is no such endpoint. `router()` in `server/src/http.rs` exposes only
+    //    `/v1/recovery/{register,pubkey,challenge,verify}` — none serve file wraps;
+    //  * and `GET /v1/files/{id}` DOES serve the recovery wrapped-DEK — to the
+    //    recovery caller. `get_file` takes `RecoveryOkSession` (which admits
+    //    `RECOVERY_ID`) and the store selects the wrap whose `recipient_id` equals
+    //    the caller's, so a recovery session receives the recovery wrap as its
+    //    `my_wrap`. `full_flow_e2e` opens exactly that server-served wrap.
+    //
+    // The real reason this test opens the local bundle is narrower: `alice`'s
+    // session is the only one it has (see the file header — the recovery account
+    // here has a placeholder `sig_pub`, so it cannot log in), and alice's view
+    // serves alice's wrap.
     let rec_wrap = bundle
         .wraps
         .iter()
@@ -392,6 +431,19 @@ async fn recovery_wrap_targets_embedded_pin_and_decrypts() {
         dek.commit(),
         bundle.manifest.dek_commit.0,
         "GATE MATCH: recovery-recovered DEK matches the file's dek_commit"
+    );
+    // Bind that in-process DEK to the SERVER's copy of the record, so this test at
+    // least cannot pass while the server holds a different manifest than the one
+    // the wrap was built against. (The full wire-bound proof is in `full_flow_e2e`.)
+    let served_manifest: maxsecu_encoding::structs::Manifest = maxsecu_encoding::decode(
+        &B64.decode(view["manifest_b64"].as_str().expect("manifest_b64"))
+            .expect("manifest_b64 is base64"),
+    )
+    .expect("the served manifest decodes canonically");
+    assert_eq!(
+        dek.commit(),
+        served_manifest.dek_commit.0,
+        "GATE MATCH: the recovered DEK also matches the manifest the SERVER stored"
     );
 
     let _ = std::fs::remove_dir_all(&blob_dir);

@@ -619,6 +619,69 @@ impl<H: DropboxHttp> ColdTier for DropboxTier<H> {
         Ok(count)
     }
 
+    /// `POST .../files/list_folder` (+ `/continue`) on `{root}/{prefix}` — the
+    /// names of its immediate children, sorted so an operator's bundle list does
+    /// not inherit Dropbox's page ordering. A missing folder is an empty listing,
+    /// not a missing capability: this tier CAN enumerate, there is simply nothing
+    /// under `prefix` (mirrors `chunk_count` reading an absent folder as `0`).
+    ///
+    /// Egress-wise this asks Dropbox for path segments Dropbox itself assigned and
+    /// already stores; no chunk is read and nothing is derived from one, so the
+    /// zero-knowledge boundary in the module doc is unchanged.
+    async fn list_prefix(&self, prefix: &str) -> Result<Option<Vec<String>>, BlobError> {
+        // `stream_path` is exactly "guard + `{root}/{x}` + leading slash", and a
+        // listing prefix is spliced into a Dropbox path the same way a blob_ref is.
+        let path = stream_path(&self.root, prefix)?;
+        let resp = self
+            .post_json(
+                &self.api_host,
+                "/2/files/list_folder",
+                serde_json::json!({ "path": path }),
+            )
+            .await?;
+        if is_path_not_found(resp.status, &resp.body) {
+            return Ok(Some(Vec::new()));
+        }
+        if resp.status != 200 {
+            return Err(BlobError::new(
+                "dropbox_list_prefix",
+                dropbox_http_msg(resp.status, &resp.body),
+            ));
+        }
+        let mut v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
+            BlobError::new("dropbox_list_prefix", format!("malformed response: {e}"))
+        })?;
+        let mut names = list_folder_entry_names(&v)?;
+        let mut has_more = v.get("has_more").and_then(|b| b.as_bool()).unwrap_or(false);
+        while has_more {
+            let cursor = v
+                .get("cursor")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| BlobError::new("dropbox_list_prefix", "has_more without cursor"))?
+                .to_owned();
+            let resp = self
+                .post_json(
+                    &self.api_host,
+                    "/2/files/list_folder/continue",
+                    serde_json::json!({ "cursor": cursor }),
+                )
+                .await?;
+            if resp.status != 200 {
+                return Err(BlobError::new(
+                    "dropbox_list_prefix",
+                    dropbox_http_msg(resp.status, &resp.body),
+                ));
+            }
+            v = serde_json::from_slice(&resp.body).map_err(|e| {
+                BlobError::new("dropbox_list_prefix", format!("malformed response: {e}"))
+            })?;
+            names.extend(list_folder_entry_names(&v)?);
+            has_more = v.get("has_more").and_then(|b| b.as_bool()).unwrap_or(false);
+        }
+        names.sort();
+        Ok(Some(names))
+    }
+
     /// `POST .../files/delete_v2` on the stream folder — idempotent.
     async fn delete_stream(&self, blob_ref: &str) -> Result<(), BlobError> {
         let path = stream_path(&self.root, blob_ref)?;
@@ -711,6 +774,25 @@ fn list_folder_entry_count(v: &serde_json::Value) -> Result<u64, BlobError> {
         .and_then(|e| e.as_array())
         .map(|a| a.len() as u64)
         .ok_or_else(|| BlobError::new("dropbox_chunk_count", "missing/invalid entries"))
+}
+
+/// Every entry's `name` on a well-formed `list_folder`/`continue` response.
+/// Fails closed like [`list_folder_entry_count`]: a missing/invalid `entries`, or
+/// an entry without a string `name`, is a malformed response and never a quietly
+/// shorter list — a listing that drops entries under-reports the bundles an
+/// operator is choosing a rollback from.
+fn list_folder_entry_names(v: &serde_json::Value) -> Result<Vec<String>, BlobError> {
+    v.get("entries")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| BlobError::new("dropbox_list_prefix", "missing/invalid entries"))?
+        .iter()
+        .map(|e| {
+            e.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n.to_owned())
+                .ok_or_else(|| BlobError::new("dropbox_list_prefix", "entry without a name"))
+        })
+        .collect()
 }
 
 /// Split one of OUR generated `https://host/path...` URLs into `(host, path)`.
@@ -1052,6 +1134,75 @@ mod tests {
     async fn chunk_count_missing_folder_is_zero() {
         let (t, _) = tier(vec![not_found_resp()]);
         assert_eq!(t.chunk_count(REF).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_prefix_returns_entry_names_with_pagination() {
+        let (t, _) = tier(vec![
+            json_resp(
+                200,
+                serde_json::json!({
+                    "entries": [
+                        {".tag": "folder", "name": "20260717T0000Z"},
+                        {".tag": "folder", "name": "20260716T0000Z"}
+                    ],
+                    "has_more": true,
+                    "cursor": "cursor-abc"
+                }),
+            ),
+            json_resp(
+                200,
+                serde_json::json!({
+                    "entries": [{".tag": "folder", "name": "20260715T0000Z"}],
+                    "has_more": false
+                }),
+            ),
+        ]);
+        // Sorted, so an operator's bundle list does not depend on Dropbox's page order.
+        assert_eq!(
+            t.list_prefix("_backup").await.unwrap().unwrap(),
+            ["20260715T0000Z", "20260716T0000Z", "20260717T0000Z"]
+        );
+
+        let reqs = t.http.requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].url.ends_with("/files/list_folder"));
+        assert!(String::from_utf8_lossy(&reqs[0].body).contains("/maxsecu/_backup"));
+        assert!(reqs[1].url.ends_with("/files/list_folder/continue"));
+        assert!(String::from_utf8_lossy(&reqs[1].body).contains("cursor-abc"));
+    }
+
+    /// A prefix that was never written is an EMPTY listing, not a missing
+    /// capability — this tier can enumerate, there is simply no bundle there yet.
+    #[tokio::test]
+    async fn list_prefix_missing_folder_is_an_empty_listing() {
+        let (t, _) = tier(vec![not_found_resp()]);
+        assert_eq!(t.list_prefix("_backup").await.unwrap(), Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn list_prefix_fails_closed_on_malformed_or_error_responses() {
+        // A 200 whose body is not a list_folder response must not read as "empty":
+        // an operator would take that as "no backups exist".
+        let (t, _) = tier(vec![resp(200, b"not json at all".to_vec())]);
+        assert!(t.list_prefix("_backup").await.is_err());
+
+        let (t2, _) = tier(vec![json_resp(200, serde_json::json!({"entries": "nope"}))]);
+        assert!(t2.list_prefix("_backup").await.is_err());
+
+        // An entry without a usable name would silently shrink the listing.
+        let (t3, _) = tier(vec![json_resp(
+            200,
+            serde_json::json!({"entries": [{".tag": "folder"}], "has_more": false}),
+        )]);
+        assert!(t3.list_prefix("_backup").await.is_err());
+
+        let (t4, _) = tier(vec![resp(500, b"internal error".to_vec())]);
+        assert!(t4.list_prefix("_backup").await.is_err());
+
+        let (t5, _) = tier(vec![]);
+        assert!(t5.list_prefix("../escape").await.is_err());
+        assert!(t5.http.requests().is_empty()); // the guard fires before any I/O
     }
 
     #[tokio::test]

@@ -199,6 +199,103 @@ test("screens use a live region for feedback", () => {
     assert.match(set, /type="range"|\.type\s*=\s*"range"/, "RAM cap uses a range slider");
   });
 
+  test("recovery banner ships hidden, is a live region, and exits via a real button", () => {
+    // The single most dangerous regression here is the banner shipping WITHOUT
+    // the `hidden` attribute: it would then paint on every ordinary session.
+    // Assert `hidden` is inside the SAME opening tag as the banner id.
+    assert.match(
+      shell,
+      /<div id="recovery-banner"[^>]*\bhidden\b[^>]*>/,
+      'the recovery banner must ship with the `hidden` attribute in the static template',
+    );
+    assert.match(
+      shell,
+      /<div id="recovery-banner"[^>]*role="status"[^>]*>/,
+      "the recovery banner must be a role=status live region",
+    );
+    // "End recovery session" must be a real, keyboard-reachable <button>.
+    assert.match(
+      shell,
+      /<button id="rb-end"[^>]*type="button"/,
+      "End recovery session must be a real <button type=\"button\">",
+    );
+    assert.match(shell, /End recovery session/, "the exit control needs a visible text label");
+    // It must call the dedicated terminator, NOT the plain local `logout`
+    // (which would leave the parked authenticated channel + cold key alive).
+    assert.match(
+      shell,
+      /end_recovery_session/,
+      "the banner must call end_recovery_session, not the plain logout",
+    );
+    // Recovery dead-end routes are both unlinked and unreachable by hash. The
+    // predicate itself lives in core/recovery-routes.ts (unit-tested there);
+    // what this lint pins is that the shell still routes BOTH decisions — the
+    // hash bounce and the nav-link hiding — through that one shared gate, so
+    // they can never drift apart.
+    assert.match(
+      shell,
+      /from "\.\.\/core\/recovery-routes\.ts"/,
+      "the shell must gate the recovery dead-end routes via core/recovery-routes.ts",
+    );
+    const gateUses = (shell.match(/isRouteHiddenFor\(/g) ?? []).length;
+    assert.ok(
+      gateUses >= 2,
+      `the hash bounce and the nav-link hiding must both use the shared gate; got ${gateUses} call(s)`,
+    );
+  });
+
+  test("recovery banner copy is TRUE about what the session can and cannot do", () => {
+    // D6/D7. The banner used to read "You cannot post, delete, invite or share
+    // from here" — the "invite" half was false: the server's `AdminSession`
+    // extractor admits RECOVERY_ID (crates/server/src/http.rs:2294) and
+    // `POST /v1/registration-keys` is `_admin: AdminSession`
+    // (crates/server/src/http.rs:395), so minting a registration key works.
+    const copy = shell.match(/<span class="rb-copy">([^<]*)<\/span>/)?.[1];
+    assert.ok(copy, "the recovery banner needs an rb-copy line");
+    // It must NOT claim inviting is impossible…
+    assert.doesNotMatch(
+      copy,
+      /cannot[^.]*\binvite\b/i,
+      "the banner must not claim a recovery session cannot invite — it can",
+    );
+    // …and must say so positively, pointing at the screen that does it.
+    assert.match(copy, /\binvite\b/i, "the banner must state that inviting a user is available");
+    assert.match(copy, /\bAdmin\b/, "the banner must name the Admin screen that hosts the invite");
+    // Sharing IS refused (`recovery_share_unsupported`) — say it plainly.
+    assert.match(
+      copy,
+      /sharing is not available/i,
+      "the banner must plainly state that sharing is not available",
+    );
+    // Posting and deleting stay barred (create_file/discard_file are AuthedSession).
+    assert.match(copy, /\bpost\b/i, "the banner must still say posting is barred");
+    assert.match(copy, /\bdelete\b/i, "the banner must still say deleting is barred");
+  });
+
+  test("recovery gate exposes a labelled connection-code control", () => {
+    const rl = readFileSync("src/components/recovery-login-screen.ts", "utf8");
+    // The ONLY way a never-registered device can be pointed at a server.
+    assert.match(rl, /id="rl-code"/, "the connection-code field must be a real <input>");
+    assert.match(
+      rl,
+      /<label>Connection code[\s\S]*?id="rl-code"/,
+      "the connection-code input must be wrapped in its own <label>",
+    );
+    assert.match(rl, /id="rl-srv-err"[^>]*role="alert"/, "the server panel needs an alert region");
+    assert.match(
+      rl,
+      /<button type="button" id="rl-srv-save"/,
+      "\"Use this server\" must be a real <button type=\"button\">",
+    );
+    // Validation stays in Rust (it needs the pinned DER on disk); the screen
+    // only calls the command and renders states.
+    assert.match(rl, /set_server_from_code/, "the screen must delegate validation to Rust");
+    // A successful recovery login must actually establish a principal + route,
+    // otherwise it lands on a frozen screen.
+    assert.match(rl, /setRecoveryPrincipal\(\)/, "a successful recovery login must set the principal");
+    assert.match(rl, /location\.hash = "#\/feed"/, "a successful recovery login must route to the feed");
+  });
+
   test("ram-gauge is a labelled meter", () => {
     const rg = readFileSync("src/components/ram-gauge.ts", "utf8");
     assert.match(rg, /role="meter"/, "RAM gauge is a meter");

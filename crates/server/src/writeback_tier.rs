@@ -12,11 +12,13 @@
 //! Once a chunk has been offloaded, the cold copy **stays** — a re-request pulls a
 //! *copy* back into the local cache (for fast repeat access) but never deletes the
 //! cold original, and a later eviction of that re-cached chunk just drops the local
-//! copy (no re-upload — the durable cold copy is already there). A chunk only ever
-//! leaves the cold tier when the whole file is **deleted by the user**
-//! (`delete_chunk`/`delete_stream`). So after its first offload a chunk is durably
-//! backed for good; the only redundancy gap is a chunk that has *never* been
-//! offloaded (fresh upload, still local-only).
+//! copy (no re-upload — the durable cold copy is already there). A chunk leaves the
+//! cold tier only when its whole stream is torn down through `delete_stream`, which
+//! an owner delete reaches — and so does every version rotation, since
+//! `http::finalize` purges the superseded version's streams the same way. So a
+//! chunk is durably backed from its first offload until its version stops being
+//! current; the redundancy gap is a chunk that has *never* been offloaded (fresh
+//! upload, still local-only).
 //!
 //! # Chunk residency
 //! Every stored chunk is in one of three states:
@@ -38,6 +40,14 @@
 //! **do count** toward the local byte capacity. So a machine full of thumbnails
 //! can sit at/over the cap with nothing evictable, which is the intended trade:
 //! previews stay instant. Detected by the `stream_type` component of `blob_ref`.
+//!
+//! # Operator backup
+//! [`WriteBackTier::backup_copy_refs`] is the one path that puts a chunk in cold
+//! WITHOUT the offload protocol: it copies and KEEPS the local copy, closing the
+//! never-offloaded redundancy gap on demand — thumbnails included. It is driven
+//! by a caller-supplied ref list (from the DB) rather than the index, and only
+//! finalized streams may be passed to it; its doc explains why each of those is
+//! load-bearing rather than incidental.
 //!
 //! # Fail-safe
 //! Every offload/rehydrate is **fail-safe**: a cold-tier I/O error leaves the chunk
@@ -263,6 +273,32 @@ pub struct WriteBackTier {
     fetching: Mutex<HashSet<(String, u64)>>,
 }
 
+/// What one [`WriteBackTier::backup_copy_refs`] run actually managed to copy.
+///
+/// The counters and [`missing`](Self::missing) exist so an INCOMPLETE copy is
+/// visible: a backup you wrongly believe is complete is worse than no backup, so
+/// a caller must consult [`is_complete`](Self::is_complete) rather than read
+/// `Ok(_)` as success.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyReport {
+    /// Chunks this run uploaded to the cold tier.
+    pub copied: u64,
+    /// Chunks the cold tier already held — offloaded earlier, or copied by a
+    /// previous run. Already backed up; nothing was done for these.
+    pub already_cold: u64,
+    /// `(blob_ref, index)` of every chunk found in NEITHER tier: the caller's
+    /// records say the stream has it, `has_chunk` says cold does not, and the
+    /// local store returned nothing. These are **not** in the backup.
+    pub missing: Vec<(String, u64)>,
+}
+
+impl CopyReport {
+    /// Whether every requested chunk is now durable in the cold tier.
+    pub fn is_complete(&self) -> bool {
+        self.missing.is_empty()
+    }
+}
+
 impl WriteBackTier {
     /// New write-back tier: `local` is the hot on-disk store, `cold` the durable
     /// backing tier, `capacity_bytes` the local byte budget, `idle` the
@@ -355,6 +391,80 @@ impl WriteBackTier {
         let now = self.clock.now();
         let victims = self.index.lock().unwrap().idle_victims(now, self.idle);
         self.offload_victims(victims).await;
+    }
+
+    /// Copy every chunk of every `(blob_ref, chunk_count)` in `refs` to the cold
+    /// tier, **keeping the local copy** — the blob half of an operator backup.
+    /// Idempotent and resumable (`has_chunk` short-circuits what is already
+    /// durable), so a run interrupted by a network fault is simply re-run.
+    ///
+    /// `refs` is supplied by the caller from the DB (`file_streams`) because this
+    /// method deliberately consults neither `LocalIndex` nor the pin rule. The
+    /// index is in-memory and lazily populated, so on a freshly restarted server
+    /// it is EMPTY — an index-driven backup (the shape of
+    /// [`run_idle_sweep`](Self::run_idle_sweep)) would copy nothing and report
+    /// success. The pin rule excludes every Thumbnail/Preview, which are never
+    /// offloaded and so have no cold copy to fall back on: skipping them would
+    /// silently omit them from the bundle. The DB is the only complete,
+    /// restart-proof record of what exists.
+    ///
+    /// # Only finalized streams
+    /// `refs` must name streams whose upload is **finalized**. Both the finalize
+    /// check and the offload protocol assume a chunk reaches cold ONLY via
+    /// `offload`, which deletes the local copy; a backup breaks that assumption on
+    /// purpose, and on an in-flight stream it costs the user their upload:
+    /// * [`chunk_count`](BlobStore::chunk_count) is `local + cold − overlap`, and
+    ///   `overlap` is read from the index — which knows nothing of a copy made
+    ///   here. A backed-up staged stream counts DOUBLE, so `http::finalize`'s
+    ///   `chunk_count == expected` check rejects the client's finalize, and keeps
+    ///   rejecting it on every retry.
+    /// * A chunk re-PUT after being copied (a resumable upload re-sending a
+    ///   missing index) leaves cold holding the SUPERSEDED bytes until some later
+    ///   offload overwrites them — so a bundle taken now can carry ciphertext the
+    ///   manifest will not verify.
+    ///
+    /// Marking the index from here is not the fix: a re-PUT racing the copy would
+    /// leave the index claiming a cold copy that holds stale bytes, and the next
+    /// offload would then drop the good local one. Filtering `refs` to finalized
+    /// streams closes all of it — chunks of a finalized version are immutable
+    /// (`http::put_chunk` 409s once `finalized`), which is what makes copying them
+    /// behind the offload protocol's back safe.
+    ///
+    /// Fail-closed: any tier I/O error aborts and surfaces, unlike the best-effort
+    /// idle sweep which swallows them. A chunk in neither tier is recorded in
+    /// [`CopyReport::missing`] instead — one unreadable chunk must not cost the
+    /// operator the rest of the corpus — but it makes the report incomplete, and
+    /// the caller must treat that as a failed backup.
+    pub async fn backup_copy_refs(&self, refs: &[(String, u64)]) -> Result<CopyReport, BlobError> {
+        let mut report = CopyReport::default();
+        for (blob_ref, chunk_count) in refs {
+            for index in 0..*chunk_count {
+                if self.cold.has_chunk(blob_ref, index).await? {
+                    report.already_cold += 1;
+                    continue;
+                }
+                let Some(bytes) = self.local.get_chunk(blob_ref, index).await? else {
+                    // Re-probe before declaring a hole. `offload` puts to cold and
+                    // THEN deletes the local copy, so a capacity-driven or idle
+                    // offload landing between the probe above and this read leaves
+                    // the chunk durable in cold yet absent locally — a local miss
+                    // alone does not prove it is in neither tier. The server is
+                    // live for the whole (multi-hour) copy, so that window is
+                    // wide, and a false `missing` costs the operator the entire
+                    // upgrade: the caller reads an incomplete report as a failed
+                    // backup and aborts.
+                    if self.cold.has_chunk(blob_ref, index).await? {
+                        report.already_cold += 1;
+                    } else {
+                        report.missing.push((blob_ref.clone(), index));
+                    }
+                    continue;
+                };
+                self.cold.put_chunk(blob_ref, index, bytes).await?;
+                report.copied += 1;
+            }
+        }
+        Ok(report)
     }
 }
 
@@ -452,7 +562,15 @@ impl BlobStore for WriteBackTier {
     }
 
     async fn delete_stream(&self, blob_ref: &str) -> Result<(), BlobError> {
-        // User delete: drop from BOTH tiers (the only time the cold copy is removed).
+        // Drop from BOTH tiers. TWO callers reach here, not one: an owner delete
+        // (`http::discard_file` → `discard_unfinalized`/`delete_file`,
+        // http.rs:1913/1927) and every version rotation — after a successful
+        // `finalize_version`, `http::finalize` purges the PRIOR version's streams
+        // through this method (http.rs:1453-1455). So a cold copy can disappear
+        // with nobody having deleted anything, and "once offloaded, durably backed
+        // for good" is only true for as long as the version stays current — the
+        // premise an operator backup must not lean on. `delete_chunk` below is a
+        // second cold-removal path, currently reached by no caller.
         self.local.delete_stream(blob_ref).await?;
         self.cold.delete_stream(blob_ref).await?;
         self.index.lock().unwrap().remove_stream(blob_ref);
@@ -813,6 +931,312 @@ mod tests {
         // A second put evicts idx 0 to cold → now brokerable (cold-only).
         t.put_chunk(REF, 1, vec![0x02; 10]).await.unwrap();
         assert!(t.broker_direct_link(REF, 0, 900).await.unwrap().is_some());
+    }
+
+    // ---- backup_copy_refs (operator backup: copy to cold, keep local) ----
+
+    /// A [`ColdTier`] that counts uploads, so a test can prove `backup_copy_refs`
+    /// puts each chunk at most once across repeated runs.
+    struct CountingCold {
+        inner: MemoryColdTier,
+        puts: std::sync::atomic::AtomicUsize,
+    }
+    impl CountingCold {
+        fn new() -> Self {
+            CountingCold {
+                inner: MemoryColdTier::new(),
+                puts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn puts(&self) -> usize {
+            self.puts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    #[async_trait]
+    impl ColdTier for CountingCold {
+        async fn put_chunk(&self, r: &str, i: u64, b: Vec<u8>) -> Result<(), BlobError> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.put_chunk(r, i, b).await
+        }
+        async fn get_chunk(&self, r: &str, i: u64) -> Result<Option<Vec<u8>>, BlobError> {
+            self.inner.get_chunk(r, i).await
+        }
+        async fn chunk_count(&self, r: &str) -> Result<u64, BlobError> {
+            self.inner.chunk_count(r).await
+        }
+        async fn delete_stream(&self, r: &str) -> Result<(), BlobError> {
+            self.inner.delete_stream(r).await
+        }
+        async fn delete_chunk(&self, r: &str, i: u64) -> Result<(), BlobError> {
+            self.inner.delete_chunk(r, i).await
+        }
+        async fn has_chunk(&self, r: &str, i: u64) -> Result<bool, BlobError> {
+            self.inner.has_chunk(r, i).await
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_copy_refs_copies_every_chunk_of_every_ref_to_cold() {
+        let (t, local, cold, _) = tier(1_000_000);
+        t.put_chunk(REF, 0, vec![0xA0; 10]).await.unwrap();
+        t.put_chunk(REF, 1, vec![0xA1; 10]).await.unwrap();
+        t.put_chunk(THUMB, 0, vec![0xA2; 10]).await.unwrap();
+
+        let report = t
+            .backup_copy_refs(&[(REF.to_owned(), 2), (THUMB.to_owned(), 1)])
+            .await
+            .unwrap();
+        assert_eq!(report.copied, 3);
+        assert_eq!(report.already_cold, 0);
+        assert!(report.is_complete());
+
+        // Every chunk is durable in cold AND still local — a backup is a copy.
+        for (r, i, b) in [(REF, 0, 0xA0), (REF, 1, 0xA1), (THUMB, 0, 0xA2)] {
+            assert_eq!(cold.get_chunk(r, i).await.unwrap().unwrap(), vec![b; 10]);
+            assert_eq!(local.get_chunk(r, i).await.unwrap().unwrap(), vec![b; 10]);
+        }
+    }
+
+    /// The pin filter that keeps Thumbnail/Preview off the cold tier is an OFFLOAD
+    /// rule, not a durability rule: a backup that skipped them would silently omit
+    /// every thumbnail on the box. Regression test for modelling the copy on
+    /// `idle_victims`, which filters `!e.pinned`.
+    #[tokio::test]
+    async fn backup_copy_refs_copies_pinned_streams_too() {
+        let (t, local, cold, clock) = tier(1_000_000);
+        t.put_chunk(THUMB, 0, vec![0x01; 10]).await.unwrap();
+
+        // Neither trigger for offload will ever move a pinned chunk to cold.
+        clock.advance(Duration::from_secs(60 * 24 * 3600));
+        t.run_idle_sweep().await;
+        assert_eq!(cold.chunk_count(THUMB).await.unwrap(), 0);
+
+        let report = t.backup_copy_refs(&[(THUMB.to_owned(), 1)]).await.unwrap();
+        assert_eq!(report.copied, 1);
+        assert_eq!(
+            cold.get_chunk(THUMB, 0).await.unwrap().unwrap(),
+            vec![0x01; 10]
+        );
+        // Still pinned local: the backup did not turn it into an offload.
+        assert!(local.get_chunk(THUMB, 0).await.unwrap().is_some());
+    }
+
+    /// `LocalIndex` is in-memory and lazily populated, so a freshly restarted
+    /// server has an EMPTY index while every chunk is still on local disk. A
+    /// backup driven off the index (the shape of `run_idle_sweep`) would copy
+    /// nothing here and report success — the "backup you wrongly believe is
+    /// complete" the design calls worse than no backup. `backup_copy_refs` is
+    /// driven off the DB's `file_streams` instead and must not care.
+    #[tokio::test]
+    async fn backup_copy_refs_works_with_an_empty_local_index() {
+        let (t, local, cold, clock) = tier(1_000_000);
+        // Post-restart: bytes are on the local store, the index has never seen them.
+        for i in 0..3u64 {
+            local
+                .put_chunk(REF, i, vec![0xB0 + i as u8; 10])
+                .await
+                .unwrap();
+        }
+
+        // The index-driven path is a no-op precisely because the index is empty.
+        clock.advance(Duration::from_secs(60 * 24 * 3600));
+        t.run_idle_sweep().await;
+        assert_eq!(cold.chunk_count(REF).await.unwrap(), 0);
+
+        let report = t.backup_copy_refs(&[(REF.to_owned(), 3)]).await.unwrap();
+        assert_eq!(report.copied, 3);
+        assert!(report.is_complete());
+        assert_eq!(cold.chunk_count(REF).await.unwrap(), 3);
+        for i in 0..3u64 {
+            assert_eq!(
+                cold.get_chunk(REF, i).await.unwrap().unwrap(),
+                vec![0xB0 + i as u8; 10]
+            );
+        }
+    }
+
+    /// A backup uploads; it never evicts. The local store is left byte-identical
+    /// even when it is already over its capacity budget — an operator backup must
+    /// not double as a cache purge.
+    #[tokio::test]
+    async fn backup_copy_refs_evicts_nothing_even_when_local_is_over_capacity() {
+        // Capacity for two chunks; four are already on disk (post-restart, so the
+        // index has not accounted for them and cannot trim them either).
+        let (t, local, _cold, _) = tier(20);
+        for i in 0..4u64 {
+            local.put_chunk(REF, i, vec![0xC0; 10]).await.unwrap();
+        }
+        t.backup_copy_refs(&[(REF.to_owned(), 4)]).await.unwrap();
+        assert_eq!(local.chunk_count(REF).await.unwrap(), 4);
+        for i in 0..4u64 {
+            assert!(local.get_chunk(REF, i).await.unwrap().is_some());
+        }
+    }
+
+    /// Resumable: a run interrupted by a cold-tier failure is re-run wholesale, so
+    /// `has_chunk` must short-circuit everything already durable rather than
+    /// re-uploading the corpus.
+    #[tokio::test]
+    async fn backup_copy_refs_is_idempotent_across_runs() {
+        let local = Arc::new(MemoryBlobStore::new());
+        let cold = Arc::new(CountingCold::new());
+        let t = WriteBackTier::new(
+            local.clone(),
+            cold.clone(),
+            1_000_000,
+            Duration::from_secs(30 * 24 * 3600),
+        );
+        t.put_chunk(REF, 0, vec![0xD0; 10]).await.unwrap();
+        t.put_chunk(REF, 1, vec![0xD1; 10]).await.unwrap();
+
+        let first = t.backup_copy_refs(&[(REF.to_owned(), 2)]).await.unwrap();
+        assert_eq!((first.copied, first.already_cold), (2, 0));
+        assert_eq!(cold.puts(), 2);
+
+        let second = t.backup_copy_refs(&[(REF.to_owned(), 2)]).await.unwrap();
+        assert_eq!((second.copied, second.already_cold), (0, 2));
+        assert!(second.is_complete());
+        assert_eq!(cold.puts(), 2); // no re-upload
+    }
+
+    /// A chunk that was offloaded and evicted lives ONLY in cold. It is already
+    /// backed up — that is what `has_chunk` running first is for — so it must be
+    /// counted, not read locally, and never treated as a fault.
+    #[tokio::test]
+    async fn backup_copy_refs_counts_a_cold_only_chunk_without_error() {
+        let (t, local, cold, _) = tier(10); // capacity for ONE chunk
+        t.put_chunk(REF, 0, vec![0xE0; 10]).await.unwrap();
+        t.put_chunk(REF, 1, vec![0xE1; 10]).await.unwrap(); // evicts idx 0 to cold
+        assert!(local.get_chunk(REF, 0).await.unwrap().is_none());
+
+        let report = t.backup_copy_refs(&[(REF.to_owned(), 2)]).await.unwrap();
+        assert_eq!(report.already_cold, 1); // idx 0: cold-only, already durable
+        assert_eq!(report.copied, 1); // idx 1: local-only, uploaded now
+        assert!(report.is_complete()); // nothing is missing
+        assert!(report.missing.is_empty());
+        assert_eq!(cold.chunk_count(REF).await.unwrap(), 2);
+    }
+
+    /// The server stays live for the whole backup, so an offload can land between
+    /// the cold probe and the local read — `offload` writes cold FIRST, then drops
+    /// the local copy, which is exactly the interleaving that makes a local miss
+    /// mean "already durable" rather than "gone". Reporting that as missing fails
+    /// an otherwise-complete backup and aborts the operator's upgrade.
+    #[tokio::test]
+    async fn backup_copy_refs_re_probes_cold_before_calling_a_chunk_missing() {
+        /// Answers `has_chunk` false the FIRST time it is asked about a key and
+        /// truthfully thereafter — the racing offload completes in between.
+        struct RacingCold {
+            inner: MemoryColdTier,
+            probed: Mutex<HashSet<(String, u64)>>,
+        }
+        #[async_trait]
+        impl ColdTier for RacingCold {
+            async fn put_chunk(&self, r: &str, i: u64, b: Vec<u8>) -> Result<(), BlobError> {
+                self.inner.put_chunk(r, i, b).await
+            }
+            async fn get_chunk(&self, r: &str, i: u64) -> Result<Option<Vec<u8>>, BlobError> {
+                self.inner.get_chunk(r, i).await
+            }
+            async fn chunk_count(&self, r: &str) -> Result<u64, BlobError> {
+                self.inner.chunk_count(r).await
+            }
+            async fn delete_stream(&self, r: &str) -> Result<(), BlobError> {
+                self.inner.delete_stream(r).await
+            }
+            async fn delete_chunk(&self, r: &str, i: u64) -> Result<(), BlobError> {
+                self.inner.delete_chunk(r, i).await
+            }
+            async fn has_chunk(&self, r: &str, i: u64) -> Result<bool, BlobError> {
+                if self.probed.lock().unwrap().insert((r.to_owned(), i)) {
+                    return Ok(false);
+                }
+                self.inner.has_chunk(r, i).await
+            }
+        }
+
+        let local = Arc::new(MemoryBlobStore::new());
+        let cold = Arc::new(RacingCold {
+            inner: MemoryColdTier::new(),
+            probed: Mutex::new(HashSet::new()),
+        });
+        // The state the race leaves behind: the offload's put to cold has landed
+        // and its local delete has run, so the chunk is durable but not local.
+        cold.inner.put_chunk(REF, 0, vec![0x77; 10]).await.unwrap();
+
+        let t = WriteBackTier::new(
+            local.clone(),
+            cold.clone(),
+            1_000_000,
+            Duration::from_secs(30 * 24 * 3600),
+        );
+        let report = t.backup_copy_refs(&[(REF.to_owned(), 1)]).await.unwrap();
+        assert_eq!(report.already_cold, 1);
+        assert_eq!(report.copied, 0);
+        assert!(
+            report.is_complete(),
+            "a chunk durable in cold was reported missing: {:?}",
+            report.missing
+        );
+    }
+
+    /// A chunk in NEITHER tier is a hole in the backup. It must not abort the run
+    /// — one unreadable chunk cannot cost the operator the other 200 GB — but it
+    /// must be named in the report, and the report must stop claiming completeness.
+    #[tokio::test]
+    async fn backup_copy_refs_reports_a_chunk_missing_from_both_tiers() {
+        let (t, _local, cold, _) = tier(1_000_000);
+        t.put_chunk(REF, 0, vec![0xF0; 10]).await.unwrap();
+        // The DB says this stream has three chunks; only index 0 exists anywhere.
+        let report = t.backup_copy_refs(&[(REF.to_owned(), 3)]).await.unwrap();
+        assert_eq!(report.copied, 1);
+        assert_eq!(
+            report.missing,
+            vec![(REF.to_owned(), 1), (REF.to_owned(), 2)]
+        );
+        assert!(!report.is_complete());
+        // The chunks that DO exist were still copied — a hole is not an abort.
+        assert_eq!(cold.chunk_count(REF).await.unwrap(), 1);
+    }
+
+    /// Unlike the best-effort idle sweep (which swallows errors so a down cold tier
+    /// never thrashes), a backup fails closed: a cold-tier fault surfaces instead
+    /// of returning a report that under-reports what it copied.
+    #[tokio::test]
+    async fn backup_copy_refs_fails_closed_on_a_cold_tier_error() {
+        struct FailingCold;
+        #[async_trait]
+        impl ColdTier for FailingCold {
+            async fn put_chunk(&self, _r: &str, _i: u64, _b: Vec<u8>) -> Result<(), BlobError> {
+                Err(BlobError::new("test", "cold down"))
+            }
+            async fn get_chunk(&self, _r: &str, _i: u64) -> Result<Option<Vec<u8>>, BlobError> {
+                Ok(None)
+            }
+            async fn chunk_count(&self, _r: &str) -> Result<u64, BlobError> {
+                Ok(0)
+            }
+            async fn delete_stream(&self, _r: &str) -> Result<(), BlobError> {
+                Ok(())
+            }
+            async fn delete_chunk(&self, _r: &str, _i: u64) -> Result<(), BlobError> {
+                Ok(())
+            }
+            async fn has_chunk(&self, _r: &str, _i: u64) -> Result<bool, BlobError> {
+                Ok(false)
+            }
+        }
+        let local = Arc::new(MemoryBlobStore::new());
+        let t = WriteBackTier::new(
+            local.clone(),
+            Arc::new(FailingCold),
+            1_000_000,
+            Duration::from_secs(30 * 24 * 3600),
+        );
+        t.put_chunk(REF, 0, vec![0x01; 10]).await.unwrap();
+        assert!(t.backup_copy_refs(&[(REF.to_owned(), 1)]).await.is_err());
+        // Fail-safe as ever: the local copy is untouched by the failed backup.
+        assert!(local.get_chunk(REF, 0).await.unwrap().is_some());
     }
 
     #[tokio::test]

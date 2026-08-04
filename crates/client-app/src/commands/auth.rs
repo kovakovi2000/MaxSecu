@@ -16,18 +16,53 @@ use crate::keystore;
 /// Resolved at startup beside the executable so the folder travels (stack.md §5.2).
 pub struct AppDir(pub PathBuf);
 
+/// WHO this session authenticated as. An enum (not a `username` plus an
+/// `is_recovery` flag) because the recovery principal has NO username *by
+/// construction* — `recovery_register` only stores the recovery account's keys, it
+/// never creates a `users` row nor publishes a directory binding — so the pair
+/// `username = Some(..) + is_recovery = true` must not even be representable. It
+/// also makes the compiler force a decision at every reader: an upload must refuse
+/// a recovery principal, a browse must not.
+///
+/// In-RAM only: never serialized, never persisted, never crosses the Tauri seam.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Principal {
+    /// An ordinary enrolled user, authenticated by `/v1/session/{challenge,proof}`.
+    User { username: String },
+    /// The trusted-server RECOVERY account (`RECOVERY_ID`), authenticated by
+    /// `/v1/recovery/{challenge,verify}`. Reads everything, uploads nothing.
+    Recovery,
+}
+
 /// The in-RAM session: the unlocked identity, the last server's id, and the
 /// opaque session token. `Identity` has no `Default`, but `Option<Identity>`
 /// does (`None`), so the whole thing derives `Default`.
 #[derive(Default)]
 pub struct SessionInner {
+    /// The unlocked key of WHICHEVER principal is signed in — a user's keystore
+    /// identity, or the operator's cold recovery identity.
     pub identity: Option<Identity>,
     pub server_id: String,
     pub token: Option<String>,
-    /// The username this session authenticated as. Stored so channel-bound admin
+    /// The principal this session authenticated as. Stored so channel-bound
     /// commands can RE-AUTHENTICATE on a fresh connection (the connect-minted
     /// token is bound to a closed channel and unusable elsewhere).
-    pub username: Option<String>,
+    pub principal: Option<Principal>,
+}
+
+impl SessionInner {
+    /// The signed-in username, or `None` for a not-signed-in / recovery session.
+    pub fn username(&self) -> Option<&str> {
+        match &self.principal {
+            Some(Principal::User { username }) => Some(username.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether the RECOVERY account is signed in (read-everything, upload-nothing).
+    pub fn is_recovery(&self) -> bool {
+        matches!(self.principal, Some(Principal::Recovery))
+    }
 }
 
 /// Async-aware managed wrapper (commands are `async`, so the guard must be a
@@ -121,12 +156,33 @@ pub async fn unlock_keystore(
 }
 
 #[tauri::command]
-pub async fn logout(session: tauri::State<'_, Session>) -> Result<(), UiError> {
-    let mut s = session.0.lock().await;
-    s.token = None;
-    s.identity = None; // forget the unlocked key on logout
-    s.server_id.clear();
-    s.username = None;
+pub async fn logout(
+    session: tauri::State<'_, Session>,
+    pool: tauri::State<'_, crate::commands::pool::AppPool>,
+) -> Result<(), UiError> {
+    // ORDER IS LOAD-BEARING: clear the session FIRST, drain the pool SECOND.
+    //
+    // Draining first leaves a window. `drain_idle` bumps the pool's generation, so
+    // an `acquire` that ENTERS after the bump is stamped with the new generation --
+    // but if the principal is still set it will happily mint a live token for the
+    // user who is signing out, and `Drop` then sees `born == current` and re-pools
+    // it. That is a signed-out principal's channel-bound token sitting in the idle
+    // set; on the recovery path it is a token that can open every user's content.
+    //
+    // Clearing first closes it from both sides: an acquire that entered BEFORE the
+    // clear is stamped with the OLD generation and the drain below makes it born
+    // stale, so its channel is discarded on drop; an acquire that enters AFTER the
+    // clear finds no principal and no identity, so it cannot mint anything at all.
+    {
+        let mut s = session.0.lock().await;
+        s.token = None;
+        s.identity = None; // forget the unlocked key on logout
+        s.server_id.clear();
+        s.principal = None;
+    }
+    // Now discard every pooled channel: each holds a live authed connection and a
+    // token minted for the principal just cleared.
+    pool.drain_idle();
     Ok(())
 }
 

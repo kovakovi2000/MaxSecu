@@ -1,5 +1,7 @@
 # Security Review Sign-off — T6 Shamir K-of-N Recovery-Key UI
 
+> **RETIRED — this document reviews a feature that NO LONGER EXISTS (marked 2026-08-01).** The sign-off below is left exactly as it was ratified on 2026-07-03; it was true of the code it reviewed. **That entire feature — the T6 split/reconstruct UI, `crypto::shamir`, `admin-core::recovery::{split_recovery_key, reconstruct_recovery_key}` and `admin-core/src/recovery_seal.rs` — was removed weeks later** by the trusted-server-recovery redesign (`docs/superpowers/specs/2026-07-03-trusted-server-recovery-registration-design.md` §8; invariant #7 in `security-review-trusted-server-recovery.md` records the deletion). Nothing in this document describes shipped behaviour: no Rust source in `crates/` references either function, and `crates/crypto/src/shamir.rs` does not exist. **The shipped recovery custody model is a single Argon2id-sealed `recovery_key.blob`** minted by `tools/maxsecu-setup` (`DESIGN.md` §16.3; a threshold split is future work, §19). Kept for provenance only — **do not treat any claim below as a current control.**
+
 **Status: PASS** — no Critical / High / Medium findings remain (the one Medium found in review, M-1, was fixed + regression-tested before sign-off).
 **Branch:** `feat/t6-shamir-recovery-ui` (`6d2cce8..HEAD`).
 **Date:** 2026-07-03.

@@ -128,23 +128,26 @@ mod tests {
 use tauri::{Emitter, State};
 
 use maxsecu_client_core::{
-    verify_and_open, verify_and_open_headers, Identity, MemoryTrustStore,
-    VerifyContext,
+    verify_and_open, verify_and_open_headers, Identity, MemoryTrustStore, VerifyContext,
 };
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::Manifest;
 
 use crate::commands::auth::{AppDir, ConnectLock, Session};
-use crate::commands::connection::{reauth, server_of};
-use crate::commands::feed::{file_type_name, hex, hex16, now_ms, parse_title_tags};
+use crate::commands::connection::server_of;
+use crate::commands::feed::{file_type_name, hex, hex16, now_ms, parse_title_tags, reauth_channel};
+use crate::commands::pool::{get_on_pooled_channel, AppPool};
 use crate::config::load_directory_pub;
+use crate::directory::Recipient;
 use crate::download::{build_download_bundle, build_stream_header, parse_file_view};
 use crate::dto::{OpenContentRequest, OpenedContentDto};
-use crate::http_client::get_json;
 use crate::state::{FetchPhase, EVT_FETCH};
 
 /// `open_content` — the viewer: fetch, verify, decrypt one file and return the
 /// content to display. Emits FetchPhase over EVT_FETCH. Sanitized errors.
+// Argument count is the Tauri managed-state injection list, not real parameters —
+// only `req` crosses the seam.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn open_content(
     req: OpenContentRequest,
@@ -155,12 +158,23 @@ pub async fn open_content(
     thumb: State<'_, crate::thumb_cache::ThumbCache>,
     media: State<'_, crate::media_cache::MediaCache>,
     seal: State<'_, std::sync::Arc<crate::session_seal::SessionSeal>>,
+    pool: State<'_, AppPool>,
 ) -> Result<OpenedContentDto, UiError> {
     let emit = |p: FetchPhase| {
         let _ = app.emit(EVT_FETCH, p);
     };
-    let out =
-        open_content_inner(&req, &dir, &session, &connect_lock, &thumb, &media, &seal, &emit).await;
+    let out = open_content_inner(
+        &req,
+        &dir,
+        &session,
+        &connect_lock,
+        &thumb,
+        &media,
+        &seal,
+        &pool,
+        &emit,
+    )
+    .await;
     if let Err(e) = &out {
         emit(FetchPhase::Failed {
             file_id: req.file_id.clone(),
@@ -170,6 +184,7 @@ pub async fn open_content(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_content_inner(
     req: &OpenContentRequest,
     dir: &State<'_, AppDir>,
@@ -178,6 +193,7 @@ async fn open_content_inner(
     thumb: &State<'_, crate::thumb_cache::ThumbCache>,
     media: &State<'_, crate::media_cache::MediaCache>,
     seal: &State<'_, std::sync::Arc<crate::session_seal::SessionSeal>>,
+    pool: &State<'_, AppPool>,
     emit: &impl Fn(FetchPhase),
 ) -> Result<OpenedContentDto, UiError> {
     // Validate the REQUESTED id up front: this is the id the served record must
@@ -186,8 +202,17 @@ async fn open_content_inner(
     let file_id = hex16(&req.file_id)?;
     use crate::thumb_cache::{CacheKey, CachedMeta};
     if let Some(v) = req.version {
-        if let Some(dto) =
-            content_hit(thumb, media, seal, CacheKey { file_id, version: v }, &req.file_id).await
+        if let Some(dto) = content_hit(
+            thumb,
+            media,
+            seal,
+            CacheKey {
+                file_id,
+                version: v,
+            },
+            &req.file_id,
+        )
+        .await
         {
             emit(FetchPhase::Ready {
                 file_id: req.file_id.clone(),
@@ -199,34 +224,51 @@ async fn open_content_inner(
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
 
-    let username = {
+    let principal = {
         let s = session.0.lock().await;
-        s.username.clone()
+        s.principal.clone()
     }
     .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
 
     let server = server_of(&dir.0)?;
-    let (mut sender, host, token) = reauth(&dir.0, &server, session, connect_lock).await?;
-    // Offline-D5 hop (spec §3/§7): resolve the effective directory verifier over the
-    // pinned connection BEFORE any binding is verified — fail closed on a bad delegation.
-    let verifier =
-        crate::directory::build_delegated_verifier(&mut sender, &host, pinned, now).await?;
 
     emit(FetchPhase::Fetching {
         file_id: req.file_id.clone(),
         fetched: 0,
         total: 0,
     });
-    let (status, view_json) = get_json(
-        &mut sender,
+    // BORROW a warm authed channel instead of minting a login per open. Opening a
+    // post used to cost a full TLS dial + challenge + proof EVERY time; the Stacked
+    // bundle view multiplies that by the member count, which is what drove the
+    // account into the server's 30-challenges-per-minute cap.
+    //
+    // The §8.5 view GET runs FIRST (it is the pool's channel-health check — see
+    // `get_on_pooled_channel`, same order `decrypt_card` uses) and the D5 delegation
+    // hop follows on the validated channel. Ordering is unchanged where it matters:
+    // the verifier is still resolved BEFORE any binding is verified below.
+    //
+    // `Box::pin` is load-bearing, not style: `open_content_inner` is already a very
+    // deep async state machine (verify ladder + direct-link fallbacks + two caches),
+    // and inlining another generic async fn's future into it overflows rustc's
+    // type-layout depth limit ("queries overflow the depth limit"). Boxing erases
+    // this sub-future's type and keeps the enclosing future's layout shallow.
+    let (mut chan, view_json) = Box::pin(get_on_pooled_channel(
+        pool,
+        &principal,
         &format!("/v1/files/{}?version=latest", req.file_id),
-        Some(&token),
-        &host,
-    )
+        UiError::new("fetch_failed", "That item is not available."),
+        || reauth_channel(&dir.0, &server, session, connect_lock),
+    ))
     .await?;
-    if status != hyper::StatusCode::OK {
-        return Err(UiError::new("fetch_failed", "That item is not available."));
-    }
+    // Owned copies so `&mut chan.sender` can be borrowed alongside them; the pooled
+    // channel returns to the pool when `chan` drops at the end of this command.
+    let host = chan.host.clone();
+    let token = chan.token.clone();
+    // Offline-D5 hop (spec §3/§7): resolve the effective directory verifier over the
+    // pinned connection BEFORE any binding is verified — fail closed on a bad delegation.
+    let verifier =
+        crate::directory::build_delegated_verifier(&mut chan.sender, &host, pinned, now).await?;
+
     let view = parse_file_view(&view_json)?;
     if req.version.is_none() {
         // NB: keyed on the UNVERIFIED envelope `view.version`; if it diverges from the
@@ -236,7 +278,10 @@ async fn open_content_inner(
             thumb,
             media,
             seal,
-            CacheKey { file_id, version: view.version },
+            CacheKey {
+                file_id,
+                version: view.version,
+            },
             &req.file_id,
         )
         .await
@@ -250,7 +295,7 @@ async fn open_content_inner(
     let manifest: Manifest =
         decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
     let (author, author_binding) = crate::directory::resolve_and_verify_author_logged(
-        &mut sender,
+        &mut chan.sender,
         &host,
         &hex(&manifest.author_id.0),
         &verifier,
@@ -263,10 +308,10 @@ async fn open_content_inner(
     // non-equivocating checkpoint (opt-in; see `enforce_author_transparency`).
     crate::commands::feed::enforce_author_transparency(&dir.0, session.inner(), author_binding)
         .await?;
-    let my_id = crate::directory::resolve_my_user_id(
-        &mut sender,
+    let me = crate::directory::resolve_me(
+        &mut chan.sender,
         &host,
-        &username,
+        &principal,
         &verifier,
         &mut trust,
         now,
@@ -274,7 +319,9 @@ async fn open_content_inner(
     .await?;
 
     // The download route setting, read once and reused for every fetch below.
-    let route_mode = crate::config::SettingsConfig::load(&dir.0).connection.route_mode;
+    let route_mode = crate::config::SettingsConfig::load(&dir.0)
+        .connection
+        .route_mode;
     let direct_http = crate::direct_link::shared_direct_http();
 
     // VIDEO: return metadata via a HEADER-ONLY open (no whole-file download, no
@@ -283,7 +330,7 @@ async fn open_content_inner(
     // the full verify+decrypt path below.
     if manifest.file_type == FileType::Video {
         let (header, header_used_direct) = build_stream_header(
-            &mut sender,
+            &mut chan.sender,
             &host,
             &token,
             &req.file_id,
@@ -306,13 +353,13 @@ async fn open_content_inner(
                 .identity
                 .as_ref()
                 .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-            verify_and_open_headers(&video_verify_ctx(file_id, &author, my_id, identity), &header)
+            verify_and_open_headers(&video_verify_ctx(file_id, &author, me, identity), &header)
         };
         let opened = match attempt {
             Ok(o) => o,
             Err(_) if header_used_direct => {
                 let (header, _) = build_stream_header(
-                    &mut sender,
+                    &mut chan.sender,
                     &host,
                     &token,
                     &req.file_id,
@@ -326,11 +373,8 @@ async fn open_content_inner(
                     .identity
                     .as_ref()
                     .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-                verify_and_open_headers(
-                    &video_verify_ctx(file_id, &author, my_id, identity),
-                    &header,
-                )
-                .map_err(|_| UiError::new("verify_failed", "This item failed verification."))?
+                verify_and_open_headers(&video_verify_ctx(file_id, &author, me, identity), &header)
+                    .map_err(|_| UiError::new("verify_failed", "This item failed verification."))?
             }
             Err(_) => {
                 return Err(UiError::new(
@@ -363,12 +407,12 @@ async fn open_content_inner(
             // author/owner. NOT gated on `my_id == author.user_id`.
             can_share: true,
             // Ownership (bundles Task 6.2): gates the owner-only permanent Delete.
-            mine: my_id == author.user_id,
+            mine: me.id().0 == author.user_id,
         });
     }
 
     let (bundle, bundle_used_direct) = build_download_bundle(
-        &mut sender,
+        &mut chan.sender,
         &host,
         &token,
         &req.file_id,
@@ -394,13 +438,13 @@ async fn open_content_inner(
             .identity
             .as_ref()
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-        run_open(identity, file_id, &author, my_id, &bundle)
+        run_open(identity, file_id, &author, me, &bundle)
     };
     let opened = match attempt {
         Ok(o) => o,
         Err(e) if bundle_used_direct => {
             let (bundle, _) = build_download_bundle(
-                &mut sender,
+                &mut chan.sender,
                 &host,
                 &token,
                 &req.file_id,
@@ -414,7 +458,7 @@ async fn open_content_inner(
                 .identity
                 .as_ref()
                 .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-            run_open(identity, file_id, &author, my_id, &bundle).map_err(|_| e)?
+            run_open(identity, file_id, &author, me, &bundle).map_err(|_| e)?
         }
         Err(e) => return Err(e),
     };
@@ -467,7 +511,7 @@ async fn open_content_inner(
                     thumbnail_b64: None,
                     author_fp: hex(&author.fingerprint[..8]),
                     recovery_ok: opened.recovery_grant_ok,
-                    mine: my_id == author.user_id,
+                    mine: me.id().0 == author.user_id,
                     // Viewer opens image/blog content, never a bundle → no member tally.
                     member_counts: crate::dto::MemberCounts::default(),
                 },
@@ -491,7 +535,7 @@ async fn open_content_inner(
         // author/owner. NOT gated on `my_id == author.user_id`.
         can_share: true,
         // Ownership (bundles Task 6.2): gates the owner-only permanent Delete.
-        mine: my_id == author.user_id,
+        mine: me.id().0 == author.user_id,
     })
 }
 
@@ -503,10 +547,10 @@ async fn open_content_inner(
 fn video_verify_ctx<'a>(
     file_id: [u8; 16],
     author: &crate::directory::VerifiedAuthor,
-    my_id: [u8; 16],
+    me: Recipient,
     identity: &'a Identity,
 ) -> VerifyContext<'a> {
-    crate::directory::build_verify_ctx(file_id, author, my_id, identity)
+    crate::directory::build_verify_ctx(file_id, author, me, identity)
 }
 
 /// Build the VerifyContext and run the whole-buffer verify+decrypt. Synchronous —
@@ -518,10 +562,10 @@ pub(crate) fn run_open(
     identity: &Identity,
     file_id: [u8; 16],
     author: &crate::directory::VerifiedAuthor,
-    my_id: [u8; 16],
+    me: Recipient,
     bundle: &maxsecu_client_core::DownloadBundle,
 ) -> Result<maxsecu_client_core::OpenedFile, UiError> {
-    let ctx = crate::directory::build_verify_ctx(file_id, author, my_id, identity);
+    let ctx = crate::directory::build_verify_ctx(file_id, author, me, identity);
     verify_and_open(&ctx, bundle)
         .map_err(|_| UiError::new("verify_failed", "This item failed verification."))
 }

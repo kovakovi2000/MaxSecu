@@ -1,0 +1,26 @@
+{
+  "argon": {
+    "m_kib": 19456,
+    "p": 1,
+    "t": 2
+  },
+  "format": "MXBU",
+  "header_len": 45,
+  "magic": "MXBU",
+  "parts": [
+    {
+      "index": 0,
+      "is_last": false,
+      "part_len": 137,
+      "plaintext": "4d58425520636f6d7061742066697874757265202d2d207365727665722d6261636b75702062756e646c65206672616d652030206f66203220286e6f7420746865206c617374207061727429"
+    },
+    {
+      "index": 1,
+      "is_last": true,
+      "part_len": 112,
+      "plaintext": "4d58425520636f6d7061742066697874757265202d2d2066696e616c206672616d652031206f662032202869735f6c61737429"
+    }
+  ],
+  "passphrase_file": "backup_v1.passphrase.txt",
+  "version": 1
+}

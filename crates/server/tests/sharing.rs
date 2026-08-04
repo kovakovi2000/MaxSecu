@@ -217,6 +217,87 @@ async fn reshare_to_the_recovery_recipient_is_rejected() {
     );
 }
 
+/// F2 — the mirror image of the test above, on the DELETE side.
+///
+/// `add_wrap` refuses to create a recovery wrap; until now `delete_wrap` was
+/// happy to destroy one. That asymmetry was the whole bug: once the recovery
+/// wrap at `current_version` is stripped, NOTHING can recreate it (both stores
+/// hard-reject `recipient_id == RECOVERY_ID` in `add_wrap`), so the file stays
+/// perfectly readable by its owner and becomes permanently unreadable by the
+/// escrow. An owner can blind the escrow to their own content, one file at a
+/// time, with a request the server used to answer `204`.
+#[tokio::test]
+async fn soft_revoke_of_the_recovery_recipient_is_rejected() {
+    let store = MemoryStore::new();
+    finalized_v1(
+        &store,
+        vec![
+            wrap(OWNER, 1, OWNER, 0xA0),
+            wrap(RECOVERY_ID.0, 2, OWNER, 0x5E),
+        ],
+    )
+    .await;
+
+    // The OWNER — the most privileged caller this route has — is refused.
+    assert_eq!(
+        store.delete_wrap(FILE, RECOVERY_ID.0, OWNER).await,
+        Err(DeleteWrapError::RecoveryProtected),
+        "not even the owner may strip the escrow wrap"
+    );
+
+    // And the wrap is still there: the recovery recipient can still open the file.
+    assert!(
+        store
+            .get_file(FILE, VersionSelector::Latest, RECOVERY_ID.0)
+            .await
+            .unwrap()
+            .is_some(),
+        "the recovery wrap must survive a refused revoke"
+    );
+}
+
+/// The guard must not over-block: an ORDINARY recipient's wrap is still
+/// revocable, by the owner and by the granter, exactly as before. A fix that
+/// bought escrow safety by breaking soft-revoke would be a worse bug.
+#[tokio::test]
+async fn soft_revoke_of_an_ordinary_recipient_still_works() {
+    let store = MemoryStore::new();
+    finalized_v1(
+        &store,
+        vec![
+            wrap(OWNER, 1, OWNER, 0xA0),
+            wrap(RECOVERY_ID.0, 2, OWNER, 0x5E),
+        ],
+    )
+    .await;
+    store
+        .add_wrap(FILE, wrap(V, 1, OWNER, 0xC0), OWNER, 2000)
+        .await
+        .unwrap();
+
+    store
+        .delete_wrap(FILE, V, OWNER)
+        .await
+        .expect("an ordinary recipient's wrap is still revocable");
+    assert!(
+        store
+            .get_file(FILE, VersionSelector::Latest, V)
+            .await
+            .unwrap()
+            .is_none(),
+        "V's wrap is gone"
+    );
+    // …and the escrow wrap is untouched by that revoke.
+    assert!(
+        store
+            .get_file(FILE, VersionSelector::Latest, RECOVERY_ID.0)
+            .await
+            .unwrap()
+            .is_some(),
+        "revoking a user must not disturb the recovery wrap"
+    );
+}
+
 #[tokio::test]
 async fn soft_revoke_by_owner_denies_the_recipient() {
     let store = MemoryStore::new();

@@ -246,6 +246,23 @@ $StartHereText = ($StartHereLines -join "`r`n") + "`r`n"
 # 5. Zip only the clean staged MaxSecuClient folder.
 # ---------------------------------------------------------------------------
 Write-Section 'Building the ZIP'
+
+# FAIL CLOSED before zipping: the handout must never carry a secret. Step 4 copies an
+# explicit file list (exe + ui\ + the two pins), so this should never fire -- it is a
+# standing assertion. It matters now that dist\MaxSecuClient can legitimately hold a
+# staged recovery\recovery_key_blob (install-client.ps1 -StageRecoveryKey): -Pins can
+# point at that tree, and any future edit that stages a client FOLDER wholesale would
+# otherwise ship the recovery key, the directory root or a keystore to every user.
+$Leaks = @(Get-ChildItem -Path $ShareClient -Recurse -Force -File -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -eq 'recovery_key_blob' -or $_.Name -eq 'local_key_blob' -or
+        $_.Name -eq 'register.key' -or $_.Name -eq 'recovery_pin.bin' -or
+        $_.Extension -eq '.blob'
+    })
+if ($Leaks.Count -gt 0) {
+    Fail ("Refusing to build the handout ZIP -- secret-shaped files are in the staged tree:`n  " + (($Leaks | ForEach-Object { $_.FullName }) -join "`n  "))
+}
+
 if ([string]::IsNullOrWhiteSpace($Out)) { $Out = Join-Path $DistDir 'MaxSecuClient-share.zip' }
 $OutDir = Split-Path $Out -Parent
 if ($OutDir -and -not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }

@@ -5,6 +5,8 @@
 //! serves until killed. There is NO bootstrap secret — enrollment is
 //! registration-key-only (via `maxsecu-setup`), and the first registrant is admin.
 
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
@@ -14,7 +16,7 @@ use std::time::Duration;
 
 use maxsecu_server::{
     router, serve, AppState, AuthConfig, AuthService, BlobStore, ColdTier, DropboxTier,
-    FsBlobStore, FsColdTier, MemoryStore, NullAuditSink, PgStore, WriteBackTier,
+    FsBlobStore, FsColdTier, MemoryStore, NullAuditSink, PgStore, Store, WriteBackTier,
 };
 
 use crate::config::{ColdTierCfg, LauncherConfig, Profile};
@@ -26,16 +28,97 @@ use crate::{bootstrap, pki};
 /// nothing is idle.
 const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// Build the blob store for the configured cold tier. With `ColdTierCfg::Off` this
-/// is just the local `FsBlobStore` (today's behavior, no offload). Otherwise it is a
-/// write-back [`WriteBackTier`] over that local store + the configured cold tier,
-/// and a background idle-offload sweeper task is spawned. Returns the type-erased
-/// store either way. The Dropbox OAuth token is never logged.
-fn build_blobs(cfg: &LauncherConfig, layout: &Layout) -> std::io::Result<Arc<dyn BlobStore>> {
-    let local: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(layout.blobs_dir()));
+/// How often the background prune sweeps long-expired `sessions` / `auth_nonces`
+/// rows. Hourly is far more often than it needs to be: with a 7-day grace window
+/// nothing is urgent, and the point of the short period is that each pass stays
+/// tiny, not that it keeps up.
+const AUTH_PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Spawn the background auth-row prune.
+///
+/// Both `sessions` and `auth_nonces` are append-plus-update-in-place on every
+/// request path — a session is *revoked* by an UPDATE and a nonce is *consumed*
+/// by an UPDATE, and no request path deletes from either; **this task is the
+/// only delete either table has** — so without it the two tables only grow, and
+/// so does `auth_nonces_open_idx`, whose `used_at IS NULL` predicate does NOT
+/// bound itself (an abandoned challenge stays open forever). `auth_nonces` is
+/// the one that matters most on top of that: a challenge is
+/// issued even for an unknown username (no user-existence oracle), the issuance
+/// cap is per claimed *name* with no per-source cap, and the login path reads the
+/// table on every channel mint.
+///
+/// Deliberately an in-process tokio task rather than a cron entry or a systemd
+/// timer: this box is deployed by drag-and-drop with no git and has no timer
+/// surface at all today, and a unit that can drift out of sync with the binary
+/// that owns the schema is a worse failure mode than the leak it fixes.
+///
+/// **A prune fault is never fatal and never reaches a request.** The task owns
+/// its own errors: it logs them and lets the next tick retry. It shares the same
+/// [`AuthService`] — hence the same pool — as the handlers, but a failed DELETE
+/// cannot fail a login, because no login ever awaits one.
+///
+/// Returns a counter the task bumps once per completed pass, faults included.
+/// [`prepare`] hands it out as [`Prepared::auth_prune_passes`] for exactly one
+/// reason: **without it this wiring is unobservable.** Every prune test drove
+/// `Store::prune_expired_auth_rows` directly, so deleting the two calls below —
+/// the only thing that makes any of it happen in production — left the whole
+/// suite green. `prepare_spawns_the_background_auth_prune` watches this counter
+/// advance, so removing the spawn now fails a test instead of silently shipping
+/// a server that never prunes.
+fn spawn_auth_prune<S: Store + 'static>(auth: Arc<AuthService<S>>) -> Arc<AtomicU64> {
+    let passes = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&passes);
+    tokio::spawn(async move {
+        // `interval`'s FIRST tick completes immediately, so the first pass runs
+        // at startup rather than an hour in — a box restarted often would
+        // otherwise never prune at all.
+        let mut ticker = tokio::time::interval(AUTH_PRUNE_INTERVAL);
+        loop {
+            ticker.tick().await;
+            match auth.prune_expired_auth_rows(now_ms()).await {
+                Ok(c) if c.total() > 0 => eprintln!(
+                    "  auth prune: removed {} expired session row(s), {} expired nonce row(s)",
+                    c.sessions, c.nonces
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "  WARNING: auth prune failed (retrying in {}s; logins are unaffected): {e}",
+                    AUTH_PRUNE_INTERVAL.as_secs()
+                ),
+            }
+            // AFTER the match, and on the error arm too: the contract is "a pass
+            // happened and the loop is still alive", which is what a fault must
+            // not break.
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    passes
+}
+
+/// Wall clock in epoch-milliseconds — the app clock the auth state machine (and
+/// so the prune cutoff) reasons in.
+///
+/// Deliberately total, unlike the request path's equivalent: a clock before the
+/// epoch yields `0`, which the prune's saturating cutoff turns into "delete
+/// nothing". Panicking here would kill the detached task for the life of the
+/// process, quietly, which is exactly the failure mode this task must not have.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Build the configured cold tier, or `None` for [`ColdTierCfg::Off`]. Shared by
+/// the serve path ([`build_blobs`]) and the backup subcommands
+/// ([`build_backup_tiers`]). The Dropbox OAuth token is never logged.
+fn build_cold(cfg: &LauncherConfig, layout: &Layout) -> std::io::Result<Option<Arc<dyn ColdTier>>> {
     let cold: Arc<dyn ColdTier> = match &cfg.cold_tier {
-        ColdTierCfg::Off => return Ok(local),
-        ColdTierCfg::Fs(dir) => Arc::new(FsColdTier::new(dir.clone())),
+        ColdTierCfg::Off => return Ok(None),
+        ColdTierCfg::Fs(dir) => {
+            reject_aliased_fs_cold_tier(dir, layout, &cfg.data_dir)?;
+            Arc::new(FsColdTier::new(dir.clone()))
+        }
         ColdTierCfg::Dropbox {
             app_key,
             app_secret,
@@ -52,6 +135,82 @@ fn build_blobs(cfg: &LauncherConfig, layout: &Layout) -> std::io::Result<Arc<dyn
             )
             .map_err(|e| std::io::Error::other(format!("dropbox tier init: {e}")))?,
         ),
+    };
+    Ok(Some(cold))
+}
+
+/// Refuse an `fs` cold tier that resolves to the SAME directory as the local blob
+/// store. **This one destroys user ciphertext, silently and permanently.**
+///
+/// `FsColdTier` and the local `FsBlobStore` use the identical `{base}/{blob_ref}/{index}`
+/// layout, so if the two roots are the same directory — set directly, or reached
+/// through a symlink or a bind mount — then `WriteBackTier::offload` does
+/// `cold.put_chunk(...)` immediately followed by `local.delete_chunk(...)` **on the
+/// very file it just wrote**. The chunk is gone from both tiers, and because offload
+/// is the idle sweeper it happens quietly, long after the upload, to data the user
+/// believes is safely stored. Nothing else in the system notices: the DB row survives
+/// and the file simply 404s forever.
+///
+/// Canonicalize before comparing, so a symlink or bind mount cannot dress the same
+/// directory up as two.
+///
+/// Scoped deliberately to EQUALITY, not containment. A cold root that merely sits
+/// inside the data dir cannot collide (a `blob_ref` is `hex(file_id)/version/stream`,
+/// 32 hex chars — never `blobs`), so refusing it would be a tightening that could
+/// stop an existing server from booting, which is its own kind of lockout. That case
+/// gets a loud warning instead: it is a real hazard, but for a different reason (a
+/// dead-box rebuild that clears the data dir would take the backup with it), and the
+/// runbook already tells the operator to keep the cold tier outside.
+fn reject_aliased_fs_cold_tier(
+    cold_dir: &Path,
+    layout: &Layout,
+    data_dir: &Path,
+) -> std::io::Result<()> {
+    let blobs = layout.blobs_dir();
+    std::fs::create_dir_all(cold_dir)?;
+    std::fs::create_dir_all(&blobs)?;
+    // If either side cannot canonicalize, fall back to the literal paths rather than
+    // failing the boot: a comparison we cannot make is not a reason to refuse to run.
+    let c = cold_dir
+        .canonicalize()
+        .unwrap_or_else(|_| cold_dir.to_path_buf());
+    let b = blobs.canonicalize().unwrap_or_else(|_| blobs.clone());
+    if c == b {
+        return Err(std::io::Error::other(format!(
+            "cold tier directory {} is the SAME directory as the local blob store {} \
+             (they resolve to {}). The two use the identical on-disk layout, so the idle \
+             offload sweeper would write each chunk to cold and then delete the very file \
+             it just wrote — destroying uploaded ciphertext permanently. Point \
+             --cold-tier-fs at a directory OUTSIDE the data dir.",
+            cold_dir.display(),
+            blobs.display(),
+            c.display(),
+        )));
+    }
+    let dd = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    if c.starts_with(&dd) {
+        eprintln!(
+            "  WARNING: the fs cold tier ({}) is INSIDE the data dir ({}). A dead-box \
+             rebuild clears the data dir and would take every backup bundle with it. \
+             Move it outside.",
+            c.display(),
+            dd.display(),
+        );
+    }
+    Ok(())
+}
+
+/// Build the blob store for the configured cold tier. With `ColdTierCfg::Off` this
+/// is just the local `FsBlobStore` (today's behavior, no offload). Otherwise it is a
+/// write-back [`WriteBackTier`] over that local store + the configured cold tier,
+/// and a background idle-offload sweeper task is spawned. Returns the type-erased
+/// store either way.
+fn build_blobs(cfg: &LauncherConfig, layout: &Layout) -> std::io::Result<Arc<dyn BlobStore>> {
+    let local: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(layout.blobs_dir()));
+    let Some(cold) = build_cold(cfg, layout)? else {
+        return Ok(local);
     };
     let tier = Arc::new(WriteBackTier::new(
         local,
@@ -72,6 +231,43 @@ fn build_blobs(cfg: &LauncherConfig, layout: &Layout) -> std::io::Result<Arc<dyn
     Ok(tier)
 }
 
+/// The cold tier + the **concrete** [`WriteBackTier`] the `backup` subcommand needs
+/// (`main.rs` / `backup_cli`). The backup engine seals bundle parts straight onto
+/// [`cold`](BackupTiers::cold); `WriteBackTier::backup_copy_refs` — an inherent
+/// method on the concrete tier, unreachable through the type-erased
+/// `Arc<dyn BlobStore>` that [`build_blobs`] hands `AppState` — copies every
+/// committed blob onto that same cold tier while keeping the local copy. This is
+/// the [`build_blobs`] sweeper pattern (hold the concrete `Arc` alongside the
+/// erased one), applied to a one-shot CLI: no sweeper task is spawned, because a
+/// subcommand has no long-lived runtime to host it.
+pub struct BackupTiers {
+    pub cold: Arc<dyn ColdTier>,
+    pub tier: Arc<WriteBackTier>,
+}
+
+/// Build the [`BackupTiers`] for the backup subcommands, or `None` when no cold
+/// tier is configured (`ColdTierCfg::Off`). The caller must **fail closed** on
+/// `None` (`BackupError::ColdTierRequired`): a backup you wrongly believe is
+/// complete is worse than no backup, and with `Off` there is no cold tier to seal
+/// the bundle onto (backup) or to enumerate and unseal it from (restore /
+/// list-backups).
+pub fn build_backup_tiers(
+    cfg: &LauncherConfig,
+    layout: &Layout,
+) -> std::io::Result<Option<BackupTiers>> {
+    let Some(cold) = build_cold(cfg, layout)? else {
+        return Ok(None);
+    };
+    let local: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(layout.blobs_dir()));
+    let tier = Arc::new(WriteBackTier::new(
+        local,
+        cold.clone(),
+        cfg.cache_capacity_bytes,
+        Duration::from_secs(cfg.offload_idle_days * 24 * 3600),
+    ));
+    Ok(Some(BackupTiers { cold, tier }))
+}
+
 /// What [`prepare`] produces: a bound listener + TLS config + the composed
 /// (monomorphized) router, plus the pinned directory key **if known at startup**.
 /// In the Prod delegation model `directory_pub` is `None` while awaiting the
@@ -82,6 +278,10 @@ pub struct Prepared {
     pub router: axum::Router,
     pub directory_pub: Option<[u8; 32]>,
     pub local_addr: std::net::SocketAddr,
+    /// Completed passes of the background auth-row prune [`prepare`] spawned
+    /// (see [`spawn_auth_prune`]). Carried out of `prepare` so the wiring is
+    /// testable at all — production ignores it.
+    pub auth_prune_passes: Arc<AtomicU64>,
 }
 
 /// Lay out the data dir, ensure the dev cert / D5, compose the `AppState` (DEV:
@@ -117,20 +317,22 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
     // Compose the router over the profile's Store. Each branch builds a distinct
     // `AppState<S>` and type-erases it via `router(..)` into the shared
     // `axum::Router`, so the differing store type never leaks into `Prepared`.
-    let app_router = match cfg.profile {
+    let (app_router, auth_prune_passes) = match cfg.profile {
         Profile::Dev => {
+            let auth = Arc::new(
+                AuthService::new(MemoryStore::new(), auth_cfg)
+                    .with_dir_signer(wiring.dir_signer.clone())
+                    .with_delegation(wiring.ctx.clone()),
+            );
+            let passes = spawn_auth_prune(auth.clone());
             let state = AppState {
-                auth: Arc::new(
-                    AuthService::new(MemoryStore::new(), auth_cfg)
-                        .with_dir_signer(wiring.dir_signer.clone())
-                        .with_delegation(wiring.ctx.clone()),
-                ),
+                auth,
                 blobs,
                 audit: Arc::new(NullAuditSink),
                 direct_links_enabled: cfg.direct_links_enabled,
                 max_file_bytes: None,
             };
-            router(state)
+            (router(state), passes)
         }
         Profile::Prod => {
             let url = cfg.database_url.clone().ok_or_else(|| {
@@ -142,18 +344,20 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
                 .connect(&url)
                 .await
                 .map_err(|e| std::io::Error::other(format!("postgres connect: {e}")))?;
+            let auth = Arc::new(
+                AuthService::new(PgStore::new(pool), auth_cfg)
+                    .with_dir_signer(wiring.dir_signer.clone())
+                    .with_delegation(wiring.ctx.clone()),
+            );
+            let passes = spawn_auth_prune(auth.clone());
             let state = AppState {
-                auth: Arc::new(
-                    AuthService::new(PgStore::new(pool), auth_cfg)
-                        .with_dir_signer(wiring.dir_signer.clone())
-                        .with_delegation(wiring.ctx.clone()),
-                ),
+                auth,
                 blobs,
                 audit: Arc::new(NullAuditSink),
                 direct_links_enabled: cfg.direct_links_enabled,
                 max_file_bytes: None,
             };
-            router(state)
+            (router(state), passes)
         }
     };
 
@@ -180,6 +384,7 @@ pub async fn prepare(cfg: &LauncherConfig) -> std::io::Result<Prepared> {
         server_config,
         directory_pub,
         local_addr,
+        auth_prune_passes,
     })
 }
 
@@ -322,4 +527,111 @@ fn fmt_utc_date(unix_secs: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let year = if m <= 2 { y + 1 } else { y };
     format!("{year:04}-{m:02}-{d:02} UTC")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "mxps-cold-{tag}-{}-{}",
+            std::process::id(),
+            maxsecu_crypto::random_array::<4>()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// THE destructive misconfiguration: an `fs` cold tier pointed at the local blob
+    /// store. `WriteBackTier::offload` would put each chunk to cold and then delete
+    /// the very file it just wrote. Refuse at construction, before a single byte moves.
+    #[test]
+    fn an_fs_cold_tier_aliasing_the_blob_store_is_refused() {
+        let data_dir = tmp("alias");
+        let layout = Layout::ensure(&data_dir).unwrap();
+        let err = reject_aliased_fs_cold_tier(&layout.blobs_dir(), &layout, &data_dir)
+            .expect_err("aliasing the blob dir must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("SAME directory"), "{msg}");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A separate directory is fine — the ordinary configuration must still build.
+    #[test]
+    fn a_disjoint_fs_cold_tier_is_accepted() {
+        let data_dir = tmp("ok-data");
+        let cold = tmp("ok-cold");
+        let layout = Layout::ensure(&data_dir).unwrap();
+        reject_aliased_fs_cold_tier(&cold, &layout, &data_dir).expect("a disjoint dir is fine");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&cold);
+    }
+
+    /// **The wiring test.** `prepare` must actually start the background auth-row
+    /// prune, and starting it must actually make a pass happen.
+    ///
+    /// This is the one thing the prune's own unit tests could not cover: they all
+    /// drive `Store::prune_expired_auth_rows` directly, so deleting
+    /// `spawn_auth_prune(auth.clone())` from BOTH profile branches used to leave
+    /// the entire suite green — and ship a server whose `sessions` /
+    /// `auth_nonces` tables grow forever. Delete either call now and this fails:
+    /// the Dev branch stops compiling (nothing binds `passes`), and were it
+    /// stubbed out the counter would never leave 0.
+    ///
+    /// It also pins the two properties of the loop that only exist at runtime:
+    /// `tokio::time::interval` fires its FIRST tick immediately (so a box that is
+    /// restarted often still prunes), and the pass completes rather than the task
+    /// dying somewhere inside it.
+    #[tokio::test]
+    async fn prepare_spawns_the_background_auth_prune() {
+        let data_dir = tmp("prune-wiring");
+        let cfg = crate::config::LauncherConfig {
+            data_dir: data_dir.clone(),
+            port: 0,
+            bind: "127.0.0.1".to_owned(),
+            public_addr: None,
+            profile: crate::config::Profile::Dev,
+            database_url: None,
+            cold_tier: crate::config::ColdTierCfg::Off,
+            cache_capacity_bytes: 200_000_000_000,
+            offload_idle_days: 30,
+            direct_links_enabled: false,
+        };
+        let prepared = prepare(&cfg).await.expect("dev prepare");
+
+        // The task is spawned, not awaited, so yield until its first pass lands.
+        // Generous ceiling because this asserts "it happens", not "how fast".
+        let mut passes = 0;
+        for _ in 0..200 {
+            passes = prepared.auth_prune_passes.load(Ordering::Relaxed);
+            if passes > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            passes > 0,
+            "prepare() returned without the background auth prune ever running a \
+             pass — sessions/auth_nonces would grow forever"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Containment is a WARNING, not a refusal: it cannot alias (a `blob_ref` is
+    /// 32 hex chars, never `blobs`), and refusing would be a tightening that could
+    /// stop an already-deployed server from booting.
+    #[test]
+    fn an_fs_cold_tier_inside_the_data_dir_is_allowed_with_a_warning() {
+        let data_dir = tmp("inside");
+        let layout = Layout::ensure(&data_dir).unwrap();
+        let cold = data_dir.join("cold");
+        reject_aliased_fs_cold_tier(&cold, &layout, &data_dir)
+            .expect("inside-the-data-dir must warn, not refuse");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
 }

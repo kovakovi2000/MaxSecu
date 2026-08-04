@@ -50,7 +50,7 @@ use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::{BundleBody, Manifest};
 use maxsecu_encoding::types::{Id, Suite, Timestamp};
 
-use crate::commands::auth::{AppDir, ConnectLock, Session};
+use crate::commands::auth::{AppDir, ConnectLock, Principal, Session};
 use crate::commands::bundle::open_bundle_members;
 use crate::commands::connection::{open_conn, reauth, server_of};
 use crate::commands::feed::{hex, hex16, now_ms};
@@ -118,8 +118,46 @@ async fn reshare_inner(
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
 
-    let username = { session.0.lock().await.username.clone() }
-        .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
+    // Sharing FROM the recovery account is deliberately refused, not faked. A
+    // recovery-minted grant carries `granted_by = RECOVERY_ID`, which the RECIPIENT
+    // cannot open, twice over:
+    //   * the server serves the recovery wrap's grant as an ANCESTOR, and every
+    //     ancestor is field-bound BEFORE the chain walk with `recipient_type !=
+    //     RecipientType::User => GrantMismatch("ancestor recipient_type")`
+    //     (client-core `download.rs`) — one bad entry fails the whole open;
+    //   * `RECOVERY_ID` is neither the author edge nor resolvable — `build_verify_ctx`
+    //     passes `NO_GRANTERS`/`NO_ADMINS`, both of which answer `None`, so the walk
+    //     ends in `GrantChainBroken`. No client has any TRUSTED source for the
+    //     recovery Ed25519 key today (the embedded pin carries only `enc_pub` + an
+    //     optional `mlkem_pub`).
+    // And `add_wrap` is idempotent-BY-REPLACE, so a recovery re-share to someone who
+    // already has working access would REPLACE their good grant with an unopenable
+    // one and silently destroy that access.
+    //
+    // CLOSED DECISION (2026-08-02): this is NOT a pending feature. Online sharing
+    // from a recovery session stays refused; the supported way to restore someone's
+    // access is the OFFLINE recovery-key ceremony (DESIGN §12.7 — `admin-core`
+    // `recovery.rs`), which mints the wrap + grant off the box under custody of the
+    // sealed cold key. The user-facing copy below must therefore point at that
+    // ceremony, not promise a later release.
+    //
+    // The error CODE `recovery_share_unsupported` is a STABLE, pinned identifier
+    // (`reshare_error_codes_are_sanitized_and_stable`) — the message may be reworded,
+    // the code may not.
+    let who = { session.0.lock().await.principal.clone() };
+    let username = match who {
+        Some(Principal::User { username }) => username,
+        Some(Principal::Recovery) => {
+            return Err(UiError::new(
+                "recovery_share_unsupported",
+                "Sharing is not supported from a recovery session. To give someone \
+                 access, share from that person's own account — or ask the operator \
+                 to run the offline recovery-key ceremony, which is the supported way \
+                 to restore access.",
+            ))
+        }
+        None => return Err(UiError::new("locked", "Sign in first.")),
+    };
 
     // Step 1: ONE reauth for the whole batch (one channel, one token).
     let server = server_of(&dir.0)?;
@@ -903,7 +941,9 @@ mod tests {
     fn session_with_identity() -> Session {
         Session(Mutex::new(SessionInner {
             identity: Some(Identity::generate()),
-            username: Some("me".to_owned()),
+            principal: Some(Principal::User {
+                username: "me".to_owned(),
+            }),
             ..Default::default()
         }))
     }

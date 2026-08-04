@@ -8,7 +8,7 @@ Work through this whenever your diff touches a frozen surface. The pre-push hook
 
 ---
 
-## The eleven frozen surfaces
+## The twelve frozen surfaces
 
 Ordered by blast radius. Each one has a golden fixture (yesterday's bytes) **and** a value lock (the constants that *are* the format).
 
@@ -18,15 +18,40 @@ Ordered by blast radius. Each one has a golden fixture (yesterday's bytes) **and
 | 2 | DEK wrap V1 (HPKE) + V2 (1168-byte hybrid) | Every file's key unrecoverable. The data is intact and unreachable. | `crypto/wrap.rs`, `crypto/hybrid.rs` |
 | 3 | `MXKB` keyblob v1 **and** v2 | User cannot log in. Their identity is gone; every wrap addressed to it is dead. | `client-core/keyblob.rs` |
 | 4 | `MXD5` seedblob + `recovery_key.blob` | Recovery dead, D5 root unrecoverable. The last resort stops being a resort. | `client-core/seedblob.rs`, `tools/maxsecu-setup` |
-| 5 | Canonical encoding: 13 `type_id`s + 13 `labels::*` | **Every signature ever made becomes invalid.** Bindings, certs, receipts — all of them. | `crates/encoding` |
+| 5 | Canonical encoding: **14** `type_id`s + 13 `labels::*` | **Every signature ever made becomes invalid.** Bindings, certs, receipts — all of them. | `crates/encoding` |
 | 6 | 113-byte delegation cert + pinned `.der` layouts | Client rejects the directory and fails closed → total lockout. | `crypto/delegation.rs`, `client-app/config.rs` |
 | 7 | `canonical_pin` (33 B classical / 1217 B hybrid) + `pin_fp` | Already-shipped clients cannot verify their pinned server. You cannot patch a binary a user already has. | `client-app/recovery_pin.rs`, `crypto/pin_fp.rs` |
 | 8 | `blob_ref` = `hex(file_id)/version/stream_type` | Every stored chunk orphans. The bytes are on disk under a name nothing looks up. | `server/blob.rs` |
 | 9 | DB schema | Every existing server strands — `upgrade-server.sh` cannot conjure a column. | `docs/schema.sql`, `migrations/` |
-| 10 | `/v1` HTTP JSON, both directions | Old client ↔ new server desync. Users do not upgrade in lockstep with the server. | `server/http.rs` |
+| 10 | `/v1` HTTP JSON, both directions | Old client ↔ new server desync. Users do not upgrade in lockstep with the server. **The freeze covers route existence + JSON shape AND *who may call a route*: loosening a caller check (a principal that used to get `403` now gets an answer) is a **widening** — safe, but ledger it; tightening one (a caller that used to succeed now gets `403`) is a **break**, and no golden fixture will catch it for you.** | `server/http.rs` |
 | 11 | Client on-disk state (`config`, `tofu`, `contacts`, `index`, `upload_staging`) | Silent data loss. And a TOFU reset is a **security** downgrade, not just an annoyance — it re-opens the very MITM window the pin closed. | `client-app/{config,tofu,contacts,index,upload_staging}.rs` |
+| 12 | `MXBU` sealed server-backup bundle (`type_id 0x000F` index) + migration `0002` tables (`file_tombstones`, `wrap_revocations`) | **A bundle that stops opening = rollback fails exactly when you need it** — the TLS key, the operational signing seed, the Dropbox refresh token and a full `pg_dump` are all sealed inside; nobody can rebuild the box without it. And a merge that misreads the tombstone / revocation tables resurrects a deleted file (a zombie feed entry over ciphertext that is gone) or hands a de-authorized recipient their wrapped DEK back. | `server/backup/format.rs`, `encoding::BackupIndex` (`0x000F`), `migrations/0002_delete_tombstones.sql` |
 
 **Deliberately not frozen:** `cache/frag/*.blob` and the other `SessionSeal` caches — sealed under a per-process ephemeral key and rebuilt on demand. Nothing is lost when their format changes.
+
+**Surface #10 — adding an optional query parameter is a WIDENING.** `ListQuery` and its siblings carry no `#[serde(deny_unknown_fields)]` (`crates/server/src/http.rs:2045-2066`), and `serde_urlencoded` drops what it does not know. So an **old** client's unchanged request still parses against a new server, and a **new** client's extra parameters are silently ignored by an old server. That second half is the dangerous one and it is not automatically safe: a parameter an old server ignores must have a **detectable** absence in the response, or the new client will act on an answer it did not ask for. The 2026-08-02 listing entry is the worked example — `offset` is ignored by prod `41912da`, so the client keys off the absence of the new `total` field and disables paging entirely rather than trusting its own page number.
+
+---
+
+## The deployment surface (not a byte format, same rule)
+
+`scripts/` is not in the twelve, because nothing there is a stored format. It is here anyway, because the two worst near-misses in this project's history came from it: an installer that deleted the TLS identity every client had pinned, and a unit-env reader that silently returned "unset" (see the 2026-07-14 and 2026-08-02 deployment entries in [`LEDGER.md`](LEDGER.md)). The rule applies unchanged: **an operator action must not cost an existing user access.**
+
+**The unit-env parser is duplicated in FIVE scripts and MUST stay byte-identical:**
+
+| script | line |
+|---|---|
+| `scripts/install-server.sh` | `:461` |
+| `scripts/upgrade-server.sh` | `:582` |
+| `scripts/backup-server.sh` | `:243` |
+| `scripts/restore-server.sh` | `:375` |
+| `scripts/fingerprint.sh` | `:79` |
+
+If you change one, change all five, and re-check the md5 of the function body across them. **Why it is not in `scripts/lib/`:** the server tree is delivered to production by SFTP drag-and-drop with **no git**. A partial copy that omitted `scripts/lib/` would make a `. scripts/lib/…` line abort under `set -euo pipefail` — and one of the five callers is `restore-server.sh`, i.e. the **dead-box rebuild** path. A sourcing failure there turns a recoverable box into an unrecoverable one, which is a strictly worse failure than the duplication it would have avoided. *(A test asserting the five copies are identical would be a reasonable addition to `crates/compat/tests/`; none exists today.)*
+
+**KNOWN, DELIBERATE DEVIATION FROM SYSTEMD — carried in all five copies.** Real systemd applies `EnvironmentFile=` **after** `Environment=`, so the **file overrides** the unit line. These scripts consult the file only as a **fallback**. It is documented in-line in every copy (e.g. `scripts/install-server.sh:459-465`) and was left unchanged on purpose: the variable at stake is `DATABASE_URL`, and flipping the precedence could change **which database an upgrade migrates** on a box that sets it in both places. Fixing it is a behaviour change and needs its own decision. Until then: **never set `DATABASE_URL` in both an `Environment=` line and an `EnvironmentFile`.**
+
+**Two smaller, pre-existing limits, recorded so nobody rediscovers them:** the parser does not handle multiple assignments on one `Environment=` line (systemd permits `Environment=A=1 B=2`; it takes everything after the first `NAME=` to end of line — no unit this repo installs is affected, but a hand-edited one could be misread); and `scripts/fingerprint.sh:127` / `scripts/upgrade-server.sh:341` read `ExecStart` from the **base unit only**, so a drop-in that overrides `ExecStart` is missed by both.
 
 ---
 

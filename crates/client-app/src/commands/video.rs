@@ -28,9 +28,14 @@
 //!   decrypts only the fragments covering the requested byte span, capped at
 //!   [`MAX_RANGE_BODY`]; only ciphertext is cached (in RAM or on disk per the
 //!   cache-location setting — ciphertext-only either way), plaintext is transient.
-//! * **Reauth/serial discipline.** Each authed command mints a fresh channel+token
-//!   under the `ConnectLock` (the Phase-3 `reauth` pattern); the identity is
-//!   borrowed only under the session lock across the SYNCHRONOUS verify.
+//! * **Reauth/serial discipline.** [`open_video`] BORROWS a warm channel+token from
+//!   the authed-connection pool (`commands::pool`) and LENDS it for the session,
+//!   instead of minting a login per open — an open per bundle member used to walk
+//!   the account straight into the server's challenge cap. [`cancel_video`] hands
+//!   the same channel back ([`end_video_session`]), so N sequential opens (the
+//!   Stacked bundle view, which serializes them) cost ONE login rather than N. A
+//!   login is still only ever minted by `reauth` under the `ConnectLock`; the
+//!   identity is borrowed only under the session lock across the SYNCHRONOUS verify.
 //! * **Fail-closed everywhere** with a sanitized [`PlayerPhase::Error`]/`UiError`
 //!   (no decode oracle).
 
@@ -40,22 +45,24 @@ use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use maxsecu_client_core::{
-    open_content_decryptor, verify_and_open_headers, ContentDecryptor, Identity,
-    MemoryTrustStore, StreamHeader,
+    open_content_decryptor, verify_and_open_headers, ContentDecryptor, Identity, MemoryTrustStore,
+    StreamHeader,
 };
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::Manifest;
 use maxsecu_encoding::types::StreamType;
 
 use crate::blob_cache::{BlobCache, Ns};
-use crate::commands::auth::{AppDir, ConnectLock, Session};
-use crate::commands::connection::{reauth, server_of};
-use crate::commands::feed::{hex, hex16, now_ms};
+use crate::commands::auth::{AppDir, ConnectLock, Principal, Session};
+use crate::commands::connection::server_of;
+use crate::commands::feed::{hex, hex16, now_ms, reauth_channel};
+use crate::commands::pool::{get_on_pooled_channel, AppPool};
 use crate::config::{load_directory_pub, RouteMode, SettingsConfig};
-use crate::directory::{resolve_and_verify_author_logged, resolve_my_user_id, VerifiedAuthor};
+use crate::directory::{
+    resolve_and_verify_author_logged, resolve_my_user_id, Recipient, VerifiedAuthor,
+};
 use crate::download::{build_stream_header, parse_file_view};
 use crate::error::UiError;
-use crate::http_client::get_json;
 use crate::jobs::{AuthedChannel, UploadJobs, VideoJob, VideoJobs};
 use crate::media_cache::MediaCache;
 use crate::state::{PlayerPhase, EVT_PLAYER};
@@ -88,7 +95,9 @@ fn player_err() -> UiError {
 
 /// The connection for this session dropped; the caller (stream_media_inner) may
 /// reconnect once and retry. Distinct from player_err so the retry is targeted.
-fn channel_dead() -> UiError { UiError::new("channel_dead", "The video connection dropped.") }
+fn channel_dead() -> UiError {
+    UiError::new("channel_dead", "The video connection dropped.")
+}
 
 /// SYNCHRONOUS TCB step: from the unlocked `identity` + a D5-VERIFIED `author`,
 /// run the §12.5 header ladder to (a) parse the authenticated fragment index out
@@ -102,12 +111,12 @@ fn open_video_job_core(
     identity: &Identity,
     file_id: [u8; 16],
     author: &VerifiedAuthor,
-    my_id: [u8; 16],
+    me: Recipient,
     header: &StreamHeader,
 ) -> Result<(ContentDecryptor, Vec<FragmentEntry>), UiError> {
     // The shared recipient-open ctx (content-substitution guard + the REQUIRED
     // `recipient_mlkem_seed` for V2/PQ videos) lives in `build_verify_ctx`.
-    let ctx = crate::directory::build_verify_ctx(file_id, author, my_id, identity);
+    let ctx = crate::directory::build_verify_ctx(file_id, author, me, identity);
 
     // Verify the header + decode the small streams; take the authenticated
     // `metadata` plaintext and parse the (re-validated) fragment index from it.
@@ -218,7 +227,11 @@ async fn probe_total_len(
     // Phase 3 below, with a targeted forced-proxy retry on failure.
     let (mut ct, mut used_direct) = {
         let mut ch = channel.lock().await;
-        let AuthedChannel { sender, host, token } = &mut *ch;
+        let AuthedChannel {
+            sender,
+            host,
+            token,
+        } = &mut *ch;
         crate::direct_link::fetch_chunk_routed(
             sender,
             host.as_str(),
@@ -250,7 +263,11 @@ async fn probe_total_len(
             Ok(last_len) => return crate::stream::total_len(n, chunk_size, last_len),
             Err(_) if used_direct => {
                 let mut ch = channel.lock().await;
-                let AuthedChannel { sender, host, token } = &mut *ch;
+                let AuthedChannel {
+                    sender,
+                    host,
+                    token,
+                } = &mut *ch;
                 ct = crate::direct_link::fetch_chunk_proxy(
                     sender,
                     host.as_str(),
@@ -294,6 +311,9 @@ fn trusted_total_len(n: u64, chunk_size: u64, server_total: u64) -> Option<u64> 
 /// native `<video>` element drives playback via the `stream://` range protocol
 /// ([`serve_range`]/[`stream_media`]) once this registers the session. Emits
 /// [`PlayerPhase::Error`] over [`EVT_PLAYER`] on failure. Sanitized errors.
+// Argument count is the Tauri managed-state injection list, not real parameters —
+// only `file_id` crosses the seam.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn open_video(
     file_id: String,
@@ -303,8 +323,18 @@ pub async fn open_video(
     connect_lock: State<'_, ConnectLock>,
     jobs: State<'_, VideoJobs>,
     dir_cache: State<'_, crate::directory::DirectoryCache>,
+    pool: State<'_, AppPool>,
 ) -> Result<(), UiError> {
-    let out = open_video_inner(&file_id, &dir, &session, &connect_lock, &jobs, &dir_cache).await;
+    let out = open_video_inner(
+        &file_id,
+        &dir,
+        &session,
+        &connect_lock,
+        &jobs,
+        &dir_cache,
+        &pool,
+    )
+    .await;
     if let Err(e) = &out {
         let _ = app.emit(
             EVT_PLAYER,
@@ -312,14 +342,77 @@ pub async fn open_video(
                 code: e.code.clone(),
             },
         );
-        // Clean up any partially-registered job (drops the decryptor → zeroizes).
+        // Clean up any partially-registered job (drops the decryptor → zeroizes) and
+        // hand its channel back to the pool — a failed open must not cost the next
+        // read a login (the failure may well have been a `rate_limited` probe).
         if let Ok(bytes) = hex16(&file_id) {
-            jobs.0.lock().await.remove(&hex(&bytes));
+            end_video_session(&jobs, &pool, &hex(&bytes)).await;
         }
     }
     out
 }
 
+/// End the video session for `file_id_hex`: drop the job (which drops the
+/// `ContentDecryptor` → zeroizes the content subkey) and RETURN its authed channel
+/// to the pool so the next read — very often the next video in a Stacked bundle —
+/// reuses it instead of minting a login.
+///
+/// The channel is only ours to give back when nothing else still holds the job's
+/// channel `Arc` (an in-flight `serve_range` clones it for the duration of a fetch).
+/// If it does, the loan is FORGOTTEN instead: the channel then dies with that fetch,
+/// which costs one login and never risks two owners of one `SendRequest`.
+async fn end_video_session(jobs: &VideoJobs, pool: &AppPool, file_id_hex: &str) {
+    let removed = jobs.0.lock().await.remove(file_id_hex);
+    let channel = removed
+        .and_then(|job| job.channel)
+        // `into_inner` yields the channel only when this is the LAST `Arc`.
+        .and_then(Arc::into_inner)
+        .map(|m| m.into_inner());
+    match channel {
+        Some(chan) => pool.return_lent(file_id_hex, chan),
+        None => pool.forget_lent(file_id_hex),
+    }
+}
+
+/// Install a freshly validated pooled channel into a LIVE video session's channel
+/// slot, taking the pool loan for it in the same breath. Returns `false` when there
+/// is no such session any more (⇒ the caller 404s).
+///
+/// Resolving the slot and calling [`AuthedPool::lend`](crate::commands::pool::AuthedPool::lend)
+/// must happen under ONE hold of the `VideoJobs` lock, because `end_video_session`
+/// — the teardown `cancel_video` runs — takes that same lock to remove the job and
+/// then clears the key's loan record (`return_lent`/`forget_lent`). Doing the lookup,
+/// dropping the lock, and only then lending left a window (real on the multi-threaded
+/// runtime, where the cancel runs on another worker) in which the teardown had
+/// ALREADY cleared the record, so the `lend` inserted a brand-new loan under a key
+/// whose session was gone: nothing would ever return or forget it and the entry lived
+/// for the rest of the process.
+///
+/// Holding the lock across the `lend` makes the cancel strictly ordered against it:
+/// either it happens first — we find no job, take no loan, and `validated` (a
+/// perfectly good warm channel) simply drops back into the pool — or it happens
+/// after, and it finds our loan and clears it. `lend` is synchronous and touches only
+/// the pool's own short-lived locks, so no await is held under the jobs lock.
+async fn install_session_channel(
+    jobs: &VideoJobs,
+    pool: &AppPool,
+    file_id_hex: &str,
+    validated: crate::commands::pool::PooledGuard<AuthedChannel>,
+) -> bool {
+    let (slot, fresh) = {
+        let g = jobs.0.lock().await;
+        match g.get(file_id_hex).and_then(|j| j.channel.clone()) {
+            // Lend under the SAME key, replacing the dead channel's loan: the session
+            // hands this one back at `cancel_video` instead.
+            Some(slot) => (slot, pool.lend(validated, file_id_hex)),
+            None => return false,
+        }
+    };
+    *slot.lock().await = fresh;
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn open_video_inner(
     file_id_str: &str,
     dir: &State<'_, AppDir>,
@@ -327,6 +420,7 @@ async fn open_video_inner(
     connect_lock: &State<'_, ConnectLock>,
     jobs: &State<'_, VideoJobs>,
     dir_cache: &State<'_, crate::directory::DirectoryCache>,
+    pool: &State<'_, AppPool>,
 ) -> Result<(), UiError> {
     // Validate the REQUESTED id up front (it is what the served record must bind to
     // and is interpolated into the request URL). Canonical lowercase hex is the
@@ -344,31 +438,34 @@ async fn open_video_inner(
     let mut trust = MemoryTrustStore::new();
     let now = now_ms();
 
-    let username = {
+    let principal = {
         let s = session.0.lock().await;
-        s.username.clone()
+        s.principal.clone()
     }
     .ok_or_else(|| UiError::new("locked", "Sign in first."))?;
 
     let server = server_of(&dir.0)?;
-    let (mut sender, host, token) = reauth(&dir.0, &server, session, connect_lock).await?;
-    // Offline-D5 hop (spec §3/§7): resolve the effective directory verifier over the
-    // pinned connection; fail closed on a bad delegation before any binding is trusted.
-    // A warm session delegation cache makes this a no-op (no extra round-trip) on the
-    // hot path shared by a bundle's videos.
-    let verifier =
-        crate::directory::build_delegated_verifier(&mut sender, &host, pinned, now).await?;
-
-    let (status, view_json) = get_json(
-        &mut sender,
+    // BORROW a warm authed channel for the whole OPEN (view + delegation + author +
+    // header). Opening a video used to mint a login every time, and the Stacked
+    // bundle view opens every member at once — the single fastest way to burn the
+    // server's 30-challenges-per-minute allowance. The §8.5 view GET is the pool's
+    // channel-health check and therefore runs FIRST (same order `decrypt_card`
+    // uses); the D5 delegation hop follows on the validated channel, still before
+    // any binding is trusted. A warm session delegation cache makes that hop a
+    // no-op (no extra round-trip) on the hot path shared by a bundle's videos.
+    let (mut chan, view_json) = get_on_pooled_channel(
+        pool,
+        &principal,
         &format!("/v1/files/{file_id_hex}?version=latest"),
-        Some(&token),
-        &host,
+        UiError::new("fetch_failed", "That item is not available."),
+        || reauth_channel(&dir.0, &server, session, connect_lock),
     )
     .await?;
-    if status != hyper::StatusCode::OK {
-        return Err(UiError::new("fetch_failed", "That item is not available."));
-    }
+    let host = chan.host.clone();
+    let token = chan.token.clone();
+    let verifier =
+        crate::directory::build_delegated_verifier(&mut chan.sender, &host, pinned, now).await?;
+
     let view = parse_file_view(&view_json)?;
     let manifest: Manifest =
         decode(&view.manifest_bytes).map_err(|_| UiError::new("untrusted", "Malformed record."))?;
@@ -382,7 +479,7 @@ async fn open_video_inner(
         Some(a) => a,
         None => {
             let (author, author_binding) = resolve_and_verify_author_logged(
-                &mut sender,
+                &mut chan.sender,
                 &host,
                 &hex(&author_id),
                 &verifier,
@@ -404,21 +501,33 @@ async fn open_video_inner(
         }
     };
     // My own user_id is stable for the session — cache it after the first resolve.
-    let my_id = match dir_cache.my_id(&username) {
-        Some(id) => id,
-        None => {
-            let id =
-                resolve_my_user_id(&mut sender, &host, &username, &verifier, &mut trust, now)
-                    .await?;
-            dir_cache.put_my_id(&username, id);
-            id
-        }
+    // The recovery principal's id is the constant sentinel (no directory binding
+    // exists for it), so it needs no lookup and nothing to memoize — which is why
+    // the branch lives here and `DirectoryCache` (username-keyed) is untouched.
+    let me = match &principal {
+        Principal::Recovery => Recipient::Recovery,
+        Principal::User { username } => match dir_cache.my_id(username) {
+            Some(id) => Recipient::User(id),
+            None => {
+                let id = resolve_my_user_id(
+                    &mut chan.sender,
+                    &host,
+                    username,
+                    &verifier,
+                    &mut trust,
+                    now,
+                )
+                .await?;
+                dir_cache.put_my_id(username, id);
+                Recipient::User(id)
+            }
+        },
     };
 
     // Header (small streams only — no content fetched here). Prefers the
     // direct-link route per the effective `route_mode`.
     let (header, header_used_direct) = build_stream_header(
-        &mut sender,
+        &mut chan.sender,
         &host,
         &token,
         &file_id_hex,
@@ -441,12 +550,12 @@ async fn open_video_inner(
             .identity
             .as_ref()
             .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-        open_video_job_core(identity, file_id, &author, my_id, &header)
+        open_video_job_core(identity, file_id, &author, me, &header)
     } {
         Ok(opened) => opened,
         Err(e) if header_used_direct => {
             let (header, _) = build_stream_header(
-                &mut sender,
+                &mut chan.sender,
                 &host,
                 &token,
                 &file_id_hex,
@@ -460,7 +569,7 @@ async fn open_video_inner(
                 .identity
                 .as_ref()
                 .ok_or_else(|| UiError::new("locked", "Unlock your keystore first."))?;
-            open_video_job_core(identity, file_id, &author, my_id, &header).map_err(|_| e)?
+            open_video_job_core(identity, file_id, &author, me, &header).map_err(|_| e)?
         }
         Err(e) => return Err(e),
     };
@@ -477,8 +586,11 @@ async fn open_video_inner(
     // Prefer the server-advertised plaintext length when it is consistent with the
     // AUTHENTICATED content_chunk_count (skips the last-chunk fetch+decrypt probe →
     // faster time-to-first-frame). `None` ⇒ fall back to the authenticated probe.
-    let trusted_total =
-        trusted_total_len(decryptor.content_chunk_count(), chunk_size, content_stream.total_bytes);
+    let trusted_total = trusted_total_len(
+        decryptor.content_chunk_count(),
+        chunk_size,
+        content_stream.total_bytes,
+    );
 
     // Register the session; probe the total plaintext length by decrypting ONLY the
     // last fragment once, but ONLY when the server length was unusable (`route_mode`
@@ -487,12 +599,19 @@ async fn open_video_inner(
     // startup, Task 7) — no per-job cache is created here.
 
     // Move the open-time authed connection into a persistent channel for all range
-    // fetches in this session (probe_total_len + every serve_range). After this point
-    // `sender`/`host`/`token` are consumed — all subsequent network access goes
-    // through the channel's Mutex, serializing overlapping range requests.
-    let channel = Arc::new(tokio::sync::Mutex::new(
-        AuthedChannel { sender, host, token },
-    ));
+    // fetches in this session (probe_total_len + every serve_range). `lend` takes it
+    // out of the pool's rotation for the session: this channel outlives the command
+    // (it lives until `cancel_video`), so holding a pool guard — and its permit — for
+    // the whole playback would starve every other reader. The loan is REMEMBERED
+    // under `file_id_hex`, so `end_video_session` hands the very same channel back
+    // when playback ends and the NEXT video open reuses it instead of minting a
+    // login — the whole point: a Stacked bundle of N videos costs one login, not N.
+    // After this point all network access goes through the channel's Mutex,
+    // serializing overlapping range requests.
+    let channel = Arc::new(tokio::sync::Mutex::new(pool.lend(chan, &file_id_hex)));
+    // A re-open of the SAME video without a `cancel_video` in between replaces the
+    // old job here; its channel dies with it (and the `lend` above already replaced
+    // that key's loan record, so the accounting stays one live loan per session).
     jobs.0.lock().await.insert(
         file_id_hex.clone(),
         VideoJob {
@@ -519,16 +638,21 @@ async fn open_video_inner(
 }
 
 /// `cancel_video` — drop the session from `VideoJobs` (drops the `ContentDecryptor`
-/// → zeroizes the content subkey). Emits the benign terminal `Error { code:
-/// "cancelled" }`.
+/// → zeroizes the content subkey) and hand the session's authed channel back to the
+/// pool ([`end_video_session`]) so the next open reuses it. Emits the benign
+/// terminal `Error { code: "cancelled" }`.
+///
+/// `pool` is Tauri managed state injected by type — nothing new crosses the seam,
+/// the JS call site is unchanged (`call("cancel_video", { fileId })`).
 #[tauri::command]
 pub async fn cancel_video(
     file_id: String,
     app: tauri::AppHandle,
     jobs: State<'_, VideoJobs>,
+    pool: State<'_, AppPool>,
 ) -> Result<(), UiError> {
     if let Ok(bytes) = hex16(&file_id) {
-        jobs.0.lock().await.remove(&hex(&bytes));
+        end_video_session(&jobs, &pool, &hex(&bytes)).await;
     }
     let _ = app.emit(
         EVT_PLAYER,
@@ -674,7 +798,15 @@ pub async fn serve_range(
             }
         }
         let channel = job.channel.clone().ok_or_else(player_err)?;
-        (req, plan, job.total_len, job.version, fetch_indices, channel, job.route_mode)
+        (
+            req,
+            plan,
+            job.total_len,
+            job.version,
+            fetch_indices,
+            channel,
+            job.route_mode,
+        )
     };
 
     // Phase B — prefetch missing ciphertext under the channel lock (no global jobs lock
@@ -687,7 +819,11 @@ pub async fn serve_range(
     let mut direct_used: HashSet<u64> = HashSet::new();
     {
         let mut ch = channel.lock().await;
-        let AuthedChannel { sender, host, token } = &mut *ch;
+        let AuthedChannel {
+            sender,
+            host,
+            token,
+        } = &mut *ch;
         for i in fetch_indices {
             let (bytes, used_direct) = crate::direct_link::fetch_chunk_routed(
                 sender,
@@ -738,7 +874,11 @@ pub async fn serve_range(
             // untrusted). Refetch exactly those indices via the forced proxy...
             {
                 let mut ch = channel.lock().await;
-                let AuthedChannel { sender, host, token } = &mut *ch;
+                let AuthedChannel {
+                    sender,
+                    host,
+                    token,
+                } = &mut *ch;
                 for i in &direct_used {
                     let bytes = crate::direct_link::fetch_chunk_proxy(
                         sender,
@@ -780,13 +920,20 @@ pub async fn serve_range(
         Err(e) => return Err(e),
     };
 
-    Ok(RangeResponse { start: req.start, len: req.len, total_len, body })
+    Ok(RangeResponse {
+        start: req.start,
+        len: req.len,
+        total_len,
+        body,
+    })
 }
 
 /// The `stream://media/<file_id_hex>` protocol entry point. Resolves the open
-/// session, mints a fresh authed channel (Phase-3 reauth), serves the requested
-/// byte range, and builds a `206 Partial Content` response. Errors map to 416
-/// (unsatisfiable range) or 500 (everything else) with an empty body — no oracle.
+/// session, serves the requested byte range over the session's own authed channel
+/// (reconnecting ONCE through the pool if that channel died — see
+/// [`stream_media_inner`]), and builds a `206 Partial Content` response. Errors map
+/// to 416 (unsatisfiable range) or 500 (everything else) with an empty body — no
+/// oracle.
 pub async fn stream_media(
     app: &tauri::AppHandle,
     path: &str,
@@ -803,10 +950,18 @@ pub async fn stream_media(
             )
             .header(http::header::CONTENT_LENGTH, r.len.to_string())
             .body(r.body)
-            .unwrap_or_else(|_| http::Response::builder().status(500).body(Vec::new()).unwrap()),
+            .unwrap_or_else(|_| {
+                http::Response::builder()
+                    .status(500)
+                    .body(Vec::new())
+                    .unwrap()
+            }),
         Err(code) => {
             let status = if code == 416 { 416 } else { 500 };
-            http::Response::builder().status(status).body(Vec::new()).unwrap()
+            http::Response::builder()
+                .status(status)
+                .body(Vec::new())
+                .unwrap()
         }
     }
 }
@@ -815,7 +970,11 @@ pub async fn stream_media(
 /// per-job temp dir). Bounded — never reads the whole file; caps the response to
 /// [`MAX_RANGE_BODY`]. Returns `None` (⇒ 416) for an unsatisfiable range or any
 /// I/O error (fail-closed). Pure — no lock, no network, no decrypt.
-fn preview_slice_file(path: &std::path::Path, first: u64, last_inclusive: Option<u64>) -> Option<RangeResponse> {
+fn preview_slice_file(
+    path: &std::path::Path,
+    first: u64,
+    last_inclusive: Option<u64>,
+) -> Option<RangeResponse> {
     use std::io::{Read, Seek, SeekFrom};
     let total = std::fs::metadata(path).ok()?.len();
     let req = crate::stream::resolve_range(first, last_inclusive, total, MAX_RANGE_BODY)?;
@@ -823,17 +982,33 @@ fn preview_slice_file(path: &std::path::Path, first: u64, last_inclusive: Option
     file.seek(SeekFrom::Start(req.start)).ok()?;
     let mut body = vec![0u8; req.len as usize];
     file.read_exact(&mut body).ok()?;
-    Some(RangeResponse { start: req.start, len: req.len, total_len: total, body })
+    Some(RangeResponse {
+        start: req.start,
+        len: req.len,
+        total_len: total,
+        body,
+    })
 }
 
 /// Serve one byte range of an author PREVIEW's staged fMP4 — plaintext the author
 /// already owns, read by range from disk; NO decrypt, NO auth, NO network.
 /// Unknown job / no preview ⇒ not_found; unsatisfiable range ⇒ range_not_satisfiable.
-async fn serve_preview_range(jobs: &UploadJobs, job_id: &str, first: u64, last_inclusive: Option<u64>) -> Result<RangeResponse, UiError> {
+async fn serve_preview_range(
+    jobs: &UploadJobs,
+    job_id: &str,
+    first: u64,
+    last_inclusive: Option<u64>,
+) -> Result<RangeResponse, UiError> {
     let guard = jobs.0.lock().await;
-    let job = guard.get(job_id).ok_or_else(|| UiError::new("not_found", "unknown preview"))?;
-    let preview = job.preview.as_ref().ok_or_else(|| UiError::new("not_found", "no preview"))?;
-    preview_slice_file(&preview.out_mp4_path, first, last_inclusive).ok_or_else(|| UiError::new("range_not_satisfiable", "range"))
+    let job = guard
+        .get(job_id)
+        .ok_or_else(|| UiError::new("not_found", "unknown preview"))?;
+    let preview = job
+        .preview
+        .as_ref()
+        .ok_or_else(|| UiError::new("not_found", "no preview"))?;
+    preview_slice_file(&preview.out_mp4_path, first, last_inclusive)
+        .ok_or_else(|| UiError::new("range_not_satisfiable", "range"))
 }
 
 /// Inner: resolve the namespace and id from the path, dispatch to the media (view)
@@ -849,7 +1024,10 @@ async fn stream_media_inner(
     // non-empty segment is the namespace (`media` or `preview`), the SECOND is the id.
     // Anything else (missing segment, extra segments, bare path) 404s.
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let (ns, id) = match segs.as_slice() { [ns, id] => (*ns, *id), _ => return Err(404u16) };
+    let (ns, id) = match segs.as_slice() {
+        [ns, id] => (*ns, *id),
+        _ => return Err(404u16),
+    };
 
     match ns {
         "media" => {
@@ -862,6 +1040,7 @@ async fn stream_media_inner(
             let connect_lock = app.state::<ConnectLock>();
             let jobs = app.state::<VideoJobs>();
             let media = app.state::<MediaCache>();
+            let pool = app.state::<AppPool>();
 
             // The session must already be open (open_video registered it).
             {
@@ -882,23 +1061,51 @@ async fn stream_media_inner(
                 Err(e) if e.code == "channel_dead" => {
                     // The persistent connection dropped. Reconnect ONCE (needs app
                     // state), replace the job's channel in-place, and retry the range.
+                    //
+                    // The replacement comes from the POOL — a warm channel costs no
+                    // login — but it must be PROVEN LIVE before it is installed,
+                    // which is exactly what `get_on_pooled_channel` does: it runs a
+                    // real authed GET (the §8.5 view of this very file) over the
+                    // channel and, on a 401 or a dead socket, falls back to a
+                    // genuinely fresh mint. Installing an unvalidated pooled channel
+                    // here would usually fail in precisely the scenario this branch
+                    // exists for: whatever killed the session's socket (server
+                    // restart, NAT/conntrack reap, network change) killed every idle
+                    // sibling at the same instant. The one extra round trip is the
+                    // health check, and it only happens on a mid-playback drop.
                     let server = server_of(&dir.0).map_err(|_| 500u16)?;
-                    let (sender, host, token) =
-                        reauth(&dir.0, &server, &session, &connect_lock).await.map_err(|_| 500u16)?;
-                    let chan = {
-                        let g = jobs.0.lock().await;
-                        g.get(&file_id_hex).and_then(|j| j.channel.clone())
-                    }
-                    .ok_or(404u16)?;
-                    {
-                        let mut c = chan.lock().await;
-                        *c = AuthedChannel { sender, host, token };
+                    let principal = { session.0.lock().await.principal.clone() }.ok_or(500u16)?;
+                    let (validated, _view) = get_on_pooled_channel(
+                        &pool,
+                        &principal,
+                        &format!("/v1/files/{file_id_hex}?version=latest"),
+                        player_err(),
+                        || reauth_channel(&dir.0, &server, &session, &connect_lock),
+                    )
+                    .await
+                    .map_err(|_| 500u16)?;
+                    // Install it into the live session — resolving the slot and
+                    // taking the loan as ONE step, so a `cancel_video` racing this
+                    // reconnect can never leave a loan behind for a session that has
+                    // already ended (see `install_session_channel`).
+                    if !install_session_channel(&jobs, &pool, &file_id_hex, validated).await {
+                        return Err(404u16);
                     }
                     serve_range(&jobs, &media, &file_id_hex, first, last_inclusive)
                         .await
-                        .map_err(|e| if e.code == "range_not_satisfiable" { 416 } else { 500 })
+                        .map_err(|e| {
+                            if e.code == "range_not_satisfiable" {
+                                416
+                            } else {
+                                500
+                            }
+                        })
                 }
-                Err(e) => Err(if e.code == "range_not_satisfiable" { 416 } else { 500 }),
+                Err(e) => Err(if e.code == "range_not_satisfiable" {
+                    416
+                } else {
+                    500
+                }),
             }
         }
         "preview" => {
@@ -907,7 +1114,8 @@ async fn stream_media_inner(
             // network — the author already owns this plaintext.
             let upload_jobs = app.state::<UploadJobs>();
             let (first, last_inclusive) = parse_byte_range(range_header);
-            serve_preview_range(&upload_jobs, id, first, last_inclusive).await
+            serve_preview_range(&upload_jobs, id, first, last_inclusive)
+                .await
                 .map_err(|e| match e.code.as_str() {
                     "not_found" => 404u16,
                     "range_not_satisfiable" => 416,
@@ -923,13 +1131,23 @@ async fn stream_media_inner(
 /// capped by `MAX_RANGE_BODY` in `resolve_range`). Only a single range is honored.
 fn parse_byte_range(h: Option<&str>) -> (u64, Option<u64>) {
     let Some(h) = h else { return (0, None) };
-    let Some(spec) = h.trim().strip_prefix("bytes=") else { return (0, None) };
+    let Some(spec) = h.trim().strip_prefix("bytes=") else {
+        return (0, None);
+    };
     let spec = spec.split(',').next().unwrap_or("").trim();
     let mut parts = spec.splitn(2, '-');
-    let first = parts.next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
-    let last = parts
+    let first = parts
         .next()
-        .and_then(|s| { let s = s.trim(); if s.is_empty() { None } else { s.parse::<u64>().ok() } });
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let last = parts.next().and_then(|s| {
+        let s = s.trim();
+        if s.is_empty() {
+            None
+        } else {
+            s.parse::<u64>().ok()
+        }
+    });
     (first, last)
 }
 
@@ -1064,8 +1282,14 @@ mod tests {
         let (owner, bundle, _content) = build_video();
         let (header, chunks) = split(&bundle);
         let author = author_of(&owner);
-        let (decryptor, index) =
-            open_video_job_core(&owner, FILE_ID.0, &author, OWNER_ID.0, &header).expect("core");
+        let (decryptor, index) = open_video_job_core(
+            &owner,
+            FILE_ID.0,
+            &author,
+            Recipient::User(OWNER_ID.0),
+            &header,
+        )
+        .expect("core");
         assert_eq!(index.len(), 2, "two-fragment index parsed");
         let dir = tmp_dir(tag);
         let cache = BlobCache::open(&dir, 1 << 20).unwrap();
@@ -1090,8 +1314,14 @@ mod tests {
         let (owner, bundle, _content) = build_video();
         let (header, _chunks) = split(&bundle);
         let author = author_of(&owner); // the genuine (D5-verified) author keys
-        let (dec, index) =
-            open_video_job_core(&owner, FILE_ID.0, &author, OWNER_ID.0, &header).expect("opens");
+        let (dec, index) = open_video_job_core(
+            &owner,
+            FILE_ID.0,
+            &author,
+            Recipient::User(OWNER_ID.0),
+            &header,
+        )
+        .expect("opens");
         assert_eq!(dec.version(), 1);
         assert_eq!(index.len(), 2);
     }
@@ -1113,7 +1343,13 @@ mod tests {
         };
         // `ContentDecryptor` is not `Debug`, so the `Ok` arm can't go through
         // `unwrap_err`; match the error directly.
-        let err = match open_video_job_core(&owner, FILE_ID.0, &forged, OWNER_ID.0, &header) {
+        let err = match open_video_job_core(
+            &owner,
+            FILE_ID.0,
+            &forged,
+            Recipient::User(OWNER_ID.0),
+            &header,
+        ) {
             Ok(_) => panic!("a forged author must not open the video"),
             Err(e) => e,
         };
@@ -1167,7 +1403,12 @@ mod tests {
         ));
         // A corrupt blob under another seq → not a hit (refetch, not fatal).
         cache
-            .put(Ns::Frag, &job.file_id_hex, 0, b"\xff\xff\xff\xff not a frame")
+            .put(
+                Ns::Frag,
+                &job.file_id_hex,
+                0,
+                b"\xff\xff\xff\xff not a frame",
+            )
             .unwrap();
         assert!(!cached_fragment_valid(
             &mut cache,
@@ -1176,6 +1417,259 @@ mod tests {
             0,
             2
         ));
+    }
+
+    // ---- the session's authed channel: lent for playback, handed back on cancel ----
+
+    /// A listener that completes real TCP connects (and holds the accepted sockets
+    /// open) so a genuine hyper HTTP/1.1 `SendRequest` can be handshaken against it.
+    /// The channel-lifecycle test below never sends a request over it — it asserts
+    /// on OWNERSHIP of the real `AuthedChannel`, so a stand-in type would prove
+    /// nothing about the code path that actually runs.
+    async fn spawn_socket_sink() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket); // keep the peer alive; never answer
+            }
+        });
+        format!("127.0.0.1:{}", addr.port())
+    }
+
+    /// Mint a REAL `AuthedChannel` over `addr`, tagged with `token` so a test can
+    /// tell one mint from another. Counts as one "login".
+    async fn mint_channel(
+        addr: &str,
+        logins: &std::sync::atomic::AtomicUsize,
+    ) -> Result<AuthedChannel, UiError> {
+        use std::sync::atomic::Ordering;
+        let n = logins.fetch_add(1, Ordering::SeqCst);
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (sender, conn) = hyper::client::conn::http1::handshake::<
+            _,
+            http_body_util::Full<hyper::body::Bytes>,
+        >(hyper_util::rt::TokioIo::new(tcp))
+        .await
+        .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(AuthedChannel {
+            sender,
+            host: "stub.localhost".into(),
+            token: format!("tok-{n}"),
+        })
+    }
+
+    /// THE HEADLINE CLAIM, at the video layer and over the REAL `AuthedChannel`:
+    /// N sequential video opens cost ONE login, not N. Each session borrows a pooled
+    /// channel, `lend`s it for playback, and `end_video_session` (what `cancel_video`
+    /// runs) hands the SAME channel back — so the next open reuses it. The Stacked
+    /// bundle view serializes its opens exactly like this loop, and it is the case
+    /// that used to walk the account into the server's 30-challenges-per-minute cap.
+    #[tokio::test]
+    async fn n_sequential_video_sessions_cost_one_login() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let addr = spawn_socket_sink().await;
+        let pool = AppPool::new(2);
+        let jobs = VideoJobs::new();
+        let principal = Principal::User {
+            username: "alice".into(),
+        };
+        let logins = AtomicUsize::new(0);
+
+        const OPENS: usize = 5;
+        let mut tokens = Vec::new();
+        for i in 0..OPENS {
+            // --- open_video: borrow a pooled channel and lend it to the session ---
+            let guard = pool
+                .acquire(&principal, || mint_channel(&addr, &logins))
+                .await
+                .expect("acquire");
+            let (job, _cache, _chunks) = build_job(&format!("lend-{i}"));
+            let chan = pool.lend(guard, &file_id_hex());
+            tokens.push(chan.token.clone());
+            let job = VideoJob {
+                channel: Some(Arc::new(tokio::sync::Mutex::new(chan))),
+                ..job
+            };
+            jobs.0.lock().await.insert(file_id_hex(), job);
+            assert!(jobs.0.lock().await.contains_key(&file_id_hex()));
+
+            // --- cancel_video: drop the session and hand the channel back ---
+            end_video_session(&jobs, &pool, &file_id_hex()).await;
+            assert!(
+                !jobs.0.lock().await.contains_key(&file_id_hex()),
+                "the session (and its decryptor) is gone after cancel"
+            );
+        }
+
+        assert_eq!(
+            logins.load(Ordering::SeqCst),
+            1,
+            "{OPENS} sequential video opens must cost ONE login, not {OPENS}"
+        );
+        assert!(
+            tokens.iter().all(|t| t == "tok-0"),
+            "every session reused the same authed channel: {tokens:?}"
+        );
+    }
+
+    /// The channel is only handed back when it is genuinely ours to hand back: if an
+    /// in-flight `serve_range` still holds the job's channel `Arc`, the session ends
+    /// (decryptor zeroized) and the loan is FORGOTTEN rather than two owners being
+    /// created for one `SendRequest`. The next open then mints — fail-safe, not
+    /// fail-fast.
+    #[tokio::test]
+    async fn a_channel_still_held_by_an_in_flight_fetch_is_not_handed_back() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let addr = spawn_socket_sink().await;
+        let pool = AppPool::new(2);
+        let jobs = VideoJobs::new();
+        let principal = Principal::User {
+            username: "alice".into(),
+        };
+        let logins = AtomicUsize::new(0);
+
+        let guard = pool
+            .acquire(&principal, || mint_channel(&addr, &logins))
+            .await
+            .expect("acquire");
+        let (job, _cache, _chunks) = build_job("inflight");
+        let chan = Arc::new(tokio::sync::Mutex::new(pool.lend(guard, &file_id_hex())));
+        // A `serve_range` in flight holds its own clone of the channel Arc.
+        let in_flight = chan.clone();
+        let job = VideoJob {
+            channel: Some(chan),
+            ..job
+        };
+        jobs.0.lock().await.insert(file_id_hex(), job);
+
+        end_video_session(&jobs, &pool, &file_id_hex()).await;
+        assert!(
+            !jobs.0.lock().await.contains_key(&file_id_hex()),
+            "the session is still torn down (the decryptor is zeroized)"
+        );
+
+        // The next open must MINT: the channel was not recoverable, and no stale
+        // bookkeeping was left behind that could hand back a channel we do not own.
+        drop(in_flight);
+        let g = pool
+            .acquire(&principal, || mint_channel(&addr, &logins))
+            .await
+            .expect("acquire");
+        assert_eq!(
+            g.token, "tok-1",
+            "a fresh channel, not the unreturnable one"
+        );
+        assert_eq!(logins.load(Ordering::SeqCst), 2);
+    }
+
+    /// The mid-playback reconnect (`stream_media_inner`'s `channel_dead` branch) must
+    /// not record a loan for a session that has already ended. `end_video_session`
+    /// clears the key's loan record; a `lend` that lands after it would insert a
+    /// fresh record under a key nobody will ever return or forget, and that entry
+    /// would live for the rest of the process. `install_session_channel` takes the
+    /// loan under the same jobs-lock hold as the lookup, so "no session" and "no
+    /// loan" are decided together.
+    #[tokio::test]
+    async fn a_reconnect_after_the_session_ended_records_no_loan() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let addr = spawn_socket_sink().await;
+        let pool = AppPool::new(2);
+        let jobs = VideoJobs::new(); // cancel_video already tore the session down
+        let principal = Principal::User {
+            username: "alice".into(),
+        };
+        let logins = AtomicUsize::new(0);
+
+        let validated = pool
+            .acquire(&principal, || mint_channel(&addr, &logins))
+            .await
+            .expect("acquire");
+        let installed = install_session_channel(&jobs, &pool, &file_id_hex(), validated).await;
+
+        assert!(!installed, "there is no live session to install into");
+        assert_eq!(
+            pool.lent_count(),
+            0,
+            "no loan may be recorded for a session that has ended"
+        );
+        // …and the perfectly good warm channel went BACK to the pool rather than
+        // being stranded: the next read costs no login.
+        let g = pool
+            .acquire(&principal, || mint_channel(&addr, &logins))
+            .await
+            .expect("acquire");
+        assert_eq!(g.token, "tok-0", "the validated channel was re-pooled");
+        assert_eq!(logins.load(Ordering::SeqCst), 1, "no extra login");
+    }
+
+    /// The same path with the session LIVE: the channel is installed into the
+    /// session's slot and the loan is recorded, so `end_video_session` hands this
+    /// very channel back to the pool afterwards (one login, not two).
+    #[tokio::test]
+    async fn a_reconnect_installs_the_channel_and_its_loan_is_returnable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let addr = spawn_socket_sink().await;
+        let pool = AppPool::new(2);
+        let jobs = VideoJobs::new();
+        let principal = Principal::User {
+            username: "alice".into(),
+        };
+        let logins = AtomicUsize::new(0);
+
+        // A live session whose channel died mid-playback (the `channel_dead` branch).
+        let dead = pool
+            .acquire(&principal, || mint_channel(&addr, &logins))
+            .await
+            .expect("acquire");
+        let (job, _cache, _chunks) = build_job("reconnect");
+        let job = VideoJob {
+            channel: Some(Arc::new(tokio::sync::Mutex::new(
+                pool.lend(dead, &file_id_hex()),
+            ))),
+            ..job
+        };
+        jobs.0.lock().await.insert(file_id_hex(), job);
+
+        // The reconnect installs a validated replacement under the SAME key.
+        let validated = pool
+            .acquire(&principal, || mint_channel(&addr, &logins))
+            .await
+            .expect("acquire");
+        assert!(install_session_channel(&jobs, &pool, &file_id_hex(), validated).await);
+        assert_eq!(
+            pool.lent_count(),
+            1,
+            "exactly one live loan for the session"
+        );
+        {
+            let job = jobs.0.lock().await;
+            let slot = job.get(&file_id_hex()).unwrap().channel.clone().unwrap();
+            assert_eq!(
+                slot.lock().await.token,
+                "tok-1",
+                "the session now streams over the validated channel"
+            );
+        }
+
+        // cancel_video: the replacement goes back to the pool and the next read
+        // reuses it instead of minting.
+        end_video_session(&jobs, &pool, &file_id_hex()).await;
+        assert_eq!(pool.lent_count(), 0, "no bookkeeping left behind");
+        let g = pool
+            .acquire(&principal, || mint_channel(&addr, &logins))
+            .await
+            .expect("acquire");
+        assert_eq!(g.token, "tok-1", "the returned channel is reused");
+        assert_eq!(logins.load(Ordering::SeqCst), 2, "no third login");
     }
 
     // ---- cancel: dropping the job drops (zeroizes) the decryptor ----
@@ -1241,16 +1735,22 @@ mod tests {
     fn trusted_total_len_accepts_only_last_chunk_consistent_lengths() {
         let cs = 1024 * 1024;
         // n=3 chunks: total must be in ((3-1)*cs, 3*cs] = (2 MiB, 3 MiB].
-        assert_eq!(super::trusted_total_len(3, cs, 2 * cs + 1), Some(2 * cs + 1)); // just over lo
+        assert_eq!(
+            super::trusted_total_len(3, cs, 2 * cs + 1),
+            Some(2 * cs + 1)
+        ); // just over lo
         assert_eq!(super::trusted_total_len(3, cs, 3 * cs), Some(3 * cs)); // full last chunk
-        assert_eq!(super::trusted_total_len(3, cs, 2 * cs + 500), Some(2 * cs + 500));
+        assert_eq!(
+            super::trusted_total_len(3, cs, 2 * cs + 500),
+            Some(2 * cs + 500)
+        );
         // Out of band → probe (None).
         assert_eq!(super::trusted_total_len(3, cs, 2 * cs), None); // == lo (too small)
         assert_eq!(super::trusted_total_len(3, cs, 3 * cs + 1), None); // > hi
         assert_eq!(super::trusted_total_len(3, cs, 0), None); // absent
         assert_eq!(super::trusted_total_len(0, cs, 100), None); // no chunks
         assert_eq!(super::trusted_total_len(3, 0, 100), None); // no chunk size
-        // n=1: total in (0, cs].
+                                                               // n=1: total in (0, cs].
         assert_eq!(super::trusted_total_len(1, cs, 1), Some(1));
         assert_eq!(super::trusted_total_len(1, cs, cs), Some(cs));
         assert_eq!(super::trusted_total_len(1, cs, cs + 1), None);
@@ -1260,10 +1760,16 @@ mod tests {
     fn parse_byte_range_forms() {
         assert_eq!(super::parse_byte_range(None), (0, None));
         assert_eq!(super::parse_byte_range(Some("bytes=0-")), (0, None));
-        assert_eq!(super::parse_byte_range(Some("bytes=100-199")), (100, Some(199)));
+        assert_eq!(
+            super::parse_byte_range(Some("bytes=100-199")),
+            (100, Some(199))
+        );
         assert_eq!(super::parse_byte_range(Some("bytes=500-")), (500, None));
         assert_eq!(super::parse_byte_range(Some("garbage")), (0, None));
-        assert_eq!(super::parse_byte_range(Some("bytes=0-99,200-299")), (0, Some(99)));
+        assert_eq!(
+            super::parse_byte_range(Some("bytes=0-99,200-299")),
+            (0, Some(99))
+        );
     }
 
     /// `preview_slice_file` reads exactly the requested bounded range from disk, caps
@@ -1290,16 +1796,20 @@ mod tests {
         }
 
         // Bounded range [100, 199] inclusive → exactly 100 bytes at the right offset.
-        let r = preview_slice_file(&path, 100, Some(199))
-            .expect("bounded range should be satisfiable");
+        let r =
+            preview_slice_file(&path, 100, Some(199)).expect("bounded range should be satisfiable");
         assert_eq!(r.start, 100);
         assert_eq!(r.len, 100);
         assert_eq!(r.total_len, 5000);
-        assert_eq!(r.body, data[100..200].to_vec(), "body must match file bytes [100,200)");
+        assert_eq!(
+            r.body,
+            data[100..200].to_vec(),
+            "body must match file bytes [100,200)"
+        );
 
         // Open-ended [0, ): 5000 < MAX_RANGE_BODY → entire file returned.
-        let r2 = preview_slice_file(&path, 0, None)
-            .expect("open-ended range should be satisfiable");
+        let r2 =
+            preview_slice_file(&path, 0, None).expect("open-ended range should be satisfiable");
         assert_eq!(r2.len, 5000);
         assert_eq!(r2.total_len, 5000);
         assert_eq!(r2.body, data, "open-ended body must equal entire file");
@@ -1318,7 +1828,8 @@ mod tests {
     #[tokio::test]
     async fn cache_stats_memory_never_over_cap() {
         let dir = tmp_dir("stats-cap");
-        let media = MediaCache::open(&dir, 1, crate::config::FragmentCacheLocation::Memory).unwrap();
+        let media =
+            MediaCache::open(&dir, 1, crate::config::FragmentCacheLocation::Memory).unwrap();
         {
             let mut c = media.0.lock().await;
             for s in 0..8u32 {
@@ -1328,7 +1839,10 @@ mod tests {
         let cap = 200 * 1024;
         let (used, disk_mode) = media.gauge_fill(cap).await;
         assert!(!disk_mode);
-        assert!(used <= cap, "fill {used} must not exceed the live cap {cap}");
+        assert!(
+            used <= cap,
+            "fill {used} must not exceed the live cap {cap}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1338,8 +1852,15 @@ mod tests {
     async fn clear_one_cache_leaves_the_other_intact() {
         let dir = tmp_dir("clear-indep");
         let seal = std::sync::Arc::new(crate::session_seal::SessionSeal::generate());
-        let media = MediaCache::open(&dir, 1, crate::config::FragmentCacheLocation::Memory).unwrap();
-        let thumb = ThumbCache::new(&dir, 64, crate::config::FragmentCacheLocation::Memory, seal.clone()).unwrap();
+        let media =
+            MediaCache::open(&dir, 1, crate::config::FragmentCacheLocation::Memory).unwrap();
+        let thumb = ThumbCache::new(
+            &dir,
+            64,
+            crate::config::FragmentCacheLocation::Memory,
+            seal.clone(),
+        )
+        .unwrap();
         let key = crate::thumb_cache::CacheKey {
             file_id: [5u8; 16],
             version: 1,
@@ -1366,7 +1887,10 @@ mod tests {
         // Clearing Media leaves Thumbnails intact…
         media.0.lock().await.clear_and_zeroize();
         assert!(media.get_content(&seal, key).await.is_none());
-        assert!(thumb.get_meta(key).await.is_some(), "thumb untouched by media clear");
+        assert!(
+            thumb.get_meta(key).await.is_some(),
+            "thumb untouched by media clear"
+        );
 
         // …and vice versa.
         thumb.clear_and_zeroize().await;

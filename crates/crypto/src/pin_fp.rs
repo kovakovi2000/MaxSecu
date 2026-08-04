@@ -36,6 +36,39 @@ pub fn pin_fingerprint(cert_der: &[u8], dir_der: &[u8]) -> String {
     base32_no_pad(&digest[..20])
 }
 
+/// Normalize a fingerprint for comparison: uppercase, then strip every char not in
+/// the RFC 4648 base32 alphabet `[A-Z2-7]`, so copy-introduced dashes/spaces/
+/// newlines do not break the compare. Mirrors the spec's normalization rule.
+///
+/// Lives here, beside the hasher that DEFINES the code's format, so the minting
+/// side (`maxsecu-setup`) and every verifying side normalize identically.
+pub fn normalize_fp(s: &str) -> String {
+    s.to_ascii_uppercase()
+        .chars()
+        .filter(|c| c.is_ascii_uppercase() || ('2'..='7').contains(c))
+        .collect()
+}
+
+/// Split an `ADDR:PORT#FINGERPRINT` **connection code** — the exact shape
+/// `maxsecu-setup` mints — into its dial target and NORMALIZED fingerprint.
+///
+/// `None` (fail closed) on anything that is not that shape: no `#`, an empty
+/// address, or a fingerprint that does not normalize to exactly the 32 chars
+/// [`pin_fingerprint`] emits. Parsing only — it decides nothing about trust; the
+/// caller still has to compare the fingerprint against pins it already has.
+pub fn parse_connection_code(code: &str) -> Option<(String, String)> {
+    let (addr, fp) = code.trim().split_once('#')?;
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return None;
+    }
+    let fp = normalize_fp(fp);
+    if fp.len() != 32 {
+        return None;
+    }
+    Some((addr.to_owned(), fp))
+}
+
 /// RFC 4648 base32 encode, uppercase, no padding. Inline (no crate dependency).
 ///
 /// Emits one output char per 5 input bits (ceil(bits/5) chars). For the 20-byte
@@ -106,6 +139,27 @@ mod tests {
                 "flipping dir byte {i} did not change the fingerprint"
             );
         }
+    }
+
+    #[test]
+    fn normalize_fp_uppercases_and_strips_separators() {
+        let fp = pin_fingerprint(b"cert", b"dir");
+        // A hand-copied code with lowercase + grouping separators normalizes back to
+        // exactly the minted fingerprint.
+        let messy = format!("{}-{} {}\n", &fp[..8].to_lowercase(), &fp[8..20], &fp[20..]);
+        assert_eq!(normalize_fp(&messy), fp);
+    }
+
+    #[test]
+    fn parse_connection_code_splits_and_fails_closed() {
+        let fp = pin_fingerprint(b"cert", b"dir");
+        let (addr, got) = parse_connection_code(&format!("  1.2.3.4:8443#{fp}  ")).unwrap();
+        assert_eq!(addr, "1.2.3.4:8443");
+        assert_eq!(got, fp);
+        // No separator, empty address, and a wrong-length fingerprint all fail closed.
+        assert_eq!(parse_connection_code(&format!("1.2.3.4:8443{fp}")), None);
+        assert_eq!(parse_connection_code(&format!("#{fp}")), None);
+        assert_eq!(parse_connection_code("1.2.3.4:8443#ABCD"), None);
     }
 
     #[test]

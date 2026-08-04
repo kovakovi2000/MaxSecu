@@ -508,6 +508,140 @@ impl Canonical for BundleBody {
     }
 }
 
+/// Smallest an encoded [`BackupEntry`] can be: an empty `path` (its 4-byte
+/// length prefix still costs) ‖ `len` ‖ `digest`. The floor an untrusted entry
+/// count is capped against before anything is reserved.
+const BACKUP_ENTRY_MIN_LEN: usize = 4 + 8 + 32;
+
+/// Encoded size of a [`BackupPart`] — fixed: `len` ‖ `digest`.
+const BACKUP_PART_LEN: usize = 8 + 32;
+
+/// `BackupEntry` — one file carried by a [`BackupIndex`]: its bundle-relative
+/// path, plaintext length, and content digest. Not a top-level [`Canonical`]
+/// struct — it has no `type_id` of its own and is only ever emitted inline
+/// within the index body.
+///
+/// There is deliberately **no `offset`**: a bundle's payload is the
+/// concatenation of its entries' bytes in `entries` order, so an entry's offset
+/// is the running sum of the preceding `len`s. Storing it as well would be a
+/// second source of truth that can disagree with the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupEntry {
+    /// Bundle-relative POSIX path, e.g. `tls/key.der`. Path *policy* — traversal,
+    /// absolute roots, reserved names — belongs to the restorer that will create
+    /// these files, not to this codec.
+    pub path: Text,
+    /// Plaintext byte length of the entry's content.
+    pub len: u64,
+    /// `SHA-256` over the entry's plaintext bytes.
+    pub digest: Hash,
+}
+
+/// `BackupPart` — one sealed `MXBU` part of a backup bundle. Inline like
+/// [`BackupEntry`]. A part's index is its **position** in [`BackupIndex::parts`],
+/// which is exactly what the seal binds into each part's AEAD AAD; storing the
+/// index here too would let the two disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupPart {
+    /// Byte length of the stored part blob (`MXBU` header ‖ ciphertext ‖ tag).
+    pub len: u64,
+    /// `SHA-256` over those same stored bytes — checkable straight off the cold
+    /// tier, before a passphrase has been asked for or Argon2id has run.
+    pub digest: Hash,
+}
+
+/// `backup_index` — `0x000F`. The authenticated table of contents of one sealed
+/// server-backup bundle (`MXBU`, `crates/server/src/backup/format.rs`): what the
+/// bundle holds and which parts carry it.
+///
+/// It exists because a bundle needs a tar and this repo has no archive crate —
+/// and because `_backup/<stamp>/manifest.json` is a **plaintext hint** that
+/// anyone holding the Dropbox account can rewrite. This is its authenticated
+/// counterpart: it rides inside the sealed bytes, so the `git_sha`, the entry
+/// table and the part digests are all covered by the bundle's AEAD tags. Restore
+/// compares hint against index and aborts when they disagree.
+///
+/// **Metadata only — never a part's payload.** [`decode`](crate::decode) runs the
+/// §7 rule-5 re-encode guard, which allocates a complete second copy of its
+/// input; an embedded N-byte payload would therefore cost ~3N and destroy the
+/// O(part size) RAM budget the part-at-a-time format exists to provide.
+///
+/// The `db` and `state` bundles share this one structure and carry **no
+/// component tag**: they are sealed independently under fresh per-bundle salts,
+/// so neither's parts can open under the other's key, and which one is in hand is
+/// the cold-tier path it came from. A tag would mean a new frozen enum registry
+/// for a distinction the key already makes.
+///
+/// Both counts are `u32`, not [`BundleBody`]'s `u16`: `part_index` is a `u32` in
+/// the part AAD, so a `u16` ceiling here would cap a bundle at 65 535 parts
+/// (~512 GiB at the 8 MiB part size) — a limit the sealed format does not have.
+/// Order is authoritative and preserved verbatim; the codec neither sorts nor
+/// de-duplicates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupIndex {
+    /// The commit the backed-up server was built from — what a `--only code`
+    /// rollback checks out. Free-form `text` rather than 20 fixed bytes so a
+    /// SHA-256 object id, or a `-dirty` marker, needs no format break.
+    pub git_sha: Text,
+    /// The bundle's files, in payload order.
+    pub entries: Vec<BackupEntry>,
+    /// The bundle's sealed parts, in `part_index` order.
+    pub parts: Vec<BackupPart>,
+    pub created_at: Timestamp,
+}
+
+impl Canonical for BackupIndex {
+    const TYPE_ID: u16 = 0x000F;
+    fn encode_body(&self, w: &mut Writer) {
+        self.git_sha.put(w);
+        debug_assert!(self.entries.len() <= u32::MAX as usize);
+        w.u32(self.entries.len() as u32);
+        for e in &self.entries {
+            e.path.put(w);
+            e.len.put(w);
+            e.digest.put(w);
+        }
+        debug_assert!(self.parts.len() <= u32::MAX as usize);
+        w.u32(self.parts.len() as u32);
+        for p in &self.parts {
+            p.len.put(w);
+            p.digest.put(w);
+        }
+        self.created_at.put(w);
+    }
+    fn decode_body(r: &mut Reader) -> Result<Self, DecodeError> {
+        let git_sha = Text::get(r)?;
+        // Both counts are attacker-controlled and — unlike `BundleBody`'s u16 —
+        // can claim 4 G elements. Cap each reservation at what the remaining
+        // input could actually hold, so a lying count costs a bounded reserve and
+        // then dies on the read it cannot satisfy, rather than reserving
+        // gigabytes before the first byte of an element is looked at.
+        let entry_count = r.u32()? as usize;
+        let mut entries = Vec::with_capacity(entry_count.min(r.remaining() / BACKUP_ENTRY_MIN_LEN));
+        for _ in 0..entry_count {
+            entries.push(BackupEntry {
+                path: Text::get(r)?,
+                len: u64::get(r)?,
+                digest: Bytes32::get(r)?,
+            });
+        }
+        let part_count = r.u32()? as usize;
+        let mut parts = Vec::with_capacity(part_count.min(r.remaining() / BACKUP_PART_LEN));
+        for _ in 0..part_count {
+            parts.push(BackupPart {
+                len: u64::get(r)?,
+                digest: Bytes32::get(r)?,
+            });
+        }
+        Ok(BackupIndex {
+            git_sha,
+            entries,
+            parts,
+            created_at: Timestamp::get(r)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +714,123 @@ mod tests {
         assert_eq!(bytes.len(), 4);
         let back: BundleBody = decode(&bytes).unwrap();
         assert!(back.members.is_empty());
+    }
+
+    fn backup_index() -> BackupIndex {
+        BackupIndex {
+            git_sha: Text::new("37283fdd1c9e4a0b").unwrap(),
+            entries: vec![
+                BackupEntry {
+                    path: Text::new("etc/maxsecu/dropbox.env").unwrap(),
+                    len: 240,
+                    digest: Bytes32([0xA1; 32]),
+                },
+                BackupEntry {
+                    path: Text::new("tls/key.der").unwrap(),
+                    len: 1218,
+                    digest: Bytes32([0xA2; 32]),
+                },
+            ],
+            parts: vec![
+                BackupPart {
+                    len: 8 * 1024 * 1024 + 61,
+                    digest: Bytes32([0xB1; 32]),
+                },
+                BackupPart {
+                    len: 4096,
+                    digest: Bytes32([0xB2; 32]),
+                },
+            ],
+            created_at: Timestamp(1_752_624_000_000),
+        }
+    }
+
+    #[test]
+    fn backup_index_roundtrips_and_preserves_order() {
+        let idx = backup_index();
+        let bytes = encode(&idx);
+        let back: BackupIndex = decode(&bytes).unwrap();
+        assert_eq!(back, idx);
+        // Order is authoritative for both lists: an entry's offset is the running
+        // sum of its predecessors' `len`, and a part's index is its position.
+        assert_eq!(back.entries[0].path.as_str(), "etc/maxsecu/dropbox.env");
+        assert_eq!(back.parts[1].len, 4096);
+    }
+
+    #[test]
+    fn backup_index_empty_roundtrips() {
+        let idx = BackupIndex {
+            git_sha: Text::new("").unwrap(),
+            entries: vec![],
+            parts: vec![],
+            created_at: Timestamp(0),
+        };
+        let bytes = encode(&idx);
+        // type_id (2) + text len (4) + entry count (4) + part count (4) + created_at (8).
+        assert_eq!(bytes.len(), 22);
+        let back: BackupIndex = decode(&bytes).unwrap();
+        assert_eq!(back, idx);
+    }
+
+    #[test]
+    fn backup_index_over_65535_parts_pins_the_u32_count_width() {
+        // A u16 part count would cap a bundle at 65_535 parts (~512 GiB at the
+        // 8 MiB part size) while `part_index` in the AEAD's part AAD is a u32 —
+        // a regression to u16 here would truncate the count and silently drop
+        // every part past the ceiling.
+        let n = 70_000u32;
+        let idx = BackupIndex {
+            git_sha: Text::new("wide").unwrap(),
+            entries: vec![],
+            parts: (0..n)
+                .map(|i| BackupPart {
+                    len: i as u64,
+                    digest: Bytes32([i as u8; 32]),
+                })
+                .collect(),
+            created_at: Timestamp(7),
+        };
+        let bytes = encode(&idx);
+        let back: BackupIndex = decode(&bytes).unwrap();
+        assert_eq!(back.parts.len(), n as usize);
+        assert_eq!(back.parts[69_999].len, 69_999);
+    }
+
+    #[test]
+    fn backup_index_lying_counts_fail_closed() {
+        // A u32 count can claim 4 G elements. The decoder must reject on the
+        // reads it cannot satisfy — and must not reserve on the claim first.
+        let mut w = Writer::new();
+        w.u16(BackupIndex::TYPE_ID);
+        w.text("");
+        w.u32(u32::MAX); // entry_count
+        assert!(matches!(
+            decode::<BackupIndex>(&w.into_bytes()),
+            Err(DecodeError::ShortInput { .. })
+        ));
+
+        let mut w = Writer::new();
+        w.u16(BackupIndex::TYPE_ID);
+        w.text("");
+        w.u32(0); // no entries
+        w.u32(u32::MAX); // part_count
+        assert!(matches!(
+            decode::<BackupIndex>(&w.into_bytes()),
+            Err(DecodeError::ShortInput { .. })
+        ));
+    }
+
+    #[test]
+    fn backup_index_type_id_is_registered() {
+        // `is_registered` is a hand-maintained `matches!` list with no
+        // exhaustiveness check, so nothing but this test notices a missed entry:
+        // an unregistered 0x000F would report UnknownTypeId here instead.
+        assert_eq!(
+            decode::<BundleBody>(&[0x00, 0x0F]),
+            Err(DecodeError::WrongTypeId {
+                expected: 0x000E,
+                got: 0x000F
+            })
+        );
     }
 }

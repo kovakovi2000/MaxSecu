@@ -11,7 +11,7 @@
 use crate::control::decode_control;
 use crate::error::{ControlAppendError, StoreError};
 use crate::files::{
-    AddWrapError, DeleteError, DeleteWrapError, DiscardError, FinalizeError, ListFilter,
+    AddWrapError, DeleteError, DeleteWrapError, DiscardError, FinalizeError, ListFilter, ListSort,
     ParsedStage, StageError, StreamRow, VersionSelector, WrapInput,
 };
 use async_trait::async_trait;
@@ -56,6 +56,21 @@ pub struct NonceRecord {
     pub username: String,
     pub expires_at_ms: u64,
     pub used: bool,
+}
+
+/// How many rows one [`Store::prune_expired_auth_rows`] pass removed, per table.
+/// `sessions + nonces == batch_limit * 2` means the pass hit its bound and more
+/// prunable rows remain — the next tick picks them up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PruneCounts {
+    pub sessions: u64,
+    pub nonces: u64,
+}
+
+impl PruneCounts {
+    pub fn total(&self) -> u64 {
+        self.sessions + self.nonces
+    }
 }
 
 /// A channel-bound session (schema.sql `sessions`); keyed by `SHA-256(token)`.
@@ -161,6 +176,22 @@ pub struct FileListEntry {
     pub small_streams: Vec<(i16, u64)>,
 }
 
+/// One page of the listing plus the size of the whole matching set.
+///
+/// `total` is what a **numbered** pager (`<< 1 2 3 4 >>`) divides by `limit` to
+/// get its page count, so it must be produced by the same filter as `entries`
+/// and must NOT be capped by `limit`/`offset`. It is returned alongside the page
+/// (rather than through a second store call) so a backend can compute both under
+/// one snapshot — `PgStore` does exactly that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileListPage {
+    /// The requested window: at most `limit` entries starting at `offset`.
+    pub entries: Vec<FileListEntry>,
+    /// Entries matching `(file_type, owner_only, caller_id)` IGNORING
+    /// `limit`/`offset`. Sort-independent.
+    pub total: u64,
+}
+
 /// One stream's chunk-slot framing for the blob tier (api.md §9): its
 /// server-assigned `blob_ref`, expected `chunk_count`, and `chunk_size` bound.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,6 +284,50 @@ pub trait Store: Send + Sync {
     async fn get_session(&self, token_hash: &[u8; 32])
         -> Result<Option<SessionRecord>, StoreError>;
     async fn revoke_session(&self, token_hash: &[u8; 32]) -> Result<(), StoreError>;
+
+    /// Delete **long-expired** `sessions` and `auth_nonces` rows, at most
+    /// `batch_limit` from each table per call. Housekeeping only: neither table
+    /// is ever pruned by a request path, so this is the ONLY delete either one
+    /// has. Driven by a background tick (`portable-server`'s `spawn_auth_prune`),
+    /// never by a handler — a prune fault must never be able to fail a login.
+    ///
+    /// **The predicate is `expires_at < now_ms - grace_ms`, and nothing else.**
+    /// Three properties are load-bearing; each one is a security or a
+    /// compatibility bug if dropped:
+    ///
+    /// 1. **Expiry-only — never `revoked_at IS NOT NULL`, never `used_at IS NOT
+    ///    NULL`.** The restore MERGE re-inserts the backup bundle's copy of both
+    ///    tables with a *bare* `ON CONFLICT DO NOTHING` (`backup::merge`
+    ///    `merge_sessions` / `merge_auth_nonces`), which relies on the live row
+    ///    still being there to win. Prune a *revoked* session and the bundle's
+    ///    pre-logout copy — `revoked_at` NULL — no longer conflicts with
+    ///    anything, so the restore silently **un-revokes a logged-out session**.
+    ///    On the recovery principal that is a token that opens every user's
+    ///    content. An expired row resurrected the same way is inert: it carries
+    ///    its original past `expires_at`, so every reader still rejects it.
+    /// 2. **A grace window far longer than the TTLs** (see
+    ///    [`AUTH_PRUNE_GRACE_MS`](crate::auth::AUTH_PRUNE_GRACE_MS)): 7 days
+    ///    against a 60-minute session / 60-second nonce TTL. Racing a live
+    ///    reader is then arithmetically impossible, and the last week of rows
+    ///    stays available for forensics.
+    /// 3. **Never an unexpired row.** That is the one shape that would be a
+    ///    compatibility *tightening* — it would sign out a user who is still
+    ///    working. Everything this removes was already invisible to both
+    ///    readers (`AuthService::validate_session` treats `expires_at_ms <=
+    ///    now_ms` as `Unauthorized`; `outstanding_nonces` filters on
+    ///    `expires_at > now`), so an older server reading a pruned table
+    ///    observes bit-identical behaviour.
+    ///
+    /// `now_ms` is the **app** clock, matching the freshness model the rest of
+    /// this trait uses (the DB clock is advisory and never a freshness basis).
+    /// `now_ms.saturating_sub(grace_ms)` means an absurdly early clock prunes
+    /// nothing rather than everything.
+    async fn prune_expired_auth_rows(
+        &self,
+        now_ms: u64,
+        grace_ms: u64,
+        batch_limit: u32,
+    ) -> Result<PruneCounts, StoreError>;
 
     // ---- Phase 2: signed key directory (DESIGN §7, api.md §6) ----
 
@@ -406,9 +481,33 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<FileView>, StoreError>;
 
     /// List finalized files (`GET /v1/files`, api.md §8.6 / D35): the
-    /// authenticated `file_type` + small-stream structure/sizes only, newest
-    /// first, filtered/limited per `filter`.
-    async fn list_files(&self, filter: ListFilter) -> Result<Vec<FileListEntry>, StoreError>;
+    /// authenticated `file_type` + small-stream structure/sizes only,
+    /// filtered/ordered/paged per `filter`.
+    ///
+    /// Semantics every backend must agree on (the ephemeral [`MemoryStore`] and
+    /// `PgStore` are both used in production paths, so a divergence is a real
+    /// behaviour change on upgrade):
+    ///
+    ///  * **visibility** — finalized (`current_version >= 1`) AND `listed` AND
+    ///    the caller holds a wrap on the current version. Unchanged.
+    ///  * **`owner_only`** — additionally `owner_id == filter.caller_id`.
+    ///  * **order** — [`ListSort::Newest`] = `updated_at DESC, file_id ASC`
+    ///    (the historical default); [`ListSort::Oldest`] = `updated_at ASC,
+    ///    file_id ASC`. `file_id` is the ASC tiebreak in BOTH directions, so
+    ///    `oldest` is the exact reverse of `newest` only up to ties.
+    ///  * **paging** — skip `filter.offset` entries of that order, then take at
+    ///    most `filter.limit`. An `offset` past the end yields an empty page, not
+    ///    an error.
+    ///  * **[`FileListPage::total`]** — the count matching the filter with
+    ///    `limit`/`offset` ignored.
+    ///
+    /// Paging is over a MUTABLE sort key (`files.updated_at` is bumped by
+    /// `finalize_version` AND by `add_wrap`, i.e. by every re-share), so a page
+    /// walk is not skip-free under concurrent re-share. See [`ListFilter::offset`].
+    ///
+    /// The `cursor` a client sends is decoded to an `offset` at the HTTP layer;
+    /// the store never sees a token.
+    async fn list_files(&self, filter: ListFilter) -> Result<FileListPage, StoreError>;
 
     /// Staging metadata for one version — owner, finalized flag, and stream
     /// slots — for the chunk PUT/GET bound checks and the finalize completeness
@@ -694,6 +793,47 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    /// Same predicate and same bound as the Postgres adapter — `expires_at`
+    /// strictly older than `now_ms - grace_ms`, at most `batch_limit` per table
+    /// — so the two backings can never drift on what "prunable" means. `revoked`
+    /// / `used` are deliberately not consulted (see the trait docs).
+    async fn prune_expired_auth_rows(
+        &self,
+        now_ms: u64,
+        grace_ms: u64,
+        batch_limit: u32,
+    ) -> Result<PruneCounts, StoreError> {
+        let cutoff_ms = now_ms.saturating_sub(grace_ms);
+        let limit = batch_limit as usize;
+        let mut inner = self.inner.lock().unwrap();
+
+        let doomed: Vec<[u8; 32]> = inner
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.expires_at_ms < cutoff_ms)
+            .map(|(h, _)| *h)
+            .take(limit)
+            .collect();
+        let sessions = doomed.len() as u64;
+        for h in doomed {
+            inner.sessions.remove(&h);
+        }
+
+        let doomed: Vec<[u8; 32]> = inner
+            .nonces
+            .iter()
+            .filter(|(_, n)| n.expires_at_ms < cutoff_ms)
+            .map(|(n, _)| *n)
+            .take(limit)
+            .collect();
+        let nonces = doomed.len() as u64;
+        for n in doomed {
+            inner.nonces.remove(&n);
+        }
+
+        Ok(PruneCounts { sessions, nonces })
+    }
+
     async fn put_binding(
         &self,
         user_id: [u8; 16],
@@ -879,6 +1019,17 @@ impl Store for MemoryStore {
     }
 
     async fn stage_version(&self, parsed: ParsedStage, now_ms: u64) -> Result<u64, StageError> {
+        // Mirror of the Postgres `file_key_wraps` CHECK
+        // `(recipient_type = 2) = (recipient_id = 00..00)`
+        // (migrations/0001_baseline.sql:253). `parse_stage` already rejects the
+        // half-shape, but this store is the LAST gate before the rows land, and
+        // `add_wrap` mirrors its own re-share rule the same way — so the two
+        // backends refuse the identical set of wrap rows.
+        for w in &parsed.wraps {
+            if (w.recipient_type == 2) != (w.recipient_id == maxsecu_encoding::RECOVERY_ID.0) {
+                return Err(StageError::MismatchedRecoveryWrap);
+            }
+        }
         let mut inner = self.inner.lock().unwrap();
         let version = parsed.version;
         let new_ver = VersionEntry {
@@ -1038,7 +1189,7 @@ impl Store for MemoryStore {
         }))
     }
 
-    async fn list_files(&self, filter: ListFilter) -> Result<Vec<FileListEntry>, StoreError> {
+    async fn list_files(&self, filter: ListFilter) -> Result<FileListPage, StoreError> {
         let inner = self.inner.lock().unwrap();
         let mut out: Vec<FileListEntry> = inner
             .files
@@ -1054,6 +1205,9 @@ impl Store for MemoryStore {
                     .is_some_and(|v| v.wraps.iter().any(|w| w.recipient_id == filter.caller_id))
             })
             .filter(|(_, f)| filter.file_type.is_none_or(|t| t == f.file_type))
+            // "My Content" (`?owner=me`): the caller's OWN posts only. Mirrors the
+            // PG predicate `files.owner_id = $caller`.
+            .filter(|(_, f)| !filter.owner_only || f.owner_id == filter.caller_id)
             .filter_map(|(id, f)| {
                 let ver = f.versions.get(&f.current_version)?;
                 let small_streams = ver
@@ -1071,14 +1225,28 @@ impl Store for MemoryStore {
                 })
             })
             .collect();
-        // Newest first, then file_id for a stable order (schema files_listing_idx).
-        out.sort_by(|a, b| {
-            b.updated_at_ms
-                .cmp(&a.updated_at_ms)
-                .then(a.file_id.cmp(&b.file_id))
-        });
-        out.truncate(filter.limit);
-        Ok(out)
+        // `total` is the whole matching set — counted BEFORE offset/limit, because
+        // it is what the numbered pager divides by `limit` to size the pager.
+        let total = out.len() as u64;
+        // `file_id` is the ASC tiebreak in BOTH directions, matching the PG
+        // `ORDER BY updated_at <dir>, file_id` (schema files_listing_idx).
+        match filter.sort {
+            ListSort::Newest => out.sort_by(|a, b| {
+                b.updated_at_ms
+                    .cmp(&a.updated_at_ms)
+                    .then(a.file_id.cmp(&b.file_id))
+            }),
+            ListSort::Oldest => out.sort_by(|a, b| {
+                a.updated_at_ms
+                    .cmp(&b.updated_at_ms)
+                    .then(a.file_id.cmp(&b.file_id))
+            }),
+        }
+        // Page: skip `offset`, take `limit`. `offset` past the end is an empty
+        // page, never an error (`usize::try_from` saturates on a 32-bit target).
+        let skip = usize::try_from(filter.offset).unwrap_or(usize::MAX);
+        let entries = out.into_iter().skip(skip).take(filter.limit).collect();
+        Ok(FileListPage { entries, total })
     }
 
     async fn version_meta(
@@ -1169,6 +1337,13 @@ impl Store for MemoryStore {
         recipient_id: [u8; 16],
         caller_id: [u8; 16],
     ) -> Result<(), DeleteWrapError> {
+        // The escrow wrap is not the owner's to remove — see
+        // `DeleteWrapError::RecoveryProtected`. Checked BEFORE anything is
+        // touched, and again on the stored row below (the id and the type are two
+        // separate ways to name the same recipient).
+        if recipient_id == maxsecu_encoding::RECOVERY_ID.0 {
+            return Err(DeleteWrapError::RecoveryProtected);
+        }
         let mut inner = self.inner.lock().unwrap();
         let Some(entry) = inner.files.get_mut(&file_id) else {
             return Err(DeleteWrapError::NotFound);
@@ -1184,6 +1359,12 @@ impl Store for MemoryStore {
         let Some(target) = ver.wraps.iter().find(|w| w.recipient_id == recipient_id) else {
             return Err(DeleteWrapError::NotFound);
         };
+        // Second half of the escrow guard: refuse on the STORED row's type too, so
+        // a wrap that reached the table as `recipient_type = 2` under some other id
+        // (the F5.3 half-shape, now refused at stage time) is still protected here.
+        if target.recipient_type == 2 {
+            return Err(DeleteWrapError::RecoveryProtected);
+        }
         // Coarse owner-or-granter gate (§14.5 "cut the subtree" intuition).
         if caller_id != owner_id && caller_id != target.granted_by {
             return Err(DeleteWrapError::NotAuthorized);
@@ -1373,6 +1554,14 @@ impl Store for FaultyStore {
     async fn revoke_session(&self, _token_hash: &[u8; 32]) -> Result<(), StoreError> {
         Err(Self::fault("revoke_session"))
     }
+    async fn prune_expired_auth_rows(
+        &self,
+        _now_ms: u64,
+        _grace_ms: u64,
+        _batch_limit: u32,
+    ) -> Result<PruneCounts, StoreError> {
+        Err(Self::fault("prune_expired_auth_rows"))
+    }
     async fn put_binding(
         &self,
         _user_id: [u8; 16],
@@ -1464,7 +1653,7 @@ impl Store for FaultyStore {
     ) -> Result<Option<FileView>, StoreError> {
         Err(Self::fault("get_file"))
     }
-    async fn list_files(&self, _filter: ListFilter) -> Result<Vec<FileListEntry>, StoreError> {
+    async fn list_files(&self, _filter: ListFilter) -> Result<FileListPage, StoreError> {
         Err(Self::fault("list_files"))
     }
     async fn version_meta(
@@ -1758,15 +1947,12 @@ mod memory_store_tests {
         }
 
         let out = store
-            .list_files(ListFilter {
-                file_type: None,
-                limit: 50,
-                caller_id: owner,
-            })
+            .list_files(ListFilter::for_caller(owner))
             .await
             .unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].file_id, bundle_id);
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].file_id, bundle_id);
+        assert_eq!(out.total, 1, "`total` counts the same set as the page");
     }
 
     /// A user-type wrap for `recipient`, granted by `granter`. `granted_by` MUST be the
@@ -1800,26 +1986,22 @@ mod memory_store_tests {
 
         // The owner sees it (holds a self-wrap).
         let mine = store
-            .list_files(ListFilter {
-                file_type: None,
-                limit: 50,
-                caller_id: owner,
-            })
+            .list_files(ListFilter::for_caller(owner))
             .await
             .unwrap();
-        assert_eq!(mine.len(), 1, "owner sees their own post");
-        assert_eq!(mine[0].file_id, file);
+        assert_eq!(mine.entries.len(), 1, "owner sees their own post");
+        assert_eq!(mine.entries[0].file_id, file);
 
         // A stranger with no wrap does NOT see it.
         let theirs = store
-            .list_files(ListFilter {
-                file_type: None,
-                limit: 50,
-                caller_id: other,
-            })
+            .list_files(ListFilter::for_caller(other))
             .await
             .unwrap();
-        assert!(theirs.is_empty(), "a non-recipient's feed omits the post");
+        assert!(
+            theirs.entries.is_empty(),
+            "a non-recipient's feed omits the post"
+        );
+        assert_eq!(theirs.total, 0, "`total` is caller-scoped too");
 
         // After adding a wrap for `other` (granted by owner), they now see it. NOTE the
         // real add_wrap signature: (file_id, wrap, caller_id, now_ms) — NO explicit version.
@@ -1828,17 +2010,240 @@ mod memory_store_tests {
             .await
             .unwrap();
         let now_theirs = store
-            .list_files(ListFilter {
-                file_type: None,
-                limit: 50,
-                caller_id: other,
-            })
+            .list_files(ListFilter::for_caller(other))
             .await
             .unwrap();
         assert_eq!(
-            now_theirs.len(),
+            now_theirs.entries.len(),
             1,
             "a recipient sees a post once shared to them"
         );
+    }
+}
+
+/// The bounded, expiry-only auth-row prune ([`Store::prune_expired_auth_rows`]),
+/// against the in-memory backing. `pg_store.rs` runs the same shapes against a
+/// live Postgres; the two must agree, because the prune's whole safety argument
+/// is that "prunable" means exactly one thing.
+///
+/// Every test here fails without the prune: before it, nothing anywhere in the
+/// server had ever deleted a `sessions` or an `auth_nonces` row.
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+    use crate::auth::{AUTH_PRUNE_BATCH, AUTH_PRUNE_GRACE_MS};
+
+    const NOW: u64 = 1_719_500_000_000;
+    const HOUR: u64 = 3_600_000;
+    const GRACE: u64 = AUTH_PRUNE_GRACE_MS;
+
+    /// Expired long enough ago to be prunable.
+    const LONG_DEAD: u64 = NOW - GRACE - HOUR;
+    /// Expired, but only an hour ago — still inside the grace window.
+    const JUST_DEAD: u64 = NOW - HOUR;
+    /// Still valid.
+    const LIVE: u64 = NOW + HOUR;
+
+    fn session(expires_at_ms: u64, revoked: bool) -> SessionRecord {
+        SessionRecord {
+            user_id: [0xA1; 16],
+            tls_exporter: [0xE7; 32],
+            expires_at_ms,
+            revoked,
+        }
+    }
+
+    async fn prune(store: &MemoryStore, now_ms: u64) -> PruneCounts {
+        store
+            .prune_expired_auth_rows(now_ms, GRACE, AUTH_PRUNE_BATCH)
+            .await
+            .expect("the in-memory backing never faults")
+    }
+
+    /// The four required shapes, in one pass over one table: only the row that is
+    /// expired *and* past the grace window goes.
+    #[tokio::test]
+    async fn prune_removes_only_sessions_expired_beyond_the_grace_window() {
+        let store = MemoryStore::new();
+        let long_dead = [0x01; 32];
+        let just_dead = [0x02; 32];
+        let live = [0x03; 32];
+        let revoked_live = [0x04; 32];
+        store
+            .insert_session(long_dead, session(LONG_DEAD, false))
+            .await
+            .unwrap();
+        store
+            .insert_session(just_dead, session(JUST_DEAD, false))
+            .await
+            .unwrap();
+        store
+            .insert_session(live, session(LIVE, false))
+            .await
+            .unwrap();
+        store
+            .insert_session(revoked_live, session(LIVE, true))
+            .await
+            .unwrap();
+
+        let c = prune(&store, NOW).await;
+        assert_eq!(c.sessions, 1, "exactly one session was prunable");
+
+        assert!(
+            store.get_session(&long_dead).await.unwrap().is_none(),
+            "a session expired beyond the grace window is removed"
+        );
+        assert!(
+            store.get_session(&just_dead).await.unwrap().is_some(),
+            "a session expired only an hour ago is INSIDE the grace window and survives"
+        );
+        assert!(
+            store.get_session(&live).await.unwrap().is_some(),
+            "an unexpired session survives — pruning one would sign out a working user"
+        );
+        assert!(
+            store.get_session(&revoked_live).await.unwrap().is_some(),
+            "a REVOKED but unexpired session survives: deleting it would let the restore \
+             merge re-insert the bundle's pre-logout copy and un-revoke the session"
+        );
+    }
+
+    /// Revocation is not part of the predicate in *either* direction: a revoked
+    /// row that is also long expired goes on its expiry alone, exactly like its
+    /// unrevoked twin. Resurrecting *that* row from a backup is harmless — it
+    /// comes back carrying its original, long-past `expires_at`.
+    #[tokio::test]
+    async fn revocation_never_enters_the_session_predicate() {
+        let store = MemoryStore::new();
+        let revoked_long_dead = [0x05; 32];
+        store
+            .insert_session(revoked_long_dead, session(LONG_DEAD, true))
+            .await
+            .unwrap();
+
+        assert_eq!(prune(&store, NOW).await.sessions, 1);
+        assert!(
+            store
+                .get_session(&revoked_long_dead)
+                .await
+                .unwrap()
+                .is_none(),
+            "expiry alone decides; the revoked flag neither saves nor dooms a row"
+        );
+    }
+
+    /// The grace boundary is strict: `expires_at == now - grace` stays.
+    #[tokio::test]
+    async fn the_grace_boundary_is_exclusive() {
+        let store = MemoryStore::new();
+        let on_the_line = [0x06; 32];
+        store
+            .insert_session(on_the_line, session(NOW - GRACE, false))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prune(&store, NOW).await.sessions,
+            0,
+            "a row exactly `grace` old is not yet past the window"
+        );
+        assert_eq!(
+            prune(&store, NOW + 1).await.sessions,
+            1,
+            "one millisecond later it is"
+        );
+    }
+
+    /// Nonces, same shapes. `outstanding_nonces` already hides an expired nonce,
+    /// so survival is proved *positively*: advance `now` until each survivor
+    /// becomes prunable and watch it be pruned on a later pass — which it could
+    /// not be had the first pass already taken it.
+    #[tokio::test]
+    async fn prune_removes_only_nonces_expired_beyond_the_grace_window() {
+        let store = MemoryStore::new();
+        store
+            .insert_nonce([0x11; 32], "alice", LONG_DEAD)
+            .await
+            .unwrap();
+        store
+            .insert_nonce([0x12; 32], "alice", JUST_DEAD)
+            .await
+            .unwrap();
+        store.insert_nonce([0x13; 32], "alice", LIVE).await.unwrap();
+        // Consumed but unexpired — `used_at` must not enter the predicate either.
+        store.insert_nonce([0x14; 32], "alice", LIVE).await.unwrap();
+        store.consume_nonce(&[0x14; 32]).await.unwrap();
+
+        assert_eq!(
+            prune(&store, NOW).await.nonces,
+            1,
+            "only the nonce expired beyond the grace window goes"
+        );
+        assert_eq!(
+            store.outstanding_nonces("alice", NOW).await.unwrap(),
+            vec![[0x13; 32]],
+            "the live unconsumed nonce is still usable by a login in flight"
+        );
+
+        assert_eq!(
+            prune(&store, LIVE + GRACE + 1).await.nonces,
+            3,
+            "the just-dead, the live and the consumed nonce all survived pass one"
+        );
+    }
+
+    /// The batch bound is a real cap and the leftovers are picked up next tick, so
+    /// a first pass over a table that has never been pruned can never become one
+    /// long lock.
+    #[tokio::test]
+    async fn a_pass_is_bounded_and_resumes_on_the_next_one() {
+        let store = MemoryStore::new();
+        for i in 0..5u8 {
+            let mut h = [0u8; 32];
+            h[0] = i;
+            store
+                .insert_session(h, session(LONG_DEAD, false))
+                .await
+                .unwrap();
+            store.insert_nonce(h, "alice", LONG_DEAD).await.unwrap();
+        }
+
+        let first = store.prune_expired_auth_rows(NOW, GRACE, 2).await.unwrap();
+        assert_eq!(
+            (first.sessions, first.nonces),
+            (2, 2),
+            "capped at the batch limit"
+        );
+        let second = store.prune_expired_auth_rows(NOW, GRACE, 2).await.unwrap();
+        assert_eq!((second.sessions, second.nonces), (2, 2));
+        let third = store.prune_expired_auth_rows(NOW, GRACE, 2).await.unwrap();
+        assert_eq!((third.sessions, third.nonces), (1, 1), "the remainder");
+        assert_eq!(
+            store.prune_expired_auth_rows(NOW, GRACE, 2).await.unwrap(),
+            PruneCounts::default(),
+            "and then it is idempotently empty"
+        );
+    }
+
+    /// A clock earlier than the grace window itself must prune nothing rather than
+    /// everything: the cutoff saturates at zero instead of wrapping.
+    #[tokio::test]
+    async fn an_absurdly_early_clock_prunes_nothing() {
+        let store = MemoryStore::new();
+        store
+            .insert_session([0x21; 32], session(1, false))
+            .await
+            .unwrap();
+        store.insert_nonce([0x22; 32], "alice", 1).await.unwrap();
+
+        assert_eq!(
+            store
+                .prune_expired_auth_rows(0, GRACE, AUTH_PRUNE_BATCH)
+                .await
+                .unwrap(),
+            PruneCounts::default(),
+            "now_ms=0 must not underflow into a cutoff that empties the table"
+        );
+        assert!(store.get_session(&[0x21; 32]).await.unwrap().is_some());
     }
 }

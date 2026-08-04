@@ -23,7 +23,7 @@
 
 use crate::blob::{BlobError, BlobStore, ChunkStatus, FetchSource, FsBlobStore, MemoryBlobStore};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// Identifies one resident ciphertext chunk in the cache: its stream `blob_ref`
@@ -200,6 +200,72 @@ pub trait ColdTier: Send + Sync {
     ) -> Result<Option<crate::blob::DirectLink>, BlobError> {
         Ok(None)
     }
+
+    /// The distinct immediate child **names** under `prefix` in this tier's
+    /// `{blob_ref}/{index}` path namespace, sorted. Names only, never bytes: it
+    /// exists so the operator backup can enumerate its own bundles
+    /// (`list_prefix("_backup")` → one name per stamp) on a tier it did not write
+    /// in this process — the cold tier is the only restart-proof record of what a
+    /// dead box had.
+    ///
+    /// `Ok(None)` means this tier **cannot enumerate**, and is deliberately NOT
+    /// the same value as `Ok(Some(vec![]))` ("enumerable, nothing there"). An
+    /// operator about to roll back reads an empty backup list as *"there is
+    /// nothing to roll back to"*, so the two facts must not share a
+    /// representation; the caller fails closed on `None` rather than reporting no
+    /// bundles. The default is `None` — mirroring [`broker_direct_link`], the
+    /// repo's shape for an absent tier capability. (There is no error to return
+    /// instead: [`BlobError`] is a plain struct, not an enum of variants.)
+    ///
+    /// A listed name is a **candidate, not proof of content**. Tiers that
+    /// materialize folders (`FsColdTier`, Dropbox) keep an emptied container
+    /// listed after its chunks are deleted, where the map-backed
+    /// [`MemoryColdTier`] has nothing left to list. Confirm a name with
+    /// [`chunk_count`](Self::chunk_count) before acting on it.
+    ///
+    /// [`broker_direct_link`]: Self::broker_direct_link
+    async fn list_prefix(&self, _prefix: &str) -> Result<Option<Vec<String>>, BlobError> {
+        Ok(None)
+    }
+}
+
+/// Reject a listing `prefix` that is empty or not a plain relative path, before
+/// it is spliced into a filesystem path. A prefix is spliced exactly like a
+/// `blob_ref`, so it gets the same containment rule — mirrors
+/// `FsBlobStore::stream_dir` and `dropbox_tier::guard_blob_ref`.
+fn guard_prefix(prefix: &str) -> Result<(), BlobError> {
+    use std::path::{Component, Path};
+    if prefix.is_empty() {
+        return Err(BlobError::new("list_prefix", "empty prefix"));
+    }
+    for c in Path::new(prefix).components() {
+        match c {
+            Component::Normal(_) => {}
+            _ => return Err(BlobError::new("list_prefix", "unsafe prefix component")),
+        }
+    }
+    Ok(())
+}
+
+/// The distinct immediate child names of `prefix` across a set of full
+/// `{blob_ref}/{index}` paths. The pure half of [`ColdTier::list_prefix`], shared
+/// by the fakes so a map-backed and a directory-backed tier cannot answer the
+/// same listing differently. `BTreeSet` gives both the dedupe (many chunks share
+/// one parent) and the sorted order the trait promises.
+fn children_of<'a>(prefix: &str, paths: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let head = format!("{}/", prefix.trim_end_matches('/'));
+    let mut names = BTreeSet::new();
+    for p in paths {
+        if let Some(rest) = p.strip_prefix(&head) {
+            match rest.split('/').next() {
+                Some(name) if !name.is_empty() => {
+                    names.insert(name.to_owned());
+                }
+                _ => {}
+            }
+        }
+    }
+    names.into_iter().collect()
 }
 
 /// Mint a scoped, single-blob capability link (api.md §9.4). The `master_token`
@@ -231,6 +297,12 @@ fn mint_direct_link(
 pub struct MemoryColdTier {
     inner: MemoryBlobStore,
     master_token: String,
+    /// The `{blob_ref}/{index}` paths this tier holds — the namespace
+    /// [`ColdTier::list_prefix`] walks. Tracked here rather than read back out of
+    /// `inner` because [`MemoryBlobStore`]'s map is private to [`crate::blob`] and
+    /// exposes no enumeration. It cannot drift: every mutation of `inner` goes
+    /// through this type's own trait methods, which maintain both together.
+    paths: Mutex<BTreeSet<String>>,
 }
 
 impl MemoryColdTier {
@@ -241,6 +313,7 @@ impl MemoryColdTier {
         MemoryColdTier {
             inner: MemoryBlobStore::new(),
             master_token: token.into(),
+            paths: Mutex::new(BTreeSet::new()),
         }
     }
 }
@@ -254,7 +327,12 @@ impl Default for MemoryColdTier {
 #[async_trait]
 impl ColdTier for MemoryColdTier {
     async fn put_chunk(&self, blob_ref: &str, index: u64, bytes: Vec<u8>) -> Result<(), BlobError> {
-        self.inner.put_chunk(blob_ref, index, bytes).await
+        self.inner.put_chunk(blob_ref, index, bytes).await?;
+        self.paths
+            .lock()
+            .unwrap()
+            .insert(format!("{blob_ref}/{index}"));
+        Ok(())
     }
     async fn get_chunk(&self, blob_ref: &str, index: u64) -> Result<Option<Vec<u8>>, BlobError> {
         self.inner.get_chunk(blob_ref, index).await
@@ -263,13 +341,26 @@ impl ColdTier for MemoryColdTier {
         self.inner.chunk_count(blob_ref).await
     }
     async fn delete_stream(&self, blob_ref: &str) -> Result<(), BlobError> {
-        self.inner.delete_stream(blob_ref).await
+        self.inner.delete_stream(blob_ref).await?;
+        let head = format!("{blob_ref}/");
+        self.paths.lock().unwrap().retain(|p| !p.starts_with(&head));
+        Ok(())
     }
     async fn delete_chunk(&self, blob_ref: &str, index: u64) -> Result<(), BlobError> {
-        self.inner.delete_chunk(blob_ref, index).await
+        self.inner.delete_chunk(blob_ref, index).await?;
+        self.paths
+            .lock()
+            .unwrap()
+            .remove(&format!("{blob_ref}/{index}"));
+        Ok(())
     }
     async fn has_chunk(&self, blob_ref: &str, index: u64) -> Result<bool, BlobError> {
         Ok(self.inner.get_chunk(blob_ref, index).await?.is_some())
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Option<Vec<String>>, BlobError> {
+        guard_prefix(prefix)?;
+        let paths = self.paths.lock().unwrap();
+        Ok(Some(children_of(prefix, paths.iter().map(|s| s.as_str()))))
     }
     async fn broker_direct_link(
         &self,
@@ -293,22 +384,25 @@ impl ColdTier for MemoryColdTier {
 /// backed by an [`FsBlobStore`].
 pub struct FsColdTier {
     inner: FsBlobStore,
+    /// The same directory `inner` was built over. Duplicated here because
+    /// [`FsBlobStore`]'s `base` is private to [`crate::blob`] and it exposes no
+    /// enumeration — [`ColdTier::list_prefix`] needs a path to walk.
+    base: std::path::PathBuf,
     master_token: String,
 }
 
 impl FsColdTier {
     pub fn new(base: impl Into<std::path::PathBuf>) -> Self {
-        FsColdTier {
-            inner: FsBlobStore::new(base),
-            master_token: "fs-cold-master-token-SECRET".to_owned(),
-        }
+        Self::with_master_token(base, "fs-cold-master-token-SECRET")
     }
     pub fn with_master_token(
         base: impl Into<std::path::PathBuf>,
         token: impl Into<String>,
     ) -> Self {
+        let base = base.into();
         FsColdTier {
-            inner: FsBlobStore::new(base),
+            inner: FsBlobStore::new(base.clone()),
+            base,
             master_token: token.into(),
         }
     }
@@ -333,6 +427,27 @@ impl ColdTier for FsColdTier {
     }
     async fn has_chunk(&self, blob_ref: &str, index: u64) -> Result<bool, BlobError> {
         Ok(self.inner.get_chunk(blob_ref, index).await?.is_some())
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Option<Vec<String>>, BlobError> {
+        guard_prefix(prefix)?;
+        let rd = match std::fs::read_dir(self.base.join(prefix)) {
+            Ok(rd) => rd,
+            // Never written / fully torn down — enumerable, just empty. Matches
+            // `chunk_count` reading a missing stream as 0 rather than a fault.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
+            Err(e) => return Err(BlobError::new("list_prefix", e.to_string())),
+        };
+        let mut names = BTreeSet::new();
+        for entry in rd {
+            let entry = entry.map_err(|e| BlobError::new("list_prefix", e.to_string()))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Skip `FsBlobStore`'s in-flight `{index}.tmp` writes exactly as its own
+            // `chunk_count` does — a half-written chunk is not a listable entry.
+            if !name.ends_with(".tmp") {
+                names.insert(name);
+            }
+        }
+        Ok(Some(names.into_iter().collect()))
     }
     async fn broker_direct_link(
         &self,
@@ -703,6 +818,171 @@ mod tests {
     async fn fs_cold_tier_rejects_unsafe_blob_ref() {
         let tier = FsColdTier::new(std::env::temp_dir().join("mxcold_guard"));
         assert!(tier.put_chunk("../escape", 0, vec![1]).await.is_err());
+    }
+
+    // ---- ColdTier::list_prefix ----
+
+    fn unique_cold_dir(tag: &str) -> std::path::PathBuf {
+        let r = maxsecu_crypto::random_array::<8>();
+        let mut hex = String::new();
+        for b in r {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        std::env::temp_dir().join(format!("mxcold_{tag}_{hex}"))
+    }
+
+    /// Write the bundle layout the backup design puts in the cold tier
+    /// (`{root}/_backup/<stamp>/{db,state}/<part>`) plus one ordinary blob, so a
+    /// listing test sees both kinds of ref sharing the namespace.
+    async fn seed_bundle_layout(tier: &dyn ColdTier) {
+        tier.put_chunk("_backup/20260716T0000Z/db", 0, vec![1])
+            .await
+            .unwrap();
+        tier.put_chunk("_backup/20260716T0000Z/db", 1, vec![2])
+            .await
+            .unwrap();
+        tier.put_chunk("_backup/20260716T0000Z/state", 0, vec![3])
+            .await
+            .unwrap();
+        tier.put_chunk("_backup/20260717T0000Z/db", 0, vec![4])
+            .await
+            .unwrap();
+        tier.put_chunk(REF, 0, vec![5]).await.unwrap();
+    }
+
+    /// The two listable fakes must answer a listing identically for the same write
+    /// history — the backup/restore engine is unit-tested against `MemoryColdTier`
+    /// but runs against a real filesystem/Dropbox tier in production, so a
+    /// divergence here would mean the tests prove nothing about the real path.
+    async fn list_prefix_contract(tier: &dyn ColdTier) {
+        // Nothing written yet: this tier CAN enumerate, there is just nothing under
+        // the prefix. Distinct from `None` (cannot enumerate at all).
+        assert_eq!(tier.list_prefix("_backup").await.unwrap(), Some(Vec::new()));
+
+        seed_bundle_layout(tier).await;
+
+        // One name per bundle stamp — an ordinary blob_ref never shows up here.
+        assert_eq!(
+            tier.list_prefix("_backup").await.unwrap().unwrap(),
+            ["20260716T0000Z", "20260717T0000Z"]
+        );
+        assert_eq!(
+            tier.list_prefix("_backup/20260716T0000Z")
+                .await
+                .unwrap()
+                .unwrap(),
+            ["db", "state"]
+        );
+        assert_eq!(
+            tier.list_prefix("_backup/20260716T0000Z/db")
+                .await
+                .unwrap()
+                .unwrap(),
+            ["0", "1"]
+        );
+        // Blobs live in the same namespace and list the same way.
+        assert_eq!(
+            tier.list_prefix("aabbccddeeff00112233445566778899/1")
+                .await
+                .unwrap()
+                .unwrap(),
+            ["1"]
+        );
+
+        // Teardown is reflected. Deleting one part of a stamp leaves its sibling.
+        tier.delete_chunk("_backup/20260716T0000Z/db", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            tier.list_prefix("_backup/20260716T0000Z/db")
+                .await
+                .unwrap()
+                .unwrap(),
+            ["0"]
+        );
+        tier.delete_stream("_backup/20260716T0000Z/db")
+            .await
+            .unwrap();
+        assert_eq!(
+            tier.list_prefix("_backup/20260716T0000Z")
+                .await
+                .unwrap()
+                .unwrap(),
+            ["state"]
+        );
+        // The other stamp is untouched.
+        assert_eq!(
+            tier.list_prefix("_backup/20260717T0000Z")
+                .await
+                .unwrap()
+                .unwrap(),
+            ["db"]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_cold_tier_list_prefix() {
+        list_prefix_contract(&MemoryColdTier::new()).await;
+    }
+
+    #[tokio::test]
+    async fn fs_cold_tier_list_prefix() {
+        let dir = unique_cold_dir("list");
+        list_prefix_contract(&FsColdTier::new(&dir)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_and_fs_cold_tiers_list_identically() {
+        let dir = unique_cold_dir("parity");
+        let mem = MemoryColdTier::new();
+        let fs = FsColdTier::new(&dir);
+        seed_bundle_layout(&mem).await;
+        seed_bundle_layout(&fs).await;
+        for prefix in [
+            "_backup",
+            "_backup/20260716T0000Z",
+            "_backup/20260716T0000Z/db",
+            "_backup/nope",
+        ] {
+            assert_eq!(
+                mem.list_prefix(prefix).await.unwrap(),
+                fs.list_prefix(prefix).await.unwrap(),
+                "tiers disagree on {prefix}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `None` (no enumeration capability) and `Some(vec![])` (enumerable, empty)
+    /// are DIFFERENT facts and must never collapse: `list-backups` rendering "no
+    /// backups" for a tier that simply cannot answer would read, to an operator
+    /// about to roll back, as "there is nothing to roll back to".
+    #[tokio::test]
+    async fn list_prefix_none_means_cannot_list_not_empty() {
+        // `BlockingColdTier` does not override `list_prefix`, so it takes the
+        // trait's default — it stands in for any tier without the capability.
+        let cannot = BlockingColdTier::new();
+        cannot.inner.put_chunk(REF, 0, vec![1]).await.unwrap();
+        assert_eq!(cannot.list_prefix("_backup").await.unwrap(), None);
+
+        // Same question, a tier that CAN answer and holds nothing there.
+        let can = MemoryColdTier::new();
+        can.put_chunk(REF, 0, vec![1]).await.unwrap();
+        assert_eq!(can.list_prefix("_backup").await.unwrap(), Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn list_prefix_rejects_unsafe_prefix() {
+        let dir = unique_cold_dir("guard");
+        for tier in [
+            &MemoryColdTier::new() as &dyn ColdTier,
+            &FsColdTier::new(&dir) as &dyn ColdTier,
+        ] {
+            assert!(tier.list_prefix("../escape").await.is_err());
+            assert!(tier.list_prefix("").await.is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- TieredBlobStore (cache over cold) ----

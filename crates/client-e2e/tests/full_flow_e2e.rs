@@ -2,7 +2,91 @@
 //! over REAL loopback TLS with real crypto (no mocks). It composes the entire
 //! trust chain the individual task e2es exercise in isolation into ONE end-to-end
 //! story, and — as the crown jewel — proves the standing recovery account can
-//! read an ordinary user's upload after a genuine channel-bound recovery login.
+//! read an ordinary user's upload **off the server, over the wire**, after a
+//! genuine channel-bound recovery login.
+//!
+//! # What "proves" means here — this file used to overstate it
+//!
+//! An earlier revision made exactly that crown-jewel claim and did **not** carry
+//! it. The only authenticated file read used `bob_token`, the *uploader's* own
+//! session. The "recovery decrypts it" step opened `bundle.wraps` — an in-process
+//! value `build_upload` had just produced locally, never re-read from the server.
+//! And the recovery session token was used for precisely one assertion,
+//! `assert!(!admin_token.is_empty())`. Deleting the entire recovery-login block
+//! left every remaining assertion passing, byte for byte (verified by doing it).
+//! The capability was never exercised end to end; the prose alone carried it.
+//!
+//! The proof below is wire-bound. After the recovery login, using ONLY the
+//! recovery session token and only bytes the server sent back:
+//!
+//!  1. `GET /v1/files` lists bob's upload for the recovery caller — the escrow
+//!     principal really is a first-class reader of another user's file;
+//!  2. `GET /v1/files/{id}?version=latest` returns `200`, and the `my_wrap` it
+//!     serves DIFFERS byte-for-byte from the one the SAME endpoint serves bob for
+//!     the SAME file. That difference is the whole mechanism: the store selects
+//!     the wrap whose `recipient_id` equals the caller's id;
+//!  3. that server-served wrap opens under the cold recovery key, and the
+//!     recovered DEK's `commit()` equals the `dek_commit` decoded from the
+//!     server-served `manifest_b64`. No in-process value participates;
+//!  4. the ciphertext chunks are FETCHED over HTTP with the recovery token and
+//!     run through the real `verify_and_open` ladder (manifest/genesis signatures,
+//!     grant chain, hybrid unwrap, AEAD open); the recovered plaintext equals the
+//!     bytes bob uploaded;
+//!  5. two negative controls make the login load-bearing: a fabricated session
+//!     token is `401`, and `POST /v1/files/{id}/wraps` carrying a REAL,
+//!     correctly-signed, correctly-hybrid-wrapped recovery-issued grant is `403`.
+//!     Sharing from recovery is deliberately NOT shipped — see the
+//!     `RecoveryOkSession` doc comment in `crates/server/src/http.rs`: a recipient
+//!     cannot verify a recovery-issued grant (`granted_by = RECOVERY_ID` resolves
+//!     to no trusted signing key), and `add_wrap` is idempotent *by replace*, so
+//!     admitting it would silently destroy an existing user's working access.
+//!     That assertion is what will catch a future change that re-admits it.
+//!
+//! Remove the recovery-login block and this file no longer compiles, let alone
+//! passes: `rec_token` is load-bearing for every assertion in steps 5-9.
+//!
+//! # Deliberately NOT proven here — do not read more into this than is true
+//!
+//!  * **Reading a file with no recovery wrap.** Every upload in this suite carries
+//!    an author-minted recovery wrap (`build_upload` always emits one). A file
+//!    whose `recovery_present` is false is out of scope; the recovery caller would
+//!    get `404` from the same no-oracle gate that hides it from any non-recipient.
+//!  * **The PostgreSQL store.** This crate links the server WITHOUT the `postgres`
+//!    feature (see `Cargo.toml`) and runs against `MemoryStore` only. `pg.rs`'s
+//!    recipient-generic wrap selection is covered by `crates/server/tests/pg_store.rs`.
+//!  * **`chunk_status` and `logout` for the recovery principal.** Three of the five
+//!    `RecoveryOkSession` handlers are exercised below (`list_files`, `get_file`,
+//!    `get_chunk`); the other two are not.
+//!  * **That every OTHER endpoint bars recovery.** Only `add_wrap` is checked. The
+//!    `AuthedSession` deny-by-default bar is what makes the rest hold; this file
+//!    does not enumerate it.
+//!
+//! # ⚠ THIS FILE IS NOT RUN BY CI — the guarantee is only as good as the habit
+//!
+//! `.github/workflows/ci.yml`'s `test` job runs `cargo fmt --all`, `cargo clippy
+//! --workspace` and `cargo test --workspace` in the ROOT workspace, which
+//! **excludes** `crates/client-app` and `crates/client-e2e` (see the root
+//! `Cargo.toml`'s `exclude`). The only client-workspace job, `compat`, builds
+//! `--test compat` and nothing else. So NOTHING here — including every assertion
+//! above — is enforced on push. It is a local gate, run by hand:
+//!
+//! ```text
+//! cargo test --manifest-path crates/client-app/Cargo.toml -p maxsecu-client-e2e \
+//!     --test full_flow_e2e
+//! ```
+//!
+//! Two practical consequences. First, a regression that re-breaks the recovery read
+//! path will be caught here only if somebody runs this suite. Second, running it at
+//! all requires `crates/client-app/recovery_pin.bin` to be ABSENT: `build.rs`
+//! prefers a real pin file over the `unpinned-dev` test pin, and this whole file is
+//! built on the test pin's reconstructable private half, so a stray real pin in the
+//! working tree makes step 1 fail with a pin mismatch. That is the pin gate working
+//! correctly, not a bug in this test.
+//!
+//! The CI-enforced half of the same guarantee is
+//! `client-core`'s `download::tests::v2_hybrid_recovery_wrap_opens`, which opens a
+//! V2 hybrid RECOVERY wrap through the real `verify_and_open` ladder. `client-core`
+//! IS in the root workspace, so that one runs on every push.
 //!
 //! The single hinge that makes this composable is the embedded recovery **pin**.
 //! `client-e2e` bakes `--features unpinned-dev`, so the pin compiled into
@@ -22,8 +106,8 @@
 //!   flow: bootstrap recovery (= embedded pin) → first user enrols as ADMIN →
 //!   second user enrols as USER → the second (ordinary) user uploads a blog whose
 //!   recovery gate MATCHES the pin and PROCEEDS → a real channel-bound recovery
-//!   LOGIN yields an admin session → the recovery cold key UNWRAPS the upload's
-//!   recovery wrap to the exact file DEK.
+//!   LOGIN yields a recovery session → that session LISTS, FETCHES, UNWRAPS and
+//!   DECRYPTS bob's file from the server, and is REFUSED when it tries to share it.
 //! * [`admin_recovery_session_mints_user_role_key`] — the admin-mint arm: a
 //!   recovery-login admin session MINTS a fresh registration key, and a later user
 //!   who enrols with THAT minted key lands User-role only.
@@ -51,16 +135,19 @@ use tokio_rustls::TlsConnector;
 use maxsecu_client_app::commands::recovery_login::{request_challenge_exchange, verify_exchange};
 use maxsecu_client_app::commands::register::register_with_key_exchange;
 use maxsecu_client_app::directory::resolve_recovery_pin;
+use maxsecu_client_app::download::{build_download_bundle, parse_file_view};
 use maxsecu_client_app::keystore;
 use maxsecu_client_app::recovery_pin::{embedded_pin, parse_pin, test_recovery_secret_seeds};
-use maxsecu_client_core::{build_upload, Identity, UploadParams};
-use maxsecu_crypto::{
-    deserialize_hybrid_wrap, sha256, unwrap_dek_hybrid, EncPublicKey, HybridEncSecretKey, SigningKey,
+use maxsecu_client_core::{
+    build_upload, verify_and_open, Identity, UploadParams, VerifyContext, NO_ADMINS, NO_GRANTERS,
 };
-use maxsecu_encoding::decode;
-use maxsecu_encoding::structs::{DirBinding, WrapContext};
-use maxsecu_encoding::types::{FileType, Id, RecipientType, Role, Timestamp};
-use maxsecu_encoding::RECOVERY_ID;
+use maxsecu_crypto::{
+    deserialize_hybrid_wrap, serialize_hybrid_wrap, sha256, unwrap_dek_hybrid, wrap_dek_hybrid,
+    EncPublicKey, HybridEncPublicKey, HybridEncSecretKey, SigningKey,
+};
+use maxsecu_encoding::structs::{DirBinding, Grant, Manifest, WrapContext};
+use maxsecu_encoding::types::{FileType, Id, RecipientType, Role, StreamType, Timestamp};
+use maxsecu_encoding::{decode, encode, labels, RECOVERY_ID};
 use maxsecu_server::{
     export_channel_binding, router, serve, AppState, AuthConfig, AuthService, MemoryBlobStore,
     MemoryStore, NullAuditSink, Store,
@@ -74,7 +161,8 @@ const REC_SIG_SEED: [u8; 32] = [0x5C; 32];
 const NEVER: u64 = 4_102_444_800_000;
 const TS: u64 = 1_719_500_000_000;
 const PASSPHRASE: &str = "capstone enrol passphrase battery 9!";
-const BLOG_BODY: &[u8] = b"An ordinary user's post the standing recovery account must be able to read.";
+const BLOG_BODY: &[u8] =
+    b"An ordinary user's post the standing recovery account must be able to read.";
 
 // ---- TLS harness (loopback, self-signed; mirrors the sibling e2e suites) ----
 
@@ -177,6 +265,23 @@ async fn get(conn: &mut Conn, uri: &str, auth: Option<&str>) -> (StatusCode, ser
     (status, json)
 }
 
+/// Raw (non-JSON) GET — for the `application/octet-stream` chunk endpoint.
+/// Returns the status and the body bytes exactly as served.
+async fn get_raw(conn: &mut Conn, uri: &str, auth: &str) -> (StatusCode, Vec<u8>) {
+    conn.sender.ready().await.unwrap();
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("host", "localhost")
+        .header("authorization", format!("MaxSecu-Session {auth}"))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = conn.sender.send_request(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec())
+}
+
 fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     for x in b {
@@ -244,7 +349,9 @@ fn recovery_cold_key() -> Identity {
 /// will MATCH; because `rec.sig` is a real signing key we hold, the recovery login
 /// proof will verify.
 async fn register_recovery(c: &mut Conn, rec: &Identity) {
-    let mlkem = rec.mlkem_pub_bytes().expect("test recovery account is hybrid (PQ)");
+    let mlkem = rec
+        .mlkem_pub_bytes()
+        .expect("test recovery account is hybrid (PQ)");
     let (st, _) = post(
         c,
         "/v1/recovery/register",
@@ -326,7 +433,11 @@ async fn full_flow_setup_enroll_upload_recover() {
         pin.enc_pub,
         "the recovery cold key's enc half IS the embedded pin"
     );
-    assert_eq!(rec.mlkem_pub_bytes(), pin.mlkem_pub, "…including the ML-KEM half");
+    assert_eq!(
+        rec.mlkem_pub_bytes(),
+        pin.mlkem_pub,
+        "…including the ML-KEM half"
+    );
     register_recovery(&mut c, &rec).await;
 
     // 2) First user enrols → ADMIN (the server's first-registrant grant).
@@ -337,7 +448,10 @@ async fn full_flow_setup_enroll_upload_recover() {
     let (st, body) = get(&mut c, "/v1/directory/alice", None).await;
     assert_eq!(st, StatusCode::OK);
     let alice = parse_binding(&body);
-    assert!(alice.roles.roles().contains(&Role::Admin), "first user is admin");
+    assert!(
+        alice.roles.roles().contains(&Role::Admin),
+        "first user is admin"
+    );
     assert!(alice.roles.roles().contains(&Role::User));
 
     // 3) Second user enrols → USER only (an ordinary poster).
@@ -402,7 +516,9 @@ async fn full_flow_setup_enroll_upload_recover() {
     .expect("the upload completes and the server accepts the recovery-wrapped file");
 
     // The server persisted a recovery grant (the file really wrapped to recovery).
-    let (st, view) = get(
+    // This is BOB's view — captured here so step 6 can compare the wrap the server
+    // serves the recovery caller against the wrap it serves the uploader.
+    let (st, bob_view) = get(
         &mut c,
         &format!("/v1/files/{fid_hex}?version=latest"),
         Some(&bob_token),
@@ -410,14 +526,19 @@ async fn full_flow_setup_enroll_upload_recover() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert!(
-        !view["recovery_grant"].is_null(),
+        !bob_view["recovery_grant"].is_null(),
         "the served file view carries a recovery grant"
     );
+    let bob_wrap_b64 = bob_view["my_wrap"]["wrapped_dek_b64"]
+        .as_str()
+        .expect("bob's view carries his own wrapped DEK")
+        .to_owned();
 
     // 5) Recovery LOGIN — the real channel-bound challenge-response with the cold
     //    key. The server wraps the challenge to the registered recovery enc pubkey
     //    (== the pin), so ONLY this cold key can unwrap it; the proof is signed with
-    //    its signing key. Success ⇒ an admin recovery session token.
+    //    its signing key. Success ⇒ a recovery session token. EVERYTHING BELOW USES
+    //    ONLY THIS TOKEN — bob's session never appears again.
     let challenge = request_challenge_exchange(&mut c.sender, "localhost", &rec)
         .await
         .expect("the cold key unwraps the recovery challenge to the nonce");
@@ -425,39 +546,280 @@ async fn full_flow_setup_enroll_upload_recover() {
         challenge.suite_is_hybrid(),
         "the hybrid recovery account ⇒ a Suite::V2 challenge wrap"
     );
-    let admin_token = verify_exchange(&mut c.sender, "localhost", &rec, &challenge, &c.exporter, TS)
-        .await
-        .expect("the channel-bound proof logs the recovery account into an admin session");
-    assert!(!admin_token.is_empty(), "server minted a recovery admin token");
+    let rec_token = verify_exchange(
+        &mut c.sender,
+        "localhost",
+        &rec,
+        &challenge,
+        &c.exporter,
+        TS,
+    )
+    .await
+    .expect("the channel-bound proof logs the recovery account into a session");
 
-    // 6) Recovery DECRYPTS the ordinary user's upload: unwrap the produced recovery
-    //    wrap with the recovery cold PRIVATE key, recovering the exact file DEK.
-    let rec_wrap = bundle
-        .wraps
-        .iter()
-        .find(|w| w.recipient_type == RecipientType::Recovery)
-        .expect("the upload produced a recovery wrap");
-    assert_eq!(
-        rec_wrap.recipient_id, RECOVERY_ID,
-        "recovery wrap uses the RECOVERY_ID sentinel"
+    // 6) The recovery session READS the ordinary user's file OFF THE SERVER.
+    //
+    //    6a) It is listed for the recovery caller — the escrow principal is a
+    //        first-class reader of a file it does not own (`RecoveryOkSession` on
+    //        `list_files`, plus the store's recipient-generic visibility gate).
+    let (st, listing) = get(&mut c, "/v1/files", Some(&rec_token)).await;
+    assert_eq!(st, StatusCode::OK, "GET /v1/files with the recovery token");
+    assert!(
+        listing["files"]
+            .as_array()
+            .expect("a files array")
+            .iter()
+            .any(|f| f["file_id"].as_str() == Some(fid_hex.as_str())),
+        "the recovery session sees bob's upload in the feed listing"
     );
-    // Suite::V2 packs the hybrid wire as enc(32) ‖ ct — reassemble + open it.
-    let mut wire = rec_wrap.wrapped_dek.enc.to_vec();
-    wire.extend_from_slice(&rec_wrap.wrapped_dek.ct);
-    let hybrid = deserialize_hybrid_wrap(&wire).expect("V2 recovery wrap is a hybrid wire");
+
+    //    6b) `GET /v1/files/{id}` with the RECOVERY token → 200, and the wrap it
+    //        serves is a DIFFERENT ciphertext from the one it served bob for the
+    //        same file/version. That difference IS the mechanism under test: the
+    //        store selects the wrap whose `recipient_id == caller_id`, so the
+    //        recovery caller receives the RECOVERY wrap, not bob's.
+    let (st, rec_view) = get(
+        &mut c,
+        &format!("/v1/files/{fid_hex}?version=latest"),
+        Some(&rec_token),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "the recovery session may read another user's file view"
+    );
+    let rec_wrap_b64 = rec_view["my_wrap"]["wrapped_dek_b64"]
+        .as_str()
+        .expect("the recovery view carries a wrapped DEK")
+        .to_owned();
+    assert_ne!(
+        rec_wrap_b64, bob_wrap_b64,
+        "the server serves each caller ITS OWN wrap — recovery's differs from bob's"
+    );
+
+    //    6c) Open THAT server-served wrap with the cold recovery key, and check the
+    //        recovered DEK against the `dek_commit` decoded from the SERVER-SERVED
+    //        manifest. No in-process value from `bundle` participates in this proof.
+    let served_wrap = B64
+        .decode(&rec_wrap_b64)
+        .expect("wrapped_dek_b64 is base64");
+    let served_manifest_bytes = B64
+        .decode(rec_view["manifest_b64"].as_str().expect("manifest_b64"))
+        .expect("manifest_b64 is base64");
+    let served_manifest: Manifest =
+        decode(&served_manifest_bytes).expect("the served manifest decodes canonically");
+    let served_version = rec_view["version"].as_u64().expect("a version");
+    assert_eq!(
+        served_manifest.version, served_version,
+        "the served manifest is the served version"
+    );
+    // Suite::V2 packs the hybrid wire as enc(32) ‖ ct, which is exactly what the
+    // §8.5 `wrapped_dek_b64` carries — parse it straight off the wire.
+    let hybrid =
+        deserialize_hybrid_wrap(&served_wrap).expect("the served V2 wrap is a hybrid wire");
     let (x_seed, mlkem_seed) = test_recovery_secret_seeds();
     let recovery_secret = HybridEncSecretKey::from_components(x_seed, mlkem_seed);
     let wrap_ctx = WrapContext {
         file_id,
-        version: bundle.manifest.version,
+        version: served_version,
         recipient_id: RECOVERY_ID,
     };
     let dek = unwrap_dek_hybrid(&recovery_secret, &hybrid, &wrap_ctx)
-        .expect("the recovery private key opens the wrap");
+        .expect("the cold recovery key opens the wrap the SERVER served it");
+    assert_eq!(
+        dek.commit(),
+        served_manifest.dek_commit.0,
+        "the DEK recovered from the SERVER-SERVED wrap matches the SERVER-SERVED manifest's dek_commit"
+    );
+    // Sanity: bob's wrap is a different ciphertext, and it is NOT openable by the
+    // recovery key (each wrap is bound to its own recipient by `WrapContext`).
+    let bob_hybrid = deserialize_hybrid_wrap(&B64.decode(&bob_wrap_b64).unwrap())
+        .expect("bob's served V2 wrap is a hybrid wire too");
+    assert!(
+        unwrap_dek_hybrid(&recovery_secret, &bob_hybrid, &wrap_ctx).is_err(),
+        "the recovery key opens ONLY the recovery-recipient wrap"
+    );
+
+    //    6d) Fetch the ciphertext chunks with the recovery token and actually open
+    //        them: the raw §9.2 endpoint answers 200, then the real product download
+    //        path (`parse_file_view` → `build_download_bundle` → `verify_and_open`)
+    //        re-fetches every stream over HTTP with the SAME token and runs the full
+    //        §12.5 ladder — manifest/genesis signatures, grant chain, hybrid unwrap,
+    //        AEAD open. The plaintext must be exactly what bob uploaded.
+    let (st, raw_chunk) = get_raw(
+        &mut c,
+        &format!("/v1/files/{fid_hex}/versions/{served_version}/streams/content/chunks/0"),
+        &rec_token,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "the recovery session may GET another user's ciphertext chunk"
+    );
+    assert!(
+        !raw_chunk.is_empty(),
+        "the chunk endpoint served ciphertext"
+    );
+    assert_ne!(
+        raw_chunk, BLOG_BODY,
+        "what the server holds is ciphertext, not the plaintext"
+    );
+
+    let parsed = parse_file_view(&rec_view).expect("the recovery file view parses");
+    let (dl, _used_direct) = build_download_bundle(
+        &mut c.sender,
+        "localhost",
+        &rec_token,
+        &fid_hex,
+        &parsed,
+        maxsecu_client_app::config::RouteMode::PreferServer,
+        None,
+    )
+    .await
+    .expect("every stream's chunks download under the recovery token");
+    let rec_ctx = VerifyContext {
+        file_id,
+        // The author/owner key comes from BOB'S SERVED DIRECTORY BINDING (step 3),
+        // not from his in-process `Identity` — the recovery client has no access to
+        // that, and neither does this proof.
+        author_sig_pub: bob_binding.sig_pub.0,
+        owner_sig_pub: bob_binding.sig_pub.0,
+        recipient_id: RECOVERY_ID,
+        recipient_type: RecipientType::Recovery,
+        recipient_secret: rec.enc_secret(),
+        recipient_mlkem_seed: rec.mlkem_seed(),
+        seen_max_version: None,
+        granter_sig_pub: &NO_GRANTERS,
+        admin_sig_pub: &NO_ADMINS,
+        tombstones: None,
+        compromise: None,
+    };
+    let opened = verify_and_open(&rec_ctx, &dl)
+        .expect("the recovery account opens an ordinary user's file end to end");
+    assert_eq!(opened.version, served_version);
+    assert_eq!(opened.file_type, FileType::Blog);
+    let content = opened
+        .streams
+        .iter()
+        .find(|s| s.stream_type == StreamType::Content)
+        .expect("a content stream");
+    assert_eq!(
+        content.plaintext, BLOG_BODY,
+        "THE CROWN JEWEL: the recovery account recovered the ordinary user's PLAINTEXT, \
+         entirely from bytes the server served it"
+    );
+
+    // 7) NEGATIVE CONTROL — a fabricated session token is refused. Without this the
+    //    reads above could be explained by an absent auth check rather than by the
+    //    login actually having happened.
+    let forged_token = hex(&maxsecu_crypto::random_array::<32>());
+    assert_ne!(forged_token, rec_token, "sanity: a different token");
+    let (st, _) = get(
+        &mut c,
+        &format!("/v1/files/{fid_hex}?version=latest"),
+        Some(&forged_token),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "a fabricated session token reads nothing — the recovery LOGIN is what unlocked step 6"
+    );
+
+    // 8) NEGATIVE CONTROL — SHARING IS BARRED. The recovery session holds a real
+    //    wrap and a real signing key, so it can mint a byte-perfect re-share: a
+    //    correctly-signed `Grant` and the file's true DEK hybrid-wrapped to alice's
+    //    directory-published keys. The server must still refuse it with `403`,
+    //    because `add_wrap` takes `AuthedSession` (which bars `RECOVERY_ID`) and NOT
+    //    `RecoveryOkSession`. See that type's doc comment: a recipient cannot verify
+    //    a recovery-issued grant, and `add_wrap` replaces destructively — admitting
+    //    it would swap an existing user's WORKING grant for an unopenable one.
+    //    If someone ever flips this handler's extractor, this assertion fails.
+    let alice_hybrid_pub = HybridEncPublicKey {
+        x25519: alice.enc_pub.0,
+        mlkem: alice
+            .mlkem_pub
+            .expect("alice enrolled PQ-hybrid, so her binding publishes an ML-KEM key")
+            .0,
+    };
+    let reshare_ctx = WrapContext {
+        file_id,
+        version: served_version,
+        recipient_id: alice.user_id,
+    };
+    let reshare_wire = serialize_hybrid_wrap(
+        &wrap_dek_hybrid(&alice_hybrid_pub, &dek, &reshare_ctx)
+            .expect("the recovered DEK re-wraps to alice"),
+    );
+    let reshare_grant = Grant {
+        file_id,
+        file_version: served_version,
+        recipient_id: alice.user_id,
+        recipient_type: RecipientType::User,
+        dek_commit: served_manifest.dek_commit,
+        granted_by: RECOVERY_ID,
+        created_at: Timestamp(TS),
+    };
+    let reshare_grant_sig = rec
+        .signing_key()
+        .sign_canonical(labels::GRANT, &reshare_grant);
+    let (st, _) = post(
+        &mut c,
+        &format!("/v1/files/{fid_hex}/wraps"),
+        Some(&rec_token),
+        serde_json::json!({
+            "recipient_id": hex(&alice.user_id.0),
+            "recipient_type": "user",
+            "wrapped_dek_b64": B64.encode(&reshare_wire),
+            "wrap_alg": 1,
+            "granted_by": hex(&RECOVERY_ID.0),
+            "grant_b64": B64.encode(encode(&reshare_grant)),
+            "grant_sig_b64": B64.encode(reshare_grant_sig),
+        }),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "a recovery-issued re-share is refused: `add_wrap` takes AuthedSession, which bars \
+         RECOVERY_ID (see RecoveryOkSession's doc comment — an admitted recovery re-share \
+         would DESTROY an existing recipient's access, because add_wrap replaces)"
+    );
+    // …and it really was refused: alice still cannot see the file.
+    let alice_token = login(
+        &mut c,
+        "alice",
+        &keystore::unlock(&dir_admin, PASSPHRASE).unwrap(),
+    )
+    .await;
+    let (st, _) = get(
+        &mut c,
+        &format!("/v1/files/{fid_hex}?version=latest"),
+        Some(&alice_token),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "the refused re-share stored nothing — alice holds no wrap for bob's file"
+    );
+
+    // 9) The in-process bundle agrees with what the wire proved. Kept LAST and
+    //    deliberately subordinate: this is a cross-check on the harness, NOT the
+    //    proof. Every assertion above stands on server-served bytes alone.
     assert_eq!(
         dek.commit(),
         bundle.manifest.dek_commit.0,
-        "the recovery-recovered DEK matches the file's committed DEK"
+        "cross-check: the wire-recovered DEK is the one build_upload committed to"
+    );
+    assert!(
+        bundle
+            .wraps
+            .iter()
+            .any(|w| w.recipient_type == RecipientType::Recovery && w.recipient_id == RECOVERY_ID),
+        "cross-check: the upload minted the RECOVERY_ID-sentinel wrap the server served back"
     );
 
     let _ = std::fs::remove_dir_all(&dir_admin);
@@ -485,9 +847,16 @@ async fn admin_recovery_session_mints_user_role_key() {
     let challenge = request_challenge_exchange(&mut c.sender, "localhost", &rec)
         .await
         .expect("recovery challenge unwraps");
-    let admin_token = verify_exchange(&mut c.sender, "localhost", &rec, &challenge, &c.exporter, TS)
-        .await
-        .expect("recovery admin session established");
+    let admin_token = verify_exchange(
+        &mut c.sender,
+        "localhost",
+        &rec,
+        &challenge,
+        &c.exporter,
+        TS,
+    )
+    .await
+    .expect("recovery admin session established");
 
     // The admin session MINTS a fresh single-use registration key.
     let (st, res) = post(
@@ -497,7 +866,11 @@ async fn admin_recovery_session_mints_user_role_key() {
         serde_json::json!({}),
     )
     .await;
-    assert_eq!(st, StatusCode::CREATED, "recovery admin session mints a reg key");
+    assert_eq!(
+        st,
+        StatusCode::CREATED,
+        "recovery admin session mints a reg key"
+    );
     let minted = res["registration_key"].as_str().unwrap().to_owned();
     assert!(!minted.is_empty());
 

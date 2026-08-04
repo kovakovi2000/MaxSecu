@@ -182,11 +182,32 @@ export function on<T>(event: string, cb: (p: T) => void): Promise<() => void> {
 
 | Command | Invoke args | Returns | Used by |
 |---|---|---|---|
-| `list_feed` | `{ req: { filter, sort, limit? } }` | `FeedEntry[]` | feed-screen |
+| `list_feed` | `{ req: { filter, sort, limit?, offset?, cursor?, owner_me? } }` | `FeedPage` (`{ entries, next_cursor, total }`) | feed-screen |
 | `decrypt_card` | `{ req: { file_id, version? } }` | `Card` | media-card |
 | `open_content` | `{ req: { file_id, version? } }` | `OpenedContent` | media-viewer |
 | `open_bundle` | `{ req: { file_id, version? } }` | `BundleView` | bundle-screen |
 | `search_local` | `{ req: { query } }` | `SearchHit[]` | feed-screen |
+
+`list_feed` used to return a bare `FeedEntry[]`; it now returns the `FeedPage`
+envelope, because a bare array had nowhere to carry a cursor or a total. Every
+paging field is optional on the way in (`#[serde(default)] Option<…>`), so an exe
+upgraded without its `ui/dist` rebuild still binds and behaves as before.
+
+**`total === null` is the old-server signal, and it is load-bearing.** An
+un-upgraded server (prod `41912da`) has no `offset`/`cursor`/`sort`/`owner`
+support: it ignores those params, returns page 1 forever, and its response body
+has no `total` key. On seeing `total === null` the UI **must render no pager at
+all** and must never request `offset > 0` — i.e. behave exactly as it does today
+(one page, up to 50 items, sorted client-side). `core/paging.ts`'s
+`shouldShowPager(total, limit)` is the single gate for that decision; the
+`#/mine` per-card `mine-only` cull is likewise re-armed only on that legacy path,
+because a paginating server has already applied `owner=me` itself.
+
+The numbered pager control itself is `core/pager.ts` (`renderPager`), shared by
+`feed-screen` (page size 50) and `bundle-screen` (member page size 60). Its host
+`<nav>` lives in each screen's **static** `innerHTML` template — the a11y lint
+rejects `${}` interpolation there — and every button is created with
+`createElement` + `addEventListener`, never an inline handler.
 
 **Download / delete / share**
 

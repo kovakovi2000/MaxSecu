@@ -20,12 +20,24 @@
 //!     [`AdminSession`](crate::http::AdminSession) extractor without a user
 //!     binding, since the escrow identity is not a users-table user.
 //!
-//! A stolen recovery *session* is tightly bounded: `AuthedSession` bars the
-//! recovery principal from every file/content endpoint, so it authorizes only
-//! coarse admin *server* actions (e.g. minting registration keys) — never a file
-//! read/write — and it yields no private key, so it can never decrypt content
-//! (spec §9). The recovery private key stays in the operator's cold file; the
-//! server only ever holds its public halves.
+//! A recovery *session* cannot be stolen and replayed — it is bound to the TLS
+//! exporter of the connection that minted it — and the only way to mint one is to
+//! hold the recovery *private* keys, since the nonce is encrypted to `enc_pub` and
+//! the proof verified against `sig_pub`. Every holder of a live recovery session
+//! therefore already holds the cold key.
+//!
+//! What such a session authorizes is an explicit, owner-approved allowlist: coarse
+//! admin *server* actions (e.g. minting registration keys) via
+//! [`AdminSession`](crate::http::AdminSession), plus the five file endpoints named
+//! on [`RecoveryOkSession`](crate::http::RecoveryOkSession) — browse every file,
+//! fetch its ciphertext, and end the session. Everything else stays barred by
+//! `AuthedSession`: no uploading, no deleting, no revoking, no direct links, and
+//! **no sharing** — `add_wrap` is barred because a recovery-issued grant is
+//! unopenable by the recipient and `add_wrap` replaces destructively, so admitting
+//! it would cost an existing user their access (see `RecoveryOkSession`).
+//! The session still yields no private key; the recovery private key stays in the
+//! operator's cold file and the server only ever holds its public halves, so the
+//! ciphertext it serves is plaintext only to a client that loaded that key.
 
 use crate::auth::AuthService;
 use crate::auth::SessionToken;
@@ -223,8 +235,16 @@ impl<S: Store> AuthService<S> {
                         SessionRecord {
                             // The reserved recovery principal — no user binding. The
                             // AdminSession extractor admits it for admin server
-                            // actions, while AuthedSession bars it from every
-                            // file/content endpoint (spec §9 blast radius).
+                            // actions and RecoveryOkSession for the FIVE allowlisted
+                            // file endpoints — list_files, get_file, get_chunk,
+                            // chunk_status, logout (browse / fetch / end-session) —
+                            // while AuthedSession bars it from every other one.
+                            // SHARING IS NOT ONE OF THEM: `add_wrap` stays on
+                            // AuthedSession and 403s this principal (closed decision,
+                            // 2026-08-02; DESIGN.md §6.3 records the same claim as
+                            // CORRECTED). Admitting it here would destroy an existing
+                            // recipient's access — add_wrap replaces by recipient_id
+                            // in both stores.
                             user_id: RECOVERY_ID.0,
                             tls_exporter: *exporter,
                             expires_at_ms: now_ms + self.session_ttl_ms(),

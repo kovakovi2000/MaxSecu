@@ -47,6 +47,71 @@ These were decided with the operator during brainstorming. Implement them as wri
   **bound to the live TLS session** (RFC-5705 exporter), reusing the existing login channel-binding.
   A recovery *session* grants admin server actions (mint registration keys) but **not** the private
   key — content decryption still requires the cold key file.
+
+  > **AMENDED 2026-08-01 (operator decision).** The last sentence above is **superseded on its
+  > *reach* half**. The operator decided the recovery identity should behave like an ordinary account
+  > that happens to be a recipient on everything — *"I want to use the recovery key just like if it
+  > were any user, the only difference that it have access to all of the uploaded file by default. So
+  > just like if I were to login but everything is shared, so I can look at the feed and everything, I
+  > can click share and share it with anyone."*
+  >
+  > **What changed.** `RECOVERY_ID` is now admitted on an explicit **five-handler allowlist** of file
+  > endpoints (`server/http.rs`, extractor `RecoveryOkSession`): `list_files`, `get_file`,
+  > `get_chunk`, `chunk_status` and `logout`. It is **always on** — there is no
+  > config flag. Everything else still runs on `AuthedSession`, which continues to hard-`403` the
+  > recovery principal, so deny-by-default is preserved: a file endpoint added tomorrow is shut to
+  > recovery until someone deliberately names the new extractor.
+  >
+  > So the shipped session **browses** every file, **opens/streams/downloads** every file, **ends
+  > itself**, and — as before this amendment — **mints user-role registration keys**.
+  >
+  > **⚠️ SHARING DID NOT SHIP — the quoted goal is only PARTLY met.** *"I can click share and share it
+  > with anyone"* is **not** delivered. `add_wrap` (`POST /v1/files/{id}/wraps`) was admitted in a
+  > draft of this amendment and then **reverted** to `AuthedSession`; the client refuses the action
+  > with `recovery_share_unsupported` (`client-app/commands/share.rs`) and the share affordance is
+  > hidden for a recovery principal. **This is a CLOSED DECISION (owner, 2026-08-02): sharing from a
+  > recovery session does not ship, is not pending, and is not scheduled** — see the sub-section
+  > below for why it is unsafe, not merely unbuilt. Do not treat the gap as an oversight and do not
+  > "fix" it by admitting the extractor.
+  >
+  > **What did NOT change.** The session is still an opaque, TLS-exporter-bound token and still yields
+  > **no private key**; minting one still requires the recovery *private* keys, so every holder of a
+  > live recovery session already holds the cold key. Recovery still cannot upload
+  > (`create_file`/`stage_version`/`put_chunk`/`finalize_version`), **share** (`add_wrap`), delete or
+  > revoke (`discard_file`/`delete_wrap`), mint a bearer cold-tier URL that outlives the session
+  > (`direct_link`), enumerate a file's other recipients (`list_recipients`), or mint admins (D5:
+  > user-role keys only).
+  >
+  > **The security cost, stated plainly.** The delta is **reach, not identity**: recovery key +
+  > network reach now yields complete, remote plaintext of every file, with **no operator
+  > involvement** and no ceremony. Previously the same key-holder had to convene the air-gapped §12.7
+  > ceremony to read a single file. Holding sharing back does not reduce that: **reads are neither
+  > audited nor rate-limited** — no read path in this server is, for any principal — so a bulk escrow
+  > browse of the whole corpus leaves no trace. This is a deliberate, accepted trade, not an
+  > oversight. See §5 item 1 and §9.
+  >
+  > **Why `add_wrap` is shut — CLOSED DECISION, owner, 2026-08-02.** Three reasons, each verified
+  > against code. **(a)** A recovery-issued grant is structurally unopenable: `client-core`'s download
+  > path rejects any ancestor whose `recipient_type` is not `User`
+  > (`crates/client-core/src/download.rs:448-450`), and the server serves exactly the recovery wrap's
+  > grant as that ancestor. **(b)** `granted_by = RECOVERY_ID` resolves to **no CLIENT-TRUSTED signing
+  > key**, so the walk ends in `GrantChainBroken`. *(Precisely: the recovery account **does** hold an
+  > Ed25519 `sig_pub` server-side, `crates/server/src/store.rs:47-51`. What is missing is a trusted
+  > path to it — `GET /v1/recovery/pubkey` serves only `enc_pub`/`mlkem_pub`
+  > (`crates/server/src/http.rs:667-686`), the recovery pin omits `sig_pub`, and every client open
+  > path passes no-op granter/admin resolvers. Earlier revisions of this spec said "no signing key
+  > exists"; that wording is **wrong** and invites the wrong fix.)* **(c)** `add_wrap` is idempotent
+  > **by REPLACE** in both stores (`crates/server/src/store.rs:1228`; `crates/server/src/pg.rs:1184-1203`),
+  > so a recovery "share" to someone who already had access would **destroy that access**, silently and
+  > irreversibly — the one thing `CLAUDE.md` forbids outright. **(c) is what makes this permanent
+  > rather than a missing feature.** Admitting the route would also make recovery a **universal grant
+  > issuer by construction** (its only authorization is "the caller already holds a wrap for this
+  > version", and recovery holds one on every finalized version). Two candidate designs would be
+  > needed to lift (a)/(b) — a published directory binding for `RECOVERY_ID` carrying a real Ed25519
+  > signing key, or `sig_pub` added to the recovery pin (a frozen surface, so itself a format change)
+  > with the chain terminating at the `DESIGN.md` §12.7 admin key — plus a server-side REPLACE refusal
+  > for (c). **The operator declined to take either on**, so none of it is scheduled. Pinned by
+  > `crates/server/tests/recovery_login_e2e.rs`, which asserts the `403` with a well-formed body.
 - **D7 — Startup precedence.** If more than one is present beside the exe: **recovery-key file →
   registration-key file → normal keystore login**.
 - **D8 — `recovery_seal` is removed** (it existed only for the retired T6).
@@ -166,7 +231,16 @@ On launch, `client-app` checks, in **precedence order (D7)**, for files beside t
 
 1. **Recovery-key file** (e.g. `recovery.key`) → **recovery panel**: a single **"Request Challenge"**
    button and status text. On click → §6. On success → a recovery **admin** session (nav exposes admin
-   actions incl. minting registration keys; can view content it can decrypt with the loaded key).
+   actions incl. minting registration keys). **AMENDED 2026-08-01 (§0 D6):** the session also **browses
+   every file, opens/streams/downloads any of them, and can end itself** — it is a
+   standing recipient on every upload, so every wrap it fetches opens with the loaded key. It **cannot
+   upload, cannot delete, cannot revoke, and CANNOT SHARE**; those endpoints still `403` the recovery
+   principal. **Corrected 2026-08-01 — an earlier draft of this item said the session "shares any of
+   them to any account". It does not:** `add_wrap` was reverted to `AuthedSession` because a
+   recovery-issued grant is unopenable by the recipient *and* `add_wrap` replaces destructively, so
+   sharing would cost an existing user their access (§0 D6, §9). The UI reflects the truth — the share
+   affordance is hidden for a recovery principal and the command refuses with
+   `recovery_share_unsupported` (`client-app/commands/share.rs`).
 2. **Registration-key file** (e.g. `register.key`) → **registration panel**: choose username +
    passphrase → generate a local `Identity` → `POST /v1/users` with the key → on success seal the new
    identity into the local keystore, and the panel deletes the local key file (server deletes its copy).
@@ -244,8 +318,45 @@ not leave dangling references).
 - **Transparency teeth (C)** require a witness/gossip to be fully meaningful; the in-repo `sink-server`
   is the witness. Full third-party witness/gossip remains a deferred ops item; the log + inclusion
   proofs + TOFU still provide strong detection meanwhile.
-- **Recovery session blast radius** is bounded to admin server actions (mint user-role keys); it cannot
-  decrypt content or mint admins (D5: user-role keys only).
+- **Recovery session blast radius** (**AMENDED 2026-08-01** — see §0 D6 for the operator decision and
+  the security cost) covers admin server actions (mint user-role keys) **plus an explicit five-handler
+  allowlist on the file surface**: `list_files` (`GET /v1/files`), `get_file` (`GET /v1/files/{id}`),
+  `get_chunk` and `chunk_status` (`GET …/chunks/{i}` and `…/status`), and `logout`
+  (`POST /v1/session/logout`). A recovery session therefore **browses every file, fetches and decrypts
+  its ciphertext, and can end itself** — the ciphertext opens because the recovery wrap is on every
+  upload (§3). It **cannot** upload
+  (`create_file`/`stage_version`/`put_chunk`/`finalize_version`), **share** (`add_wrap` — see below),
+  delete or revoke
+  (`discard_file`/`delete_wrap`), mint a bearer cold-tier URL that outlives the session
+  (`direct_link`), enumerate a file's other recipients (`list_recipients` — owner-only in the store),
+  or mint admins (D5: user-role keys only). It still yields **no private key**: the token is opaque,
+  and the cold key stays in the operator's sealed keyblob. Every other file endpoint — including any
+  added later — stays barred by `AuthedSession` unless it deliberately opts out.
+  - **Corrected 2026-08-01 — an earlier draft of this bullet listed `add_wrap` in the allowlist and
+    claimed a recovery session "grants any file to any account". It does not, and the route is
+    `403`.** *(Retired claim, kept for provenance — do not act on it.)* ~~`add_wrap`
+    (`POST /v1/files/{id}/wraps` — **sharing**) … and grants any file to any account.~~ **Sharing from
+    the recovery identity is a CLOSED DECISION (owner, 2026-08-02): it does not ship and is not
+    pending.** Admitting `add_wrap` would make recovery a **universal grant issuer by construction**
+    (its only authorization is "the caller already holds a wrap for this version", and recovery holds
+    one on every finalized version) — and worse, it would do so *destructively*: `add_wrap` is
+    idempotent **by REPLACE** in both stores (`crates/server/src/store.rs:1228`;
+    `crates/server/src/pg.rs:1184-1203`), while a recovery-issued grant is **unopenable** by the
+    recipient (`client-core`'s download path rejects a non-`User` ancestor `recipient_type`,
+    `crates/client-core/src/download.rs:448-450`, and `granted_by = RECOVERY_ID` resolves to **no
+    client-trusted signing key** — the recovery account does hold an Ed25519 `sig_pub` server-side,
+    `crates/server/src/store.rs:47-51`, but no client has a trusted path to it: `GET
+    /v1/recovery/pubkey` serves only `enc_pub`/`mlkem_pub`, `crates/server/src/http.rs:667-686` — so
+    the walk ends in `GrantChainBroken`). Re-sharing to someone who already had access would replace
+    their working grant with a dead one and **destroy data access that already worked**; that is the
+    reason the decision is permanent rather than a feature awaiting a protocol. Two candidate designs
+    would have been needed — (1) a trust anchor (publish a directory binding for `RECOVERY_ID` carrying
+    a real Ed25519 signing key, **or** add `sig_pub` to the recovery pin and terminate the chain at the
+    `DESIGN.md` §12.7 admin key) **and** (2) a server-side refusal of a REPLACE when
+    `granted_by == RECOVERY_ID` — and **the operator declined to take either on**. The bar stays on the
+    extractor (a client-side refusal is not a security boundary), and
+    `crates/server/tests/recovery_login_e2e.rs` asserts the `403` with a well-formed body so that
+    admitting the route breaks the build.
 - Preserve existing crypto discipline: zeroize transient key material; only DTOs cross the Tauri seam;
   no key material in logs/Debug; e2e over real TLS with real crypto.
 

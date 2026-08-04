@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod bootstrap;
 pub mod bundle;
 pub mod connection;
 pub mod delete_cmd;

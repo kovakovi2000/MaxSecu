@@ -2225,12 +2225,26 @@ mod tests {
         assert!(version_acceptable(8, Some(7)).is_ok()); // next version
     }
 
+    /// The recovery account's HYBRID cold key for a [`build_v2`] bundle — both legs,
+    /// so a test can actually open the V2 recovery wrap (the classical X25519 secret
+    /// alone cannot: a `Suite::V2` wrap needs the ML-KEM seed too, and a V2 open with
+    /// `recipient_mlkem_seed: None` fails closed with `PqKeyMissing`).
+    struct V2Recovery {
+        sk: maxsecu_crypto::EncSecretKey,
+        mlkem_seed: [u8; 64],
+    }
+
+    /// The V2 content plaintext, asserted on the way back out of a recovery open.
+    const V2_CONTENT: &[u8] = b"post-quantum content stream";
+
     /// Build a V2 (PQ-hybrid) upload bundle: owner + recovery both PQ-enrolled.
-    fn build_v2() -> (Identity, UploadBundle) {
+    /// Returns the recovery cold key as well — it is the whole point of the escrow,
+    /// and dropping it is how [`v2_hybrid_recovery_wrap_opens`]'s gap went unnoticed.
+    fn build_v2() -> (Identity, UploadBundle, V2Recovery) {
         use maxsecu_crypto::generate_mlkem_keypair;
         let owner = Identity::generate();
-        let (_recovery_sk, recovery_pk) = generate_enc_keypair();
-        let (_recovery_seed, recovery_mlkem) = generate_mlkem_keypair();
+        let (recovery_sk, recovery_pk) = generate_enc_keypair();
+        let (recovery_seed, recovery_mlkem) = generate_mlkem_keypair();
         let params = UploadParams {
             owner: &owner,
             owner_id: OWNER_ID,
@@ -2243,18 +2257,25 @@ mod tests {
             created_at: NOW,
         };
         let streams = PlaintextStreams {
-            content: b"post-quantum content stream".to_vec(),
+            content: V2_CONTENT.to_vec(),
             metadata: Some(b"title=pq".to_vec()),
             thumbnail: None,
             preview: None,
         };
         let bundle = build_upload(&params, &streams).unwrap();
-        (owner, bundle)
+        (
+            owner,
+            bundle,
+            V2Recovery {
+                sk: recovery_sk,
+                mlkem_seed: recovery_seed,
+            },
+        )
     }
 
     #[test]
     fn v2_hybrid_wrap_opens_on_download() {
-        let (owner, bundle) = build_v2();
+        let (owner, bundle, _recovery) = build_v2();
         assert!(matches!(bundle.manifest.alg, Suite::V2));
         let sw = bundle
             .wraps
@@ -2313,6 +2334,107 @@ mod tests {
         let mut c2 = c.clone();
         c2.recipient_mlkem_seed = None;
         assert_eq!(verify_and_open(&c2, &db), Err(DownloadError::PqKeyMissing));
+    }
+
+    /// The **recovery** account opens a `Suite::V2` (PQ-hybrid) file — the escrow
+    /// path as the real deployment actually runs it.
+    ///
+    /// This closes a gap that neither neighbouring test covered, and the gap sat on
+    /// the highest-consequence path in the system:
+    ///
+    ///  * [`recovery_wrap_recipient_round_trips`] opens as the recovery recipient,
+    ///    but its bundle comes from `build()`, which passes
+    ///    `recovery_mlkem_pub: None` → `Suite::V1`. It therefore never reaches the
+    ///    `Suite::V2` arm, and it asserts only `opened.version == 1` — never the
+    ///    recovered plaintext;
+    ///  * [`v2_hybrid_wrap_opens_on_download`] does exercise `Suite::V2`, but it
+    ///    opens as the **owner** and discards the recovery cold key entirely.
+    ///
+    /// A real deployment's `recovery_account` row has `mlkem_pub` set, so every file
+    /// its users upload is V2 and every recovery open must supply BOTH legs. An
+    /// escrow open that reached this arm with `recipient_mlkem_seed: None` would
+    /// fail `PqKeyMissing` on every record in the system — an unrecoverable escrow,
+    /// discovered only in an emergency. The negative half below pins that too.
+    #[test]
+    fn v2_hybrid_recovery_wrap_opens() {
+        let (owner, bundle, recovery) = build_v2();
+        assert!(
+            matches!(bundle.manifest.alg, Suite::V2),
+            "precondition: a PQ recovery pin ⇒ the hybrid suite"
+        );
+        let rw = bundle
+            .wraps
+            .iter()
+            .find(|w| w.recipient_type == RecipientType::Recovery)
+            .expect("build_upload always mints a recovery wrap");
+        assert_eq!(rw.recipient_id, RECOVERY_ID);
+
+        // The recovery caller's leaf record: the RECOVERY wrap + the RECOVERY grant.
+        // (This mirrors what the server serves a `RECOVERY_ID` session — `get_file`
+        // selects the wrap whose `recipient_id` equals the caller's.)
+        let mut db = self_bundle(&bundle);
+        db.wrapped_dek = rw.wrapped_dek.clone();
+        db.grant_bytes = encode(&rw.grant);
+        db.grant_sig = rw.grant_sig;
+
+        let pk = owner.sig_pub_bytes();
+        let c = VerifyContext {
+            file_id: FILE_ID,
+            author_sig_pub: pk,
+            owner_sig_pub: pk,
+            recipient_id: RECOVERY_ID,
+            recipient_type: RecipientType::Recovery,
+            recipient_secret: &recovery.sk,
+            recipient_mlkem_seed: Some(recovery.mlkem_seed),
+            seen_max_version: None,
+            granter_sig_pub: &NO_GRANTERS,
+            admin_sig_pub: &NO_ADMINS,
+            tombstones: None,
+            compromise: None,
+        };
+        let opened = verify_and_open(&c, &db).expect("the V2 hybrid RECOVERY wrap opens");
+        assert_eq!(opened.version, 1);
+        assert_eq!(opened.file_type, FileType::Blog);
+        assert!(opened.recovery_grant_ok);
+        // The point of the escrow: the PLAINTEXT comes back, not merely a header.
+        let content = opened
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Content)
+            .expect("a content stream");
+        assert_eq!(
+            content.plaintext, V2_CONTENT,
+            "the recovery account recovered the author's plaintext from a V2 hybrid wrap"
+        );
+        let meta = opened
+            .streams
+            .iter()
+            .find(|s| s.stream_type == StreamType::Metadata)
+            .expect("a metadata stream");
+        assert_eq!(meta.plaintext, b"title=pq");
+
+        // NEGATIVE: the classical leg alone is not enough. A recovery open that
+        // forgets the ML-KEM seed fails closed on EVERY V2 record — it must not
+        // silently degrade to the X25519-only path.
+        let mut c_no_pq = c.clone();
+        c_no_pq.recipient_mlkem_seed = None;
+        assert_eq!(
+            verify_and_open(&c_no_pq, &db),
+            Err(DownloadError::PqKeyMissing),
+            "a V2 recovery open without the ML-KEM seed fails closed, never degrades"
+        );
+
+        // NEGATIVE: the ML-KEM leg must be the RIGHT one — a wrong seed does not
+        // open the wrap (so the positive case above is not passing on the X25519
+        // leg alone, which would defeat the entire point of the hybrid).
+        let (other_seed, _other_pub) = maxsecu_crypto::generate_mlkem_keypair();
+        let mut c_wrong_pq = c.clone();
+        c_wrong_pq.recipient_mlkem_seed = Some(other_seed);
+        assert_eq!(
+            verify_and_open(&c_wrong_pq, &db),
+            Err(DownloadError::DekUnwrap),
+            "the PQ leg genuinely participates in the KEK"
+        );
     }
 
     #[test]

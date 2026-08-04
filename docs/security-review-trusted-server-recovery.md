@@ -66,6 +66,105 @@ operator *equivocation about keys* detectable, they do not provide operator conf
 
 **No Critical, High, or Medium findings.**
 
+### ADDENDUM 2026-08-01 — invariant #3 is **SUPERSEDED** by an operator decision
+
+The row above is left exactly as it was ratified: it was true of the code it reviewed. It is **no
+longer a description of the shipped system**, and this addendum supersedes it.
+
+> **Corrected 2026-08-01 — an earlier revision of this addendum said recovery is "a universal grant
+> issuer BY CONSTRUCTION" and listed `add_wrap` among the admitted handlers. That was written against
+> a design that was REVERTED before it landed, and it is FALSE of the shipped system: `add_wrap` runs
+> on `AuthedSession` and still `403`s the recovery principal.** The grant-issuer analysis itself is
+> **correct and is kept below**, moved out of "what shipped" and into *"why the route is shut"* —
+> it is precisely the reason nobody may quietly admit `add_wrap` later. The read half of the finding
+> is unchanged and is not softened by the correction.
+
+**What changed.** The operator decided the recovery identity should behave like an ordinary account
+that happens to be a recipient on everything (spec §0 D6, *AMENDED 2026-08-01*). `AuthedSession` still
+hard-`403`s `RECOVERY_ID` and is still the deny-by-default rule — but **five** handlers now
+deliberately opt out of it via a second extractor, `RecoveryOkSession` (`server/http.rs`):
+`list_files`, `get_file`, `get_chunk`, `chunk_status` and `logout`. It is **always on**; there is no
+config flag. `crates/server/tests/recovery_login_e2e.rs` asserts both halves — the admitted routes
+answer `200`/`404` rather than `403`, and `create_file`, `stage_version`, `finalize_version`,
+`add_wrap`, `delete_wrap`, `discard_file`, `list_recipients` and `direct_link` still answer `403`.
+
+So the shipped recovery session **browses** every file, **opens/streams/downloads** every file, **ends
+itself**, and — as before today, unchanged since T5 — **mints user-role registration keys**. It cannot
+upload, cannot delete, cannot revoke, cannot mint a session-outliving direct link, cannot enumerate a
+file's other recipients, and **cannot share**.
+
+**Residual risk, restated honestly.** "A stolen recovery *session* decrypts nothing" (§1, §6) is no
+longer the operative bound. The delta is **reach, not identity**: a session token is TLS-exporter-bound
+and can only be minted by a holder of the recovery *private* keys, so every holder of a live recovery
+session already held the cold key — but that key-holder previously had to convene the air-gapped
+§12.7 ceremony to read a single file. **Now: recovery key + network reach yields complete, remote
+plaintext of every file, with no operator involvement and no ceremony.** That is the full cost and it
+is not reduced by the sharing revert. Two consequences that are easy to miss:
+
+- **Reads are neither audited nor rate-limited** — no read path in this server is, for any principal —
+  so a bulk escrow browse leaves no trace. Sessions are also not behind the anti-automation limiter
+  (see the Info observation above), so the only real bound on volume is the operator's own restraint.
+- **`get_chunk` is not side-effect-free** when a cold tier is configured: it rehydrates and may offload
+  capacity victims, exactly as for an ordinary caller. A bulk escrow browse therefore *moves the
+  operator's cold-tier working set*, which is the one externally visible trace it does leave.
+
+**Why `add_wrap` is shut — a CLOSED DECISION (owner, 2026-08-02), and the grant-issuer analysis that
+is exactly why it stays shut.** Sharing from a recovery session **does not ship and is not pending**.
+The analysis below is the reason the decision is final; it is not a list of prerequisites anyone is
+working through. *(Earlier revisions of this section framed it as "blocked on a protocol decision,
+not on willingness". That framing is retired — the operator declined to take on either of the two
+candidate designs, and reason 3 below makes the route unsafe even with both.)*
+
+- **Admitting `add_wrap` would make recovery a universal grant issuer BY CONSTRUCTION.** `add_wrap`'s
+  only authorization is "the caller already holds a wrap for this version" (`store.rs::add_wrap`), and
+  the recovery principal holds one on **every** finalized version. So admitting the extractor is not a
+  narrow widening — it hands the escrow the power to make any account a permanent reader of any file,
+  with a single unprivileged-looking `POST`. (The grant edge *would* be audited — `GrantEdge` — which
+  is the one mitigating property, and the only one.)
+- **And today it would do that *destructively*, costing an existing user their data.** `add_wrap` is
+  idempotent **by REPLACE**: the store drops any existing row for that `recipient_id` before inserting.
+  The replacement grant is **unopenable** — `client-core`'s download path field-binds the ancestor
+  before the chain walk and rejects any ancestor whose `recipient_type` is not `User`
+  (`crates/client-core/src/download.rs:448-450`), and `granted_by = RECOVERY_ID` resolves to **no
+  CLIENT-TRUSTED signing key**, so the walk ends in `GrantChainBroken`. A recovery "share" to somebody
+  who **already had working access** would therefore swap their good grant for a dead one, silently
+  and irreversibly. That is a backward-compatibility break of the worst kind (`CLAUDE.md`;
+  `docs/compat/LEDGER.md` 2026-08-01) — worse than `2a626d6`, because no re-enroll repairs it. **This
+  is the reason the decision is permanent** rather than a feature awaiting a protocol: the failure
+  mode is not "sharing is unbuilt", it is "sharing on this route strands an existing user".
+- **CORRECTION (2026-08-02) — "no signing key exists" is WRONG; "no client-trusted path to it" is
+  right.** The recovery account **does** hold an Ed25519 `sig_pub` server-side
+  (`crates/server/src/store.rs:47-51`, `RecoveryAccount { enc_pub, sig_pub, mlkem_pub }`). What is
+  missing is any way for a client to *trust* it: `GET /v1/recovery/pubkey` serves only `enc_pub_b64`
+  and `mlkem_pub_b64` (`crates/server/src/http.rs:667-686`), the embedded recovery pin omits
+  `sig_pub`, and every client open path passes no-op granter/admin resolvers. Wherever this document
+  or its siblings previously said the key does not exist, read it as **no trusted path to the key**.
+  The conclusion is unchanged; the reason is more precise, and the imprecise version invites the wrong
+  fix (minting a key server-side would change nothing).
+- **The two candidate designs, and why they are not a plan.** Lifting the trust-anchor half would take
+  either a published directory binding for `RECOVERY_ID` carrying a real Ed25519 signing key, or
+  `sig_pub` added to the recovery pin (frozen surface #7 — itself a format change) with the chain
+  terminating at the `DESIGN.md` §12.7 admin key; the REPLACE half would take a server-side refusal
+  when `granted_by == RECOVERY_ID`. **The operator declined to take either on**, so neither is
+  scheduled and this document does not track them. The client refuses too
+  (`recovery_share_unsupported`, `client-app/commands/share.rs`), but a client-side refusal is not a
+  security boundary and must not be mistaken for one — the bar is the extractor, and
+  `crates/server/tests/recovery_login_e2e.rs` posts a well-formed body so that admitting it breaks the
+  build.
+
+**What still holds.** Invariants #1, #2 and #4–#9 are untouched, and invariant #3 is **narrowed, not
+deleted** — recovery is still not a *file-writing* or *grant-issuing* principal; what it lost is the
+"decrypts nothing online" read bound. Specifically: (a) **deny-by-default
+survives** — the bar stays on `AuthedSession`, so a file endpoint added tomorrow is closed to recovery
+until someone deliberately names `RecoveryOkSession`; deleting the check instead would have opened
+every present *and future* handler silently; (b) the session still yields **no private key** — it is
+an opaque token and the cold key stays in the operator's Argon2id-sealed keyblob; (c) uploading,
+deleting, revoking, **sharing**, minting a session-outliving bearer cold-tier URL, enumerating a file's
+other recipients, and minting admins are all still refused; (d) the challenge is still single-use and
+channel-bound, and every failure is still a uniform `401`. **Non-goal (spec §9) is unchanged and now
+simply more visible:** this system never claimed to hide data from the operator — the operator holds
+the recovery key by design.
+
 ### Info-level observations (no action required)
 
 - **Uniform hex hardening.** `http.rs::hex_fixed` now ASCII-gates before slicing (`if !s.is_ascii() || s.len() != 2*N { return None }`), closing the non-ASCII multibyte slice-panic class (same as T6 M-1) across every hex JSON field, including the attacker-reachable `recovery_verify` `challenge_id`. `hex16` in the client recovery-login mirrors it. (✓)

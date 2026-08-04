@@ -11,8 +11,10 @@ use hyper::client::conn::http1::SendRequest;
 use maxsecu_client_core::{DirectoryVerifier, TrustStore, VerifyError};
 use maxsecu_encoding::decode;
 use maxsecu_encoding::structs::DirBinding;
+use maxsecu_encoding::types::{Id, RecipientType};
 use maxsecu_encoding::RECOVERY_ID;
 
+use crate::commands::auth::Principal;
 use crate::error::UiError;
 use crate::http_client::get_json;
 
@@ -96,6 +98,41 @@ pub struct VerifiedAuthor {
     pub mlkem_pub: Option<[u8; 1184]>,
 }
 
+/// WHOSE wrap an open path unwraps: an ordinary user (their directory-resolved
+/// `user_id`) or the RECOVERY account (the all-zero [`RECOVERY_ID`] sentinel). The
+/// `Copy` shape lets it thread through the open paths exactly like the `[u8; 16]`
+/// it replaces.
+///
+/// The two arms differ ONLY in the `(recipient_id, recipient_type)` pair the
+/// verify context is bound to. The key material is unchanged in both: it comes from
+/// whichever `Identity` the session holds, which for a recovery session IS the cold
+/// recovery key — so a PQ-hybrid (V2) recovery wrap opens with `mlkem_seed()`
+/// exactly like a user's does, instead of failing closed on a missing PQ leg.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recipient {
+    User([u8; 16]),
+    Recovery,
+}
+
+impl Recipient {
+    /// The `recipient_id` this principal's wrap is bound to.
+    pub(crate) fn id(self) -> Id {
+        match self {
+            Recipient::User(id) => Id(id),
+            Recipient::Recovery => RECOVERY_ID,
+        }
+    }
+
+    /// The `recipient_type` tag the grant/wrap must carry (`check_grant_fields`
+    /// compares it by plain equality — client-core `download.rs`).
+    fn kind(self) -> RecipientType {
+        match self {
+            Recipient::User(_) => RecipientType::User,
+            Recipient::Recovery => RecipientType::Recovery,
+        }
+    }
+}
+
 /// Build the recipient-open [`VerifyContext`] shared by EVERY §12.5 open path
 /// (viewer content/video-header, feed card header, bundle content, video job).
 /// This is the ONE home for the content-substitution guard: `file_id` MUST be
@@ -114,17 +151,16 @@ pub struct VerifiedAuthor {
 pub(crate) fn build_verify_ctx<'a>(
     file_id: [u8; 16],
     author: &VerifiedAuthor,
-    my_id: [u8; 16],
+    me: Recipient,
     identity: &'a maxsecu_client_core::Identity,
 ) -> maxsecu_client_core::VerifyContext<'a> {
     use maxsecu_client_core::{VerifyContext, NO_ADMINS, NO_GRANTERS};
-    use maxsecu_encoding::types::{Id, RecipientType};
     VerifyContext {
         file_id: Id(file_id),
         author_sig_pub: author.sig_pub,
         owner_sig_pub: author.sig_pub,
-        recipient_id: Id(my_id),
-        recipient_type: RecipientType::User,
+        recipient_id: me.id(),
+        recipient_type: me.kind(),
         recipient_secret: identity.enc_secret(),
         recipient_mlkem_seed: identity.mlkem_seed(),
         seen_max_version: None,
@@ -500,6 +536,31 @@ pub async fn resolve_my_user_id(
     }
     let (bytes, sig) = parse_binding(&json)?;
     Ok(verify_author_binding(verifier, trust, &bytes, &sig, now_ms)?.user_id)
+}
+
+/// Resolve WHO the current session is as a [`Recipient`] — the single replacement
+/// for every `resolve_my_user_id` call site on an open path, so the "no directory
+/// lookup for the recovery principal" rule cannot be forgotten at one of them.
+///
+/// A user delegates to the unchanged [`resolve_my_user_id`] (today's D5-verified
+/// `GET /v1/directory/{username}`). The recovery principal has NO `users` row and
+/// NO published binding — `recovery_register` only stores the recovery account's
+/// keys — so its id is the constant sentinel; a directory GET here could never
+/// succeed and is deliberately not attempted.
+pub(crate) async fn resolve_me(
+    sender: &mut SendRequest<Full<Bytes>>,
+    host: &str,
+    principal: &Principal,
+    verifier: &DirectoryVerifier,
+    trust: &mut (dyn TrustStore + Send),
+    now_ms: u64,
+) -> Result<Recipient, UiError> {
+    match principal {
+        Principal::User { username } => Ok(Recipient::User(
+            resolve_my_user_id(sender, host, username, verifier, trust, now_ms).await?,
+        )),
+        Principal::Recovery => Ok(Recipient::Recovery),
+    }
 }
 
 /// Resolve + D5-verify MY OWN binding by username (`GET /v1/directory/{username}`),

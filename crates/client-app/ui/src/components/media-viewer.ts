@@ -3,7 +3,21 @@ import { serial } from "../core/serial.ts";
 import { runViewerOpen } from "../core/viewer-open.ts";
 import { needsConfirm, confirmModal } from "../core/confirm.ts";
 import { settingsStore } from "../core/settings.ts";
-import type { OpenedContent, FetchMsg } from "../core/types.ts";
+import { cardHref } from "../core/card-view.ts";
+// The bundle screen owns the retained, SIGNATURE-VERIFIED member order (see the
+// "Retained bundle state" block there) — this is where next/previous gets its
+// order from, and the only place it may come from.
+//
+// This is a module cycle (bundle-screen.ts imports this file for the embedded
+// <media-viewer> element). It is init-safe in both load orders: neither module
+// touches the other's bindings at module-evaluation time, only inside methods.
+import {
+  bundleNeighbours,
+  memberVersion,
+  rememberBundlePageFor,
+  rememberMemberVersion,
+} from "./bundle-screen.ts";
+import type { BundleMemberView, OpenedContent, FetchMsg } from "../core/types.ts";
 import "./progress-meter.ts";
 import "./skeleton-card.ts";
 import "./video-player.ts";
@@ -12,6 +26,7 @@ import "./share-dialog.ts";
 import type { ShareDialog } from "./share-dialog.ts";
 import { toast } from "../core/toast.ts";
 import { downloadPost } from "../core/download.ts";
+import { getPrincipalKind } from "../core/session.ts";
 
 // Viewer (spec §5): renders one decrypted post. Image → data: URL <img>; blog →
 // textContent (NEVER innerHTML). Subscribes to EVT_FETCH for live status. The
@@ -29,6 +44,11 @@ export class MediaViewer extends HTMLElement {
   // owner-only Delete is shown ONLY in the routed viewer — deleting a lone member
   // would break the bundle, so embedded viewers never surface Delete.
   private embedded = false;
+  // The bundle this item is being viewed as a member OF, or "" when it is not.
+  // Set from `from=bundle&bundle=…` (routed) or the `bundle-id` attribute
+  // (embedded). It gates next/previous and is the key under which a verified
+  // version is remembered for later opens.
+  private bundleId = "";
 
   connectedCallback() {
     // Two mount modes, sharing ALL content rendering (image/blog/video/meta):
@@ -46,12 +66,16 @@ export class MediaViewer extends HTMLElement {
     let version: number | undefined;
     if (fileIdAttr !== null) {
       id = fileIdAttr;
-      version = undefined;
+      // An embedded (Stacked bundle-member) viewer is handed the member's version
+      // whenever the host knows one, so the open can short-circuit on the content
+      // cache BEFORE any network or reauth. Absent ⇒ exactly today's behaviour.
+      version = parseVersion(this.getAttribute("version"));
+      this.bundleId = this.getAttribute("bundle-id") ?? "";
     } else {
       const params = new URLSearchParams(location.hash.split("?")[1] ?? "");
       id = params.get("id") ?? "";
-      const vParam = params.get("v");
-      version = vParam !== null ? Number(vParam) : undefined;
+      version = parseVersion(params.get("v"));
+      if (params.get("from") === "bundle") this.bundleId = params.get("bundle") ?? "";
     }
     this.reqId = id;
 
@@ -75,6 +99,11 @@ export class MediaViewer extends HTMLElement {
       this.innerHTML = `
         <main id="main" class="viewer-main" tabindex="-1" aria-labelledby="vw-h">
           <a id="vw-back" href="#/feed" class="back-link">← Back to feed</a>
+          <nav id="vw-bundle-nav" class="viewer-bundle-nav" aria-label="Bundle navigation" hidden>
+            <button id="vw-prev" type="button" class="secondary" aria-label="Previous item">← Previous</button>
+            <span id="vw-pos" class="viewer-bundle-pos"></span>
+            <button id="vw-next" type="button" class="secondary" aria-label="Next item">Next →</button>
+          </nav>
           <section class="viewer-frame" aria-label="Opened post">
             <div class="viewer-head">
               <p class="eyebrow">decrypted payload</p>
@@ -93,6 +122,9 @@ export class MediaViewer extends HTMLElement {
       backLink.href = back.href;
       backLink.textContent = back.label;
       (this.querySelector("#main") as HTMLElement).focus();
+      // Next/Previous over the bundle's members, wired BEFORE the open so the walk
+      // is usable while the item is still decrypting.
+      if (this.bundleId !== "") this.renderBundleNav(this.bundleId, id);
     }
 
     // The Share… action (T4, D-OQ3): shown on ANY successful open (any current
@@ -154,10 +186,69 @@ export class MediaViewer extends HTMLElement {
     this.cleanup?.();
   }
 
+  // Next / Previous across the bundle this item belongs to, so a member opened
+  // from a gallery can be walked without bouncing back to the gallery each time.
+  //
+  // ORDER: strictly the retained, SIGNATURE-VERIFIED member list that open_bundle
+  // returned (see bundle-screen.ts). It is never re-derived from a feed listing,
+  // the local index, or the DOM — commands/bundle.rs is explicit that members must
+  // never be read from a server-served listing, and that rule does not stop at the
+  // seam. When this session has not opened that bundle (a reload, or a typed
+  // deep-link straight to #/viewer?from=bundle) there IS no verified order, so the
+  // controls stay hidden rather than offering a guessed one.
+  //
+  // KEYBOARD: these are real <button>s, so Enter/Space work by default — which is
+  // the whole of what this viewer binds. Deliberately NO global Arrow-key binding:
+  // an opened video mounts <video-player>, whose Media Chrome hotkeys already own
+  // ArrowLeft/ArrowRight for seeking, and stealing those would break playback.
+  private renderBundleNav(bundleId: string, fileId: string) {
+    const nav = this.querySelector("#vw-bundle-nav") as HTMLElement | null;
+    if (nav === null) return;
+    const around = bundleNeighbours(bundleId, fileId);
+    if (around === null || around.total <= 1) return;
+    // Keep the gallery's retained page in step with the walk, so "Back to bundle"
+    // lands on the page CONTAINING this item even after crossing a page boundary.
+    rememberBundlePageFor(bundleId, fileId);
+    (this.querySelector("#vw-pos") as HTMLElement).textContent =
+      `Item ${around.index + 1} of ${around.total}`;
+    const prev = this.querySelector("#vw-prev") as HTMLButtonElement;
+    const next = this.querySelector("#vw-next") as HTMLButtonElement;
+    // Disabled at the ends — an enabled control that does nothing when pressed is
+    // worse than one that says it is unavailable.
+    prev.disabled = around.prev === null;
+    next.disabled = around.next === null;
+    prev.addEventListener("click", () => this.goToMember(bundleId, around.prev));
+    next.addEventListener("click", () => this.goToMember(bundleId, around.next));
+    nav.hidden = false;
+  }
+
+  // Walk to a neighbour by ROUTING to it, exactly like every other navigation in
+  // the app, so the back/forward stack, the back-link and the address bar all stay
+  // honest. `cardHref` carries the member's version when one is known, which is
+  // what lets the re-open hit the content cache instead of re-running the whole
+  // verify ladder (and a nested bundle member correctly routes to #/bundle).
+  private goToMember(bundleId: string, m: BundleMemberView | null) {
+    if (m === null) return;
+    location.hash = cardHref(m.file_type, m.file_id, memberVersion(bundleId, m), { bundleId });
+  }
+
   private render(c: OpenedContent) {
     (this.querySelector("#vw-h") as HTMLElement).textContent = c.title || "(untitled)";
-    (this.querySelector("#vw-share-btn") as HTMLButtonElement).hidden = !c.can_share;
+    // Hidden for a RECOVERY principal: `reshare_file` refuses one outright
+    // (`recovery_share_unsupported`), so offering the button would be a guaranteed
+    // dead end. This is a CLOSED decision (2026-08-02), not a pending feature —
+    // restoring someone's access is done via the offline recovery-key ceremony
+    // (DESIGN §12.7), never from a live recovery session.
+    (this.querySelector("#vw-share-btn") as HTMLButtonElement).hidden =
+      !c.can_share || getPrincipalKind() === "recovery";
     this.opened = c;
+
+    // Remember the VERIFIED version of this bundle member. The signed BundleBody
+    // carries only (file_id, file_type) — no versions — so this successful open is
+    // the cheapest place the client ever learns one, and knowing it is what lets
+    // the next re-open (the next/previous walk, or returning to the item) skip the
+    // network entirely on the content cache. A no-op outside a bundle.
+    if (this.bundleId !== "") rememberMemberVersion(this.bundleId, this.reqId, c.version);
 
     // A Download button on ANY successful open (routed and embedded — the head
     // markup is shared). Verify+decrypt+write happens in the TCB (download_content);
@@ -276,6 +367,18 @@ function backTarget(params: URLSearchParams): { href: string; label: string } {
     return { href, label: "← Back to bundle" };
   }
   return { href: "#/feed", label: "← Back to feed" };
+}
+
+// A version is only worth sending when it is a REAL one. Versions start at 1 in
+// Rust, and `open_content` treats a supplied version as authoritative: it tries
+// the content cache on it BEFORE the network and then SKIPS its second,
+// post-fetch cache check (that one is gated on the version being absent). So a 0,
+// a NaN or an empty string must all become "absent" — sending one would cost the
+// open both cache chances instead of buying it one.
+function parseVersion(raw: string | null): number | undefined {
+  if (raw === null || raw.trim() === "") return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
 }
 
 function readBlogText(c: OpenedContent): string | null {

@@ -48,9 +48,9 @@ use maxsecu_encoding::types::{
 };
 use maxsecu_server::{
     router, AddWrapError, AppState, AuthConfig, AuthService, ControlAppendError, DeleteError,
-    DeleteWrapError, DiscardError, EnrollOutcome, FileListEntry, FileMeta, FileView, FinalizeError,
-    ListFilter, MemoryBlobStore, MemoryStore, NullAuditSink, ParsedStage, RecipientView,
-    RecoveryAccount, SessionRecord, StageError, Store, StoreError, StoredBinding,
+    DeleteWrapError, DiscardError, EnrollOutcome, FileListPage, FileMeta, FileView, FinalizeError,
+    ListFilter, MemoryBlobStore, MemoryStore, NullAuditSink, ParsedStage, PruneCounts,
+    RecipientView, RecoveryAccount, SessionRecord, StageError, Store, StoreError, StoredBinding,
     StoredControlRecord, TlsExporter, UserRecord, VersionMeta, VersionSelector, WrapInput,
 };
 
@@ -132,6 +132,14 @@ impl Store for FaultyStore {
     }
     async fn get_session(&self, _t: &[u8; 32]) -> Result<Option<SessionRecord>, StoreError> {
         Err(bait("get_session"))
+    }
+    async fn prune_expired_auth_rows(
+        &self,
+        _n: u64,
+        _g: u64,
+        _b: u32,
+    ) -> Result<PruneCounts, StoreError> {
+        Err(bait("prune_expired_auth_rows"))
     }
     async fn revoke_session(&self, _t: &[u8; 32]) -> Result<(), StoreError> {
         Err(bait("revoke_session"))
@@ -217,7 +225,7 @@ impl Store for FaultyStore {
     ) -> Result<Option<FileView>, StoreError> {
         Err(bait("get_file"))
     }
-    async fn list_files(&self, _f: ListFilter) -> Result<Vec<FileListEntry>, StoreError> {
+    async fn list_files(&self, _f: ListFilter) -> Result<FileListPage, StoreError> {
         Err(bait("list_files"))
     }
     async fn version_meta(&self, _f: [u8; 16], _v: u64) -> Result<Option<VersionMeta>, StoreError> {
@@ -302,6 +310,14 @@ impl Store for FileFaultyStore {
     }
     async fn get_session(&self, t: &[u8; 32]) -> Result<Option<SessionRecord>, StoreError> {
         self.inner.get_session(t).await
+    }
+    async fn prune_expired_auth_rows(
+        &self,
+        n: u64,
+        g: u64,
+        b: u32,
+    ) -> Result<PruneCounts, StoreError> {
+        self.inner.prune_expired_auth_rows(n, g, b).await
     }
     async fn revoke_session(&self, t: &[u8; 32]) -> Result<(), StoreError> {
         self.inner.revoke_session(t).await
@@ -398,7 +414,7 @@ impl Store for FileFaultyStore {
     ) -> Result<Option<FileView>, StoreError> {
         Err(bait("get_file"))
     }
-    async fn list_files(&self, _f: ListFilter) -> Result<Vec<FileListEntry>, StoreError> {
+    async fn list_files(&self, _f: ListFilter) -> Result<FileListPage, StoreError> {
         Err(bait("list_files"))
     }
     async fn version_meta(&self, _f: [u8; 16], _v: u64) -> Result<Option<VersionMeta>, StoreError> {

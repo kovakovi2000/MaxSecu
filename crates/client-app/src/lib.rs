@@ -2,17 +2,17 @@
 //! connection/auth orchestration over the client-core TCB. The thin binary
 //! (`main.rs`) wires these into a Tauri app; integration tests drive the same
 //! modules directly.
+pub mod blob_cache;
 pub mod commands;
 pub mod config;
 pub mod contacts;
-pub mod directory;
 pub mod direct_link;
+pub mod directory;
 pub mod disk_free;
 pub mod download;
 pub mod dto;
 pub mod error;
 pub mod ffmpeg_bin;
-pub mod blob_cache;
 pub mod http_client;
 pub mod index;
 pub mod jobs;
@@ -25,15 +25,15 @@ pub mod recovery_pin;
 pub mod revocations;
 pub mod session;
 pub mod session_seal;
-pub mod thumb_cache;
-mod timeout;
 pub mod sink;
 pub mod state;
+pub mod stream;
+pub mod thumb_cache;
+mod timeout;
 pub mod tofu;
 pub mod tor;
 pub mod transparency;
 pub mod transport;
 pub mod upload;
 pub mod upload_staging;
-pub mod stream;
 pub mod video;

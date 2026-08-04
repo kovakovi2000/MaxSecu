@@ -10,16 +10,29 @@
 # fingerprint does not change, so clients keep working WITHOUT re-pinning.
 #
 # What it does:
-#   1. (optional) pg_dump the metadata database as a quick safety backup.
+#   1. Take a SEALED, rollback-able backup (scripts/backup-server.sh) so a failed
+#      upgrade can actually be undone — and ABORT the upgrade if the backup fails.
+#      This replaces the old bare pg_dump, which nothing ever read back. It runs
+#      BEFORE the pull, using the currently-installed binary, so the bundle records
+#      the PRE-upgrade commit (which `restore --only code` checks out to roll the code
+#      BACK) and a still-un-migrated database. The bundle is encrypted with a
+#      passphrase you are prompted for; skip it only with an explicit --no-backup.
+#      (The one exception is the FIRST upgrade into this feature: the installed binary
+#      predates the `backup` subcommand, so pass --no-backup for that upgrade alone.)
 #   2. (optional) `git pull --ff-only` when this folder is a git checkout; if it
 #      isn't (you copied the files in by hand), that step is skipped.
-#   3. Rebuild the release server binary WHILE the old one keeps serving, so a
-#      build failure leaves the running server completely untouched.
+#   3. STOP the server, refresh source timestamps so cargo cannot reuse a stale
+#      build, and rebuild the release binary. The service is down for the whole
+#      update: that makes two live server processes impossible and lets the
+#      migrations run against a quiescent database. A copy of the binary that was
+#      running is kept first, and ANY failure from here on puts it back and starts
+#      the server again — a failed upgrade never leaves the box down.
 #   4. Apply any pending database migrations (migrations/NNNN_*.sql), each in one
 #      transaction, BEFORE the new binary starts — so the new code never meets an
 #      old schema. Migrations only ADD to the schema; your rows are never
-#      rewritten or dropped, and step 1 took a dump first anyway. Nothing at all
-#      happens here when the schema is already up to date (the common case).
+#      rewritten or dropped, and the sealed backup in step 1 already captured a
+#      restore point. Nothing at all happens here when the schema is already up to
+#      date (the common case).
 #   5. (optional) set the local cache capacity via a systemd drop-in.
 #   6. RECONCILE the service's environment with what this build expects. The unit
 #      was written once, by install-server.sh, and is never rewritten here — so a
@@ -29,17 +42,20 @@
 #      already defaults to. It NEVER touches a variable you have set: your port,
 #      your DATABASE_URL, your cache capacity and your Dropbox login are read, not
 #      written. Running it twice changes nothing.
-#   7. Restart the service (a ~1s blip) and health-check it.
+#   7. Start the service again and health-check it PROPERLY: `systemctl is-active`
+#      is a false-green on a Type=simple + Restart=always unit, so this waits and
+#      requires the unit to be active AND to not have restarted in between.
 #
 # Usage:
-#   ./scripts/upgrade-server.sh                    # pull + backup + rebuild + restart
+#   ./scripts/upgrade-server.sh                    # backup + pull + rebuild + restart
 #   ./scripts/upgrade-server.sh --no-pull          # rebuild the current checkout as-is
-#   ./scripts/upgrade-server.sh --no-backup        # skip the pg_dump
+#   ./scripts/upgrade-server.sh --no-backup        # skip the sealed pre-upgrade backup
 #   ./scripts/upgrade-server.sh --capacity-gb 50   # also set the cache cap to 50 GB
 #
 # Flags:
 #   --no-pull        Do NOT `git pull`; rebuild whatever is checked out now.
-#   --no-backup      Do NOT pg_dump the database first.
+#   --no-backup      Do NOT take the sealed pre-upgrade backup. You then upgrade with
+#                    NO rollback point — only pass this if you know why.
 #   --capacity-gb N  Set MAXSECU_CACHE_CAPACITY_BYTES via a systemd drop-in (GB).
 #   -h, --help       Show this help.
 #
@@ -60,13 +76,18 @@ Usage: upgrade-server.sh [--no-pull] [--no-backup] [--capacity-gb N]
 Rebuild + restart an already-installed MaxSecu server IN PLACE, with no data
 loss and no client re-pin. Your rows, blobs, TLS cert, client pins, and Dropbox
 login are all left untouched (only `install-server.sh --reset` deletes those).
-The build runs while the old server keeps serving, so a build failure leaves
-production running the old binary.
+The service is STOPPED for the whole update, so the downtime is the length of
+the rebuild, not a blip. That is the trade for never having two live server
+processes and for migrating a quiescent database. A copy of the running binary
+is taken first and a trap puts it back on ANY failure — including Ctrl-C or a
+dropped SSH session — so a failed upgrade never leaves the box down.
 
 Pending database migrations (migrations/NNNN_*.sql) are applied before the
 restart, each in a single transaction, so the new code never starts against an
 old schema. Migrations only ADD to the schema — no account, key, or uploaded
-file is ever touched — and a pg_dump is taken first unless you pass --no-backup.
+file is ever touched — and a SEALED, rollback-able backup is taken first (via
+scripts/backup-server.sh) unless you pass --no-backup. A failed backup ABORTS
+the upgrade: an upgrade you cannot roll back is the failure this guards against.
 
 The service's ENVIRONMENT is reconciled the same way: any variable this build
 expects that your unit does not define anywhere is added via a systemd drop-in,
@@ -75,7 +96,8 @@ your port, your DATABASE_URL, your cache capacity, your Dropbox login — is rea
 and left alone, never overwritten. Running the upgrade twice changes nothing.
 
   --no-pull        Do NOT `git pull`; rebuild whatever is checked out now.
-  --no-backup      Do NOT pg_dump the database first.
+  --no-backup      Do NOT take the sealed pre-upgrade backup. You then upgrade with
+                   NO rollback point — only pass this if you know why.
   --capacity-gb N  Set the local cache capacity in GB (writes a systemd drop-in
                    for MAXSECU_CACHE_CAPACITY_BYTES). Omit to leave it unchanged.
   -h, --help       Show this help.
@@ -156,6 +178,15 @@ DATA_DIR="${MAXSECU_DATA_DIR:-$RUN_HOME/maxsecu-server-data}"
 UNIT_PATH="/etc/systemd/system/maxsecu-server.service"
 DROPIN_DIR="/etc/systemd/system/maxsecu-server.service.d"
 SERVER_BIN="$ROOT/target/release/maxsecu-portable-server"
+# The sealed-backup driver (design 2026-07-16). It scrapes the unit's env, runs the
+# freshly-built binary's `backup` subcommand under sudo, and reads the passphrase from
+# stdin. We call it with the passphrase piped in (never on argv).
+BACKUP_SCRIPT="$ROOT/scripts/backup-server.sh"
+# Soft minimum for the backup passphrase, mirroring MIN_PASSPHRASE_CHARS in
+# crates/server/src/backup/format.rs (the binary is the real authority — it refuses to
+# seal a shorter one, which would abort the upgrade anyway). Kept equal, never higher,
+# so this pre-check never rejects a passphrase the binary would accept.
+MIN_BACKUP_PASSPHRASE_CHARS=12
 # The drop-in this script generates to reconcile the unit's environment (step 7b).
 # `10-` sorts before an operator's own drop-in and before `capacity.conf`, and
 # drop-ins are applied in lexicographic order with the LAST assignment winning —
@@ -229,10 +260,15 @@ MAXSECU_DROPBOX_ROOT|-
 #                         would point the server at a database that does not exist
 #                         — every account, key and upload gone from the users'
 #                         point of view. Its absence is therefore a HARD ERROR, not
-#                         something to paper over: step 6b already aborts the
-#                         upgrade (before touching anything) when it is missing,
-#                         and tells you to re-run install-server.sh to repair the
-#                         unit. There is no default and there must never be one.
+#                         something to paper over: step 5c aborts the upgrade when
+#                         it is missing, BEFORE the server is stopped (which is why
+#                         that lookup lives in 5c and not next to the migrations
+#                         that use it), and names the two ways to repair the unit
+#                         (a sealed backup, or a root-only drop-in). It does NOT
+#                         send you back to install-server.sh: that script refuses to
+#                         touch an existing install, and forcing it past the refusal
+#                         re-mints the DB password when the unit carries no working
+#                         one. There is no default and never must be.
 #
 #   MAXSECU_DATA_DIR      Absence means the server is using `./maxsecu-server-data`
 #                         RELATIVE to WorkingDirectory. That directory holds the TLS
@@ -289,6 +325,23 @@ echo "==> Checking the existing install"
 if ! run_root "test -f '$UNIT_PATH'"; then
 	echo "error: $UNIT_PATH not found — this server is not installed yet." >&2
 	echo "       Run scripts/install-server.sh first (this script only UPGRADES)." >&2
+	echo "" >&2
+	echo "       If this box DID have MaxSecu and only the unit is gone, do not treat" >&2
+	echo "       it as a fresh install: install-server.sh detects the surviving data" >&2
+	echo "       dir / database and refuses. Put the unit back from a sealed bundle —" >&2
+	echo "           sudo bash scripts/restore-server.sh --list" >&2
+	echo "       — because that unit is the ONLY copy of the database password. Only" >&2
+	echo "       if no bundle exists is 'install-server.sh <flags>" >&2
+	echo "       --force-overwrite-existing-install' the right tool, and then ONLY with" >&2
+	echo "       the real data directory stated explicitly:" >&2
+	echo "           sudo env MAXSECU_DATA_DIR=/actual/path bash scripts/install-server.sh \\" >&2
+	echo "                --force-overwrite-existing-install <flags>" >&2
+	echo "       Without it the installer resolves the data dir from the INVOKING USER's" >&2
+	echo "       home, and with the unit gone there is nothing to correct that guess." >&2
+	echo "       It keeps the TLS certificate (no client re-pins) ONLY IF the cert is" >&2
+	echo "       actually found at <data dir>/tls/cert.der; if it is not, the installer" >&2
+	echo "       now REFUSES rather than mint a new server identity and lock every" >&2
+	echo "       pinned client out permanently. The DB password is re-minted either way." >&2
 	exit 1
 fi
 
@@ -298,37 +351,169 @@ if [ "$UNIT_BIN" != "$SERVER_BIN" ]; then
 	echo "error: the service runs a different binary than this repo would build:" >&2
 	echo "         service ExecStart : $UNIT_BIN" >&2
 	echo "         this repo builds  : $SERVER_BIN" >&2
-	echo "       Run this script from the SAME clone the service was installed from," >&2
-	echo "       or re-run install-server.sh to repoint the unit." >&2
+	echo "       Run this script from the SAME clone the service was installed from" >&2
+	echo "       (the folder whose target/release/ holds the ExecStart path above)." >&2
+	echo "       Do NOT re-run install-server.sh to repoint the unit: it now REFUSES to" >&2
+	echo "       touch an existing install (it would rewrite the whole unit from this" >&2
+	echo "       run's flags). If the original clone is genuinely gone, edit ExecStart" >&2
+	echo "       in the unit itself — it is the ONE line this check reads — and restart:" >&2
+	echo "           sudo sed -i 's|^ExecStart=.*|ExecStart=$SERVER_BIN|' '$UNIT_PATH'" >&2
+	echo "           sudo systemctl daemon-reload && sudo systemctl restart maxsecu-server" >&2
 	exit 1
 fi
 echo "    OK — service runs $SERVER_BIN"
 echo "    data dir (left untouched): $DATA_DIR"
 
 # --------------------------------------------------------------------------- #
-# 4. Optional quick DB backup. The metadata DB is small (blobs live in the data
-#    dir, not Postgres), so a pg_dump is fast and cheap insurance. We never
-#    modify the DB, but this lets you roll back the whole box if you want to.
-#    The data dir is NOT tarred here — it can be huge and is never touched.
+# 3b. Decide the pre-upgrade backup and collect its passphrase NOW, up front, so a box
+#     that cannot be backed up fails FAST — before anything is pulled or built. The
+#     SEALED backup itself runs next (step 4), BEFORE the pull, so it records the
+#     pre-upgrade commit and an un-migrated DB (see step 4 for why). This replaces the
+#     old bare pg_dump, which was DB-only, unencrypted, and which nothing ever read
+#     back — it was not a real rollback path.
+#
+#     FAIL CLOSED: a silent no-backup upgrade is exactly the failure this feature
+#     prevents, so a non-interactive run with no way to supply a passphrase ABORTS.
+#     The ONLY way to upgrade without a rollback point is the explicit --no-backup.
+#
+#     The passphrase is read WITHOUT echo into a variable and later piped to
+#     backup-server.sh on stdin — never on argv (/proc is world-readable). It lives in
+#     this shell's memory only until step 4 consumes and unsets it.
+# --------------------------------------------------------------------------- #
+BACKUP_PASSPHRASE=""
+if [ "$DO_BACKUP" -eq 1 ]; then
+	if [ ! -f "$BACKUP_SCRIPT" ]; then
+		echo "error: $BACKUP_SCRIPT not found — cannot take the sealed pre-upgrade backup." >&2
+		echo "       Update this checkout (the backup driver ships alongside this script)," >&2
+		echo "       or pass --no-backup to upgrade WITHOUT a rollback point." >&2
+		exit 1
+	fi
+	# CAN THE INSTALLED BINARY EVEN TAKE A BACKUP? Probe it STATICALLY.
+	#
+	# Ordered BEFORE the TTY check on purpose: this is a hard property of the box, not
+	# of how the script was invoked, and "your binary cannot do this, pass --no-backup"
+	# is a far more useful thing to be told than "no terminal".
+	#
+	# backup-server.sh runs `<installed binary> backup`. A binary that predates the
+	# backup feature ends its argument match in `_ => {}` — so that argument does not
+	# error, it FALLS THROUGH AND STARTS A SERVER: a second maxsecu-server, as root,
+	# on the compiled-in default port, against this same database and data dir, with
+	# the backup passphrase sitting on its stdin and no timeout. On a box installed
+	# with --port (so the default port is free) it BINDS SUCCESSFULLY and serves
+	# forever while this script hangs. That is the single worst thing this script can
+	# do, and it happens on the FIRST upgrade into the backup feature — i.e. on every
+	# existing deployment, exactly once, which is the least-tested path there is.
+	#
+	# The probe must not RUN the binary, because running it is the hazard. So look for
+	# a string only a backup-capable binary contains: `MXBU`, the sealed bundle's
+	# 4-byte magic (crates/server/src/backup/format.rs). Verified present in a
+	# backup-capable binary and absent from a pre-feature one.
+	#
+	# Fail CLOSED and make the operator choose: skipping the backup silently would
+	# remove the rollback point without saying so.
+	if ! grep -aq 'MXBU' "$SERVER_BIN" 2>/dev/null; then
+		echo "error: the INSTALLED server binary predates the backup feature, so it cannot" >&2
+		echo "       take the sealed pre-upgrade backup this script wants." >&2
+		echo "" >&2
+		echo "       Re-run this ONE upgrade with --no-backup:" >&2
+		echo "           sudo bash scripts/upgrade-server.sh --no-backup" >&2
+		echo "" >&2
+		echo "       Every later upgrade can take a backup normally, because the binary this" >&2
+		echo "       upgrade installs supports it. Nothing has been changed and the server is" >&2
+		echo "       still running." >&2
+		echo "" >&2
+		echo "       (Refusing rather than skipping silently: asking the old binary to run a" >&2
+		echo "       'backup' it does not know would make it start a SECOND server as root" >&2
+		echo "       against this same database.)" >&2
+		exit 1
+	fi
+	if [ ! -t 0 ]; then
+		echo "error: no terminal to read a backup passphrase from, and --no-backup was not" >&2
+		echo "       given. Refusing a silent no-rollback upgrade — that is the exact failure" >&2
+		echo "       this backup guards against. Re-run in a terminal to be prompted, or pass" >&2
+		echo "       --no-backup to upgrade WITHOUT a rollback point." >&2
+		exit 1
+	fi
+	echo "==> A sealed, rollback-able backup will be taken before this upgrade changes"
+	echo "    anything. Choose a passphrase to encrypt it (Argon2id). You will need this"
+	echo "    EXACT passphrase to restore — it is stored NOWHERE, so keep it safe."
+	while :; do
+		printf 'Backup passphrase (min %s chars): ' "$MIN_BACKUP_PASSPHRASE_CHARS"
+		read -rs BACKUP_PASSPHRASE || BACKUP_PASSPHRASE=""
+		printf '\n'
+		printf 'Confirm passphrase: '
+		read -rs backup_pp_confirm || backup_pp_confirm=""
+		printf '\n'
+		if [ "$BACKUP_PASSPHRASE" != "$backup_pp_confirm" ]; then
+			echo "    the two entries did not match — try again." >&2
+			continue
+		fi
+		if [ "${#BACKUP_PASSPHRASE}" -lt "$MIN_BACKUP_PASSPHRASE_CHARS" ]; then
+			echo "    too short (minimum $MIN_BACKUP_PASSPHRASE_CHARS characters) — try again." >&2
+			continue
+		fi
+		break
+	done
+	unset backup_pp_confirm
+else
+	echo "==> Skipping the sealed pre-upgrade backup (--no-backup) — this upgrade will"
+	echo "    have NO rollback point if it goes wrong."
+fi
+
+# --------------------------------------------------------------------------- #
+# 4. SEALED, ROLLBACK-ABLE PRE-UPGRADE BACKUP (design 2026-07-16). This replaces the
+#    old bare pg_dump, which was DB-only, unencrypted, and which nothing ever read
+#    back — it was never a real rollback path. The sealed bundle carries the DB dump,
+#    the unit + drop-ins + Dropbox creds, the TLS cert and the delegation config, and
+#    it copies every committed blob onto the cold tier. Backup is a pure READ — it
+#    does not stop the server.
+#
+#    IT RUNS BEFORE THE PULL, ON PURPOSE, using the CURRENTLY-INSTALLED binary
+#    ($SERVER_BIN as it is right now — the running one). Two reasons:
+#      * the backup manifest records `git rev-parse HEAD`, and `restore --only code`
+#        checks that SHA out. To roll the code BACK after a bad upgrade it must be the
+#        PRE-upgrade commit — so the backup has to run before `git pull` moves HEAD.
+#      * the DB is still un-migrated here, so the bundle is a clean pre-upgrade state.
+#    Consequence (documented): the FIRST upgrade INTO this feature is from a binary
+#    that predates the `backup` subcommand, so its backup fails — pass --no-backup for
+#    that one transitional upgrade; every subsequent upgrade backs up normally.
+#
+#    ABORT ON FAILURE ("Auto-backup, abort on failure"): a failed backup means the
+#    upgrade would not be rollback-able. Nothing has been pulled, built, migrated or
+#    restarted at this point, so aborting leaves the running server wholly untouched.
+#
+#    The passphrase (collected in step 3b) is piped to backup-server.sh on STDIN,
+#    never on argv (/proc is world-readable). backup-server.sh owns the privilege +
+#    env-scraping (it exports the unit's cold-tier env and runs the binary under
+#    sudo); we stay agnostic to that and simply feed it the passphrase line.
 # --------------------------------------------------------------------------- #
 if [ "$DO_BACKUP" -eq 1 ]; then
-	BACKUP_DIR="$RUN_HOME/maxsecu-upgrade-backups"
-	STAMP="$(date +%Y%m%d%H%M%S)"
-	BACKUP_FILE="$BACKUP_DIR/db-$STAMP.sql"
-	echo "==> Backing up the metadata database to $BACKUP_FILE"
-	run_as_user "mkdir -p '$BACKUP_DIR'"
-	# Dump as the postgres superuser (role/db are named 'maxsecu'); write to a
-	# path the run user owns. Fail the upgrade if the backup can't be written.
-	if [ "$IS_ROOT" -eq 1 ]; then
-		su - postgres -c "pg_dump maxsecu" >"$BACKUP_FILE"
-	else
-		sudo -u postgres pg_dump maxsecu >"$BACKUP_FILE"
+	echo "==> Taking the sealed pre-upgrade backup (scripts/backup-server.sh)"
+	if ! printf '%s\n' "$BACKUP_PASSPHRASE" | bash "$BACKUP_SCRIPT"; then
+		unset BACKUP_PASSPHRASE
+		echo "error: the sealed pre-upgrade backup FAILED — aborting the upgrade before any" >&2
+		echo "       change. Nothing was pulled, built, migrated or restarted; the running" >&2
+		echo "       server is untouched. Likely causes:" >&2
+		echo "         * this is the FIRST upgrade into the backup feature — the installed" >&2
+		echo "           binary predates the 'backup' subcommand. Pass --no-backup for this" >&2
+		echo "           one upgrade; the next one backs up normally." >&2
+		echo "         * NO cold tier is configured (the bundle has nowhere to live). Do NOT" >&2
+		echo "           re-run install-server.sh to add one — it refuses to touch an existing" >&2
+		echo "           install. Add it IN PLACE with a systemd drop-in (no data is touched," >&2
+		echo "           no client re-pins):" >&2
+		echo "               sudo install -d /etc/systemd/system/maxsecu-server.service.d" >&2
+		echo "               printf '[Service]\\nEnvironment=MAXSECU_COLD_TIER=fs\\nEnvironment=MAXSECU_COLD_FS_DIR=/srv/maxsecu-cold\\n' \\" >&2
+		echo "                 | sudo install -m 0644 /dev/stdin \\" >&2
+		echo "                   /etc/systemd/system/maxsecu-server.service.d/20-cold-tier.conf" >&2
+		echo "               sudo install -d -o \$(sed -n 's/^User=//p' '$UNIT_PATH' | tail -n1) -m 0700 /srv/maxsecu-cold" >&2
+		echo "               sudo systemctl daemon-reload && sudo systemctl restart maxsecu-server" >&2
+		echo "           (the directory must be OUTSIDE the data dir, and owned by the unit's" >&2
+		echo "           User= — an fs tier aliasing the blob dir destroys ciphertext.)" >&2
+		echo "       Or pass --no-backup to upgrade WITHOUT a rollback point." >&2
+		exit 1
 	fi
-	run_as_user "test -s '$BACKUP_FILE'" ||
-		{ echo "error: database backup is empty — aborting before any change." >&2; exit 1; }
-	echo "    backup OK ($(wc -c <"$BACKUP_FILE") bytes)"
-else
-	echo "==> Skipping database backup (--no-backup)"
+	unset BACKUP_PASSPHRASE
+	echo "    backup OK"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -359,59 +544,112 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 6. Rebuild the release binary WHILE the old server keeps serving. cargo links
-#    the new binary via an atomic rename, so overwriting the in-use file is safe;
-#    and if the build fails we `exit` here, leaving production on the old binary.
+# 5c. Resolve everything we read out of the unit BEFORE anything is stopped.
+#
+#     Every one of these lookups can fail, and a failure must abort while the
+#     server is still SERVING. Resolving them after the stop is how you get an
+#     upgrade that dies at "no DATABASE_URL" with production already down and no
+#     rollback — the abort messages below even promise the opposite ("before
+#     touching anything"), so the promise and the code have to be made to agree.
+#
+#     The parser matters. systemd accepts a leading indent on `Environment=` and
+#     optional surrounding quotes, and it also takes the same variables from any
+#     `EnvironmentFile=` the unit loads. An anchored `^Environment=` scrape sees
+#     none of that and reports "unset" for a perfectly valid unit.
 # --------------------------------------------------------------------------- #
-echo "==> Rebuilding maxsecu-portable-server (release) — this can take a while"
-if ! run_as_user "cd '$ROOT' && . '$CARGO_ENV' && cargo build --release -p maxsecu-portable-server"; then
-	echo "error: build failed. The running server was NOT touched (still on the old" >&2
-	echo "       binary). Fix the build and re-run; nothing was restarted." >&2
-	exit 1
-fi
-if ! run_as_user "test -x '$SERVER_BIN'"; then
-	echo "error: build reported success but $SERVER_BIN is missing/not executable." >&2
-	exit 1
-fi
-echo "    build OK"
 
 # --------------------------------------------------------------------------- #
-# 6b. Apply pending database migrations — BEFORE the restart, so the new binary
-#     never starts against an old schema.
+# THE UNIT-ENV PARSER — FIVE IDENTICAL COPIES, ON PURPOSE. They live in:
 #
-#     This is the hole this step closes: docs/schema.sql used to be applied ONLY
-#     by install-server.sh on a FRESH install, and this script applied no schema
-#     change at all. Any edit to the schema therefore stranded every existing
-#     deployment — new code expecting a column the running database did not have.
+#     scripts/install-server.sh   scripts/upgrade-server.sh
+#     scripts/backup-server.sh    scripts/restore-server.sh
+#     scripts/fingerprint.sh
 #
-#     migrations/apply.sh applies each pending migrations/NNNN_*.sql in ONE
-#     transaction together with its schema_migrations row (all-or-nothing), in
-#     numeric order, and REFUSES to run if an already-applied migration's
-#     recorded sha256 no longer matches the file on disk (rewritten history would
-#     make this server and a fresh install permanently different products).
+# CHANGE ONE, CHANGE ALL FIVE. It is deliberately NOT extracted into
+# scripts/lib/unit-env.sh: the server tree is delivered to the VPS by SFTP
+# drag-and-drop with no git, so a partial copy that misses scripts/lib/ is a
+# realistic failure mode — and `. missing-file` under `set -euo pipefail` would
+# abort a DEAD-BOX RESTORE, the one path that must never fail for an avoidable
+# reason. Self-contained beats DRY here.
 #
-#     Migrations must run as the `maxsecu` APP role, not the postgres superuser —
-#     otherwise new objects would be owned by `postgres` and the server could not
-#     use them. The role's password lives in the root-owned 0600 systemd unit, so
-#     we read it from there and pass it via PGPASSWORD (never on argv, where `ps`
-#     would show it).
+# WHY NOT AN ANCHORED `^Environment=` SCRAPE: systemd accepts an INDENTED
+# `Environment=` line and optional surrounding quotes, it merges the base unit with
+# every drop-in (LAST assignment wins), and it takes the same variables from any
+# `EnvironmentFile=` the unit loads (an optional leading `-` = "ignore if absent").
+# A stricter scrape reports "unset" for a perfectly valid unit — which aborts a
+# backup, and a failed backup aborts the upgrade that depends on it.
+#
+# KNOWN, DELIBERATE DEVIATION FROM SYSTEMD: real systemd applies `EnvironmentFile=`
+# AFTER the `Environment=` lines, so the FILE overrides the unit line. These copies
+# consult the file only as a FALLBACK, when no `Environment=` line supplies the
+# name. That is the behaviour all of these scripts have always had, and DATABASE_URL
+# is the variable at stake: flipping the precedence could change WHICH DATABASE an
+# upgrade migrates on a box that sets it in both places. The deviation is recorded
+# here rather than "fixed" blind.
 # --------------------------------------------------------------------------- #
-echo "==> Applying database migrations"
+resolve_unit_env() { # $1 = variable name -> its effective value, or empty
+	_name="$1"
+	# The unit and every drop-in as ONE blob, read as root (they are 0600). Re-read
+	# on EVERY call, never cached: restore-server.sh REPLACES the unit mid-run and
+	# must then see the NEW one. `</dev/null` on every run_root so `sudo bash -c`
+	# cannot swallow a caller's stdin — backup/restore carry the bundle passphrase
+	# there. Tolerates a missing unit (fresh box / dead box): empty, never an abort.
+	_all="$(run_root "cat '$UNIT_PATH' '$DROPIN_DIR'/*.conf 2>/dev/null || cat '$UNIT_PATH' 2>/dev/null || true" </dev/null | tr -d '\r')"
+	_val="$(
+		printf '%s\n' "$_all" |
+			sed -n "s/^[[:space:]]*Environment=[\"']\\{0,1\\}${_name}=//p" |
+			sed -e 's/^["'\'']//' -e 's/["'\'']$//' |
+			tail -n1
+	)"
+	if [ -z "$_val" ]; then
+		_files="$(
+			printf '%s\n' "$_all" |
+				sed -n 's/^[[:space:]]*EnvironmentFile=//p' |
+				sed -e 's/^-//' -e 's/^["'\'']//' -e 's/["'\'']$//' |
+				sed '/^$/d'
+		)"
+		while IFS= read -r _f; do
+			[ -n "$_f" ] || continue
+			run_root "test -f '$_f'" </dev/null || continue
+			_v2="$(
+				run_root "cat '$_f'" </dev/null | tr -d '\r' |
+					sed -n "s/^[[:space:]]*${_name}=//p" |
+					sed -e 's/^["'\'']//' -e 's/["'\'']$//' |
+					tail -n1
+			)"
+			[ -n "$_v2" ] && _val="$_v2"
+		done <<EOF
+$_files
+EOF
+	fi
+	printf '%s' "$_val"
+}
 
-# Take the LAST Environment=DATABASE_URL= across the unit and any drop-in, which
-# is what systemd itself would use. The optional surrounding quotes systemd
-# permits are stripped.
-DATABASE_URL="$(
-	run_root "cat '$UNIT_PATH' '$DROPIN_DIR'/*.conf 2>/dev/null |
-		sed -n 's/^Environment=\"\\?DATABASE_URL=//p' |
-		sed 's/\"\$//' |
-		tail -n1"
-)"
-DATABASE_URL="$(printf '%s' "$DATABASE_URL" | tr -d '\r')"
+DATABASE_URL="$(resolve_unit_env DATABASE_URL)"
 if [ -z "$DATABASE_URL" ]; then
-	echo "error: no DATABASE_URL in $UNIT_PATH — cannot reach the database to check" >&2
-	echo "       for pending schema migrations. Refusing to restart into a possibly" >&2
-	echo "       mismatched schema. Re-run scripts/install-server.sh to repair the unit." >&2
+	echo "error: no DATABASE_URL in $UNIT_PATH (or in any EnvironmentFile it loads)" >&2
+	echo "       — cannot reach the database to check for pending schema migrations." >&2
+	echo "       Refusing to restart into a possibly mismatched schema." >&2
+	echo "       Nothing has been changed and the server is still running." >&2
+	echo "" >&2
+	echo "       Do NOT re-run install-server.sh to repair the unit: it refuses to touch" >&2
+	echo "       an existing install, and forcing it past that refusal re-mints the" >&2
+	echo "       database password whenever the unit carries no working one — which is" >&2
+	echo "       exactly the state you are in. Repair it one of these two ways:" >&2
+	echo "         1. from a sealed backup (it contains the original unit):" >&2
+	echo "               sudo bash scripts/restore-server.sh --list" >&2
+	echo "               printf '%s' 'passphrase' | sudo bash scripts/restore-server.sh \\" >&2
+	echo "                   --from latest --only state" >&2
+	echo "         2. or, if the password is genuinely lost, set a new one and put the" >&2
+	echo "            matching URL in a ROOT-ONLY (0600 — it is a secret) drop-in:" >&2
+	echo "               sudo -u postgres psql -c \"ALTER ROLE maxsecu PASSWORD 'NEWPASS'\"" >&2
+	echo "               sudo install -d /etc/systemd/system/maxsecu-server.service.d" >&2
+	echo "               printf '[Service]\\nEnvironment=DATABASE_URL=postgres://maxsecu:NEWPASS@localhost/maxsecu\\n' \\" >&2
+	echo "                 | sudo install -m 0600 /dev/stdin \\" >&2
+	echo "                   /etc/systemd/system/maxsecu-server.service.d/20-database-url.conf" >&2
+	echo "               sudo systemctl daemon-reload && sudo systemctl restart maxsecu-server" >&2
+	echo "            (No account, key or upload is touched by either route — the rows" >&2
+	echo "            live in the database, not in the unit.)" >&2
 	exit 1
 fi
 
@@ -436,8 +674,180 @@ fi
 if [ -z "$DB_USER" ] || [ -z "$DB_HOST" ] || [ -z "$DB_NAME" ]; then
 	echo "error: could not parse the DATABASE_URL from $UNIT_PATH." >&2
 	echo "       Expected postgres://USER:PASS@HOST/DB. Refusing to continue." >&2
+	echo "       Nothing has been changed and the server is still running." >&2
 	exit 1
 fi
+
+# The data dir the unit actually uses — NOT a guess. Used only for the read-only
+# fingerprint print at the end, but guessing it prints a spurious error on any box
+# installed with a non-default data dir.
+UNIT_DATA_DIR="$(resolve_unit_env MAXSECU_DATA_DIR)"
+if [ -n "$UNIT_DATA_DIR" ]; then
+	DATA_DIR="$UNIT_DATA_DIR"
+fi
+
+# --------------------------------------------------------------------------- #
+# 6. STOP THE SERVER, then rebuild.
+#
+#    The service is down for the whole update. That is deliberate: it makes it
+#    impossible for two server processes to be live at once, and it lets the
+#    migrations below run against a quiescent database. The price is real downtime
+#    for the length of the build, which makes the FAILURE path the important part
+#    — so we keep a copy of the binary that is running right now and put it back if
+#    anything goes wrong. A failed upgrade must never leave the box down.
+#
+#    "Anything goes wrong" has to mean ANYTHING, not just the failures we thought
+#    to guard. Between the stop and the start there are dozens of privileged
+#    commands, any of which `set -euo pipefail` will abort on, plus whatever a
+#    Ctrl-C or a dropped SSH session does. So the rollback hangs off a TRAP rather
+#    than off individual `if` blocks: SERVER_STOPPED is raised the moment the unit
+#    goes down and cleared only when a start has been CONFIRMED healthy, and the
+#    EXIT trap restores the old binary whenever it is still raised.
+# --------------------------------------------------------------------------- #
+PREV_BIN="$SERVER_BIN.pre-upgrade"
+SERVER_STOPPED=0
+ENV_TMP=""
+
+# Is the unit genuinely healthy, or merely "active"?
+#
+# `systemctl is-active` ALONE IS A FALSE-GREEN. The unit is Type=simple with
+# Restart=always, so systemd reports it active the instant the fork/exec succeeds
+# — a binary that panics 200ms into startup still reads "active" while it
+# crash-loops. So: sample NRestarts, wait, and require both that it is still
+# active and that it has not restarted in between.
+#
+# The wait must outlast the SLOWEST way the server can die on startup, or the
+# check is a false-green of its own. The serve path's Postgres acquire timeout is
+# 10s (crates/portable-server/src/run.rs), so a binary that cannot reach the
+# database is still on its FIRST process — active, NRestarts unchanged — for a
+# full 10 seconds. A 5s window declared that healthy.
+SETTLE_SECONDS=20
+settle_check() {
+	_before="$(run_root "systemctl show maxsecu-server -p NRestarts --value" </dev/null | tr -d '\r')"
+	sleep "$SETTLE_SECONDS"
+	_after="$(run_root "systemctl show maxsecu-server -p NRestarts --value" </dev/null | tr -d '\r')"
+	SETTLE_RESTARTS_BEFORE="$_before"
+	SETTLE_RESTARTS_AFTER="$_after"
+	run_root "systemctl is-active --quiet maxsecu-server" </dev/null &&
+		[ "$_before" = "$_after" ]
+}
+
+# Put the pre-upgrade binary back and bring the server up again. Reached from the
+# EXIT trap, so it must be safe to call in any state and must never itself abort.
+restore_previous_binary() {
+	[ "$SERVER_STOPPED" = "1" ] || return 0
+	echo "==> Restoring the pre-upgrade binary and starting the server again" >&2
+	# STOP FIRST. On the crash-loop path the unit is auto-restarting, so the old
+	# process may hold the image (`cp` -> ETXTBSY) and `systemctl start` would be a
+	# no-op against a unit systemd already considers active. And a unit that burned
+	# through the default start rate limit (5 starts / 10s, which a 200ms death plus
+	# RestartSec=2 reaches) sits in `failed` and will not start at all until it is
+	# reset — so reset it.
+	run_root "systemctl stop maxsecu-server" </dev/null || true
+	run_root "systemctl reset-failed maxsecu-server" </dev/null || true
+	# UNLINK BEFORE COPYING — not cosmetic. Cargo HARDLINKS
+	# target/release/<bin> to target/release/deps/<bin>-<hash> (verified: same inode,
+	# link count 2). A plain `cp` opens the destination with O_TRUNC and writes THROUGH
+	# that link, so it would rewrite cargo's cached artifact with the OLD bytes while
+	# leaving cargo's fingerprint saying "fresh" — and a later bare
+	# `cargo build --release` would then re-link the stale binary into place and report
+	# success. Removing the path first breaks the link, so the copy lands on a new
+	# inode and cargo's cache is left honest.
+	run_root "rm -f '$SERVER_BIN'" || true
+	run_root "cp -p '$PREV_BIN' '$SERVER_BIN'" || true
+	run_root "systemctl start maxsecu-server" </dev/null || true
+	# Judge the rollback by the SAME standard as the upgrade. Reporting success from
+	# a bare `is-active` here would be the exact false-green this script exists to
+	# eliminate, on the one path where being wrong is worst.
+	if settle_check; then
+		echo "    the server is back up on the pre-upgrade binary; your data is untouched." >&2
+		SERVER_STOPPED=0
+	else
+		echo "    WARNING: the server did NOT come back up healthy." >&2
+		echo "             (NRestarts $SETTLE_RESTARTS_BEFORE -> $SETTLE_RESTARTS_AFTER over ${SETTLE_SECONDS}s)" >&2
+		echo "             The pre-upgrade binary is in place at $SERVER_BIN." >&2
+		echo "             Investigate with: journalctl -u maxsecu-server -n 50 --no-pager" >&2
+	fi
+}
+
+# One EXIT trap for the whole script. It owns BOTH the tempfile cleanup and the
+# rollback, because a second `trap ... EXIT` anywhere would silently replace this
+# one — which is how the env-reconcile step used to disarm the rollback.
+on_exit() {
+	_status=$?
+	[ -n "$ENV_TMP" ] && rm -f "$ENV_TMP"
+	if [ "$SERVER_STOPPED" = "1" ]; then
+		echo "" >&2
+		echo "error: the upgrade stopped early with the service still DOWN" >&2
+		echo "       (exit status $_status). Rolling back so the box is serving again." >&2
+		restore_previous_binary
+	fi
+	return $_status
+}
+trap on_exit EXIT
+# Convert a Ctrl-C / SIGTERM into a normal exit so the EXIT trap above runs. The
+# largest window for one is the multi-minute rebuild, with the service down.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "==> Stopping maxsecu-server for the update"
+run_root "cp -p '$SERVER_BIN' '$PREV_BIN'"
+run_root "systemctl stop maxsecu-server"
+# From here until a CONFIRMED healthy start, the EXIT trap owns the box.
+SERVER_STOPPED=1
+
+# DEFEAT CARGO'S mtime FRESHNESS CHECK.
+#
+# Production is deployed by DRAGGING THE TREE OVER, and SFTP clients commonly
+# PRESERVE each file's modification time. If those times end up older than the
+# artifacts already in target/ — which happens whenever the box was last built more
+# recently than the sources were authored — cargo judges the changed crates "fresh"
+# and does not rebuild them. Observed for real: crates/server sources dated 07-17
+# against an rlib built 08-01 produced `unresolved import maxsecu_server::backup`.
+# That failure was loud, but the same mechanism can just as easily yield a binary
+# that silently mixes new and old code while this script prints UPGRADE COMPLETE.
+# Touching the workspace sources makes them all newer than any surviving artifact,
+# so cargo re-examines every one; unchanged crates still hit the cache, so this
+# costs little. Registry dependencies are immutable and unaffected.
+echo "==> Refreshing source timestamps so cargo cannot reuse a stale build"
+run_as_user "find '$ROOT/crates' '$ROOT/tools' -name '*.rs' -type f -exec touch {} + 2>/dev/null || true; touch '$ROOT/Cargo.toml' '$ROOT/Cargo.lock' 2>/dev/null || true; true"
+
+echo "==> Rebuilding maxsecu-portable-server (release) — this can take a while"
+if ! run_as_user "cd '$ROOT' && . '$CARGO_ENV' && cargo build --release -p maxsecu-portable-server"; then
+	echo "error: build failed. Nothing was migrated and no configuration changed." >&2
+	restore_previous_binary
+	exit 1
+fi
+if ! run_as_user "test -x '$SERVER_BIN'"; then
+	echo "error: build reported success but $SERVER_BIN is missing/not executable." >&2
+	restore_previous_binary
+	exit 1
+fi
+echo "    build OK"
+
+# --------------------------------------------------------------------------- #
+# 6b. Apply pending database migrations — BEFORE the restart, so the new binary
+#     never starts against an old schema.
+#
+#     This is the hole this step closes: docs/schema.sql used to be applied ONLY
+#     by install-server.sh on a FRESH install, and this script applied no schema
+#     change at all. Any edit to the schema therefore stranded every existing
+#     deployment — new code expecting a column the running database did not have.
+#
+#     migrations/apply.sh applies each pending migrations/NNNN_*.sql in ONE
+#     transaction together with its schema_migrations row (all-or-nothing), in
+#     numeric order, and REFUSES to run if an already-applied migration's
+#     recorded sha256 no longer matches the file on disk (rewritten history would
+#     make this server and a fresh install permanently different products).
+#
+#     Migrations must run as the `maxsecu` APP role, not the postgres superuser —
+#     otherwise new objects would be owned by `postgres` and the server could not
+#     use them. The role's password lives in the root-owned 0600 systemd unit, so
+#     we read it from there and pass it via PGPASSWORD (never on argv, where `ps`
+#     would show it). DATABASE_URL was resolved and parsed back in step 5c, while
+#     the server was still up, precisely so that a bad unit cannot strand the box.
+# --------------------------------------------------------------------------- #
+echo "==> Applying database migrations"
 
 MIGRATIONS_DIR="$ROOT/migrations"
 db_psql() {
@@ -447,10 +857,19 @@ db_psql() {
 # shellcheck source=../migrations/apply.sh
 . "$MIGRATIONS_DIR/apply.sh"
 
-migrations_ensure_table
-# Refuse BEFORE applying anything: a rewritten history must never be half-run.
-migrations_verify_history
-migrations_apply_pending
+# Each of these returns non-zero (never exits) on failure, so guarding them in an
+# `if` is enough — and it MUST be guarded now that the service is stopped: a bare
+# `set -e` abort here would leave the box down. Every migration runs in its own
+# transaction, so a failure leaves the schema at the last good state, which is
+# exactly the schema the pre-upgrade binary expects.
+if ! migrations_ensure_table ||
+	# Refuse BEFORE applying anything: a rewritten history must never be half-run.
+	! migrations_verify_history ||
+	! migrations_apply_pending; then
+	echo "error: database migrations failed. The schema is at its last good state." >&2
+	restore_previous_binary
+	exit 1
+fi
 
 # --------------------------------------------------------------------------- #
 # 7. Optional: set the cache capacity via a systemd drop-in (clean + reversible;
@@ -661,8 +1080,10 @@ if [ -z "$DROPIN_BODY" ]; then
 		echo "    the unit already defines every variable this build expects — nothing to do"
 	fi
 else
+	# NB: no `trap ... EXIT` here. ENV_TMP is a global that the single on_exit trap
+	# already cleans up; installing a second EXIT trap would REPLACE that one and
+	# silently disarm the rollback for the rest of the run — with the service down.
 	ENV_TMP="$(mktemp)"
-	trap 'rm -f "$ENV_TMP"' EXIT
 	{
 		echo "# GENERATED by scripts/upgrade-server.sh — DO NOT EDIT."
 		echo "#"
@@ -682,32 +1103,58 @@ else
 	if run_root "test -f '$ENV_DROPIN'" && run_root "cmp -s '$ENV_TMP' '$ENV_DROPIN'"; then
 		echo "    already reconciled — no change"
 		rm -f "$ENV_TMP"
-		trap - EXIT
+		ENV_TMP=""
 	else
 		echo "    adding to $ENV_DROPIN:$ADDED"
 		run_root "mkdir -p '$DROPIN_DIR'"
 		run_root "install -o root -g root -m 0644 '$ENV_TMP' '$ENV_DROPIN'"
 		rm -f "$ENV_TMP"
-		trap - EXIT
+		ENV_TMP=""
 		run_root "systemctl daemon-reload"
 	fi
 fi
 
 # --------------------------------------------------------------------------- #
-# 8. Restart the service (a brief blip) and confirm it came back healthy.
+# 8. Start the service again (it has been down since step 6) and confirm it is
+#    genuinely healthy.
+#
+#    The health check is `settle_check` (defined in step 6), which exists because
+#    `systemctl is-active` ALONE IS A FALSE-GREEN: the unit is Type=simple with
+#    Restart=always, so systemd reports it active the instant the fork/exec
+#    succeeds — a binary that panics 200ms into startup still reads "active" while
+#    it crash-loops, and this script would happily print UPGRADE COMPLETE over it.
+#    The wait is ${SETTLE_SECONDS}s rather than a couple, because the slowest way
+#    to die on startup is a Postgres connect, whose acquire timeout alone is 10s.
 # --------------------------------------------------------------------------- #
-echo "==> Restarting maxsecu-server"
-run_root "systemctl restart maxsecu-server"
+echo "==> Starting maxsecu-server"
+run_root "systemctl reset-failed maxsecu-server" </dev/null || true
+run_root "systemctl start maxsecu-server" </dev/null || true
 
-if run_root "systemctl is-active --quiet maxsecu-server"; then
+echo "    waiting ${SETTLE_SECONDS}s to confirm it stays up"
+if settle_check; then
 	echo "    service is active (running)"
+	# Confirmed healthy — the EXIT trap stands down.
+	SERVER_STOPPED=0
 else
-	echo "error: maxsecu-server did NOT come back active. Recent logs:" >&2
+	if [ "$SETTLE_RESTARTS_BEFORE" != "$SETTLE_RESTARTS_AFTER" ]; then
+		echo "error: maxsecu-server is CRASH-LOOPING (NRestarts $SETTLE_RESTARTS_BEFORE -> $SETTLE_RESTARTS_AFTER)." >&2
+		echo "       systemd reports it 'active' because the unit is Type=simple, but the" >&2
+		echo "       new binary is dying on startup." >&2
+	else
+		echo "error: maxsecu-server did NOT come back active. Recent logs:" >&2
+	fi
 	run_root "journalctl -u maxsecu-server -n 40 --no-pager" >&2 || true
-	echo "       Investigate above. Your data is intact; you can roll back the binary" >&2
-	echo "       with 'git checkout <old-commit> && cargo build --release -p maxsecu-portable-server'." >&2
+	echo "       Your data is intact. Rolling back to the binary that was running" >&2
+	echo "       before this upgrade so the server is serving again:" >&2
+	restore_previous_binary
+	echo "       Note: the schema HAS been migrated. Migrations only ADD, so the" >&2
+	echo "       pre-upgrade binary runs fine against it. Investigate the logs above," >&2
+	echo "       then re-run this script once the cause is fixed." >&2
 	exit 1
 fi
+
+# Keep the pre-upgrade binary as a zero-cost manual rollback point.
+echo "    (previous binary kept at $PREV_BIN)"
 
 # The TLS cert was not touched, so the fingerprint clients pinned is unchanged.
 # Print it so you can confirm it matches what your users already have.

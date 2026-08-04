@@ -65,6 +65,26 @@ jobs:
         run: rustup show
       - name: Postgres integration gate
         run: cargo test -p maxsecu-server --test pg_store --locked
+      # The server's own unit tests, on LINUX. The `test` job above runs the whole
+      # workspace but on windows-latest, where every `#[cfg(unix)]` assertion compiles
+      # to a no-op — so the backup module's POSIX-mode checks (does restore's staging
+      # tree, which holds the plaintext pg_dump, the TLS private key, the operational
+      # signing seed and the unit file's DB password, stay 0700/0600?) executed NOWHERE.
+      # It was proved vacuous: stripping every `harden(...)` call out of `restore()` did
+      # not fail a single job. This step is what makes those assertions real.
+      - name: Server unit tests on Linux (executes the #[cfg(unix)] permission assertions)
+        run: cargo test -p maxsecu-server --lib --locked
+      # The restore-MERGE safety suite, for the same reason as the step above: it is
+      # 17 Postgres tests (two throwaway databases per test, both loaded from
+      # docs/schema.sql), and the Windows `test` job sets MAXSECU_PG_OPTIONAL=1 with no
+      # Postgres, so `MergeDb::setup()` returns None and every one of them returns
+      # immediately and reports `ok`. Without this step a regression that let a restore
+      # resurrect a hard-deleted file, or hand a de-authorized recipient their wrapped
+      # DEK back, would ship green. Same service container and same baked-in default URL
+      # as pg_store above (postgres://maxsecu:maxsecu@localhost/maxsecu); the suite
+      # CREATEs its own databases, which the image's POSTGRES_USER can do.
+      - name: Backup/restore merge gate (delete + revoke tombstones survive a restore)
+        run: cargo test -p maxsecu-server --test backup_merge --locked
       # The other half of the compat gate: a FRESH install (docs/schema.sql) and an
       # UPGRADED install (migrations/0001_baseline.sql + every migration) must be the
       # same product. Without this, editing schema.sql silently strands every already

@@ -122,9 +122,23 @@ powershell -ExecutionPolicy Bypass -File scripts\install-client.ps1 -ConnectionC
 Copy that whole line; you'll paste it into Part 2. The server is now running on
 its own — you can close the SSH window.
 
-> Want a different port, or Dropbox storage offload? See
+> Want a different port, or storage offload? See
 > [Optional settings (advanced)](#optional-settings-advanced) for the extra flags
-> (`--port`, `--dropbox`).
+> (`--port`, `--dropbox`, `--cold-tier-fs`).
+>
+> **Decide storage offload now if you ever want a backup.** The sealed backup
+> bundle lives on the same "cold tier" the offload uses, so a server without one
+> **cannot be backed up at all**, and `upgrade-server.sh` then refuses to upgrade
+> something it could not roll back. Once this box has been installed at all — a
+> systemd service, a TLS certificate in the data folder, **or** any account in the
+> database — you can no longer re-run this installer to add it (it refuses on any
+> one of those three, so a failed first attempt already blocks a re-run). Add
+> `--cold-tier-fs /srv/maxsecu-cold`
+> (just a folder on the VPS — no account needed) or `--dropbox` to the command
+> above. If you skip it now you can still add one later **without re-running the
+> installer** — see [Change a setting on a running
+> server](#change-a-setting-on-a-running-server) — doing it at install time is
+> just simpler. See [Back up the server](#back-up-the-server--backup-serversh-and-restore-serversh).
 
 ---
 
@@ -142,9 +156,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -Connectio
 ```
 
 The `-ConnectionCode` carries the address plus the server-cert fingerprint; the
-`-Token` is the one-time delegation token. Keep the quotes — they stop PowerShell
-from choking on the `#`. (If you don't pass `-Token`, the script asks you to paste
-the token before continuing.)
+`-Token` is the one-time delegation token. The quotes are harmless and keep
+PowerShell from mis-reading the `#` if you retype the line by hand — the exact line
+the server printed also works as-is. (If you don't pass `-Token`, the script asks
+you to paste the token before continuing.)
 
 This is the step that performs the one-time **delegation ceremony** described in
 [the trust model](#whos-in-charge--the-trust-model-short-version): your PC
@@ -236,12 +251,15 @@ journalctl -u maxsecu-server -f           # watch what it's doing live (Ctrl+C t
 | "Secure connection failed" / the app can't connect | The server address is wrong — double-check `YOUR_SERVER_IP:8443`. Or the server was rebuilt with a new IP address, in which case the old app no longer trusts it — get a fresh ZIP from your admin. |
 | Can't SSH into the server | Check the IP address is right and that your SSH key or password is correct. Ask your VPS provider if unsure. |
 | `install-server.sh: Permission denied` | The download lost the "executable" mark. Either run it through bash — `bash scripts/install-server.sh --public` — or restore the mark once with `chmod +x scripts/*.sh`. |
-| "recovery account already registered" (409) when building the client | The server still has state from an earlier setup. You must reset it, not just re-clone — see [Start over from scratch](#start-over-from-scratch-full-reset). |
+| "recovery account already registered" (409) when building the client | **This is normal, and nothing was changed.** Every server that has already been set up answers this way — the setup step is one-shot, so it stopped and wrote nothing. Re-run the client build from the **same project folder the original ceremony ran in**: it still holds `recovery_pin.bin` and `directory_pub.der`, and the build reuses them to produce a working app. If that folder is gone, the two files are not equal: `directory_pub.der` **can** be rebuilt from your `d5_recovery.blob` backup and the recovery passphrase (`maxsecu-setup restore` — it is the same directory root, so no user has to re-pin), but `recovery_pin.bin` **cannot be rebuilt by any command** and the build needs it too — ask whoever ran the original ceremony for a copy (see [Recovery](#recovery--the-most-important-thing-to-protect)). Do **not** reach for a [reset](#start-over-from-scratch-full-reset): it erases every account and cannot be undone, and it is the answer only if you genuinely want to wipe this server and start over. |
 | The Windows script says `cargo` or `npm` is missing | Your PC needs two free developer tools. Install **Rust** (from rustup.rs, choose the MSVC option) and **Node.js LTS** (from nodejs.org), then run the script again. |
 | Windows warns "unknown publisher" when you open the app | This build isn't code-signed, which is normal for a self-built app. Click **More info**, then **Run anyway**. |
 | The server won't start | SSH in and run `journalctl -u maxsecu-server -e` to see the error message. |
 | "sign-up is closed" / users can't register | The delegation ceremony (Part 2) hasn't been completed yet, or it failed. Finish Part 2 on your admin PC — that opens sign-up. |
-| The client installer says the token is invalid or already used | The delegation token is single-use. If you re-ran `install-server.sh`, it printed a **new** token — use that one. If the server is already delegated it won't print a token at all (sign-up is already open); you don't need one. |
+| The client installer says the token is invalid or already used | The token is single-use — a completed ceremony burns it. If the server is **already delegated** nobody needs a token: sign-up is already open, so your users just register in the app. To build another client ZIP yourself, re-run the client installer **from the project folder that already holds `recovery_key.blob`, `recovery_pin.bin`, `register.key` and `directory_pub.der`** — it skips the ceremony and never asks for a token. (Run from a folder missing any of those four and it *will* stop and ask, and pressing Enter aborts it.) If the ceremony never completed and you lost the printed line, the token is **still on the server** and you can simply read it back — no reset, nothing destroyed. SSH in and run `sudo systemctl restart maxsecu-server`, then `journalctl -u maxsecu-server -e`: while a server is awaiting delegation, every start prints a `one-time delegation token:` line. If that file was deleted, the restart writes a fresh token and prints that instead. Do **not** reach for a [reset](#start-over-from-scratch-full-reset). |
+| `REFUSING: this box's account database could not be read` | The installer could not ask PostgreSQL how many accounts are on this box, and it will **not** assume "none" — that assumption is what installs straight over a live server and locks every app out for good. **Nothing that holds your data was changed.** (The one thing the check may have done is *start* PostgreSQL to ask — it says so when it did, and leaves it running; what starts at boot is untouched.) The message lists the three usual causes and the exact command to test with; fix PostgreSQL, then run the same command again. Do **not** reach for a [reset](#start-over-from-scratch-full-reset). |
+| `REFUSING: this box has real accounts and a BROKEN TLS identity` | Half of the server's identity is on disk (`cert.der` without `key.der`, or the other way round). The server rebuilds **both** when either is missing, so its next start would mint a **new** identity and permanently lock out every app you handed out. **The unit, the data folder and the database are untouched** (the check may have started PostgreSQL and left it running; the message says so when it did). Put the original back from a backup — `printf '%s' 'my bundle passphrase' \| sudo bash scripts/restore-server.sh --from latest --only state` (the passphrase is piped in; without it the command sits there waiting for it) — see [Back up the server](#back-up-the-server--backup-serversh-and-restore-serversh). The message also spells out what to do if you have no backup. |
+| `REFUSING: this box has real accounts but no TLS certificate here` | The database holds accounts but the installer found no certificate in the folder it resolved — so it is looking at the wrong folder, and continuing would mint a new identity and orphan every uploaded file. **The unit, the data folder and the database are untouched** (the check may have started PostgreSQL and left it running; the message says so when it did). Follow the three options the message prints; there is no flag that overrides this one. |
 
 ---
 
@@ -255,6 +273,70 @@ they are the master key that can recover the whole system. Keep **both files** a
 the passphrase **offline** (for example on a USB stick in a drawer) and **never
 share them with anyone**. The app ZIP you hand out to other people contains
 **neither** — that is deliberate. If you lose them, there is no way to recover.
+
+Keep a **third** thing beside them: a copy of **`dist\MaxSecuClient-share.zip`**,
+and your **server address and port** written on paper. A recovery sign-in only
+works from an app folder that already holds this server's pinned certificate, and
+that ZIP is exactly such a folder — it carries no secrets, which is why it is safe
+to store next to the keys. Without it there is nothing to unzip on a new PC, and a
+fresh copy of the project code **cannot** rebuild one for a server that is already
+set up.
+
+### Using the recovery key (breakglass sign-in)
+
+When you actually need it — a lost admin login, or rebuilding on a brand-new PC —
+the app can sign in **with the recovery key itself**. That session can browse and
+open every file, and mint registration keys. It cannot post, delete or share, so
+it cannot hand a file back to a user who lost access — that still needs the
+offline ceremony in `docs/runbooks/recovery-session.md`.
+
+The catch is a naming one, and it is why this needs a command rather than drag and
+drop: the ceremony wrote your key as **`recovery_key.blob`** in the project folder,
+but the app looks for it inside the folder the `.exe` sits in, as
+**`recovery\recovery_key_blob`** — a different folder *and* a different filename
+(no dot, `blob` last). Don't copy it by hand. Run:
+
+```
+powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -StageRecoveryKey E:\recovery_key.blob
+```
+
+That copies the file — byte for byte, still sealed with the same passphrase — into
+`dist\MaxSecuClient\recovery\recovery_key_blob`, checks the copy matches, and
+restricts it to your Windows account. It builds nothing and contacts no server. It
+does need an **app folder to put the key into**, though: `dist\MaxSecuClient` from
+an earlier build on this PC, or an unzipped copy of `MaxSecuClient-share.zip` (the
+next command). If there is no such folder it stops and says so — it never guesses.
+
+Staging into an unzipped app folder instead (e.g. the handout ZIP on a new PC):
+
+```
+powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -StageRecoveryKey E:\recovery_key.blob -ClientDir C:\Users\you\Desktop\MaxSecuClient
+```
+
+Then open the app. It starts on the **recovery sign-in** screen. On a PC that has
+never signed up there is no saved server yet, so open *"Server — set or change"* on
+that screen. You do **not** need the connection code: the address is normally
+already filled in for you, read out of the certificate in that folder, and a plain
+`YOUR_SERVER_IP:8443` is enough on its own (paste the whole code if you still have
+it). The **port** is the one part the app cannot work out — add it after the colon
+yourself. Then enter the recovery passphrase.
+
+**When you are done, take the copy back out** — passing the **same** `-ClientDir`
+you staged into:
+
+```
+powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -UnstageRecoveryKey -ClientDir C:\Users\you\Desktop\MaxSecuClient
+```
+
+Leave `-ClientDir` off and it looks in `dist\MaxSecuClient` instead: on a PC that
+has one, it finds nothing to remove there, prints a cheerful success, and your
+master key is still sitting in the folder you actually staged it into. Drop the
+`-ClientDir` **only** when `dist\MaxSecuClient` is where you staged it.
+
+> That staged file is a **full copy of your master key**. Anyone who gets it *and*
+> the passphrase can read every file of every user. Leave it in place only for as
+> long as the session lasts, and keep the offline original as the real one. It is
+> never put into any ZIP you hand out.
 
 ---
 
@@ -282,14 +364,30 @@ cd ~/maxsecu
 That stops and removes the service, drops the database (every account, including
 the recovery account) and its login role, deletes the data folder and TLS
 certificate, removes the saved Dropbox login, and closes the firewall port —
-everything except the source code itself. It's safe to run even on a server that
-was only half–set-up, or never set up at all.
+everything except the source code itself. It reads the **real** data folder out of
+the installed service file, so it wipes the box you actually have, not a guess.
+It's safe to run on a server that was only half–set-up, or never set up at all.
+
+**It asks first.** In a terminal it prints what is at stake — including how many
+accounts are about to be destroyed — and waits for you to type **`DESTROY`**, in
+capitals. Anything else aborts and nothing is touched.
+
+**It can also refuse, and that is a good thing.** If PostgreSQL is installed here
+but will not answer, it stops before deleting anything: removing the folder and
+the service file while the database survives would leave accounts that nobody —
+including you — could ever reach again. Fix PostgreSQL, then run the same command
+again.
+
+**Read the last lines it prints.** If it says this machine is **not** back to
+zero, something survived and it names what. Do not install over that — clear the
+cause and run `--reset` again first.
 
 > **Rented a brand-new VPS instead?** Then skip this — a new VPS is already blank.
 > Just start from [Part 1](#part-1--set-up-the-server-do-this-once).
 
-> If you installed on a custom port, add the same `--port N` so the right firewall
-> rule is removed, e.g. `./scripts/install-server.sh --reset --port 9443`.
+> The firewall port is read from the installed service file, so you no longer need
+> to repeat `--port N`. Pass it only if the service file is already gone and you
+> installed on a custom port, e.g. `./scripts/install-server.sh --reset --port 9443`.
 
 When it's done, reinstall from [Part 1](#part-1--set-up-the-server-do-this-once).
 
@@ -302,16 +400,39 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-client.ps1 -Reset
 ```
 
 That deletes the built apps (`dist\`), the recovery + registration files
-(`recovery_key.blob`, `recovery_pin.bin`, `register.key`), and the recovery pin
-embedded into the client. If you ever unzipped or copied the admin app somewhere
-else (for example onto your Desktop) and signed in there, delete that copy too —
-each copy keeps its own login data inside its own folder.
+(`recovery_key.blob`, `recovery_pin.bin`, `register.key`), **the directory root and
+its backup** (`d5_key.blob`, `d5_recovery.blob`), the pinned `directory_pub.der`
+and `connection_code.txt`, and the recovery pin embedded into the client. If you
+ever unzipped or copied the admin app somewhere else (for example onto your
+Desktop) and signed in there, delete that copy too — each copy keeps its own login
+data inside its own folder.
+
+> **Your sign-in key is rescued, not destroyed.** The `keystore\` folder inside the
+> admin app holds the sealed private key of whoever signed in there, and there is no
+> server-side copy of it — deleting it loses that account for good. So `-Reset`
+> copies it to `dist\_keystore-rescue-<date>\` first and prints where. To keep
+> signing in as the same user afterwards, copy that `keystore\` folder back into the
+> rebuilt app folder before you open it. Delete the rescue once you're sure you
+> don't need it — it is still your sealed private key. (A recovery key you staged
+> with `-StageRecoveryKey` is deliberately **not** rescued: it is only ever a copy,
+> and your offline original is the real one.)
 
 Then rebuild from [Part 2](#part-2--build-your-app-and-the-shareable-app-on-your-windows-pc).
 
-> **This erases your recovery key.** `recovery_key.blob` and the recovery
-> passphrase are the only master key to the *old* server. Only wipe them when you
-> genuinely intend to abandon that server for good.
+> **This erases your recovery key and your directory-root backup.**
+> `recovery_key.blob`, `d5_recovery.blob` and the recovery passphrase are the only
+> master key to the *old* server. Only wipe them when you genuinely intend to
+> abandon that server for good.
+>
+> It also erases **`recovery_pin.bin`**, and **no command in this project can
+> recreate that file** — not the recovery passphrase, not `maxsecu-setup restore`,
+> which rebuilds `directory_pub.der` but not the pin. (The pin is the *public* half
+> of the recovery identity sealed inside `recovery_key.blob`, so it is not lost
+> mathematically — but nothing shipped here derives it, so treat it as gone.)
+> Without it you can never build an
+> app that connects to the old server again. So if all you hit was *"recovery
+> account already registered" (409)* in [If something goes
+> wrong](#if-something-goes-wrong), do **not** run `-Reset`.
 
 ---
 
@@ -326,14 +447,34 @@ defaults worked for you.
 
 Run it in a terminal on the VPS. Flags can be combined.
 
+> **This is a fresh-install tool — it is not a way to change a running server.**
+> On a box that already has MaxSecu (a systemd service, a TLS certificate in the
+> data folder, or any user account in the database) it **refuses to run** and
+> prints what to use instead. That refusal is deliberate: re-running the installer
+> rewrites the service file from whatever flags you type this time, and with
+> `--rotate-tls-identity` it replaces the server's identity, which locks out every
+> app you have already handed out — permanently, with no way for those users to
+> repair it themselves. Pick the right tool:
+>
+> | You want to… | Use |
+> |---|---|
+> | apply a code update | `sudo bash scripts/upgrade-server.sh` |
+> | change a setting (port, cold tier, cache size) | a systemd drop-in — see [Change a setting on a running server](#change-a-setting-on-a-running-server) |
+> | back up / roll back data | [`scripts/backup-server.sh`, `scripts/restore-server.sh`](#back-up-the-server--backup-serversh-and-restore-serversh) |
+> | wipe the box and start again | `./scripts/install-server.sh --reset`, then install |
+
 | Option | What it does |
 |---|---|
-| `--public [IP]` | Make the server reachable from the internet. Binds `0.0.0.0` and bakes the public IP into the TLS certificate. If you omit the IP it is auto-detected and shown for you to confirm. Without `--public` the server is local-only (`127.0.0.1`), useful only for testing. |
+| `--public [IP]` | Make the server reachable from the internet. Binds `0.0.0.0` and bakes the public IP into the TLS certificate. If you omit the IP it is auto-detected and shown for you to confirm. Without `--public` the server is local-only (`127.0.0.1`), useful only for testing. **Going public afterwards is not a setting change:** the address is baked into the certificate, so a local-only box can only be reached from the internet by minting a new one — which permanently locks out every app already handed out. There **is** a later path, and it is not a reset: see the **"If your VPS's public IP changed"** note further down this section — it keeps the database, the recovery account and every upload, and only the handed-out ZIPs must be rebuilt. Reach for `--reset` only if you also want the accounts gone. Simplest of all: pass `--public` the first time. |
 | `--port N` | Listen port (default `8443`). If you change this, give users `YOUR_SERVER_IP:N` **and** pass the matching `-Port N` to the client installer below. |
-| `--capacity-gb N` | Local disk cache size in GB before the cold tier starts offloading (default `200`). Interactively you're prompted; a non-interactive run silently uses `200`. Only matters with `--dropbox` on. |
-| `--dropbox` | Turn on **Dropbox cold-tier offload** — idle/overflow files are moved to your Dropbox to save disk. Needs a real terminal: it asks for your Dropbox App key + secret, prints a URL for you to click **Allow** on, and you paste the one-time code back (paste it promptly — it expires within a minute or two). Safe to run again later to add Dropbox to an existing server. |
+| `--capacity-gb N` | Local disk cache size in GB before the cold tier starts offloading (default `200`). Interactively you're prompted; a non-interactive run silently uses `200`. Only matters with a cold tier on. |
+| `--dropbox` | Turn on **Dropbox cold-tier offload** — idle/overflow files are moved to your Dropbox to save disk. Needs a real terminal: it asks for your Dropbox App key + secret, prints a URL for you to click **Allow** on, and you paste the one-time code back (paste it promptly — it expires within a minute or two). Decide this **at install time**; adding it later is a drop-in, not a re-run. |
 | `--no-dropbox` | Skip the Dropbox prompt entirely (also the behavior when there's no terminal). |
-| `--reset` | Tear the server down to zero and exit (does **not** reinstall): stop + remove the service, drop the database + role, delete the data dir + TLS cert, remove the saved Dropbox login, close the firewall port. See [Start over from scratch](#start-over-from-scratch-full-reset). Combine with `--port N` if you installed on a custom port. |
+| `--cold-tier-fs DIR` | Use a local folder as the cold tier instead of Dropbox (no account needed). `DIR` must be an absolute path **outside** the data folder. Mutually exclusive with `--dropbox`. |
+| `--reset` | Tear the server down to zero and exit (does **not** reinstall): stop + remove the service, drop the database + role, delete the data dir + TLS cert, remove the saved Dropbox login, close the firewall port. The data folder and the firewall port are read from the installed service file, not guessed. In a terminal it first shows what is at stake and makes you type **`DESTROY`**; with no terminal it just proceeds. It **refuses without destroying anything** if PostgreSQL cannot be reached on a box that has it, and it reports honestly what survived instead of always claiming success. See [Start over from scratch](#start-over-from-scratch-full-reset). |
+| `--force-overwrite-existing-install` | Proceed even though an existing install was found. The service file is **rewritten from this run's flags**, so pass every flag the box was installed with. It does *not* delete the TLS certificate, does *not* drop the database, does *not* move the data folder, and reuses the database password from the existing service file whenever that password still works. If this run's data folder or run user disagrees with the installed service file — which happens when you re-run from a different account, e.g. a root shell entered with `su -` — the install is **refused outright** and naming this flag does not override that. **It cannot promise your users keep working, though:** "the certificate is not deleted" only helps if a certificate is actually **found** in the resolved data folder — if none is, the server mints a **new identity** and every installed app is locked out permanently. So a box whose database still holds accounts while no certificate is found there is **also refused outright**, with no override: that combination means the data folder was not located. When there is **no service file** (e.g. it was deleted) the data folder is a *guess* based on the account you are logged in as, so state it — `sudo env MAXSECU_DATA_DIR=/actual/path bash ./scripts/install-server.sh …`. |
+| `--rotate-tls-identity` | Delete the TLS certificate + client pins so the server mints a **new identity**. Only for a server whose public IP genuinely changed. **Every existing app stops connecting permanently** and each user needs a freshly built ZIP. |
+| `--assume-no-database` | **Last resort — it can destroy a working server.** Before installing, the script counts the accounts in the database, and that count is what stops it installing over a live box; if it cannot get an answer it stops (the `REFUSING: this box's account database could not be read` row in [If something goes wrong](#if-something-goes-wrong) — that is the only one this flag touches; the other two `REFUSING` rows fire on a count that *was* read, and no flag overrides them). This flag says *"I have checked, this machine holds no MaxSecu accounts — carry on."* It overwrites nothing by itself and it is **not** a substitute for `--force-overwrite-existing-install`, but it **gives up that protection**: if accounts really are here, every app you handed out is locked out permanently. Use it only when rebuilding a box whose database is genuinely gone. Otherwise repair PostgreSQL and re-run without it. |
 
 Example — custom port with Dropbox offload:
 
@@ -341,9 +482,122 @@ Example — custom port with Dropbox offload:
 ./scripts/install-server.sh --public --port 9443 --dropbox
 ```
 
-> Re-running with `--public` regenerates the server's TLS certificate. Any app
-> you already handed out pinned the old certificate and will stop connecting, so
-> rebuild and redistribute the client ZIP (Part 2) afterwards.
+> **If your VPS's public IP changed** the certificate no longer matches the
+> address, and the only fix is a new certificate — which every app you handed out
+> will reject. Re-install with both opt-outs, then rebuild and redistribute the
+> client ZIP (Part 2) to **every** user.
+>
+> **Read this before you run the command below.** It **permanently locks out every
+> app you have already handed out**, and no user can repair that themselves — each
+> one needs a freshly built ZIP from you, and anyone you cannot reach loses access
+> to their files. Run it only when the public IP has genuinely changed. **If you
+> are not sure — for example you only want a code update — run
+> `sudo bash scripts/upgrade-server.sh` instead**: it keeps the certificate, so no
+> app has to re-pin.
+>
+> ```
+> ./scripts/install-server.sh --public NEW.IP.HERE --port 8443 \
+>     --force-overwrite-existing-install --rotate-tls-identity
+> ```
+>
+> Repeat **every** flag the box was installed with, on that one line. The service
+> file is rewritten from this run's flags, so a `--cold-tier-fs DIR` you leave out
+> is silently dropped — and the server then has nowhere to put a backup.
+
+### Change a setting on a running server
+
+Never re-run the installer for this. A **systemd drop-in** is applied after the
+service file, so it overrides one value and touches nothing else — no data is
+moved, no certificate changes, and no app has to re-pin. Example, turning on a
+local-folder cold tier:
+
+```
+sudo mkdir -p /etc/systemd/system/maxsecu-server.service.d
+sudo tee /etc/systemd/system/maxsecu-server.service.d/20-cold-tier.conf >/dev/null <<'EOF'
+[Service]
+Environment=MAXSECU_COLD_TIER=fs
+Environment=MAXSECU_COLD_FS_DIR=/srv/maxsecu-cold
+EOF
+sudo install -d -o "$(sudo sed -n 's/^User=//p' /etc/systemd/system/maxsecu-server.service | tail -n1)" -m 0700 /srv/maxsecu-cold
+sudo systemctl daemon-reload && sudo systemctl restart maxsecu-server
+```
+
+The same shape works for `MAXSECU_PORT`, `MAXSECU_BIND` and
+`MAXSECU_CACHE_CAPACITY_BYTES`. A drop-in that holds a **secret** (`DATABASE_URL`,
+a Dropbox token) must be `0600`, not the `0644` above.
+
+**A port change needs two things the drop-in does not do for you.** Only the
+installer ever opens the firewall, so after changing `MAXSECU_PORT` you must open
+the new port yourself — `sudo ufw allow 9443/tcp` (and `sudo ufw delete allow
+8443/tcp` once you're sure), on a box where ufw is active — or the server is simply
+unreachable. And **every app you already handed out still dials the old port**: tell
+each user the new `YOUR_SERVER_IP:9443` so they can change it on their sign-in
+screen. Nobody has to re-pin — the certificate does not cover the port — but until
+they retype the address they cannot connect.
+
+The cold-tier folder must be **outside** the data folder — an `fs` cold tier that
+points at, or inside, the server's blob directory **destroys ciphertext**, and
+**nothing checks that for you** on any path (`--cold-tier-fs` verifies the
+directory is an absolute path and writable, not that it is outside your data
+folder). It must also be **owned by the user the service runs
+as** — that is what the long `sed` above reads out of the service file. Do not
+substitute your own username: if the owner is wrong the server simply cannot write
+there, offload stops and backups fail. Details: `docs/runbooks/prod-upgrade.md`.
+
+### Back up the server — `backup-server.sh` and `restore-server.sh`
+
+A backup is one **passphrase-locked bundle** holding everything the box needs to
+come back: the database, the service file (the only copy of the database
+password), the saved Dropbox login, the server's TLS identity, and the delegation
+files. It is written to the **cold tier** — the same Dropbox folder or local
+folder the storage offload uses — so a server with **no cold tier cannot be backed
+up**. Turn one on at install time (`--dropbox` or `--cold-tier-fs DIR`), or on a
+running server with a drop-in as in [Change a setting on a running
+server](#change-a-setting-on-a-running-server).
+
+Take one. The passphrase is piped in rather than typed as an option, because
+anything on a command line is readable by everyone on that machine:
+
+```
+printf '%s' 'my bundle passphrase' | sudo bash scripts/backup-server.sh
+```
+
+> **That passphrase is stored nowhere.** Without the exact text, nothing and
+> nobody can ever open the bundle. Minimum 12 characters. Write it down and keep
+> it with your recovery key.
+
+Backing up only **reads** — it never stops the server and never changes the
+database, so it is safe to run at any time. Run it before anything risky;
+`upgrade-server.sh` runs it for you.
+
+| Option | What it does |
+|---|---|
+| `--keep N` | Keep the newest N bundles and delete older ones (default `10`, minimum `1`). Your users' files are never pruned — only old bundles are. |
+
+To see what you have, and to roll back:
+
+```
+sudo bash scripts/restore-server.sh --list
+printf '%s' 'my bundle passphrase' | sudo bash scripts/restore-server.sh --from latest --dry-run
+printf '%s' 'my bundle passphrase' | sudo bash scripts/restore-server.sh --from latest
+```
+
+`--list` needs no passphrase. Do the `--dry-run` first: it opens the bundle,
+checks it, prints exactly what it would do, and changes nothing. A real restore
+also opens the bundle **before** it stops the server, so a wrong passphrase costs
+you nothing but a retry.
+
+| Option | What it does |
+|---|---|
+| `--from latest` or `--from <stamp>` | Which bundle to use. Required unless you passed `--list`. |
+| `--only db,state,code,blobs` | Restore only some parts (default `db,state,code`). `--only state` puts back just the service file, the TLS identity and the delegation files — that is the one to use when the server's identity is broken but its data is fine. |
+| `--db-mode merge` / `replace` | `merge` (the default whenever the live database still exists) only **adds back** what is missing and never removes a live row, so it cannot cost anyone their account. `replace` overwrites the live database wholesale and therefore throws away everything created since the backup — it needs `--force` for exactly that reason. |
+| `--dry-run` | Open, check and print the plan; change nothing, never stop the server. |
+| `--force` | Authorize `--db-mode replace` over a live database. |
+| `--cold-tier-fs <dir>` / `--dropbox-env <path>` | Only for rebuilding a **dead** box: there is no service file left to read the cold-tier location out of, so you have to say where the bundle is. |
+
+Full detail, including rebuilding a dead VPS from scratch:
+[`docs/runbooks/backup-restore.md`](docs/runbooks/backup-restore.md).
 
 ### Upgrade a running server — `upgrade-server.sh`
 
@@ -356,16 +610,33 @@ cd ~/maxsecu
 ./scripts/upgrade-server.sh
 ```
 
-It pulls the latest code, rebuilds the server binary **while the old one keeps
-serving** (so a build failure never takes production down), then restarts the
-service — a one-second blip. Your database, blobs, TLS certificate, client pins,
-and Dropbox login are all left exactly in place, and the server fingerprint is
-unchanged, so existing clients keep working with no re-pin.
+First it asks you for a **backup passphrase** and takes a sealed backup (see
+[above](#back-up-the-server--backup-serversh-and-restore-serversh)) — if that
+fails, the upgrade stops before changing anything. Then it pulls the latest code,
+**stops the server**, rebuilds it, applies any database migrations, and starts it
+again. **The server is down for the whole rebuild** — minutes, not seconds — so do
+it when nobody needs it. If the build fails, the binary that was running is put
+straight back and the server restarted, so a failed upgrade never leaves the box
+down. Your database, blobs, TLS certificate, client pins, and Dropbox login are
+all left exactly in place, and the server fingerprint is unchanged, so existing
+clients keep working with no re-pin.
+
+> **It needs a terminal, and it needs a cold tier.** You type the backup
+> passphrase at a prompt, so run it over SSH rather than from a script — with no
+> terminal it stops rather than upgrade with no way back. And if the server has no
+> cold tier the backup has nowhere to go; the upgrade stops and prints how to add
+> one without touching your data.
+>
+> **The very first upgrade onto this version needs `--no-backup`.** The server
+> binary already installed on your box predates the backup feature and cannot take
+> one, so run `sudo bash scripts/upgrade-server.sh --no-backup` that once. Every
+> upgrade after it backs up normally. The script checks and tells you which case
+> you are in — it will not guess.
 
 | Option | What it does |
 |---|---|
 | `--no-pull` | Rebuild the current checkout instead of `git pull`-ing first. |
-| `--no-backup` | Skip the quick `pg_dump` safety backup taken before the restart. |
+| `--no-backup` | Skip the sealed, rollback-able backup taken before anything changes (`scripts/backup-server.sh`). You then upgrade with **no rollback point** — only pass this if you know why. |
 | `--capacity-gb N` | Also set the local cache capacity to N GB (via a systemd drop-in), without editing the unit by hand. |
 
 > This never deletes data — only `install-server.sh --reset` does that. Do **not**
@@ -386,7 +657,9 @@ directly fails with a "not digitally signed / cannot be loaded" error.
 | `-Fingerprint code` | The server-cert fingerprint (the text after `#` in the connection code). Manual alternative to `-ConnectionCode`; pair it with `-ServerAddr`. |
 | `-Port N` | Server port. Must match the server's `--port` (default `8443`). Only needed with the manual `-ServerAddr`/`-Fingerprint` pair — `-ConnectionCode` already carries the port. |
 | `-RecoveryPassphrase "pw"` | Supply the recovery passphrase non-interactively (skips the prompt) so the install can run unattended. Prefer the `SETUP_RECOVERY_PW` env var — a flag value is visible in shell history and process listings. Omit both for the normal prompt (no echo). |
-| `-Reset` | Tear the client down to zero and exit (no build): delete `dist\`, the recovery/registration files, **and the directory root** (`d5_key.blob` / `d5_recovery.blob`), so the next run starts fresh. No other arguments are required with it. See [Start over from scratch](#start-over-from-scratch-full-reset). |
+| `-StageRecoveryKey <path>` | Put your cold `recovery_key.blob` where the app actually reads it, then exit (no build, no server contact). It needs an app folder to stage **into**: `dist\MaxSecuClient` by default, or add `-ClientDir <folder>` pointing at an unzipped `MaxSecuClient-share.zip` — that is the fresh-PC case. If that folder holds no `maxsecu-client-app.exe` it stops rather than drop the key somewhere the app never looks. See [Using the recovery key](#using-the-recovery-key-breakglass-sign-in). |
+| `-UnstageRecoveryKey` | Remove a recovery key staged by the flag above (overwrite, then delete) and exit. Run it as soon as the recovery session is over. Takes the same optional `-ClientDir <folder>`. |
+| `-Reset` | Tear the client down to zero and exit (no build): delete `dist\`, the recovery/registration files, **and the directory root** (`d5_key.blob` / `d5_recovery.blob`), so the next run starts fresh. Your **sign-in keystore is rescued first** to `dist\_keystore-rescue-<date>\`. No other arguments are required with it. See [Start over from scratch](#start-over-from-scratch-full-reset). |
 
 Example — passing the address and fingerprint manually instead of a code:
 
@@ -466,7 +739,7 @@ reset+reinstall path, re-runs the oracle, then unregisters the distro and resets
 the client.
 
     powershell -ExecutionPolicy Bypass -File scripts\test-full-install.ps1
-    # options: -Port 8443  -KeepOnFailure  -Iterations 3
+    # options: -Port 18443 (the default; change only if that port is taken)  -KeepOnFailure  -Iterations 3
 
 Requirements: WSL2 with virtualization enabled; the Rust MSVC + Node toolchains
 (the same the normal client install needs). The Ubuntu rootfs is downloaded once

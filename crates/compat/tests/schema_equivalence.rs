@@ -651,7 +651,7 @@ async fn compat_fresh_install_equals_upgraded_install() {
         // predicate, a `search_path` regression that lands the DDL somewhere else,
         // a catalog change in a future Postgres) would turn this gate green while
         // comparing nothing at all. Every aspect here is non-empty in the real
-        // schema — 14 tables, 6 triggers, 5 trigger functions, 2 column comments —
+        // schema — 16 tables, 8 triggers, 5 trigger functions, 2 column comments —
         // so zero rows means the probe is broken, not that the schema is bare.
         if a.is_empty() || b.is_empty() {
             sanity.push_str(&format!(

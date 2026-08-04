@@ -32,6 +32,8 @@
 # lock is identical on a Windows checkout and on Linux CI. (.gitattributes
 # already forces LF, so in practice this is the plain file digest.)
 
-schema       f666b01ede1e3a4fe4dca08ae29f098ce5704cbac1a35dd27af604500817946c
+schema       cdbebab406c7af0fa7bea6d21c060c5a30084644a5e2eed741fb4eef5c4b6a39
 0001         828d88127d86c96863e0462c513b358f0c3f586289c174e46582f652550f263f
-schema_head  1
+0002         7fd2417d54bf9ead7a00deced41901e2fff5314981032a90da467fd26cf2aa43
+0003         ebfa282189692b3bb9586fe165be2a9e90102e4ed5df9c9167ee024e587e8226
+schema_head  3
