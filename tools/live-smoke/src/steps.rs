@@ -61,12 +61,20 @@ async fn enroll(
 }
 
 /// Channel-bound login for an already-enrolled identity sealed in `dir`.
-async fn login(c: &mut Conn, host: &str, dir: &Path, username: &str) -> Result<(Identity, String), String> {
-    let id = keystore::unlock(dir, PASSPHRASE).map_err(|e| format!("unlock {username}: {}", e.message))?;
+async fn login(
+    c: &mut Conn,
+    host: &str,
+    dir: &Path,
+    username: &str,
+) -> Result<(Identity, String), String> {
+    let id = keystore::unlock(dir, PASSPHRASE)
+        .map_err(|e| format!("unlock {username}: {}", e.message))?;
     let ok = login_exchange(&mut c.sender, &id, username, host, &c.exporter, TS)
         .await
         .map_err(|e| format!("login {username}: {}", e.message))?;
-    if ok.token.is_empty() { return Err(format!("empty token for {username}")); }
+    if ok.token.is_empty() {
+        return Err(format!("empty token for {username}"));
+    }
     Ok((id, ok.token))
 }
 
@@ -129,15 +137,28 @@ async fn view_own_blog(
     file_id: [u8; 16],
 ) -> Result<Vec<u8>, String> {
     let fid_hex = net::hex(&file_id);
-    let (st, json) = net::get(c, &format!("/v1/files/{fid_hex}?version=latest"), host, Some(token)).await?;
+    let (st, json) = net::get(
+        c,
+        &format!("/v1/files/{fid_hex}?version=latest"),
+        host,
+        Some(token),
+    )
+    .await?;
     if st != hyper::StatusCode::OK {
         return Err(format!("file view GET status {st}"));
     }
     let view = parse_file_view(&json).map_err(|e| format!("parse_file_view: {}", e.message))?;
-    let (bundle, _direct) =
-        build_download_bundle(&mut c.sender, host, token, &fid_hex, &view, RouteMode::PreferServer, None)
-            .await
-            .map_err(|e| format!("build_download_bundle: {}", e.message))?;
+    let (bundle, _direct) = build_download_bundle(
+        &mut c.sender,
+        host,
+        token,
+        &fid_hex,
+        &view,
+        RouteMode::PreferServer,
+        None,
+    )
+    .await
+    .map_err(|e| format!("build_download_bundle: {}", e.message))?;
 
     let ctx = VerifyContext {
         file_id: Id(file_id),
@@ -165,7 +186,14 @@ async fn view_own_blog(
 
 /// Admin mints a fresh single-use registration key over `c` with `admin_token`.
 async fn mint_key(c: &mut Conn, host: &str, admin_token: &str) -> Result<String, String> {
-    let (st, res) = net::post(c, "/v1/registration-keys", host, Some(admin_token), serde_json::json!({})).await?;
+    let (st, res) = net::post(
+        c,
+        "/v1/registration-keys",
+        host,
+        Some(admin_token),
+        serde_json::json!({}),
+    )
+    .await?;
     if st != hyper::StatusCode::CREATED {
         return Err(format!("mint registration key status {st}"));
     }
@@ -176,16 +204,27 @@ async fn mint_key(c: &mut Conn, host: &str, admin_token: &str) -> Result<String,
 }
 
 /// As the logged-in caller (`token`), list the feed and assert `want_fid_hex` appears.
-async fn assert_feed_contains(c: &mut Conn, host: &str, token: &str, want_fid_hex: &str) -> Result<(), String> {
+async fn assert_feed_contains(
+    c: &mut Conn,
+    host: &str,
+    token: &str,
+    want_fid_hex: &str,
+) -> Result<(), String> {
     let (st, json) = net::get(c, "/v1/files?limit=200", host, Some(token)).await?;
     if st != hyper::StatusCode::OK {
         return Err(format!("feed GET status {st}"));
     }
-    let found = json["files"].as_array().map(|a| {
-        a.iter().any(|f| f["file_id"].as_str() == Some(want_fid_hex))
-    }).unwrap_or(false);
+    let found = json["files"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .any(|f| f["file_id"].as_str() == Some(want_fid_hex))
+        })
+        .unwrap_or(false);
     if !found {
-        return Err(format!("user2 feed does not contain admin file {want_fid_hex}"));
+        return Err(format!(
+            "user2 feed does not contain admin file {want_fid_hex}"
+        ));
     }
     Ok(())
 }
@@ -772,12 +811,29 @@ pub async fn run(server: &str, host: &str, client_dir: &Path) -> Result<(), Stri
 
     // ---- Admin uploads a blog and views it back (full round-trip) ----
     let round_trip = async {
-        let file_id = upload_blog(&mut c2, host, &admin_id, &admin_uid, &admin_token, BLOG_BODY, "SmokeDiary").await?;
-        let got = view_own_blog(&mut c2, host, &admin_id, &admin_uid, &admin_token, file_id).await?;
+        let file_id = upload_blog(
+            &mut c2,
+            host,
+            &admin_id,
+            &admin_uid,
+            &admin_token,
+            BLOG_BODY,
+            "SmokeDiary",
+        )
+        .await?;
+        let got =
+            view_own_blog(&mut c2, host, &admin_id, &admin_uid, &admin_token, file_id).await?;
         if got != BLOG_BODY {
-            return Err(format!("view-back mismatch: {} bytes decrypted, expected {}", got.len(), BLOG_BODY.len()));
+            return Err(format!(
+                "view-back mismatch: {} bytes decrypted, expected {}",
+                got.len(),
+                BLOG_BODY.len()
+            ));
         }
-        eprintln!("live-smoke: admin upload + view-back OK ({} bytes)", got.len());
+        eprintln!(
+            "live-smoke: admin upload + view-back OK ({} bytes)",
+            got.len()
+        );
         Ok::<[u8; 16], String>(file_id)
     }
     .await;
@@ -799,13 +855,26 @@ pub async fn run(server: &str, host: &str, client_dir: &Path) -> Result<(), Stri
         assert_feed_contains(&mut c4, host, &user_token, &net::hex(&admin_file_id)).await?;
         eprintln!("live-smoke: cross-user feed visibility OK");
 
-        const USER_BODY: &[u8] = b"live-smoke user2 post: a second independent account round-trips too.";
-        let user_fid = upload_blog(&mut c4, host, &user_id, &user_uid, &user_token, USER_BODY, "User2Diary").await?;
+        const USER_BODY: &[u8] =
+            b"live-smoke user2 post: a second independent account round-trips too.";
+        let user_fid = upload_blog(
+            &mut c4,
+            host,
+            &user_id,
+            &user_uid,
+            &user_token,
+            USER_BODY,
+            "User2Diary",
+        )
+        .await?;
         let got2 = view_own_blog(&mut c4, host, &user_id, &user_uid, &user_token, user_fid).await?;
         if got2 != USER_BODY {
             return Err(format!("user2 view-back mismatch: {} bytes", got2.len()));
         }
-        eprintln!("live-smoke: user2 upload + view-back OK ({} bytes)", got2.len());
+        eprintln!(
+            "live-smoke: user2 upload + view-back OK ({} bytes)",
+            got2.len()
+        );
         Ok::<(), String>(())
     }
     .await;
@@ -867,12 +936,7 @@ const SEED_IMAGE_PNG: &[u8] = &[
 /// Enroll `username` over `c` into an ALREADY-seeded `dir` (register.key present);
 /// returns the server-assigned `user_id` (hex16). The dir is the caller's — this is
 /// the explicit-dir counterpart of `enroll`, which makes its own throwaway temp dir.
-async fn enroll_at(
-    c: &mut Conn,
-    host: &str,
-    dir: &Path,
-    username: &str,
-) -> Result<String, String> {
+async fn enroll_at(c: &mut Conn, host: &str, dir: &Path, username: &str) -> Result<String, String> {
     let reg = register_with_key_exchange(&mut c.sender, host, dir, username, PASSPHRASE)
         .await
         .map_err(|e| format!("enroll {username}: {}", e.message))?;
@@ -896,8 +960,9 @@ async fn upload_image(
         .await
         .map_err(|e| format!("resolve_recovery_pin (recovery gate): {}", e.message))?;
 
-    let (file_type, streams) = maxsecu_client_app::upload::prepare_image_streams(src_png, title, &[])
-        .map_err(|e| format!("prepare_image_streams: {}", e.message))?;
+    let (file_type, streams) =
+        maxsecu_client_app::upload::prepare_image_streams(src_png, title, &[])
+            .map_err(|e| format!("prepare_image_streams: {}", e.message))?;
     let file_id = Id(maxsecu_crypto::random_array::<16>());
     let bundle = build_upload(
         &UploadParams {
@@ -942,7 +1007,12 @@ fn seed_app_dir_path(state_path: &Path) -> PathBuf {
 
 /// One `files[]` entry: `content_sha256` is over the PLAINTEXT `view_own_blog`
 /// returns (the Content stream), so `verify` recomputes it the identical way.
-fn file_record(tag: &str, file_id: &[u8; 16], plaintext: &[u8], file_type: &str) -> serde_json::Value {
+fn file_record(
+    tag: &str,
+    file_id: &[u8; 16],
+    plaintext: &[u8],
+    file_type: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "tag": tag,
         "file_id": net::hex(file_id),
@@ -980,11 +1050,13 @@ fn write_state(
 
 fn read_state(path: &Path) -> Result<serde_json::Value, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read state {}: {e}", path.display()))?;
-    let v: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| format!("parse state {}: {e}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("parse state {}: {e}", path.display()))?;
     let ver = v.get("version").and_then(|x| x.as_u64());
     if ver != Some(STATE_VERSION) {
-        return Err(format!("state version mismatch: got {ver:?}, want {STATE_VERSION}"));
+        return Err(format!(
+            "state version mismatch: got {ver:?}, want {STATE_VERSION}"
+        ));
     }
     Ok(v)
 }
@@ -1038,13 +1110,34 @@ pub async fn seed(
     let mut files = Vec::new();
 
     // Blog upload + view-back to confirm it landed; record the content digest.
-    let blog_fid = upload_blog(&mut c2, host, &id, &user_id, &token, BLOG_BODY, "BackupDiary").await?;
+    let blog_fid = upload_blog(
+        &mut c2,
+        host,
+        &id,
+        &user_id,
+        &token,
+        BLOG_BODY,
+        "BackupDiary",
+    )
+    .await?;
     let blog_pt = view_own_blog(&mut c2, host, &id, &user_id, &token, blog_fid).await?;
     files.push(file_record("blog", &blog_fid, &blog_pt, "blog"));
-    eprintln!("live-smoke seed: blog uploaded + viewed ({} bytes)", blog_pt.len());
+    eprintln!(
+        "live-smoke seed: blog uploaded + viewed ({} bytes)",
+        blog_pt.len()
+    );
 
     // Image upload — the PINNED Thumbnail/Preview streams round-trip the cold tier.
-    let img_fid = upload_image(&mut c2, host, &id, &user_id, &token, SEED_IMAGE_PNG, "BackupPhoto").await?;
+    let img_fid = upload_image(
+        &mut c2,
+        host,
+        &id,
+        &user_id,
+        &token,
+        SEED_IMAGE_PNG,
+        "BackupPhoto",
+    )
+    .await?;
     let img_pt = view_own_blog(&mut c2, host, &id, &user_id, &token, img_fid).await?;
     files.push(file_record("image", &img_fid, &img_pt, "image"));
     eprintln!(
@@ -1084,7 +1177,9 @@ pub async fn verify(
         ));
     }
     if rec_host != host {
-        return Err(format!("state host mismatch: recorded {rec_host}, got {host}"));
+        return Err(format!(
+            "state host mismatch: recorded {rec_host}, got {host}"
+        ));
     }
     let app_dir = PathBuf::from(state_str(&st, "app_dir")?);
     let username = state_str(&st, "username")?;
@@ -1170,7 +1265,16 @@ pub async fn verify(
     // triple + recovery_account + operational_secret to wrap and to pass the pin gate.
     const POST_BODY: &[u8] =
         b"live-smoke verify: a fresh post AFTER restore proves the write path survived.";
-    let new_fid = upload_blog(&mut c, host, &id, &user_id, &token, POST_BODY, "PostRestore").await?;
+    let new_fid = upload_blog(
+        &mut c,
+        host,
+        &id,
+        &user_id,
+        &token,
+        POST_BODY,
+        "PostRestore",
+    )
+    .await?;
     let got = view_own_blog(&mut c, host, &id, &user_id, &token, new_fid).await?;
     if got != POST_BODY {
         return Err(format!(
@@ -1187,6 +1291,888 @@ pub async fn verify(
     // (the paging assertions need at least two rows, and more rows make the cursor
     // walk a real walk rather than a single hop).
     assert_paginated_listing(&mut c, host, &token).await?;
+
+    Ok(())
+}
+
+// ===========================================================================
+//  PROD-UPGRADE FILE-FIDELITY oracle — the `--phase upload-files|download-files`
+//  pair.
+//
+//  `upload-files` reads REAL files off disk, uploads each one through the REAL
+//  prepare path for its kind, downloads it straight back, writes the recovered
+//  plaintext to --out-dir, and records a digest for EVERY stream in --state.
+//  `download-files` then reopens the SAME sealed app-dir after the upgrade — no
+//  re-enroll, no re-pin, no upload of the recorded files — re-downloads each one,
+//  and fails on any digest that moved.
+//
+//  Honesty rule baked into the design: source-byte identity is MEASURED at upload
+//  time, never assumed. Thumbnail/Preview are derived by the client and have no
+//  source counterpart at all; a non-PNG image source is re-encoded to PNG
+//  (client-core/src/media.rs) so its original bytes are irrecoverable. For any
+//  stream where the client transformed the input, the ONLY sound assertion is
+//  pre-upgrade recovered bytes == post-upgrade recovered bytes, and that is what
+//  is asserted — the source comparison is skipped and the skip is PRINTED.
+//
+//  FileType::Video is deliberately unreachable here: this oracle is built with
+//  `default-features = false`, so `embed-ffmpeg` is OFF and ffmpeg is compiled
+//  OUT (ffmpeg_bin::ensure_ffmpeg is the fail-closed `video_unavailable` stub);
+//  and even with ffmpeg present prepare_video_streams always re-muxes to
+//  fragmented MP4, so a Video Content stream can never equal the source file.
+//  An .mp4 is uploaded as Generic — byte-preserving, multi-chunk, and honest
+//  about what it does and does not prove.
+// ===========================================================================
+
+/// The account these two phases own. Distinct from `run`'s (`smokeadmin`) and
+/// `seed`'s (`bkupadmin`) so the three oracles never share an app-dir or identity.
+pub const FILES_USER: &str = "upgradeuser";
+
+/// Chunk size for the fidelity uploads: the PRODUCT's own value (1 MiB —
+/// `commands/upload.rs` seals every in-RAM upload at `VIDEO_CHUNK_SIZE`). The
+/// 4 KiB `steps.rs` uses elsewhere is fine for a 70-byte blog but would turn a
+/// 6 MiB MP4 into ~1500 sequential PUTs. Inside the server's [4 KiB, 8 MiB]
+/// framing bounds and under its 8 MiB + 64 KiB body limit.
+const FILES_CHUNK_SIZE: u32 = maxsecu_client_app::upload::VIDEO_CHUNK_SIZE;
+
+/// Build identity of THIS oracle binary: the lowercase-hex SHA-256 of the file
+/// behind `std::env::current_exe()`, computed at RUN time.
+///
+/// `download-files` refuses to run against a state file written by a DIFFERENT
+/// build unless `--allow-client-upgrade`: the post-upgrade lap must use the
+/// PRE-upgrade client, or it proves nothing about existing users' installs.
+///
+/// This used to be `option_env!("MAXSECU_ORACLE_BUILD")` stamped in at compile
+/// time, which was wrong in the way that matters: nothing in the tree ever set
+/// that variable, so it was permanently `"unset"`, the comparison was always
+/// `"unset" == "unset"`, and the guard could never fire — while both phases
+/// printed a WARNING that read, to a log skimmer, like covered ground. Hashing
+/// the running executable needs no build plumbing, is always available, and is
+/// exactly the property the guard wants to assert: same bytes on both laps.
+///
+/// Fails CLOSED. If the executable cannot be located or read there is no honest
+/// identity to compare, so both phases abort rather than degrade to a guard that
+/// passes by default.
+fn oracle_build_id() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot locate this oracle binary (current_exe): {e}"))?;
+    let bytes = std::fs::read(&exe)
+        .map_err(|e| format!("cannot read this oracle binary {}: {e}", exe.display()))?;
+    Ok(sha_hex(&bytes))
+}
+
+/// First 12 hex chars of a build id — enough to eyeball in a log, short enough to
+/// sit on one line. Length-guarded so it can never panic on a truncated value.
+fn short_build(b: &str) -> &str {
+    &b[..b.len().min(12)]
+}
+
+/// Everything both file-fidelity phases need. A struct rather than nine positional
+/// parameters so `main.rs` stays readable and clippy stays quiet.
+pub struct FilesArgs<'a> {
+    pub server: &'a str,
+    pub host: &'a str,
+    pub client_dir: &'a Path,
+    pub state: &'a Path,
+    pub app_dir: Option<&'a Path>,
+    pub out_dir: &'a Path,
+    pub files: &'a [String],
+    pub allow_client_upgrade: bool,
+    pub allow_server_id_change: bool,
+}
+
+/// Which prepare path a `--file` argument takes. Deliberately EXPLICIT (the caller
+/// writes `image:`/`generic:`/`blog:`) rather than inferred from the extension. The
+/// GUI infers (`ui/src/core/composer.ts::detectKind`), but inference would route a
+/// `.mp4` down the VIDEO path, whose Content stream is a re-muxed fMP4 and can never
+/// be byte-identical to the source — and a green run would then be misread as
+/// "video upload verified". Naming the path is the honesty gate.
+#[derive(Clone, Copy, PartialEq)]
+enum FileKind {
+    Image,
+    Generic,
+    Blog,
+}
+
+impl FileKind {
+    fn parse(s: &str) -> Result<FileKind, String> {
+        match s {
+            "image" => Ok(FileKind::Image),
+            "generic" => Ok(FileKind::Generic),
+            "blog" => Ok(FileKind::Blog),
+            "video" => Err(
+                "--file kind 'video' is NOT supported by this oracle: ffmpeg is COMPILED OUT of \
+                 this build (default-features = false ⇒ embed-ffmpeg off ⇒ ensure_ffmpeg is the \
+                 fail-closed `video_unavailable` stub), and prepare_video_streams always re-muxes \
+                 to fragmented MP4 anyway, so a Video Content stream can never equal the source \
+                 bytes. Upload the file as 'generic:' instead — byte-preserving and multi-chunk — \
+                 and cover the transcode path with the manual GUI smoke."
+                    .to_owned(),
+            ),
+            other => Err(format!(
+                "unknown --file kind '{other}' (want image|generic|blog; 'video' is rejected on \
+                 purpose — ffmpeg is compiled out of this oracle)"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            FileKind::Image => "image",
+            FileKind::Generic => "generic",
+            FileKind::Blog => "blog",
+        }
+    }
+}
+
+/// `<kind>:<path>`. Split on the FIRST colon only, so a Windows path keeps its
+/// drive letter (`image:D:\shots\a.png` -> ("image", "D:\\shots\\a.png")).
+fn parse_file_arg(spec: &str) -> Result<(FileKind, PathBuf), String> {
+    let (kind, path) = spec.split_once(':').ok_or_else(|| {
+        format!("--file '{spec}' must be '<kind>:<path>', e.g. image:D:\\fixtures\\shot.png")
+    })?;
+    if path.is_empty() {
+        return Err(format!("--file '{spec}' has an empty path"));
+    }
+    Ok((FileKind::parse(kind)?, PathBuf::from(path)))
+}
+
+fn base_name(p: &Path) -> Result<String, String> {
+    p.file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_owned())
+        .ok_or_else(|| format!("source path {} has no usable file name", p.display()))
+}
+
+fn sha_hex(bytes: &[u8]) -> String {
+    net::hex(&maxsecu_crypto::sha256(bytes))
+}
+
+fn stream_name_of(t: StreamType) -> &'static str {
+    match t {
+        StreamType::Content => "content",
+        StreamType::Metadata => "metadata",
+        StreamType::Thumbnail => "thumbnail",
+        StreamType::Preview => "preview",
+    }
+}
+
+fn file_type_name(t: FileType) -> &'static str {
+    match t {
+        FileType::Video => "video",
+        FileType::Image => "image",
+        FileType::Blog => "blog",
+        FileType::Generic => "generic",
+        FileType::Bundle => "bundle",
+    }
+}
+
+/// Refuse to write recovered bytes into a directory that holds one of the SOURCES.
+/// Overwriting a source with the bytes we just recovered would make any external
+/// `sha256sum src out` comparison vacuously green.
+fn assert_out_dir_disjoint(out_dir: &Path, sources: &[PathBuf]) -> Result<(), String> {
+    let out = std::fs::canonicalize(out_dir)
+        .map_err(|e| format!("canonicalize --out-dir {}: {e}", out_dir.display()))?;
+    for p in sources {
+        let parent = p.parent().unwrap_or_else(|| Path::new("."));
+        let par = match std::fs::canonicalize(parent) {
+            Ok(x) => x,
+            Err(_) => continue, // source dir is gone; nothing to clobber
+        };
+        if par == out {
+            return Err(format!(
+                "--out-dir {} is the SAME directory as source {} — the recovered bytes would \
+                 overwrite the source and make the SHA-256 comparison meaningless",
+                out_dir.display(),
+                p.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read a REAL file off disk and run it through the REAL prepare path for its kind.
+/// Returns (file_type, streams, the source bytes as read).
+fn prepare_from_disk(
+    kind: FileKind,
+    path: &Path,
+) -> Result<(FileType, maxsecu_client_core::PlaintextStreams, Vec<u8>), String> {
+    let source = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let name = base_name(path)?;
+    match kind {
+        // The real GUI image path. Content is stream-copied verbatim when the source
+        // is already PNG, RE-ENCODED otherwise; Thumbnail + Preview are always
+        // derived. `upload_files` measures which happened.
+        FileKind::Image => {
+            let (ft, streams) =
+                maxsecu_client_app::upload::prepare_image_streams(&source, &name, &[]).map_err(
+                    |e| format!("prepare_image_streams({}): {}", path.display(), e.message),
+                )?;
+            Ok((ft, streams, source))
+        }
+        // The real GUI generic path: raw bytes, no transcode, original filename in
+        // the metadata (commands/upload.rs UploadKind::Generic does exactly this).
+        FileKind::Generic => {
+            let streams = maxsecu_client_core::PlaintextStreams {
+                content: source.clone(),
+                metadata: Some(maxsecu_client_app::upload::prepare_generic_metadata(
+                    &name,
+                    &name,
+                    &[],
+                )),
+                thumbnail: None,
+                preview: None,
+            };
+            Ok((FileType::Generic, streams, source))
+        }
+        // Blog: content passes through untouched.
+        FileKind::Blog => {
+            let streams =
+                maxsecu_client_app::upload::prepare_blog_streams(source.clone(), &name, &[]);
+            Ok((FileType::Blog, streams, source))
+        }
+    }
+}
+
+/// Upload already-prepared streams as `owner`. Structurally identical to
+/// `upload_blog`/`upload_image` (same recovery-pin gate, same `build_upload`, same
+/// `run_pipeline`), differing only in taking the file_type + streams from the caller
+/// and sealing at the product's 1 MiB chunk size.
+async fn upload_prepared(
+    c: &mut Conn,
+    host: &str,
+    owner: &Identity,
+    owner_uid_hex: &str,
+    token: &str,
+    file_type: FileType,
+    streams: &maxsecu_client_core::PlaintextStreams,
+) -> Result<[u8; 16], String> {
+    let recovery = resolve_recovery_pin(&mut c.sender, host)
+        .await
+        .map_err(|e| format!("resolve_recovery_pin (recovery gate): {}", e.message))?;
+
+    let file_id = Id(maxsecu_crypto::random_array::<16>());
+    let bundle = build_upload(
+        &UploadParams {
+            owner,
+            owner_id: Id(net::hex16(owner_uid_hex)?),
+            owner_key_version: 1,
+            file_id,
+            file_type,
+            chunk_size: FILES_CHUNK_SIZE,
+            recovery_pub: EncPublicKey::from_bytes(recovery.enc_pub),
+            recovery_mlkem_pub: recovery.mlkem_pub,
+            created_at: Timestamp(TS),
+        },
+        streams,
+    )
+    .map_err(|e| format!("build_upload({}): {e:?}", file_type_name(file_type)))?;
+
+    maxsecu_client_app::upload::run_pipeline(
+        &mut c.sender,
+        host,
+        token,
+        &bundle,
+        |_, _| {},
+        maxsecu_client_app::upload::StageFlags::default(),
+    )
+    .await
+    .map_err(|e| format!("run_pipeline({}): {}", file_type_name(file_type), e.message))?;
+
+    Ok(file_id.0)
+}
+
+/// Like `view_own_blog`, but returns EVERY decrypted stream, not just Content.
+/// Thumbnail/Preview have no source counterpart, so their pre/post digests are the
+/// only evidence the pinned-blob path survived the upgrade.
+async fn open_all_streams(
+    c: &mut Conn,
+    host: &str,
+    owner: &Identity,
+    owner_uid_hex: &str,
+    token: &str,
+    file_id: [u8; 16],
+) -> Result<Vec<maxsecu_client_core::OpenedStream>, String> {
+    let fid_hex = net::hex(&file_id);
+    let (st, json) = net::get(
+        c,
+        &format!("/v1/files/{fid_hex}?version=latest"),
+        host,
+        Some(token),
+    )
+    .await?;
+    if st != hyper::StatusCode::OK {
+        return Err(format!("file view GET {fid_hex} status {st}"));
+    }
+    let view = parse_file_view(&json).map_err(|e| format!("parse_file_view: {}", e.message))?;
+    let (bundle, _direct) = build_download_bundle(
+        &mut c.sender,
+        host,
+        token,
+        &fid_hex,
+        &view,
+        RouteMode::PreferServer,
+        None,
+    )
+    .await
+    .map_err(|e| format!("build_download_bundle({fid_hex}): {}", e.message))?;
+
+    let ctx = VerifyContext {
+        file_id: Id(file_id),
+        author_sig_pub: owner.sig_pub_bytes(),
+        owner_sig_pub: owner.sig_pub_bytes(),
+        recipient_id: Id(net::hex16(owner_uid_hex)?),
+        recipient_type: RecipientType::User,
+        recipient_secret: owner.enc_secret(),
+        recipient_mlkem_seed: owner.mlkem_seed(),
+        seen_max_version: None,
+        granter_sig_pub: &NO_GRANTERS,
+        admin_sig_pub: &NO_ADMINS,
+        tombstones: None,
+        compromise: None,
+    };
+    let opened =
+        verify_and_open(&ctx, &bundle).map_err(|e| format!("verify_and_open({fid_hex}): {e:?}"))?;
+    Ok(opened.streams)
+}
+
+fn content_bytes(streams: &[maxsecu_client_core::OpenedStream]) -> Result<&[u8], String> {
+    streams
+        .iter()
+        .find(|s| s.stream_type == StreamType::Content)
+        .map(|s| s.plaintext.as_slice())
+        .ok_or_else(|| "no content stream in opened file".to_owned())
+}
+
+/// One JSON record per decrypted stream, in the manifest's ascending order (which
+/// `verify_and_open` preserves), so the pre/post comparison is a plain value compare.
+fn stream_records(streams: &[maxsecu_client_core::OpenedStream]) -> Vec<serde_json::Value> {
+    streams
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "stream": stream_name_of(s.stream_type),
+                "bytes": s.plaintext.len() as u64,
+                "sha256": sha_hex(&s.plaintext),
+            })
+        })
+        .collect()
+}
+
+/// The app-dir these phases use: `--app-dir` when given, else `<state>.appdir` (the
+/// same convention `seed` uses, so the sealed keystore is a durable artifact).
+fn files_app_dir(a: &FilesArgs<'_>) -> PathBuf {
+    match a.app_dir {
+        Some(p) => p.to_path_buf(),
+        None => seed_app_dir_path(a.state),
+    }
+}
+
+/// The server's own view of who this account is. Doubles as an assertion: a restore
+/// or migration that stranded the account changes what the directory serves.
+async fn binding_user_id(c: &mut Conn, host: &str, username: &str) -> Result<String, String> {
+    let (st, body) = net::get(c, &format!("/v1/directory/{username}"), host, None).await?;
+    if st != hyper::StatusCode::OK {
+        return Err(format!("directory GET {username} status {st}"));
+    }
+    let bytes = B64
+        .decode(body["binding_b64"].as_str().ok_or("no binding_b64")?)
+        .map_err(|e| format!("b64: {e}"))?;
+    let binding: DirBinding = decode(&bytes).map_err(|e| format!("decode binding: {e}"))?;
+    Ok(net::hex(&binding.user_id.0))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_files_state(
+    a: &FilesArgs<'_>,
+    app_dir: &Path,
+    user_id: &str,
+    sig_pub: &str,
+    enc_pub: &str,
+    server_id: &str,
+    oracle_build: &str,
+    files: &[serde_json::Value],
+) -> Result<(), String> {
+    // Absolute, canonical: `download-files` compares against it to refuse writing
+    // the post-upgrade recovery on top of the pre-upgrade one.
+    let out_abs = std::fs::canonicalize(a.out_dir)
+        .map_err(|e| format!("canonicalize --out-dir {}: {e}", a.out_dir.display()))?;
+    // STATE_VERSION stays 1 on purpose: `read_state` hard-rejects any other value,
+    // and the envelope is a strict SUPERSET of `write_state`'s, so the backup-E2E
+    // `verify()` can still consume a file written here.
+    let v = serde_json::json!({
+        "version": STATE_VERSION,
+        "server": a.server,
+        "host": a.host,
+        "app_dir": app_dir.to_string_lossy(),
+        "username": FILES_USER,
+        "user_id": user_id,
+        "sig_pub": sig_pub,
+        "enc_pub": enc_pub,
+        "server_id": server_id,
+        "oracle_build": oracle_build,
+        "out_dir": out_abs.to_string_lossy(),
+        "files": files,
+    });
+    let bytes = serde_json::to_vec_pretty(&v).map_err(|e| format!("serialize state: {e}"))?;
+    std::fs::write(a.state, bytes).map_err(|e| format!("write state {}: {e}", a.state.display()))
+}
+
+/// PHASE `upload-files`: upload every `--file` through its real prepare path,
+/// download each straight back, write the recovered plaintext to `--out-dir`, and
+/// record a digest for EVERY stream in `--state`.
+///
+/// Enrolls ONLY when the app-dir has no keystore. If a keystore exists it is
+/// unlocked and reused (no re-enroll, `register.key` untouched), which makes this
+/// phase safe to run a SECOND time after the upgrade to prove the write path.
+pub async fn upload_files(a: &FilesArgs<'_>) -> Result<(), String> {
+    if a.files.is_empty() {
+        return Err("--phase upload-files needs at least one --file <kind>:<path>".into());
+    }
+    // Computed FIRST: if this binary cannot identify itself the whole run is
+    // unverifiable, and that must surface in a second rather than after a live upload.
+    let build = oracle_build_id()?;
+
+    // Validate every source BEFORE touching the network, so a typo fails in a
+    // second rather than half-way through a live upload.
+    let mut specs: Vec<(FileKind, PathBuf)> = Vec::with_capacity(a.files.len());
+    for spec in a.files {
+        specs.push(parse_file_arg(spec)?);
+    }
+    let mut names: Vec<String> = Vec::with_capacity(specs.len());
+    for (_, p) in &specs {
+        let md = std::fs::metadata(p).map_err(|e| format!("source {}: {e}", p.display()))?;
+        if !md.is_file() {
+            return Err(format!("source {} is not a file", p.display()));
+        }
+        let n = base_name(p)?;
+        if names.contains(&n) {
+            return Err(format!(
+                "two --file arguments share the basename '{n}' — the recovered copies would \
+                 overwrite each other in --out-dir"
+            ));
+        }
+        names.push(n);
+    }
+    std::fs::create_dir_all(a.out_dir)
+        .map_err(|e| format!("mkdir --out-dir {}: {e}", a.out_dir.display()))?;
+    let src_paths: Vec<PathBuf> = specs.iter().map(|(_, p)| p.clone()).collect();
+    assert_out_dir_disjoint(a.out_dir, &src_paths)?;
+
+    let app_dir = files_app_dir(a);
+    let t = net::transport(a.client_dir, a.host, a.server)?;
+
+    // Enroll ONLY on a virgin app-dir. A keystore that exists but will not unlock is
+    // a HARD failure below — never re-enroll over it, because that would mint a brand
+    // new identity and hide the exact damage this test hunts for.
+    let mut enrolled_uid: Option<String> = None;
+    if keystore::exists(&app_dir) {
+        if app_dir.join("register.key").exists() {
+            return Err(format!(
+                "register.key is present in {} alongside an existing keystore — refusing to run \
+                 (this state is ambiguous and could re-enroll)",
+                app_dir.display()
+            ));
+        }
+        eprintln!(
+            "live-smoke files: reusing the sealed identity in {} (NO re-enroll)",
+            app_dir.display()
+        );
+    } else {
+        let admin_key = std::fs::read_to_string(a.client_dir.join("register.key"))
+            .map_err(|e| format!("read admin register.key: {e}"))?
+            .trim()
+            .to_owned();
+        let _ = std::fs::remove_dir_all(&app_dir);
+        seed_app_dir(&app_dir, &admin_key)?;
+        let mut c0 = net::open(&t).await?;
+        let uid = enroll_at(&mut c0, a.host, &app_dir, FILES_USER).await?;
+        if app_dir.join("register.key").exists() {
+            return Err(
+                "register.key survived enroll — the single-use registration key was not consumed"
+                    .into(),
+            );
+        }
+        eprintln!(
+            "live-smoke files: enrolled {FILES_USER} ({uid}) into {}",
+            app_dir.display()
+        );
+        enrolled_uid = Some(uid);
+    }
+
+    let id = keystore::unlock(&app_dir, PASSPHRASE)
+        .map_err(|e| format!("keystore::unlock({}): {}", app_dir.display(), e.message))?;
+    let sig_pub = net::hex(&id.sig_pub_bytes());
+    let enc_pub = net::hex(&id.enc_pub_bytes());
+
+    let mut c = net::open(&t).await?; // fresh channel for the channel-bound login
+    let ok = login_exchange(&mut c.sender, &id, FILES_USER, a.host, &c.exporter, TS)
+        .await
+        .map_err(|e| format!("login {FILES_USER}: {}", e.message))?;
+    if ok.token.is_empty() {
+        return Err(format!("empty token for {FILES_USER}"));
+    }
+    let token = ok.token.clone();
+    let server_id = ok.server_id.clone();
+
+    let user_id = binding_user_id(&mut c, a.host, FILES_USER).await?;
+    if let Some(uid) = enrolled_uid {
+        if uid != user_id {
+            return Err(format!(
+                "enroll returned user_id {uid} but the directory binding serves {user_id}"
+            ));
+        }
+    }
+    eprintln!("live-smoke files: logged in as {FILES_USER} ({user_id}), server_id={server_id}");
+    eprintln!(
+        "live-smoke files: oracle binary sha256={}… — recorded in --state as the build \
+         download-files must match",
+        short_build(&build)
+    );
+
+    let mut records: Vec<serde_json::Value> = Vec::with_capacity(specs.len());
+    for ((kind, path), name) in specs.iter().zip(names.iter()) {
+        let (file_type, streams, source) = prepare_from_disk(*kind, path)?;
+        let source_sha = sha_hex(&source);
+
+        let fid =
+            upload_prepared(&mut c, a.host, &id, &user_id, &token, file_type, &streams).await?;
+        let fid_hex = net::hex(&fid);
+
+        // Read it straight back through the real verify ladder: this run's own
+        // recovered bytes are the PRE-upgrade reference the post-upgrade lap uses.
+        let opened = open_all_streams(&mut c, a.host, &id, &user_id, &token, fid).await?;
+        let content = content_bytes(&opened)?;
+        let content_sha = sha_hex(content);
+
+        let dest = a.out_dir.join(name);
+        std::fs::write(&dest, content).map_err(|e| format!("write {}: {e}", dest.display()))?;
+
+        // MEASURED, not assumed. A .png under `image:` comes back verbatim; a .jpg
+        // under `image:` does not, and that is recorded truthfully.
+        let content_is_source = content_sha == source_sha;
+
+        eprintln!(
+            "live-smoke files: {name} kind={} file_type={} fid={fid_hex} src={}B content={}B \
+             streams={} {} -> {}",
+            kind.name(),
+            file_type_name(file_type),
+            source.len(),
+            content.len(),
+            opened.len(),
+            if content_is_source {
+                "SOURCE-IDENTICAL"
+            } else {
+                "TRANSFORMED(cross-run-only)"
+            },
+            dest.display()
+        );
+
+        records.push(serde_json::json!({
+            "tag": name,
+            "kind": kind.name(),
+            "file_id": fid_hex,
+            "file_type": file_type_name(file_type),
+            "source_path": path.to_string_lossy(),
+            "source_sha256": source_sha,
+            "source_bytes": source.len() as u64,
+            "content_sha256": content_sha,
+            "content_bytes": content.len() as u64,
+            "content_is_source": content_is_source,
+            "streams": stream_records(&opened),
+        }));
+    }
+
+    write_files_state(
+        a, &app_dir, &user_id, &sig_pub, &enc_pub, &server_id, &build, &records,
+    )?;
+    eprintln!(
+        "live-smoke files: uploaded + read back {}/{} file(s); state {}",
+        records.len(),
+        specs.len(),
+        a.state.display()
+    );
+    // The sealed app-dir is deliberately LEFT IN PLACE: `download-files` reopens
+    // this exact keystore, which is what "no re-enroll" actually means.
+    Ok(())
+}
+
+/// PHASE `download-files`: reopen the SAME sealed app-dir after the upgrade and
+/// re-download every recorded file. This phase NEVER re-enrolls and NEVER re-uploads
+/// a recorded file — if the server lost a blob it must fail, not silently re-create.
+pub async fn download_files(a: &FilesArgs<'_>) -> Result<(), String> {
+    if !a.files.is_empty() {
+        return Err(
+            "--file is not valid with --phase download-files (the file set comes from --state)"
+                .into(),
+        );
+    }
+    let st = read_state(a.state)?;
+    let rec_server = state_str(&st, "server")?;
+    let rec_host = state_str(&st, "host")?;
+    if rec_server != a.server {
+        return Err(format!(
+            "state server mismatch: recorded {rec_server}, got {}",
+            a.server
+        ));
+    }
+    if rec_host != a.host {
+        return Err(format!(
+            "state host mismatch: recorded {rec_host}, got {}",
+            a.host
+        ));
+    }
+
+    // The post-upgrade lap must run the SAME (pre-upgrade) client binary, or it
+    // proves nothing about the installs real users already have.
+    let rec_build = state_str(&st, "oracle_build")?;
+    let build = oracle_build_id()?;
+    if rec_build != build && !a.allow_client_upgrade {
+        return Err(format!(
+            "oracle build changed: --state was written by '{rec_build}', this binary is \
+             '{build}'. The post-upgrade lap must use the PRE-upgrade client. Pass \
+             --allow-client-upgrade to run the NEW client deliberately."
+        ));
+    }
+    eprintln!(
+        "live-smoke files: oracle binary sha256={}… — {}",
+        short_build(&build),
+        if rec_build == build {
+            "SAME binary that wrote --state"
+        } else {
+            "DIFFERENT from --state, allowed by --allow-client-upgrade"
+        }
+    );
+
+    let app_dir = PathBuf::from(state_str(&st, "app_dir")?);
+    // NO re-enroll: the single-use key was consumed at upload time and must still be
+    // gone. Its absence is the proof this app-dir was never re-enrolled.
+    if app_dir.join("register.key").exists() {
+        return Err(format!(
+            "register.key is present in {} — download-files must NOT re-enroll",
+            app_dir.display()
+        ));
+    }
+    if !keystore::exists(&app_dir) {
+        return Err(format!(
+            "no keystore in {} — the sealed identity is gone; a re-enroll here would hide the \
+             very break this test hunts",
+            app_dir.display()
+        ));
+    }
+    let id = keystore::unlock(&app_dir, PASSPHRASE)
+        .map_err(|e| format!("keystore::unlock({}): {}", app_dir.display(), e.message))?;
+    if net::hex(&id.sig_pub_bytes()) != state_str(&st, "sig_pub")? {
+        return Err("sig_pub changed after the upgrade (identity not preserved)".into());
+    }
+    if net::hex(&id.enc_pub_bytes()) != state_str(&st, "enc_pub")? {
+        return Err("enc_pub changed after the upgrade (identity not preserved)".into());
+    }
+    eprintln!("live-smoke files: unlocked the SAME sealed identity; sig/enc pub keys match");
+
+    std::fs::create_dir_all(a.out_dir)
+        .map_err(|e| format!("mkdir --out-dir {}: {e}", a.out_dir.display()))?;
+    let out_abs = std::fs::canonicalize(a.out_dir)
+        .map_err(|e| format!("canonicalize --out-dir {}: {e}", a.out_dir.display()))?;
+    if out_abs.to_string_lossy() == state_str(&st, "out_dir")? {
+        return Err(format!(
+            "--out-dir {} is the SAME directory the upload phase wrote to — a failed write here \
+             would leave the PRE-upgrade copy in place and read as green. Use a distinct directory.",
+            out_abs.display()
+        ));
+    }
+
+    let files = st
+        .get("files")
+        .and_then(|f| f.as_array())
+        .ok_or("state: missing 'files' array")?;
+    if files.is_empty() {
+        return Err("state records ZERO files — this run would verify nothing".into());
+    }
+    let sources: Vec<PathBuf> = files
+        .iter()
+        .filter_map(|f| f.get("source_path").and_then(|x| x.as_str()))
+        .map(PathBuf::from)
+        .collect();
+    assert_out_dir_disjoint(a.out_dir, &sources)?;
+
+    let username = state_str(&st, "username")?;
+    let user_id = state_str(&st, "user_id")?;
+
+    let t = net::transport(a.client_dir, a.host, a.server)?;
+    let mut c = net::open(&t).await?;
+    let ok = login_exchange(&mut c.sender, &id, &username, a.host, &c.exporter, TS)
+        .await
+        .map_err(|e| format!("login {username}: {}", e.message))?;
+    if ok.token.is_empty() {
+        return Err(format!("empty token for {username}"));
+    }
+    let token = ok.token.clone();
+    eprintln!("live-smoke files: login OK (no re-enroll, no re-pin)");
+
+    let rec_server_id = state_str(&st, "server_id")?;
+    if ok.server_id != rec_server_id {
+        if a.allow_server_id_change {
+            eprintln!(
+                "live-smoke files: WARNING server_id changed ({rec_server_id} -> {}) — allowed by \
+                 --allow-server-id-change",
+                ok.server_id
+            );
+        } else {
+            return Err(format!(
+                "server_id changed across the upgrade: recorded {rec_server_id}, now {}. Every \
+                 login proof is bound to it. Pass --allow-server-id-change only if this rotation \
+                 is intended and recorded in docs/compat/LEDGER.md.",
+                ok.server_id
+            ));
+        }
+    }
+
+    // user_id is the recipient_id inside every DEK wrap — a migration that stranded
+    // this account changes what the directory serves.
+    let served_uid = binding_user_id(&mut c, a.host, &username).await?;
+    if served_uid != user_id {
+        return Err(format!(
+            "binding user_id mismatch: recorded {user_id}, served {served_uid}"
+        ));
+    }
+
+    // The recovery pin the server serves must still match this app's EMBEDDED pin,
+    // or no future upload from this install can ever wrap a DEK.
+    resolve_recovery_pin(&mut c.sender, a.host)
+        .await
+        .map_err(|e| format!("recovery pin gate after the upgrade: {}", e.message))?;
+    eprintln!("live-smoke files: directory binding + recovery pin both unchanged");
+
+    let total = files.len();
+    let mut done = 0usize;
+    for f in files {
+        let tag = f
+            .get("tag")
+            .and_then(|x| x.as_str())
+            .ok_or("file record: missing 'tag'")?;
+        let fid_hex = f
+            .get("file_id")
+            .and_then(|x| x.as_str())
+            .ok_or("file record: missing 'file_id'")?;
+        let fid = net::hex16(fid_hex)?;
+
+        let opened = open_all_streams(&mut c, a.host, &id, &user_id, &token, fid).await?;
+
+        // EVERY stream, not just content. Thumbnail/Preview are derived and have no
+        // source counterpart, so this cross-run compare is their ONLY evidence.
+        let want = f
+            .get("streams")
+            .and_then(|x| x.as_array())
+            .ok_or("file record: missing 'streams'")?;
+        let got = stream_records(&opened);
+        if got.len() != want.len() {
+            return Err(format!(
+                "file '{tag}' {fid_hex}: stream COUNT changed after the upgrade (recorded {}, got {})",
+                want.len(),
+                got.len()
+            ));
+        }
+        for (w, g) in want.iter().zip(got.iter()) {
+            if w != g {
+                return Err(format!(
+                    "file '{tag}' {fid_hex}: stream record changed after the upgrade\n  recorded {w}\n  got      {g}"
+                ));
+            }
+        }
+
+        let content = content_bytes(&opened)?;
+        let content_sha = sha_hex(content);
+        let want_content = f
+            .get("content_sha256")
+            .and_then(|x| x.as_str())
+            .ok_or("file record: missing 'content_sha256'")?;
+        if content_sha != want_content {
+            return Err(format!(
+                "file '{tag}' {fid_hex}: CONTENT digest changed after the upgrade (got \
+                 {content_sha}, recorded {want_content})"
+            ));
+        }
+
+        let dest = a.out_dir.join(tag);
+        std::fs::write(&dest, content).map_err(|e| format!("write {}: {e}", dest.display()))?;
+
+        let is_src = f
+            .get("content_is_source")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let src_sha = f
+            .get("source_sha256")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let src_path = f.get("source_path").and_then(|x| x.as_str()).unwrap_or("");
+
+        if is_src {
+            if content_sha != src_sha {
+                return Err(format!(
+                    "file '{tag}' {fid_hex}: recovered content != SOURCE bytes (got {content_sha}, \
+                     source {src_sha})"
+                ));
+            }
+            // Re-hash the source ON DISK when it is still there: proves the state
+            // file was not regenerated or edited between the two laps.
+            if !src_path.is_empty() {
+                if let Ok(bytes) = std::fs::read(src_path) {
+                    let now = sha_hex(&bytes);
+                    if now != src_sha {
+                        return Err(format!(
+                            "file '{tag}': the SOURCE at {src_path} changed since the upload phase \
+                             (now {now}, recorded {src_sha}) — the comparison would be meaningless"
+                        ));
+                    }
+                }
+            }
+            eprintln!(
+                "live-smoke files: {tag} {fid_hex} OK {} bytes SOURCE-IDENTICAL -> {}",
+                content.len(),
+                dest.display()
+            );
+        } else {
+            eprintln!(
+                "live-smoke files: {tag} {fid_hex} OK {} bytes CROSS-RUN-IDENTICAL (the client \
+                 transformed this source at upload time, so source-byte identity is impossible by \
+                 design and is NOT asserted) -> {}",
+                content.len(),
+                dest.display()
+            );
+        }
+        done += 1;
+    }
+    if done != total {
+        return Err(format!("verified {done} of {total} recorded files"));
+    }
+    eprintln!("live-smoke files: {done}/{total} recorded file(s) verified after the upgrade");
+
+    // The WRITE path must survive too: a fresh post from the SAME pre-upgrade
+    // identity needs the delegation triple + recovery account + operational key to
+    // still wrap and to still pass the pin gate. Uses the existing helpers verbatim.
+    const POST_BODY: &[u8] =
+        b"live-smoke files: a fresh post AFTER the upgrade proves an EXISTING identity can still write.";
+    let new_fid = upload_blog(
+        &mut c,
+        a.host,
+        &id,
+        &user_id,
+        &token,
+        POST_BODY,
+        "PostUpgrade",
+    )
+    .await?;
+    let got = view_own_blog(&mut c, a.host, &id, &user_id, &token, new_fid).await?;
+    if got != POST_BODY {
+        return Err(format!(
+            "post-upgrade write/view mismatch: {} bytes decrypted",
+            got.len()
+        ));
+    }
+    eprintln!(
+        "live-smoke files: post-upgrade upload + view-back OK ({} bytes)",
+        got.len()
+    );
 
     Ok(())
 }

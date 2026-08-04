@@ -26,9 +26,15 @@ escape hatch, so nobody — not you, not a support ticket — can undo them.
 2. **NEVER pass `--rotate-tls-identity`** unless you have accepted that **every existing client
    is permanently locked out** and every user must be re-installed by hand. It mints a new
    server identity. There is no re-pin path for a non-technical user.
-3. **NEVER use `install-client.ps1 -Reset` to update a client.** It deletes `dist\`. It now
-   rescues the keystore first, but it is not an upgrade tool — update the exe and `ui/` in
-   place, preserving `keystore/`, `config/` and `index/`.
+3. **NEVER use `install-client.ps1` to update a client — with or without `-Reset`.** Both
+   paths rebuild `dist\MaxSecuClient` from scratch. `-Reset` deletes `dist\` outright; the
+   plain Install path deletes `dist\MaxSecuClient` on its way to laying out a fresh one. Both
+   now rescue a non-empty `keystore\` first, and the Install path additionally **refuses**
+   outright when it finds one (override: `-ForceReplaceClient`) — but neither is an upgrade
+   tool. The upgrade tool is **`scripts\build-upgrade-zip.ps1`**: it ships only the exe and
+   `ui\`, so `keystore\`, `config\` and `index\` are untouched and nobody re-enrolls or
+   re-pins. Losing `keystore\local_key_blob` is terminal: there is no server-side copy,
+   `register.key` is single-use, and there is no admin escape hatch.
 4. **NEVER let the data directory be guessed.** If you are unsure the box's data dir matches
    the invoking user's home, state it: `sudo env MAXSECU_DATA_DIR=/actual/path bash …`. A
    wrong data dir orphans every uploaded blob and mints a new TLS identity.

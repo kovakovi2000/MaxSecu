@@ -214,6 +214,47 @@ fi
 echo "    OK — service runs $SERVER_BIN"
 
 # --------------------------------------------------------------------------- #
+# 2c. REFUSE when the INSTALLED binary predates the backup feature.
+#
+# upgrade-server.sh runs this same probe (its step 3b) — duplicated here ON PURPOSE,
+# because upgrade-server.sh is NOT the only way to reach this script. It is reached
+# directly by an operator, by `install-server.sh`'s existing-install refusal (which
+# offers `sudo bash scripts/backup-server.sh` as remedy 3), and by
+# docs/runbooks/backup-restore.md. Every one of those bypasses the guard in
+# upgrade-server.sh.
+#
+# Handing `backup` to a pre-feature binary does NOT fail. Its argument match ended in
+# `_ => {}`, so it fell through and STARTED A SECOND SERVER, as root, against this
+# same database and data dir, on the compiled-in default port, with the passphrase on
+# its stdin and no timeout. Measured on a real 41912da box: it served for 705 seconds
+# until it was killed by hand, and it wrote into <data_dir>/client-pins. Worse, a
+# pre-feature binary that resolves a data dir with no cert MINTS A NEW TLS IDENTITY
+# and a new directory trust root there — which locks out every pinned client
+# permanently, with no admin escape hatch.
+#
+# The probe must not RUN the binary, because running it is the hazard. Look for a
+# string only a backup-capable binary contains: `MXBU`, the sealed bundle's 4-byte
+# magic (crates/server/src/backup/format.rs).
+# --------------------------------------------------------------------------- #
+if ! grep -aq 'MXBU' "$SERVER_BIN" 2>/dev/null; then
+	echo "error: the INSTALLED server binary predates the backup feature, so it cannot" >&2
+	echo "       take a backup. Nothing was changed and the server is still running." >&2
+	echo "" >&2
+	echo "       On this binary a backup is not possible AT ALL, so the one upgrade that" >&2
+	echo "       installs backup support has to skip it:" >&2
+	echo "" >&2
+	echo "           sudo bash scripts/upgrade-server.sh --no-backup" >&2
+	echo "" >&2
+	echo "       After that upgrade this script works normally, and every later upgrade" >&2
+	echo "       takes a sealed backup automatically." >&2
+	echo "" >&2
+	echo "       (Refusing rather than trying: asking a pre-feature binary to run a" >&2
+	echo "       'backup' it does not know makes it start a SECOND server as root against" >&2
+	echo "       this same database, and it never exits.)" >&2
+	exit 1
+fi
+
+# --------------------------------------------------------------------------- #
 # 3a. Scrape the environment the running server uses out of its unit, so the
 #     backup binary resolves EXACTLY the same database, data dir and cold tier
 #     the server does (the binary reads these through its LauncherConfig — the

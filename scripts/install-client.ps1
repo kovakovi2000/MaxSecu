@@ -84,6 +84,21 @@ param(
     [Parameter(ParameterSetName = 'Install')]
     [string] $Token = '',
 
+    # Allow section 8 to replace a client folder that already holds a NON-EMPTY
+    # keystore. Without this the run REFUSES there, because dist\MaxSecuClient is
+    # rebuilt from scratch and that keystore is the Argon2id-sealed private key of
+    # whoever signed in from it -- there is no server-side copy and no admin escape
+    # hatch, so losing it means that account can never sign in again.
+    #
+    # This is NOT the tool for updating an installed client. That is
+    # scripts\build-upgrade-zip.ps1, which ships only the exe + ui\ and leaves
+    # keystore\, config\ and index\ untouched.
+    #
+    # Even with this switch the keystore is RESCUED to
+    # dist\_keystore-rescue-<stamp>\ first, exactly as -Reset does.
+    [Parameter(ParameterSetName = 'Install')]
+    [switch] $ForceReplaceClient,
+
     # Tear the CLIENT down to zero and exit (no build): delete dist\ (both the admin
     # app and the handout ZIP), the recovery + registration secrets in the repo root
     # (recovery_key.blob / recovery_pin.bin / register.key), and the recovery pin
@@ -881,6 +896,65 @@ Write-Section 'Laying out the admin working client (dist\MaxSecuClient)'
 
 $DistDir  = Join-Path $Root 'dist'
 $AdminDir = Join-Path $DistDir 'MaxSecuClient'
+
+# FAIL CLOSED on an existing ENROLLED client.
+#
+# This section rebuilds dist\MaxSecuClient from scratch, and the Remove-Item below
+# used to be unconditional. dist\MaxSecuClient\keystore\ holds the Argon2id-sealed
+# PRIVATE KEY of whoever signed in from that client. There is no server-side copy,
+# register.key is single-use, and there is no admin escape hatch -- so wiping it
+# means that account can never sign in again and its files are unreadable forever.
+# -Reset has rescued that folder since the day it cost a real account (section 1b);
+# the Install path never did, and README/runbook both tell an admin to re-run this
+# script from the same folder to mint another user's ZIP.
+#
+# An EMPTY keystore (a fresh ceremony, or a resumed run that failed before anyone
+# signed in) is not an enrolled client, so the common cases are unaffected.
+$AdminKeystore = Join-Path $AdminDir 'keystore'
+$SealedCount = 0
+if (Test-Path $AdminKeystore) {
+    $SealedCount = @(Get-ChildItem -Path $AdminKeystore -File -Recurse -Force -ErrorAction SilentlyContinue).Count
+}
+if ($SealedCount -gt 0 -and -not $ForceReplaceClient) {
+    Write-Host ''
+    Write-Host '============================================================' -ForegroundColor Red
+    Write-Host ' REFUSING: that client folder holds a signed-in account.' -ForegroundColor Red
+    Write-Host '============================================================' -ForegroundColor Red
+    Write-Host ''
+    Write-Host "    $AdminKeystore"
+    Write-Host "    holds $SealedCount sealed key file(s)."
+    Write-Host ''
+    Write-Host ' This script LAYS OUT A NEW CLIENT and would delete that folder. The'
+    Write-Host ' keystore is the only copy of that account''s private key -- not on the'
+    Write-Host ' server, not recoverable by an admin. Deleting it ends the account.'
+    Write-Host ''
+    Write-Host ' To UPDATE an installed client to a new build, use the upgrade ZIP. It' -ForegroundColor Cyan
+    Write-Host ' ships only the exe + ui\ and leaves keystore\, config\ and index\ alone:' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '     powershell -ExecutionPolicy Bypass -File scripts\build-upgrade-zip.ps1'
+    Write-Host ''
+    Write-Host ' To make a handout ZIP for a NEW user, nothing here needs re-running --'
+    Write-Host ' mint a registration key and send the existing dist\MaxSecuClient-share.zip.'
+    Write-Host ''
+    Write-Host ' If you really do mean to replace this client, say so explicitly:'
+    Write-Host ''
+    Write-Host "     ... install-client.ps1 <your args> -ForceReplaceClient"
+    Write-Host ''
+    Write-Host ' Even then the keystore is copied to dist\_keystore-rescue-<stamp>\ first.'
+    Write-Host ''
+    Write-Host ' NOTHING WAS CHANGED BY THIS RUN.' -ForegroundColor Yellow
+    Write-Host '============================================================' -ForegroundColor Red
+    exit 1
+}
+if ($SealedCount -gt 0) {
+    # -ForceReplaceClient: proceed, but rescue first -- same shape as section 1b.
+    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+    $RescueDir = Join-Path $DistDir ('_keystore-rescue-' + $stamp)
+    New-Item -ItemType Directory -Path (Join-Path $RescueDir 'MaxSecuClient') -Force | Out-Null
+    Copy-Item -Path $AdminKeystore -Destination (Join-Path $RescueDir 'MaxSecuClient') -Recurse -Force
+    Write-Host "  -ForceReplaceClient: rescued $AdminKeystore -> $RescueDir\MaxSecuClient\keystore" -ForegroundColor Yellow
+}
+
 if (Test-Path $AdminDir) {
     Remove-Item -Path $AdminDir -Recurse -Force
 }

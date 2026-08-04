@@ -264,6 +264,44 @@ if [ ! -x "$SERVER_BIN" ]; then
 	exit 1
 fi
 
+# REFUSE when the binary at $SERVER_BIN predates the backup feature.
+#
+# The same probe upgrade-server.sh and backup-server.sh run, duplicated here for the
+# same reason: this script is reached directly. `--list` is the worst door of the
+# three — it takes no passphrase, it is documented as read-only, and it is what six
+# different refusal messages tell an operator to run first. On a box still running a
+# pre-feature binary, `list-backups` is an argument that binary does not know, so it
+# falls through and starts a SECOND server as root against the live database and data
+# dir; and if that data dir has no cert it MINTS A NEW TLS IDENTITY, locking out every
+# pinned client permanently.
+#
+# Note this does NOT break the dead-box rebuild path above: that path has the operator
+# build the binary from the NEW tree first, and a new binary carries MXBU.
+#
+# The probe must not RUN the binary — running it is the hazard.
+if ! grep -aq 'MXBU' "$SERVER_BIN" 2>/dev/null; then
+	echo "error: the server binary at" >&2
+	echo "           $SERVER_BIN" >&2
+	echo "       predates the backup feature, so it cannot read or write sealed bundles." >&2
+	echo "       Nothing was changed." >&2
+	echo "" >&2
+	echo "       There is nothing to restore from on such a box: no bundle can have been" >&2
+	echo "       taken by a binary that has no backup support. What you want is one of:" >&2
+	echo "" >&2
+	echo "         * UPGRADING this server (keeps every account, key, pin and upload):" >&2
+	echo "               sudo bash scripts/upgrade-server.sh --no-backup" >&2
+	echo "" >&2
+	echo "         * REBUILDING a dead box: build the binary from the NEW tree first" >&2
+	echo "               cargo build --release -p maxsecu-portable-server" >&2
+	echo "           and then come back here — a new binary supports restore." >&2
+	echo "" >&2
+	echo "       (Refusing rather than trying: this binary would treat 'restore' and" >&2
+	echo "       'list-backups' as unknown arguments and START A SECOND SERVER as root" >&2
+	echo "       against the live database, which never exits and can mint a NEW TLS" >&2
+	echo "       identity that locks out every installed client.)" >&2
+	exit 1
+fi
+
 # Run a command string as root (directly if already root, else via sudo).
 run_root() {
 	if [ "$IS_ROOT" -eq 1 ]; then

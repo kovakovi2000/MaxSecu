@@ -544,6 +544,77 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+# 5a. SANITY-CHECK THE TREE ON DISK -- while the server is still serving.
+#
+# Production has no git. The new version is DRAGGED AND DROPPED on top of the old
+# folder, so there is no commit to verify against and a copy can be partial: an
+# interrupted SFTP transfer, a zip extracted without its subfolders, or simply the
+# wrong directory. Every one of those used to be discovered AFTER the server was
+# stopped -- migrations/apply.sh is sourced at step 6b, so a missing migrations/
+# aborted the run under `set -e` with the service already down.
+#
+# Check it here, where a failure costs nothing, and PRINT what was found so the
+# operator can see whether the folder they copied is the one they meant.
+# --------------------------------------------------------------------------- #
+echo "==> Checking the source tree on disk"
+if [ ! -d "$ROOT/migrations" ]; then
+	echo "error: $ROOT/migrations does not exist." >&2
+	echo "       This tree cannot be the new version -- every release since the" >&2
+	echo "       migration runner landed ships that directory." >&2
+	echo "" >&2
+	echo "       You are most likely upgrading the WRONG FOLDER, or the copy of the" >&2
+	echo "       new tree onto this box is incomplete. Re-copy the whole tree over" >&2
+	echo "       $ROOT and run this again." >&2
+	echo "" >&2
+	echo "       The server was NOT stopped and nothing was changed." >&2
+	exit 1
+fi
+if [ ! -f "$ROOT/migrations/apply.sh" ]; then
+	echo "error: $ROOT/migrations/apply.sh is missing (the migration runner)." >&2
+	echo "       The copy of the new tree onto this box is incomplete. Re-copy it." >&2
+	echo "       The server was NOT stopped and nothing was changed." >&2
+	exit 1
+fi
+TREE_MIGRATIONS="$(find "$ROOT/migrations" -maxdepth 1 -type f -name '*.sql' | wc -l | tr -d ' ')"
+if [ "$TREE_MIGRATIONS" -eq 0 ]; then
+	echo "error: $ROOT/migrations holds no .sql files at all." >&2
+	echo "       Expected at least 0001_baseline.sql. The copy is incomplete." >&2
+	echo "       The server was NOT stopped and nothing was changed." >&2
+	exit 1
+fi
+echo "    migrations in this tree: $TREE_MIGRATIONS"
+find "$ROOT/migrations" -maxdepth 1 -type f -name '*.sql' -printf '      %f\n' 2>/dev/null | LC_ALL=C sort || true
+
+# --------------------------------------------------------------------------- #
+# 5b. PRE-FETCH the crates this build needs -- still before anything is stopped.
+#
+# The rebuild at step 6 runs with the service DOWN. cargo resolves and downloads
+# dependencies at that moment, so on a box with no outbound HTTPS to crates.io (a
+# firewalled VPS, an expired proxy, a DNS outage) the FIRST thing that fails is the
+# build, and it fails mid-downtime. The EXIT trap does restore the previous binary,
+# but the outage is real and the operator is left reading a cargo network error.
+#
+# Fetching here turns that into a clean pre-flight refusal with the server still
+# serving. It is a no-op on a box whose registry cache is already warm.
+# --------------------------------------------------------------------------- #
+echo "==> Pre-fetching build dependencies (before anything is stopped)"
+if ! run_as_user "cd '$ROOT' && . '$CARGO_ENV' && cargo fetch --locked"; then
+	echo "error: could not fetch the crates this build needs." >&2
+	echo "" >&2
+	echo "       This runs BEFORE the server is stopped precisely so a network or" >&2
+	echo "       registry problem cannot strand you mid-upgrade. The server is still" >&2
+	echo "       running and nothing was changed." >&2
+	echo "" >&2
+	echo "       Usual causes: no outbound HTTPS to crates.io / static.crates.io," >&2
+	echo "       a proxy that needs configuring, or a Cargo.lock that disagrees with" >&2
+	echo "       Cargo.toml (--locked refuses to update it)." >&2
+	echo "" >&2
+	echo "       Fix connectivity and run this script again." >&2
+	exit 1
+fi
+echo "    dependencies are available locally"
+
+# --------------------------------------------------------------------------- #
 # 5c. Resolve everything we read out of the unit BEFORE anything is stopped.
 #
 #     Every one of these lookups can fail, and a failure must abort while the
@@ -824,6 +895,27 @@ if ! run_as_user "test -x '$SERVER_BIN'"; then
 	exit 1
 fi
 echo "    build OK"
+
+# Did this build actually produce different code? PREV_BIN is the byte copy taken
+# before the stop. An IDENTICAL hash means the tree on disk builds exactly what was
+# already installed -- which is correct and expected when re-running this script,
+# but is ALSO the signature of the one mistake a no-git deployment makes easily:
+# upgrading a folder the new files were never copied into. Say so rather than
+# printing an unqualified success; the operator is the only one who can tell the
+# two apart.
+NEW_BIN_SHA="$(run_root "sha256sum '$SERVER_BIN' 2>/dev/null | cut -d' ' -f1" || true)"
+OLD_BIN_SHA="$(run_root "sha256sum '$PREV_BIN' 2>/dev/null | cut -d' ' -f1" || true)"
+if [ -n "$NEW_BIN_SHA" ] && [ "$NEW_BIN_SHA" = "$OLD_BIN_SHA" ]; then
+	echo ""
+	echo "    NOTE: the rebuilt binary is BYTE-IDENTICAL to the one already installed"
+	echo "          ($NEW_BIN_SHA)."
+	echo "          That is normal if you are re-running this script. If you expected"
+	echo "          NEW code, the new files did not reach $ROOT -- check that you"
+	echo "          copied the new tree over THIS folder, then run this again."
+	echo ""
+else
+	echo "    binary changed: ${OLD_BIN_SHA:-(none)} -> ${NEW_BIN_SHA:-(unknown)}"
+fi
 
 # --------------------------------------------------------------------------- #
 # 6b. Apply pending database migrations — BEFORE the restart, so the new binary
@@ -1157,9 +1249,22 @@ fi
 echo "    (previous binary kept at $PREV_BIN)"
 
 # The TLS cert was not touched, so the fingerprint clients pinned is unchanged.
-# Print it so you can confirm it matches what your users already have.
-echo "==> Server fingerprint (unchanged — clients do NOT need to re-pin):"
-run_as_user "MAXSECU_DATA_DIR='$DATA_DIR' '$SERVER_BIN' print-fingerprint" || true
+#
+# PRINT THE CERT-ONLY FINGERPRINT. This used to print `print-fingerprint`, which is
+# pin_fingerprint(cert, directory_pub) -- a DIFFERENT value from the one in the
+# connection code an installed client actually holds, which install-server.sh builds
+# from `print-cert-fingerprint` = pin_fingerprint(cert, &[]). The two can never
+# match, so the old line invited a non-technical operator to compare a value against
+# their users' connection code, see a mismatch under a banner promising it was
+# unchanged, and conclude the server identity had rotated -- the one conclusion that
+# leads to re-pinning every client for no reason.
+echo "==> Server-cert fingerprint (unchanged — clients do NOT need to re-pin):"
+echo "    This is the value in your users' connection code, after the '#'."
+run_as_user "MAXSECU_DATA_DIR='$DATA_DIR' '$SERVER_BIN' print-cert-fingerprint" || true
+# The directory pin is a separate value and is NOT what clients compare on connect.
+# Shown labelled, so the two can never be confused again.
+echo "    (directory pin, a different value — not the connection code:)"
+run_as_user "MAXSECU_DATA_DIR='$DATA_DIR' '$SERVER_BIN' print-fingerprint 2>/dev/null | sed 's/^/      /'" || true
 
 echo ""
 echo "================ UPGRADE COMPLETE ================"

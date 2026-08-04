@@ -159,6 +159,69 @@ if ($SkipBuild) {
 }
 
 # ---------------------------------------------------------------------------
+# 2b. HARD GATE: the exe about to be shipped must carry the REAL recovery pin, and
+#     it must be the pin THIS tree holds.
+#
+#     Section 0 only proves recovery_pin.bin EXISTS. That is not enough:
+#
+#       * -SkipBuild ships whatever binary is already in target\release, which may
+#         predate the current recovery_pin.bin entirely.
+#       * A tree that was used for a DIFFERENT server (or the main development
+#         checkout, whose pin belongs to no deployment) embeds a pin for another
+#         recovery account. Nothing fails at startup and login still works -- the
+#         damage shows up later, as EVERY upload failing `server_untrusted`,
+#         because resolve_recovery_pin compares the served key against the
+#         embedded one on every upload.
+#       * A build made with --features unpinned-dev embeds the NON-SECURE test pin.
+#
+#     install-client.ps1 has run exactly this check since the pin was introduced
+#     (its section 7b); the upgrade path shipped without it. Same check, same
+#     failure text shape.
+# ---------------------------------------------------------------------------
+Write-Section 'Verifying the shipped client embedded the real recovery pin'
+$PinTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("maxsecu-upgradezip-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $PinTmp -Force | Out-Null
+try {
+    $FpOut = Join-Path $PinTmp 'recovery-pin-fp.out'
+    $FpErr = Join-Path $PinTmp 'recovery-pin-fp.err'
+    # The client is a GUI-subsystem binary, so `& $exe` does not reliably capture
+    # stdout. --print-recovery-pin-fp exits before any window is created.
+    Start-Process -FilePath $ClientExe -ArgumentList '--print-recovery-pin-fp' `
+        -Wait -PassThru -NoNewWindow `
+        -RedirectStandardOutput $FpOut -RedirectStandardError $FpErr | Out-Null
+    $FpText = ''
+    if (Test-Path $FpOut) { $FpText = (Get-Content -Path $FpOut -Raw) }
+    $shaMatch = [regex]::Match($FpText, '(?im)^\s*recovery-pin-sha256:\s*([0-9a-f]{64})\s*$')
+    $isTestMatch = [regex]::Match($FpText, '(?im)^\s*recovery-pin-is-test:\s*(true|false)\s*$')
+    if (-not $shaMatch.Success) {
+        Fail "Could not read the embedded recovery pin from $ClientExe (--print-recovery-pin-fp printed nothing usable). Do not distribute this build."
+    }
+    $EmbeddedSha = $shaMatch.Groups[1].Value.ToLowerInvariant()
+    $ExpectedSha = (Get-FileHash -Path $EmbeddedPin -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($isTestMatch.Success -and $isTestMatch.Groups[1].Value -ne 'false') {
+        Fail "The shipped client embedded the NON-SECURE test pin (recovery-pin-is-test: $($isTestMatch.Groups[1].Value)). Do not distribute this build; rebuild without --features unpinned-dev."
+    }
+    if ($EmbeddedSha -ne $ExpectedSha) {
+        Fail @"
+The client binary does NOT carry this tree's recovery pin.
+
+    exe embeds        : $EmbeddedSha
+    recovery_pin.bin  : $ExpectedSha
+
+Do not distribute this build. Every upload from it would fail 'server_untrusted'.
+If you passed -SkipBuild, drop it and rebuild. If this checkout belongs to a
+DIFFERENT server than the one you are upgrading, build from that server's tree --
+the pin is per-deployment.
+"@
+    }
+    Write-Host "  VERIFIED - real recovery pin embedded (sha256 $($EmbeddedSha.Substring(0,12))...); no test pin present." -ForegroundColor Green
+    Write-Host "  Cross-check it against the SERVER you are upgrading before you send the ZIP:" -ForegroundColor DarkGray
+    Write-Host "    sudo -u postgres psql -d maxsecu -tAc ""SELECT encode(sha256(enc_pub || CASE WHEN mlkem_pub IS NULL THEN '\x00'::bytea ELSE '\x01'::bytea END || coalesce(mlkem_pub,''::bytea)),'hex') FROM recovery_account WHERE id = true""" -ForegroundColor DarkGray
+} finally {
+    Remove-Item -Path $PinTmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
 # 3. Stage the UPGRADE payload: ONLY the two things that change on a code update
 #    — the exe and ui\ — plus UPGRADE-HERE.txt. Deliberately NO config\ (keep the
 #    user's existing server pin), NO keystore, NO account data of any kind.

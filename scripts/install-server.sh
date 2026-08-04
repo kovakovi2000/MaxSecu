@@ -2015,6 +2015,17 @@ if [ -n "$EXISTING_SIGNALS" ] && [ "$FORCE_OVERWRITE" -ne 1 ]; then
 	echo "        printf '%s' 'passphrase' | sudo bash scripts/backup-server.sh" >&2
 	echo "        sudo bash scripts/restore-server.sh --list" >&2
 	echo "" >&2
+	echo "    TWO PRECONDITIONS, or both of those refuse (harmlessly) instead:" >&2
+	echo "      a) A BACKUP NEEDS A COLD TIER. It is where the sealed bundle is" >&2
+	echo "         written, so with MAXSECU_COLD_TIER off there is nowhere to put" >&2
+	echo "         one and a backup is not possible at all. Add a tier in place with" >&2
+	echo "         the drop-in in remedy 2 above — do NOT re-run this installer for" >&2
+	echo "         it, which is what you are reading this message for." >&2
+	echo "      b) THE INSTALLED BINARY MUST ALREADY SUPPORT BACKUPS. On a server" >&2
+	echo "         installed before that feature, neither command can work; upgrade" >&2
+	echo "         first, and that one upgrade has to skip its own backup:" >&2
+	echo "             sudo bash scripts/upgrade-server.sh --no-backup" >&2
+	echo "" >&2
 	echo " 4. START OVER FROM ZERO (destroys EVERYTHING on this box — every account," >&2
 	echo "    every key, every upload, the TLS identity and the database):" >&2
 	echo "" >&2

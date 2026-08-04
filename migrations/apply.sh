@@ -140,10 +140,38 @@ EOF
 # in ONE transaction with its schema_migrations row. Idempotent: re-running it
 # applies nothing. Call migrations_verify_history FIRST.
 migrations_apply_pending() {
-	local dir applied name id sha pending=0
+	local dir applied name id sha names pending=0
 
 	dir="$MIGRATIONS_DIR"
 	applied="$(migrations_applied)"
+
+	# Resolve the migration list ONCE, and FAIL CLOSED if it cannot be resolved.
+	#
+	# This used to be `done < <(migrations_names)` on each loop below. A process
+	# substitution's exit status is invisible to the shell -- `set -euo pipefail`
+	# cannot see it -- so EVERY way migrations_names can fail (directory missing, a
+	# stray unnumbered .sql, zero migrations found) produced an EMPTY list, both
+	# loops ran zero times, `pending` stayed 0, and this function RETURNED 0 after
+	# printing "database schema is already up to date". upgrade-server.sh then
+	# restarted the server and printed a fully successful upgrade -- with the new
+	# code running against an un-migrated schema. The new code expects
+	# file_tombstones/wrap_revocations to exist, so the delete and revoke paths
+	# start 500ing on a box whose operator was just told everything was fine.
+	#
+	# This is not a theoretical ordering. Production has no git and is deployed by
+	# dragging the new tree on top of the old folder, so a copy that drops or
+	# truncates migrations/ is the EXPECTED failure -- and it landed on the one
+	# path that reported success.
+	if ! names="$(migrations_names)"; then
+		echo "error: cannot determine which migrations to apply (see the error above)." >&2
+		echo "       Refusing to report an up-to-date schema without having read the" >&2
+		echo "       migrations directory. Nothing was changed." >&2
+		echo "" >&2
+		echo "       If you deployed by copying the tree over the old one, the copy is" >&2
+		echo "       probably incomplete: $MIGRATIONS_DIR must hold 0001_baseline.sql" >&2
+		echo "       and every later NNNN_<slug>.sql. Re-copy and run this again." >&2
+		return 1
+	fi
 
 	# Pre-pass: vet EVERY pending migration before applying ANY of them, so a bad
 	# one at the end cannot leave the earlier ones half-shipped.
@@ -168,7 +196,7 @@ migrations_apply_pending() {
 			echo "       statements. Nothing was changed." >&2
 			return 1
 		fi
-	done < <(migrations_names)
+	done <<<"$names"
 
 	while IFS= read -r name; do
 		[ -n "$name" ] || continue
@@ -193,7 +221,7 @@ migrations_apply_pending() {
 			return 1
 		fi
 		pending=$((pending + 1))
-	done < <(migrations_names)
+	done <<<"$names"
 
 	if [ "$pending" -eq 0 ]; then
 		echo "    database schema is already up to date"
@@ -208,13 +236,24 @@ migrations_apply_pending() {
 # this on a database that was not just created from docs/schema.sql — it would
 # mark migrations as applied that this database has never seen.
 migrations_mark_all_applied() {
-	local name id sha
+	local name id sha names count
+	# Same fail-closed rule as migrations_apply_pending: resolve the list ONCE and
+	# refuse if it cannot be read. Silently marking ZERO migrations as applied on a
+	# fresh install is worse than failing -- the database would then look like it
+	# predates 0001 forever, and the NEXT upgrade would replay every migration
+	# against a schema that already has all of it.
+	if ! names="$(migrations_names)"; then
+		echo "error: cannot read the migrations directory (see the error above)." >&2
+		echo "       Refusing to record an empty migration history. Nothing was changed." >&2
+		return 1
+	fi
 	while IFS= read -r name; do
 		[ -n "$name" ] || continue
 		id="${name%%_*}"
 		sha="$(migrations_sha "$MIGRATIONS_DIR/$name")"
 		printf "INSERT INTO schema_migrations (id, sha256) VALUES (%s, '%s') ON CONFLICT (id) DO NOTHING;\n" \
 			"$((10#$id))" "$sha"
-	done < <(migrations_names) | db_psql -q
-	echo "    recorded $(migrations_names | wc -l) migration(s) as applied (fresh install)"
+	done <<<"$names" | db_psql -q
+	count="$(printf '%s\n' "$names" | sed '/^$/d' | wc -l)"
+	echo "    recorded $count migration(s) as applied (fresh install)"
 }
