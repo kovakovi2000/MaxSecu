@@ -126,6 +126,25 @@ jobs:
         run: rustup show
       - name: Compat gate - root workspace (encoding, crypto, keyblob, seedblob, HTTP wire)
         run: cargo test -p maxsecu-compat --locked
+      # ui/dist IS GITIGNORED, so a fresh checkout does not have it - and the client
+      # bin resolves `frontendDist: "ui/dist"` inside `tauri::generate_context!()` at
+      # COMPILE time, panicking when the directory is missing. `cargo test --test compat`
+      # still builds the bin target, so without this step the client half below cannot
+      # even compile:
+      #     error: proc macro panicked
+      #       --> src\main.rs: .build(tauri::generate_context!())
+      #       = help: message: The `frontendDist` configuration is set to "ui/dist"
+      #               but this path doesn't exist
+      # That is exactly how this job failed from the day it was added until 2026-08-04:
+      # the client half of the backward-compatibility gate - the keyblob, recovery-pin,
+      # settings and TOFU-pin consumers, the whole reason this job exists - had NEVER
+      # actually run in CI. Reproduced on a clean `git worktree` of b193d11.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build ui/dist (gitignored, but generate_context! needs it to compile)
+        working-directory: crates/client-app/ui
+        run: npm ci && npm run build
       # The client workspace is heavy (it links arti), so build ONLY the compat test
       # target. `--no-default-features` drops `embed-ffmpeg`: vendor/ffmpeg/ffmpeg.exe
       # is gitignored and absent on the runner, and the gate must not depend on it.
