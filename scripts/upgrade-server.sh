@@ -598,7 +598,12 @@ find "$ROOT/migrations" -maxdepth 1 -type f -name '*.sql' -printf '      %f\n' 2
 # serving. It is a no-op on a box whose registry cache is already warm.
 # --------------------------------------------------------------------------- #
 echo "==> Pre-fetching build dependencies (before anything is stopped)"
-if ! run_as_user "cd '$ROOT' && . '$CARGO_ENV' && cargo fetch --locked"; then
+# Deliberately NOT `--locked`. The rebuild at step 6 runs a plain
+# `cargo build --release`, so it tolerates a Cargo.lock that needs refreshing. A
+# pre-flight that is STRICTER than the step it guards can refuse an upgrade that
+# would have succeeded -- a false blocker. This must fail only where the build
+# would also fail, i.e. when the crates cannot be obtained at all.
+if ! run_as_user "cd '$ROOT' && . '$CARGO_ENV' && cargo fetch"; then
 	echo "error: could not fetch the crates this build needs." >&2
 	echo "" >&2
 	echo "       This runs BEFORE the server is stopped precisely so a network or" >&2

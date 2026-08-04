@@ -3407,7 +3407,7 @@ else
 	# the fact is a --reset + reinstall, or a drop-in for MAXSECU_BIND /
 	# MAXSECU_PUBLIC_ADDR plus --rotate-tls-identity to re-mint the SANs (which
 	# locks out every already-installed client). Say the honest thing here.
-	PUBLIC_ADDRESS="127.0.0.1:$PORT (local-only — see 'going public' in the README)"
+	PUBLIC_ADDRESS="127.0.0.1:$PORT (local-only — re-run with --public to expose it; see 'Part 1 — Set up the server' in the README)"
 	CONN_ADDR="127.0.0.1:$PORT"
 fi
 

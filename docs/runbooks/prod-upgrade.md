@@ -126,6 +126,21 @@ cd ~/maxsecu
 sudo bash scripts/fingerprint.sh before /root/fp-before.txt
 ```
 
+> **On the FIRST upgrade of an existing box this order is impossible as written, and that is
+> not your mistake.** `scripts/fingerprint.sh` arrived with the backup/rollback work — a server
+> installed before it simply has no such file, so there is nothing to run in §3.1 yet. Two ways
+> out, both fine:
+>
+> * copy **only** `scripts/fingerprint.sh` from the new tree onto the box, run §3.1, then do the
+>   full copy in §3.2 (the script is read-only — it runs queries and hashes files, and writes
+>   nothing but its own output file); or
+> * do §3.2 first and take the "before" fingerprint immediately after, **before** running
+>   `upgrade-server.sh`. Copying source files changes no database row, no blob and no TLS
+>   material, so the baseline is still valid for everything that matters. The one section that
+>   is then not a true "before" is *migrations present in the tree on this box*.
+>
+> Either way, take it before `upgrade-server.sh` runs. That is the line that matters.
+
 It records: row counts for every access-bearing table; the `users` row (login); the signed
 `directory_bindings` row; every file, version, stream and key wrap; the TLS cert fingerprint;
 raw digests of `tls/cert.der` and the delegation config; a digest of every blob; the cold
@@ -393,6 +408,14 @@ instant the fork succeeds. A binary that panics 200 ms into startup still reads 
 **Guard:** start, wait, then require that it is **still** active **and** that `NRestarts` has
 not moved. The wait is 20 seconds — the slowest way to die on startup is a Postgres connect,
 whose timeout alone is 10 seconds, so a 5-second window called that healthy.
+
+> **`NRestarts` alone is a WEAK signal — do not read `NRestarts=0` as "nothing restarted".**
+> systemd resets the counter on an explicit `stop`/`start`, which is exactly what this script
+> does, so a perfectly normal upgrade ends at `0` and a rehearsal measured `0` straight across
+> a real restart. It only ever catches a *crash loop*. The load-bearing evidence that the
+> process was replaced is **`MainPID` changing** plus the **server binary's sha256 changing**;
+> compare those in the before/after `fingerprint.sh` output, and treat `NRestarts` as the
+> crash-loop detector it is, nothing more.
 
 ### 4.5 An aborted upgrade used to leave the box down
 
